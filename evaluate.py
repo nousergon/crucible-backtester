@@ -35,6 +35,23 @@ from ssm_secrets import load_secrets
 
 load_secrets()
 
+# Structured logging + flow-doctor singleton via alpha-engine-lib (shared
+# pattern across all 5 entrypoints; see executor/main.py for reference).
+# Module-top so import-time errors in pandas / boto3 / analysis modules
+# below are also captured by flow-doctor's ERROR handler. evaluate.py
+# runs on EC2 spot via spot_backtest.sh; not in a Lambda image, so the
+# simple repo-root path resolution works.
+#
+# exclude_patterns starts empty by deliberate convention.
+from alpha_engine_lib.logging import setup_logging
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
+setup_logging(
+    "evaluate",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
+
 import boto3
 from botocore.exceptions import ClientError
 import pandas as pd
@@ -772,17 +789,15 @@ def _run_regression(
 def main() -> None:
     args = _parse_args()
 
-    # Structured logging + flow-doctor singleton are provided by
-    # alpha_engine_lib. setup_logging() configures the root logger and,
-    # when FLOW_DOCTOR_ENABLED=1, attaches flow-doctor's ERROR handler
-    # using the config at flow-doctor.yaml.
-    from alpha_engine_lib.logging import setup_logging, get_flow_doctor
-    _flow_doctor_yaml = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
-    setup_logging("evaluate", flow_doctor_yaml=_flow_doctor_yaml)
+    # setup_logging already ran at module-top (see comment near the
+    # alpha_engine_lib.logging import). Apply the user-requested level here.
+    # Note: get_flow_doctor() retrieval was dropped — every fd.report()
+    # call site lived in backtest.py, never in this module's body.
+    # ERROR-level escalation still flows through the root-attached
+    # FlowDoctorHandler from setup_logging.
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     _health_start = _time.time()
 
-    fd = get_flow_doctor()
     config = load_config(args.config)
 
     # Preflight: AWS_REGION + S3 bucket reachable. Evaluation reads

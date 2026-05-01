@@ -33,12 +33,66 @@ import os
 import sys
 import time
 
-# Load secrets from SSM Parameter Store before any os.environ.get calls
+# Ensure the project root is on sys.path so sibling modules (ssm_secrets)
+# can be imported below. Cheap; safe at module-top.
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from ssm_secrets import load_secrets
-load_secrets()
+
+# Structured logging + flow-doctor singleton via alpha-engine-lib (shared
+# pattern across all 5 entrypoints; see executor/main.py for reference).
+# When FLOW_DOCTOR_ENABLED=1 the root logger gets a handler that
+# captures ERROR+ records — every log.error() call in the handler
+# below is automatically routed to flow-doctor without explicit
+# fd.report() plumbing.
+#
+# Path resolution: LAMBDA_TASK_ROOT (=/var/task in the Lambda image,
+# where lambda_health/Dockerfile COPYs flow-doctor.yaml) takes
+# precedence; falls back to two-dirs-up from this file for local dev
+# (lambda_health/handler.py → repo root). Mirrors alpha-engine-research
+# / alpha-engine-predictor pattern.
+#
+# exclude_patterns starts empty by deliberate convention.
+#
+# Why module-top is safe even though load_secrets is deferred below:
+# flow-doctor.yaml only references EMAIL_SENDER / EMAIL_RECIPIENTS /
+# GMAIL_APP_PASSWORD, all populated by Lambda's `--environment` block
+# BEFORE the Python interpreter starts. load_secrets() pulls separate
+# SSM-backed secrets (e.g. ANTHROPIC_API_KEY) that flow_doctor.init()
+# does not consult.
+from alpha_engine_lib.logging import setup_logging
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(
+    os.environ.get(
+        "LAMBDA_TASK_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ),
+    "flow-doctor.yaml",
+)
+setup_logging(
+    "lambda_health",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 log = logging.getLogger(__name__)
+
+# Expensive init is deferred to the first handler invocation to keep
+# Lambda's cold-start init phase under the 10-second hard timeout.
+# Pre-emptively applies research's / predictor's _ensure_init pattern
+# even though lambda_health is "lightweight" — load_secrets() is an
+# SSM round-trip (~1-2s) and the same v72-class regression that hit
+# alpha-engine-predictor is the failure mode we want to keep closed.
+# Idempotent via the `_init_done` flag.
+_init_done = False
+
+
+def _ensure_init() -> None:
+    """Run expensive init once, on the first handler invocation."""
+    global _init_done
+    if _init_done:
+        return
+    from ssm_secrets import load_secrets
+    load_secrets()
+    _init_done = True
 
 
 def handler(event: dict, context) -> dict:
@@ -49,16 +103,9 @@ def handler(event: dict, context) -> dict:
         date     (str)  : Override date YYYY-MM-DD (default: today UTC)
         dry_run  (bool) : If True, skip S3 writes and email (for canary tests)
     """
-    # Structured logging + flow-doctor singleton come from
-    # alpha_engine_lib. When FLOW_DOCTOR_ENABLED=1 the root logger gets
-    # a handler that captures ERROR+ records — every log.error() call
-    # in the phases below is automatically routed to flow-doctor
-    # without explicit fd.report() plumbing. The yaml ships alongside
-    # this handler in the Lambda container (see Dockerfile COPY).
-    from alpha_engine_lib.logging import setup_logging, get_flow_doctor
-    _flow_doctor_yaml = os.path.join(os.environ.get("LAMBDA_TASK_ROOT", os.path.dirname(os.path.abspath(__file__))), "flow-doctor.yaml")
-    setup_logging("lambda_health", flow_doctor_yaml=_flow_doctor_yaml)
-    fd = get_flow_doctor()
+    # Run the deferred SSM secrets fetch on the first invocation. Warm
+    # containers pay zero cost via the _init_done flag.
+    _ensure_init()
 
     t0 = time.time()
     bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
