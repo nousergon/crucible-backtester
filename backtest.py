@@ -43,6 +43,27 @@ from ssm_secrets import load_secrets
 
 load_secrets()
 
+# Structured logging + flow-doctor singleton via alpha-engine-lib (shared
+# pattern across all 5 entrypoints; see executor/main.py for reference).
+# Module-top so import-time errors in vectorbt / boto3 / arcticdb /
+# executor modules below are also captured by flow-doctor's ERROR
+# handler. backtest.py runs on EC2 spot via spot_backtest.sh; not in
+# a Lambda image, so the simple repo-root path resolution works. The
+# get_flow_doctor singleton is retrieved inside main() — fd is an
+# active consumer (~7 fd.report() call sites for param-sweep /
+# simulation / optimizer error escalation).
+#
+# exclude_patterns starts empty by deliberate convention; add patterns
+# only after observing real ERROR-level noise during a backtest run.
+from alpha_engine_lib.logging import setup_logging, get_flow_doctor
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
+setup_logging(
+    "backtest",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
+
 import boto3
 import pandas as pd
 import yaml
@@ -3665,17 +3686,14 @@ def _export_simulation_artifacts(
 def main() -> None:
     args = _parse_args()
 
-    # Structured logging + flow-doctor singleton come from
-    # alpha_engine_lib. setup_logging() configures the root logger and,
-    # when FLOW_DOCTOR_ENABLED=1, initializes the shared FlowDoctor
-    # instance using the config at flow-doctor.yaml and attaches its
-    # ERROR-level log handler. Respects the --log-level CLI flag.
-    from alpha_engine_lib.logging import setup_logging, get_flow_doctor
-    _flow_doctor_yaml = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
-    setup_logging("backtest", flow_doctor_yaml=_flow_doctor_yaml)
+    # setup_logging already ran at module-top (see comment near the
+    # alpha_engine_lib.logging import). Apply the user-requested level here.
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     _health_start = _time.time()
 
+    # Retrieve the shared flow-doctor instance for explicit fd.report()
+    # call sites in this function (param sweep / simulation / optimizer
+    # error escalation). Returns None when FLOW_DOCTOR_ENABLED=0.
     fd = get_flow_doctor()
 
     config = load_config(args.config)
