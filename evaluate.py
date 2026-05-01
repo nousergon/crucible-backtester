@@ -968,6 +968,36 @@ def main() -> None:
 
         report_md = "\n".join(completeness_header) + "\n" + report_md
 
+        # Append LLM cost report (PR 4 of cost-telemetry workstream).
+        # Reads decision_artifacts/_cost/{date}/cost.parquet from the
+        # research bucket; emits a placeholder section if the parquet is
+        # absent (capture flag off, no Saturday SF, etc.) so the cost
+        # surface is always visible to operators.
+        try:
+            from analysis.cost_report import build_cost_section
+            cost_section = build_cost_section(args.date)
+            report_md = report_md + "\n" + cost_section
+        except Exception as cost_err:
+            # Renderer hard-fail (corrupt parquet, IAM denial, etc.) —
+            # log loud and surface in the email rather than crashing the
+            # whole evaluator. Per feedback_no_silent_fails this is the
+            # narrow exception: the evaluator's primary purpose (signal
+            # quality / param sweep) shouldn't be blocked by a cost-
+            # report render error. The error message lands in the email.
+            logger.error(
+                "[cost_report] section render failed: %s — emitting "
+                "error placeholder so operators see the regression",
+                cost_err,
+            )
+            report_md = report_md + "\n" + "\n".join([
+                "## LLM cost report",
+                "",
+                f"- _Cost report render failed: `{cost_err}`._",
+                "  Investigate `analysis/cost_report.py` + the parquet at "
+                f"`s3://alpha-engine-research/decision_artifacts/_cost/{args.date}/cost.parquet`.",
+                "",
+            ])
+
         # Save
         out_dir = save(
             report_md=report_md,
