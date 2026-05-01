@@ -274,3 +274,302 @@ class TestBuildCostSection:
         assert "## LLM cost report" in md
         assert "_No cost data available_" in md
         assert "ALPHA_ENGINE_DECISION_CAPTURE_ENABLED" in md
+
+
+# ── PR 5b: anomaly detection ──────────────────────────────────────────────
+
+
+def _make_multi_date_stub(date_to_df: dict[str, pd.DataFrame | None]) -> MagicMock:
+    """Build an S3 stub whose get_object dispatches by Key.
+
+    ``date_to_df`` maps run_date (YYYY-MM-DD) → DataFrame (parquet to
+    return) or None (raise NoSuchKey).
+    """
+    stub = MagicMock()
+
+    def _get_object(*, Bucket: str, Key: str):
+        # Extract date from key: decision_artifacts/_cost/{date}/cost.parquet
+        parts = Key.split("/")
+        if len(parts) >= 3:
+            date_str = parts[-2]
+            df = date_to_df.get(date_str)
+            if df is None:
+                raise ClientError(
+                    {"Error": {"Code": "NoSuchKey", "Message": "not found"}},
+                    "GetObject",
+                )
+            buf = io.BytesIO()
+            df.to_parquet(buf, index=False, engine="pyarrow")
+            return {"Body": _StubBody(buf.getvalue())}
+        raise ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "not found"}},
+            "GetObject",
+        )
+
+    stub.get_object.side_effect = _get_object
+    return stub
+
+
+@pytest.fixture(autouse=True)
+def reset_anomaly_env(monkeypatch):
+    monkeypatch.delenv("ALPHA_ENGINE_COST_ANOMALY_RATIO", raising=False)
+    yield
+
+
+class TestAnomalyRatioResolution:
+    def test_default_is_2x(self):
+        from analysis.cost_report import _resolve_anomaly_ratio
+        assert _resolve_anomaly_ratio() == 2.0
+
+    def test_env_override(self, monkeypatch):
+        from analysis.cost_report import _resolve_anomaly_ratio
+        monkeypatch.setenv("ALPHA_ENGINE_COST_ANOMALY_RATIO", "3.5")
+        assert _resolve_anomaly_ratio() == 3.5
+
+    def test_zero_disables(self, monkeypatch):
+        from analysis.cost_report import _resolve_anomaly_ratio
+        monkeypatch.setenv("ALPHA_ENGINE_COST_ANOMALY_RATIO", "0")
+        assert _resolve_anomaly_ratio() == 0.0
+
+    def test_unparseable_returns_zero_with_warn(self, monkeypatch, caplog):
+        from analysis.cost_report import _resolve_anomaly_ratio
+        monkeypatch.setenv("ALPHA_ENGINE_COST_ANOMALY_RATIO", "abc")
+        with caplog.at_level("WARNING"):
+            assert _resolve_anomaly_ratio() == 0.0
+        assert any("not a number" in r.message for r in caplog.records)
+
+
+class TestPreviousWeeklyDates:
+    def test_returns_n_prior_weekly_dates(self):
+        from analysis.cost_report import _previous_weekly_dates
+        dates = _previous_weekly_dates("2026-05-09", weeks=4)
+        # Saturday 2026-05-09 → previous 4 Saturdays: 5/02, 4/25, 4/18, 4/11.
+        assert dates == ["2026-05-02", "2026-04-25", "2026-04-18", "2026-04-11"]
+
+
+class TestDetectAnomaly:
+    def test_no_baseline_when_all_priors_missing(self):
+        from analysis.cost_report import detect_anomaly
+
+        stub = _make_multi_date_stub({})  # nothing exists
+        result = detect_anomaly(
+            "2026-05-09", current_total_cost_usd=0.50, s3_client=stub,
+        )
+        assert result["status"] == "no_baseline"
+        assert result["is_anomaly"] is False
+        assert result["baseline_mean_usd"] is None
+        assert result["baseline_dates_found"] == []
+        assert len(result["baseline_dates_missing"]) == 4
+
+    def test_ok_when_under_threshold(self):
+        from analysis.cost_report import detect_anomaly
+
+        # Baseline averages $0.50; current $0.60 = 1.2x < 2.0× threshold.
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=0.50),
+        ])
+        stub = _make_multi_date_stub({
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        result = detect_anomaly(
+            "2026-05-09", current_total_cost_usd=0.60, s3_client=stub,
+        )
+        assert result["status"] == "ok"
+        assert result["is_anomaly"] is False
+        assert result["baseline_mean_usd"] == pytest.approx(0.50)
+        assert result["ratio"] == pytest.approx(1.2)
+        assert len(result["baseline_dates_found"]) == 4
+
+    def test_anomaly_when_over_threshold(self, caplog):
+        from analysis.cost_report import detect_anomaly
+
+        # Baseline averages $0.50; current $1.50 = 3.0x > 2.0× threshold.
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=0.50),
+        ])
+        stub = _make_multi_date_stub({
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        with caplog.at_level("WARNING"):
+            result = detect_anomaly(
+                "2026-05-09", current_total_cost_usd=1.50, s3_client=stub,
+            )
+        assert result["status"] == "anomaly"
+        assert result["is_anomaly"] is True
+        assert result["ratio"] == pytest.approx(3.0)
+        # Verify the WARN log fired with the diagnostic info.
+        assert any("anomaly" in r.message for r in caplog.records)
+        assert any("3.00x" in r.message for r in caplog.records)
+
+    def test_partial_baseline_uses_available_dates(self):
+        """If 2 of 4 priors are missing, baseline is mean of the 2 found."""
+        from analysis.cost_report import detect_anomaly
+
+        baseline_df_a = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=0.40),
+        ])
+        baseline_df_b = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=0.60),
+        ])
+        # Only 5/02 and 4/25 exist; 4/18 and 4/11 missing.
+        stub = _make_multi_date_stub({
+            "2026-05-02": baseline_df_a,
+            "2026-04-25": baseline_df_b,
+        })
+        result = detect_anomaly(
+            "2026-05-09", current_total_cost_usd=0.55, s3_client=stub,
+        )
+        assert result["status"] == "ok"
+        assert result["baseline_mean_usd"] == pytest.approx(0.50)  # (0.40 + 0.60) / 2
+        assert len(result["baseline_dates_found"]) == 2
+        assert len(result["baseline_dates_missing"]) == 2
+
+    def test_disabled_when_threshold_zero(self, monkeypatch):
+        from analysis.cost_report import detect_anomaly
+
+        monkeypatch.setenv("ALPHA_ENGINE_COST_ANOMALY_RATIO", "0")
+        result = detect_anomaly(
+            "2026-05-09", current_total_cost_usd=999.0, s3_client=MagicMock(),
+        )
+        assert result["status"] == "alerting_disabled"
+        assert result["is_anomaly"] is False
+
+
+class TestRenderAnomalySection:
+    def test_anomaly_section_includes_warning_marker(self):
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.50,
+            "baseline_dates_found": ["2026-05-02", "2026-04-25"],
+            "baseline_dates_missing": [],
+            "baseline_mean_usd": 0.50,
+            "ratio": 3.0,
+            "threshold_ratio": 2.0,
+            "is_anomaly": True,
+            "status": "anomaly",
+        })
+        assert "ANOMALY DETECTED" in md
+        assert ":warning:" in md
+        assert "3.00x" in md
+        assert "2.00x" in md
+
+    def test_ok_section_omits_warning_marker(self):
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 0.60,
+            "baseline_dates_found": ["2026-05-02"],
+            "baseline_dates_missing": [],
+            "baseline_mean_usd": 0.50,
+            "ratio": 1.2,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "ok",
+        })
+        assert "ANOMALY DETECTED" not in md
+        assert "1.20x" in md
+
+    def test_no_baseline_section(self):
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 0.50,
+            "baseline_dates_found": [],
+            "baseline_dates_missing": ["2026-05-02", "2026-04-25", "2026-04-18", "2026-04-11"],
+            "baseline_mean_usd": None,
+            "ratio": None,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "no_baseline",
+        })
+        assert "_No baseline available_" in md
+        assert "ANOMALY DETECTED" not in md
+
+    def test_alerting_disabled_section(self):
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.0,
+            "baseline_dates_found": [],
+            "baseline_dates_missing": [],
+            "baseline_mean_usd": None,
+            "ratio": None,
+            "threshold_ratio": 0.0,
+            "is_anomaly": False,
+            "status": "alerting_disabled",
+        })
+        assert "_Anomaly alerting disabled_" in md
+        assert "ALPHA_ENGINE_COST_ANOMALY_RATIO" in md
+
+    def test_partial_baseline_notes_gaps(self):
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 0.55,
+            "baseline_dates_found": ["2026-05-02", "2026-04-25"],
+            "baseline_dates_missing": ["2026-04-18", "2026-04-11"],
+            "baseline_mean_usd": 0.50,
+            "ratio": 1.1,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "ok",
+        })
+        assert "Baseline gaps" in md
+        assert "2 of 4" in md
+
+
+class TestBuildCostSectionWithAnomaly:
+    def test_happy_path_includes_anomaly_section(self):
+        """build_cost_section with priors present runs anomaly detection
+        and appends the section to the main report."""
+        from analysis.cost_report import build_cost_section
+
+        # Current run is small ($0.01); baseline of 4 priors is also small.
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=0.01),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=0.01),
+        ])
+        stub = _make_multi_date_stub({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        md = build_cost_section("2026-05-09", s3_client=stub)
+        assert "## LLM cost report" in md
+        assert "### Anomaly check" in md
+        assert "ANOMALY DETECTED" not in md  # under threshold
+
+    def test_anomaly_path_renders_warning(self):
+        """build_cost_section detects + renders the anomaly when over threshold."""
+        from analysis.cost_report import build_cost_section
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        md = build_cost_section("2026-05-09", s3_client=stub)
+        assert "ANOMALY DETECTED" in md
+        assert "10.00x" in md  # 10.00 / 1.00 = 10×
