@@ -15,4 +15,4 @@ ib_insync~=0.9.86
 #   Spot: infrastructure/spot_backtest.sh does the same before pip install.
 #   Lambda: lambda_health/Dockerfile installs from vendor/alpha-engine-lib
 #          staged by infrastructure/deploy_health.sh from a sibling checkout.
-alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.1.4
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.2
