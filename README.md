@@ -41,7 +41,7 @@ flowchart LR
     Eval --> Grades[A-F component grades<br/>52-week trend]
 ```
 
-Runs Saturday after Predictor Training on a c5.large EC2 spot instance (~$0.01/week). Spot instance now runs backtest + parity + evaluator + LLM-as-judge atomically — consolidated from 8 dedicated SF states into one job (2026-04-24).
+Runs weekly after Predictor Training on a c5.large EC2 spot instance (~$0.01/week). Spot instance now runs backtest + parity + evaluator + LLM-as-judge atomically — consolidated from 8 dedicated SF states into one job (2026-04-24).
 
 ## Configuration
 

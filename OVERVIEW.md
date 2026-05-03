@@ -86,7 +86,7 @@ Weekly system evaluator + autonomous parameter optimizer. Reads historical signa
 
 | Mode | Where | Command |
 |---|---|---|
-| Production weekly | EC2 spot (c5.large) | Saturday Step Function via `infrastructure/spot_backtest.sh` |
+| Production weekly | EC2 spot (c5.large) | weekly Step Function via `infrastructure/spot_backtest.sh` |
 | Local signal-quality only | venv | `python backtest.py --mode signal-quality` |
 | Local full run | venv | `python backtest.py --mode all --upload` |
 | Local predictor-only | venv | `python backtest.py --mode predictor-backtest` |
@@ -97,7 +97,7 @@ Weekly system evaluator + autonomous parameter optimizer. Reads historical signa
 | Rollback all configs to previous | venv | `python backtest.py --rollback` |
 | Spot smoke test | local | `bash infrastructure/spot_backtest.sh --smoke-only` |
 
-Deploy: `git push origin main`. Saturday SF picks up latest commit when `spot_backtest.sh` clones `--branch main`. No persistent EC2 host.
+Deploy: `git push origin main`. The weekly SF picks up the latest commit when `spot_backtest.sh` clones `--branch main`. No persistent EC2 host.
 
 ## Tests
 
