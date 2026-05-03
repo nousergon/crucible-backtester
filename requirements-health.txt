@@ -3,7 +3,7 @@ pandas>=2.0
 scipy>=1.10
 boto3>=1.26.0
 # alpha-engine-lib provides setup_logging + get_flow_doctor used by
-# lambda_health/handler.py. Installed from the vendor/alpha-engine-lib
-# copy staged by infrastructure/deploy_health.sh (see Dockerfile).
-# [flow_doctor] pulls the flow-doctor extra; no other extras are needed
-# because this Lambda does not touch ArcticDB.
+# lambda_health/handler.py. Installed inside lambda_health/Dockerfile
+# from public git+https. [flow_doctor] pulls the flow-doctor extra;
+# no other extras are needed because this Lambda does not touch
+# ArcticDB.

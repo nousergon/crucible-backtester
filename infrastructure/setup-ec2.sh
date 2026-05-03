@@ -1,6 +1,6 @@
 #!/bin/bash
 # Post-clone setup: venv, deps, log file, cron.
-# Run after git clone — credentials must already be in ~/.netrc.
+# Run after git clone.
 #
 # Usage (from EC2, after cloning):
 #   bash ~/alpha-engine-backtester/infrastructure/setup-ec2.sh

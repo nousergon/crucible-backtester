@@ -344,12 +344,9 @@ done
 
 # ── Upload .env BEFORE pip install ─────────────────────────────────────────────
 # .env carries non-secret runtime config (EMAIL_*, S3_BUCKET, etc.) that the
-# workload sources before running. The alpha-engine-lib PAT is NO LONGER
-# sourced from .env — the spot fetches it from SSM at pip-install time (see
-# the DEPS block below). This matches the spot_data_weekly pattern; removes
-# the class of failure where an ALPHA_ENGINE_LIB_TOKEN typo / missing-var on
-# the dispatcher .env crashes a fresh spot bootstrap (hit 2026-04-20 during
-# the partial-execution SF dry-run).
+# workload sources before running. alpha-engine-lib was flipped public
+# 2026-05-03, so the spot installs it directly from git+https with no auth —
+# earlier versions of this script fetched a PAT from SSM /alpha-engine/lib-token.
 if [ ! -f "$ENV_FILE" ]; then
     echo "ERROR: .env not found (checked alpha-engine-data/.env, ~/.alpha-engine.env, ./.env)"
     exit 1
@@ -364,25 +361,13 @@ run_remote bash -s <<'DEPS'
 set -euo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 
-# Source .env for non-secret runtime vars (EMAIL_*, S3_BUCKET, etc.). The
-# alpha-engine-lib PAT comes from SSM below — keeps the secret off the
-# dispatcher + off the SCP wire.
+# Source .env for non-secret runtime vars (EMAIL_*, S3_BUCKET, etc.).
+# alpha-engine-lib is public; pip resolves the git+https URL in
+# requirements.txt without auth.
 set -a
 # shellcheck disable=SC1091
 source /home/ec2-user/alpha-engine-backtester/.env
 set +a
-
-# Fetch alpha-engine-lib PAT from SSM Parameter Store. The spot's IAM
-# profile (alpha-engine-executor-profile) grants ssm:GetParameter on
-# /alpha-engine/*. Token is scoped to a local shell var, never exported,
-# unset immediately after git config. Matches spot_data_weekly.sh.
-LIB_TOKEN=$(aws ssm get-parameter --name /alpha-engine/lib-token --with-decryption --query 'Parameter.Value' --output text --region us-east-1 2>/dev/null || echo "")
-if [ -z "$LIB_TOKEN" ]; then
-    echo "ERROR: could not fetch /alpha-engine/lib-token from SSM — required for alpha-engine-lib pip install"
-    exit 1
-fi
-git config --global url."https://x-access-token:${LIB_TOKEN}@github.com/cipher813/alpha-engine-lib".insteadOf "https://github.com/cipher813/alpha-engine-lib"
-unset LIB_TOKEN
 
 if command -v python3.12 &>/dev/null; then
     PIP="python3.12 -m pip"
