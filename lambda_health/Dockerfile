@@ -13,20 +13,15 @@
 
 FROM public.ecr.aws/lambda/python:3.12
 
-# Stage alpha-engine-lib from a local vendor directory.
-# infrastructure/deploy_health.sh populates vendor/alpha-engine-lib
-# from a sibling checkout before the Docker build. Mirrors the
-# alpha-engine-predictor Dockerfile staging pattern — the private repo
-# reaches the build context without needing a GitHub PAT or Docker
-# build secret. The [flow_doctor] extra pulls flow-doctor; we do not
-# need [arcticdb] here (the health Lambda reads S3 only).
-COPY vendor/alpha-engine-lib /tmp/alpha-engine-lib
-
 # Copy and install Python requirements first for better layer caching.
+# alpha-engine-lib is installed from public git+https with [flow_doctor]
+# extra (lib was flipped public 2026-05-03; previous versions vendored
+# a local copy via deploy_health.sh staging). No [arcticdb] — health
+# Lambda reads S3 only.
 COPY requirements-health.txt .
-RUN pip install --no-cache-dir /tmp/alpha-engine-lib[flow_doctor] && \
+RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.2" && \
     pip install --no-cache-dir -r requirements-health.txt && \
-    rm -rf /root/.cache/pip /tmp/alpha-engine-lib
+    rm -rf /root/.cache/pip
 
 # Copy application code
 COPY ssm_secrets.py .
