@@ -91,19 +91,6 @@ _LOCAL_PREIMPORTS_BACKTEST = (
     "store.arctic_reader",
 )
 
-# Per-ticker ArcticDB freshness threshold (calendar days). The executor's
-# hard-fail ATR/VWAP guards require last_date >= run_date - 1 trading day;
-# 5 calendar days covers a long weekend + buffer for holidays. Tickers
-# stale beyond this fail preflight rather than burning 2 hours of spot
-# compute in predictor-backtest mode's inner loop.
-_UNIVERSE_MAX_STALE_DAYS = 5
-
-# Universe-freshness check parallelism — trades a small bump in per-ticker
-# memory for wall-clock time. 20 threads → ~10 sec for 900 tickers on a
-# c5.large. ArcticDB's internal I/O is thread-safe; we only read the
-# ``.index[-1]`` value so even with 900 symbols the total data touched
-# is tiny.
-_UNIVERSE_FRESHNESS_THREADS = 20
 
 
 class BacktesterPreflight(BasePreflight):
@@ -152,19 +139,11 @@ class BacktesterPreflight(BasePreflight):
             # so 0 orders across 60 combos × 2500 dates).
             self._check_vectorized_signal_extraction()
             self._check_predictor_weights()
-            # synthetic/predictor_backtest.py reads from ArcticDB. SPY
-            # lives in the ``macro`` library (market-wide series); its
-            # freshness is a sufficient signal that the ArcticDB write
-            # path upstream (alpha-engine-data DailyData) is healthy.
-            # 8-day threshold: weekly cadence + 1 day buffer.
-            self.check_arcticdb_fresh("macro", "SPY", max_stale_days=8)
-            # Per-ticker freshness scan across the universe library —
-            # macro.SPY can be fresh while individual tickers (ASGN,
-            # MOH 2026-04-21) silently stop receiving daily_append writes.
-            # Executor's load_atr_14_pct / load_daily_vwap guards fire
-            # two hours deep into predictor-backtest mode when that
-            # happens. Scanning here catches it at preflight in ~10s.
-            self._check_universe_freshness(max_stale_days=_UNIVERSE_MAX_STALE_DAYS)
+            # Data-freshness assertions (universe + macro/SPY) live upstream
+            # in alpha-engine-data's preflight, which runs as Saturday SF's
+            # DataPhase1 step before the backtester step. If upstream data
+            # is stale, the data step hard-fails and the SF never reaches
+            # the backtester — re-checking here was redundant.
             # backtest.py's simulate path imports executor.main, which
             # in turn imports executor.config_loader and reads the
             # executor's risk.yaml. If it resolves to the placeholder
@@ -454,109 +433,6 @@ class BacktesterPreflight(BasePreflight):
                     "predictor/weights/meta/momentum_model.txt every "
                     f"run — investigate there. Underlying error: {exc}"
                 ) from exc
-
-    def _check_universe_freshness(self, max_stale_days: int) -> None:
-        """Scan every ticker in the ArcticDB ``universe`` library; hard-fail
-        if any ticker's last_date is older than ``max_stale_days`` calendar
-        days from today.
-
-        Motivation (2026-04-21 ~17:19 PT dry-run): backtester main completed
-        with real portfolio stats + param-sweep results, then ``predictor-
-        backtest`` mode's executor-simulate loop hit
-        ``load_atr_14_pct failed validation — stale tickers ['ASGN (2026-04-01)',
-        'MOH (2026-04-01)']`` ~2 hours in. Same class as the SNDK incident
-        earlier that day: individual tickers stop getting daily_append
-        writes while macro.SPY stays current, so
-        ``check_arcticdb_fresh("macro", "SPY", ...)`` reports healthy.
-
-        Runs the scan concurrently — 20 threads × ~900 tickers × one
-        ``tail(1)`` read each ≈ 5-10 sec on c5.large. Caller pays that
-        cost once at preflight, avoids burning 2 hours of spot compute
-        before the same condition surfaces deep in the call chain.
-
-        Raises ``RuntimeError`` with the stale ticker list + last_dates
-        so the operator sees exactly which upstream writes failed.
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from datetime import date, timedelta
-
-        try:
-            from alpha_engine_lib.arcticdb import open_universe_lib
-        except ImportError as exc:
-            raise RuntimeError(
-                f"Pre-flight: alpha_engine_lib.arcticdb not importable for "
-                f"universe-freshness scan: {exc}"
-            ) from exc
-
-        lib = open_universe_lib(self.bucket, region=self.region)
-        symbols = list(lib.list_symbols())
-        if not symbols:
-            raise RuntimeError(
-                f"Pre-flight: ArcticDB universe on bucket {self.bucket!r} "
-                "has zero symbols — data pipeline upstream has not written "
-                "anything. Investigate alpha-engine-data DataPhase1."
-            )
-
-        today = date.today()
-        cutoff = today - timedelta(days=max_stale_days)
-
-        def _last_date_for(sym: str) -> tuple[str, date | None, str | None]:
-            """Return (symbol, last_date, error_msg)."""
-            try:
-                # tail(1) reads just the last row — avoids pulling 10y of
-                # features per ticker for what is ultimately a one-datetime
-                # freshness check. ~20ms per symbol typical.
-                df = lib.tail(sym, n=1).data
-                if df.empty:
-                    return sym, None, "empty frame"
-                last_ts = df.index[-1]
-                # Normalize timezone / strip time component for clean
-                # date comparison — matches check_arcticdb_fresh semantics.
-                import pandas as pd
-                last_date = pd.Timestamp(last_ts)
-                if last_date.tzinfo is not None:
-                    last_date = last_date.tz_convert("UTC").tz_localize(None)
-                return sym, last_date.date(), None
-            except Exception as exc:
-                return sym, None, str(exc)
-
-        stale: list[tuple[str, date]] = []
-        errored: list[tuple[str, str]] = []
-        with ThreadPoolExecutor(max_workers=_UNIVERSE_FRESHNESS_THREADS) as pool:
-            for sym, last_date, err in pool.map(_last_date_for, symbols):
-                if err is not None:
-                    errored.append((sym, err))
-                elif last_date is None:
-                    errored.append((sym, "no last_date"))
-                elif last_date < cutoff:
-                    stale.append((sym, last_date))
-
-        # Errored tickers are themselves a red flag — can't verify freshness.
-        if errored:
-            sample = [f"{s}({e[:40]})" for s, e in errored[:5]]
-            raise RuntimeError(
-                f"Pre-flight: {len(errored)} universe ticker(s) in ArcticDB "
-                f"could not be read for freshness check. Sample: {sample}. "
-                "Treated as fatal because a silent read error here would "
-                "mask exactly the kind of per-ticker write skip this scan "
-                "exists to catch."
-            )
-
-        if stale:
-            # Sort by stalest first so the operator sees the worst offenders.
-            stale.sort(key=lambda x: x[1])
-            summary = [f"{sym} (last={d.isoformat()})" for sym, d in stale[:10]]
-            more = f" (+{len(stale) - 10} more)" if len(stale) > 10 else ""
-            raise RuntimeError(
-                f"Pre-flight: {len(stale)}/{len(symbols)} universe ticker(s) "
-                f"have stale ArcticDB data (older than {max_stale_days} "
-                f"calendar days, cutoff={cutoff.isoformat()}). "
-                f"Top offenders: {summary}{more}. "
-                "Same class as 2026-04-21 ASGN/MOH failure: daily_append "
-                "skipped these tickers, executor guards would abort the "
-                "backtester ~2 hours in. Backfill via polygon one-shot "
-                "or investigate daily_append skip logic before re-running."
-            )
 
     # ── Mode-specific primitives ─────────────────────────────────────────
 
