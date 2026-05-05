@@ -8,12 +8,15 @@ yfinance~=0.2.54
 pyarrow~=14.0
 ib_insync~=0.9.86
 # Replay harness (replay/runner.py) re-invokes captured agents under a
-# different model — bare Anthropic SDK keeps backtester free of langchain.
-# Tool-use is reproduced via the SDK's native tool block (matches what
-# langchain_anthropic.with_structured_output emits under the hood).
-anthropic~=0.40
+# different model. Uses langchain_anthropic.with_structured_output() —
+# matches the production-agent invocation pattern exactly so replay
+# concordance measures "would Haiku produce the same output as Sonnet
+# given the same input" rather than "do we get the same answer when we
+# call the model two different ways." Schema classes resolve via
+# alpha_engine_lib.agent_schemas.resolve_schema_for_agent.
+langchain-anthropic~=0.3
 # alpha-engine-lib pulls in arcticdb + flow-doctor via extras; see
 # preflight.py and the `from alpha_engine_lib.logging import setup_logging`
 # call sites in backtest.py / evaluate.py / lambda_health/handler.py.
-# Public since 2026-05-03 — pip installs directly from git+https.
-alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.2
+# v0.4.0 adds the agent_schemas submodule used by replay/runner.py.
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.4.0
