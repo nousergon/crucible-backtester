@@ -368,24 +368,28 @@ class TestRunnerIntegration:
         s3.get_object.return_value = {"Body": body}
         s3.put_object = MagicMock()
 
-        anth = MagicMock()
-        anth.messages.create.return_value = SimpleNamespace(
-            content=[SimpleNamespace(
-                type="tool_use",
-                input={"ranked_picks": [
-                    {"ticker": "NVDA", "quant_score": 85},
-                    {"ticker": "AAPL", "quant_score": 73},
-                ]},
-            )],
-            usage=SimpleNamespace(
-                input_tokens=100, output_tokens=50,
-                cache_read_input_tokens=0, cache_creation_input_tokens=0,
-            ),
-        )
+        # Build langchain-style fake: factory → llm → with_structured_output
+        # → runnable whose .invoke() returns the include_raw=True dict shape.
+        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        parsed = QuantAnalystOutput(ranked_picks=[
+            {"ticker": "NVDA", "quant_score": 85, "rationale": "x"},
+            {"ticker": "AAPL", "quant_score": 73, "rationale": "y"},
+        ])
+        structured = MagicMock()
+        structured.invoke.return_value = {
+            "raw": SimpleNamespace(response_metadata={"usage": {
+                "input_tokens": 100, "output_tokens": 50,
+            }}),
+            "parsed": parsed,
+            "parsing_error": None,
+        }
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured
+        factory = MagicMock(return_value=llm)
 
         replay = replay_artifact(
             artifact_key="k.json", target_model="claude-haiku-4-5",
-            s3_client=s3, anthropic_client=anth,
+            s3_client=s3, chat_anthropic_factory=factory,
             persist=False,
         )
 
@@ -416,12 +420,17 @@ class TestRunnerIntegration:
         s3.get_object.return_value = {"Body": body}
         s3.put_object = MagicMock()
 
-        anth = MagicMock()
-        anth.messages.create.side_effect = RuntimeError("API down")
+        # Factory whose runnable raises on invoke — replay must capture
+        # the error rather than propagate.
+        structured = MagicMock()
+        structured.invoke.side_effect = RuntimeError("API down")
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured
+        factory = MagicMock(return_value=llm)
 
         replay = replay_artifact(
             artifact_key="k.json", target_model="claude-haiku-4-5",
-            s3_client=s3, anthropic_client=anth,
+            s3_client=s3, chat_anthropic_factory=factory,
             persist=False,
         )
 
