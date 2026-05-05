@@ -7,6 +7,11 @@ pyyaml~=6.0
 yfinance~=0.2.54
 pyarrow~=14.0
 ib_insync~=0.9.86
+# Replay harness (replay/runner.py) re-invokes captured agents under a
+# different model — bare Anthropic SDK keeps backtester free of langchain.
+# Tool-use is reproduced via the SDK's native tool block (matches what
+# langchain_anthropic.with_structured_output emits under the hood).
+anthropic~=0.40
 # alpha-engine-lib pulls in arcticdb + flow-doctor via extras; see
 # preflight.py and the `from alpha_engine_lib.logging import setup_logging`
 # call sites in backtest.py / evaluate.py / lambda_health/handler.py.
