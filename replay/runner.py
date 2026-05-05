@@ -314,12 +314,33 @@ def replay_artifact(
         kind = "structured"
         replay_output = parsed if isinstance(parsed, dict) else {"_value": parsed}
 
+    # Per-agent comparison (PR B). Only meaningful when the replay
+    # actually produced structured output — text-fallback and error
+    # paths skip comparison (they'd wash through the generic scorer
+    # with low agreement and pollute downstream concordance metrics).
+    agent_id = artifact.get("agent_id", "")
+    original_output = artifact.get("agent_output") or {}
+    if kind == "structured":
+        from replay.comparison import compute_comparison
+        comparison = compute_comparison(
+            agent_id=agent_id,
+            original_output=original_output,
+            replay_output=replay_output,
+        )
+    else:
+        comparison = {
+            "agreement_score": 0.0,
+            "diff_summary": f"replay produced no structured output (kind={kind})",
+            "scorer": "skipped",
+            "agent_id_base": (agent_id or "").split(":", 1)[0],
+        }
+
     replay = ReplayOutput(
         original_run_id=artifact.get("run_id", ""),
-        original_agent_id=artifact.get("agent_id", ""),
+        original_agent_id=agent_id,
         original_model=original_model,
         original_artifact_key=artifact_key,
-        original_output=artifact.get("agent_output") or {},
+        original_output=original_output,
         replay_model=target_model,
         replay_timestamp=datetime.now(timezone.utc).isoformat(),
         replay_output=replay_output,
@@ -327,6 +348,7 @@ def replay_artifact(
         replay_cost=usage,
         replay_latency_ms=latency_ms,
         replay_error=err,
+        comparison=comparison,
     )
 
     if persist:

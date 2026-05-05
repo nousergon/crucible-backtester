@@ -102,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
         "original_model": replay.original_model,
         "replay_model": replay.replay_model,
         "kind": replay.replay_output_kind,
+        "agreement_score": replay.comparison.get("agreement_score"),
+        "diff_summary": replay.comparison.get("diff_summary"),
         "latency_ms": replay.replay_latency_ms,
         "error": replay.replay_error,
         "tokens": replay.replay_cost,
