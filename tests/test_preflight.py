@@ -1,10 +1,14 @@
 """
 Tests for BacktesterPreflight mode composition.
 
-The BasePreflight primitives (check_env_vars / check_s3_bucket /
-check_arcticdb_fresh) are tested in alpha-engine-lib. These tests
-only verify that each mode calls the expected primitives in the
-expected order.
+The BasePreflight primitives (check_env_vars / check_s3_bucket) are
+tested in alpha-engine-lib. These tests only verify that each mode
+calls the expected primitives in the expected order.
+
+Data-freshness checks (universe + macro/SPY) moved upstream to
+alpha-engine-data's preflight 2026-05-05; the data step in the Saturday
+SF hard-fails on staleness before the backtester runs, so re-checking
+here is redundant.
 """
 
 from __future__ import annotations
@@ -25,7 +29,10 @@ class TestBacktesterPreflight:
         with pytest.raises(ValueError, match="unknown mode"):
             BacktesterPreflight(bucket="b", mode="bogus")
 
-    def test_backtest_mode_checks_arcticdb(self):
+    def test_backtest_mode_runs_env_and_artifact_checks(self):
+        """backtest mode: env + S3 + lib version + imports + vectorized
+        signal extraction + predictor weights + executor config. No
+        data-freshness primitives — those moved upstream."""
         pf = BacktesterPreflight(bucket="b", mode="backtest")
         with patch.object(pf, "check_env_vars") as env, \
              patch.object(pf, "check_s3_bucket") as s3, \
@@ -33,19 +40,19 @@ class TestBacktesterPreflight:
              patch.object(pf, "_check_executor_config") as exec_cfg, \
              patch.object(pf, "_check_lib_version") as lib_v, \
              patch.object(pf, "_check_imports") as imports, \
-             patch.object(pf, "_check_predictor_weights") as pred_w, \
-             patch.object(pf, "_check_universe_freshness") as univ_f:
+             patch.object(pf, "_check_vectorized_signal_extraction") as vec, \
+             patch.object(pf, "_check_predictor_weights") as pred_w:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
-        adb.assert_called_once_with("macro", "SPY", max_stale_days=8)
+        adb.assert_not_called()
         exec_cfg.assert_called_once()
         lib_v.assert_called_once()
         imports.assert_called_once()
+        vec.assert_called_once()
         pred_w.assert_called_once()
-        univ_f.assert_called_once()
 
-    def test_evaluate_mode_skips_arcticdb(self):
+    def test_evaluate_mode_runs_env_and_s3_only(self):
         pf = BacktesterPreflight(bucket="b", mode="evaluate")
         with patch.object(pf, "check_env_vars") as env, \
              patch.object(pf, "check_s3_bucket") as s3, \
@@ -53,20 +60,17 @@ class TestBacktesterPreflight:
              patch.object(pf, "_check_executor_config") as exec_cfg, \
              patch.object(pf, "_check_lib_version") as lib_v, \
              patch.object(pf, "_check_imports") as imports, \
-             patch.object(pf, "_check_predictor_weights") as pred_w, \
-             patch.object(pf, "_check_universe_freshness") as univ_f:
+             patch.object(pf, "_check_predictor_weights") as pred_w:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
         adb.assert_not_called()
         exec_cfg.assert_not_called()
-        # Backtest-mode-only checks must also not fire in evaluate mode.
         lib_v.assert_not_called()
         imports.assert_not_called()
         pred_w.assert_not_called()
-        univ_f.assert_not_called()
 
-    def test_lambda_health_mode_skips_arcticdb(self):
+    def test_lambda_health_mode_runs_env_and_s3_only(self):
         pf = BacktesterPreflight(bucket="b", mode="lambda_health")
         with patch.object(pf, "check_env_vars") as env, \
              patch.object(pf, "check_s3_bucket") as s3, \
@@ -74,8 +78,7 @@ class TestBacktesterPreflight:
              patch.object(pf, "_check_executor_config") as exec_cfg, \
              patch.object(pf, "_check_lib_version") as lib_v, \
              patch.object(pf, "_check_imports") as imports, \
-             patch.object(pf, "_check_predictor_weights") as pred_w, \
-             patch.object(pf, "_check_universe_freshness") as univ_f:
+             patch.object(pf, "_check_predictor_weights") as pred_w:
             pf.run()
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
@@ -84,7 +87,22 @@ class TestBacktesterPreflight:
         lib_v.assert_not_called()
         imports.assert_not_called()
         pred_w.assert_not_called()
-        univ_f.assert_not_called()
+
+    def test_no_mode_calls_data_freshness_primitives(self):
+        """Regression: no mode may call macro freshness or universe
+        freshness scan. Both moved upstream to alpha-engine-data."""
+        for mode in ("backtest", "evaluate", "lambda_health"):
+            pf = BacktesterPreflight(bucket="b", mode=mode)
+            with patch.object(pf, "check_env_vars"), \
+                 patch.object(pf, "check_s3_bucket"), \
+                 patch.object(pf, "check_arcticdb_fresh") as adb, \
+                 patch.object(pf, "_check_executor_config"), \
+                 patch.object(pf, "_check_lib_version"), \
+                 patch.object(pf, "_check_imports"), \
+                 patch.object(pf, "_check_vectorized_signal_extraction"), \
+                 patch.object(pf, "_check_predictor_weights"):
+                pf.run()
+            adb.assert_not_called()
 
 
 class TestExecutorConfigCheck:
