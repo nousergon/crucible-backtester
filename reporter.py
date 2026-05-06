@@ -372,6 +372,64 @@ def _section_pipeline_health(health: dict) -> list[str]:
     return lines
 
 
+def _section_decision_capture_coverage(coverage: dict) -> list[str]:
+    """Build Decision Capture Coverage section.
+
+    Phase 2 transparency-inventory — answers the *agent decisions* row's
+    coverage question: of the 8 canonical agents that run on every
+    Saturday SF, how many emitted ≥1 captured artifact?
+    """
+    lines = ["## Decision Capture Coverage", ""]
+
+    if coverage.get("status") == "no_recent_sf_run":
+        lines.append(f"> {coverage.get('reason', 'no Saturday SF run found')}")
+        lines.append("")
+        return lines
+    if coverage.get("status") != "ok":
+        err = coverage.get("error", "unknown error")
+        lines.append(f"> Coverage computation skipped: {err}")
+        lines.append("")
+        return lines
+
+    sf_date = coverage.get("most_recent_sf_date", "?")
+    pct = coverage.get("coverage_pct", 0.0)
+    n_present = coverage.get("n_canonical_present", 0)
+    n_expected = coverage.get("n_canonical_expected", 0)
+    flag = "✅" if pct >= 99.0 else ("⚠️" if pct >= 75.0 else "🔴")
+
+    lines.append(
+        f"- Most-recent SF: **{sf_date}** — {flag} **{pct:.1f}%** "
+        f"({n_present}/{n_expected} canonical agents)"
+    )
+
+    # Per-agent breakdown — show only missing ones inline; full set in JSON artifact.
+    per_agent = coverage.get("per_agent", {})
+    missing = [a for a, v in per_agent.items() if not v.get("present")]
+    if missing:
+        lines.append(f"- **Missing**: {', '.join(missing)}")
+
+    thesis = coverage.get("thesis_update_count", 0)
+    if thesis > 0:
+        lines.append(f"- thesis_update captures: {thesis} (variable; not in coverage %)")
+
+    uncategorized = coverage.get("uncategorized_agents", []) or []
+    if uncategorized:
+        lines.append(f"- Uncategorized agents: {', '.join(uncategorized)}")
+
+    rolling = coverage.get("rolling", {})
+    n_sat = rolling.get("n_saturdays_with_data", 0)
+    if n_sat >= 2:
+        lines.append(
+            f"- Rolling ({n_sat}-Saturday avg): "
+            f"{rolling.get('coverage_pct_mean', 0):.1f}% "
+            f"(min {rolling.get('coverage_pct_min', 0):.1f}, "
+            f"max {rolling.get('coverage_pct_max', 0):.1f})"
+        )
+
+    lines.append("")
+    return lines
+
+
 def build_report(
     run_date: str,
     signal_quality: dict,
@@ -396,6 +454,7 @@ def build_report(
     shadow_book: dict | None = None,
     exit_timing: dict | None = None,
     macro_eval: dict | None = None,
+    decision_capture_coverage: dict | None = None,
     trigger_opt: dict | None = None,
     predictor_sizing: dict | None = None,
     scanner_opt: dict | None = None,
@@ -428,6 +487,12 @@ def build_report(
     if pipeline_health:
         lines += _section_pipeline_health(pipeline_health)
         lines += [""]
+
+    # Decision capture coverage (Phase 2 transparency-inventory).
+    # Lives next to pipeline_health since it's the same flavor — both
+    # are pre-analytics observability surfaces, not analysis findings.
+    if decision_capture_coverage:
+        lines += _section_decision_capture_coverage(decision_capture_coverage)
 
     # System Report Card (component grades)
     if grading and grading.get("status") in ("ok", "partial"):
@@ -591,6 +656,7 @@ def save(
     confusion_matrix: dict | None = None,
     post_trade: dict | None = None,
     monte_carlo: dict | None = None,
+    decision_capture_coverage: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -644,6 +710,7 @@ def save(
         ("e2e_lift.json", e2e_lift),
         ("veto_analysis.json", veto_result),
         ("confusion_matrix.json", confusion_matrix),
+        ("decision_capture_coverage.json", decision_capture_coverage),
     ]:
         if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
