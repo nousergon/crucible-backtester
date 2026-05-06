@@ -1,0 +1,9 @@
+# Concordance Lambda — minimal deps. Mirrors lambda_health/requirements-health.txt
+# in spirit (lightweight, no LightGBM / vectorbt / ArcticDB).
+boto3>=1.34
+pyyaml>=6.0
+# replay.batch invokes target models via langchain_anthropic.with_structured_output
+# against the canonical agent_schemas Pydantic contract (lib v0.4.0 — pulled in
+# above via the alpha-engine-lib install).
+langchain-anthropic~=0.3
+pydantic>=2.0
