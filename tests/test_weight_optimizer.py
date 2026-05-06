@@ -202,3 +202,206 @@ class TestApplyWeights:
             outcome = apply_weights(result, bucket="test-bucket")
             assert outcome["applied"] is True
             assert outcome["weights"] == {"quant": 0.45, "qual": 0.55}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Evaluator-revamp PR 6: skill-composite fit target + shadow mode
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _make_df_with_continuous_returns(n: int = 200, signal_strength: float = 0.5):
+    """Synthetic score_performance with both binary beat_spy + continuous return cols.
+
+    Higher quant_score → higher return_10d (signal). qual_score is noise.
+    Used to verify the IC-on-continuous-returns fit target picks up
+    quant > qual when only the continuous channel carries the signal.
+    """
+    import random
+    random.seed(7)
+    rows = []
+    for i in range(n):
+        day = (i % 28) + 1
+        score_date = f"2026-01-{day:02d}"
+        quant = random.uniform(40, 90)
+        qual = random.uniform(40, 90)
+        # Continuous return: scales with quant. qual is pure noise.
+        ret_10d = (quant - 65) / 100.0 * signal_strength + random.gauss(0, 0.02)
+        ret_30d = ret_10d * 1.5
+        rows.append({
+            "symbol": f"S{i % 20}",
+            "score_date": score_date,
+            "quant_score": quant,
+            "qual_score": qual,
+            "return_10d": ret_10d,
+            "return_30d": ret_30d,
+            "beat_spy_10d": int(ret_10d > 0),
+            "beat_spy_30d": int(ret_30d > 0),
+        })
+    return pd.DataFrame(rows)
+
+
+class TestSkillCompositeFitTarget:
+
+    def test_default_off_uses_legacy_path(self):
+        _init_default_config()
+        df = _make_df_with_continuous_returns(n=300)
+        result = compute_weights(df, current_weights={"quant": 0.50, "qual": 0.50})
+        assert result["status"] == "ok"
+        # Default fit_target stamps as legacy.
+        assert result["fit_target"] == "beat_spy_pearson"
+
+    def test_flag_on_switches_to_ic_path(self):
+        init_config({
+            "weight_optimizer": {
+                "default_weights": {"quant": 0.50, "qual": 0.50},
+                "max_single_change": 0.10,
+                "min_meaningful_change": 0.03,
+                "blend_factor": 0.20,
+                "confidence_low": 100,
+                "confidence_medium": 300,
+                "horizon_blend": {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50},
+                "blend_factor_min": 0.20,
+                "blend_factor_max": 0.50,
+                "blend_ramp_samples": 500,
+                "use_skill_composite_target": True,
+            }
+        })
+        df = _make_df_with_continuous_returns(n=300, signal_strength=0.8)
+        result = compute_weights(df, current_weights={"quant": 0.50, "qual": 0.50})
+        assert result["status"] == "ok"
+        assert result["fit_target"] == "skill_composite_ic"
+        # IC path should pick up that quant carries the signal → suggested
+        # quant weight > qual weight (or at least correlations[quant] >
+        # correlations[qual] on a return horizon).
+        c_quant = result["correlations"]["quant"]["beat_spy_10d"] or 0.0
+        c_qual = result["correlations"]["qual"]["beat_spy_10d"] or 0.0
+        assert c_quant > c_qual
+
+    def test_skill_composite_continuous_returns_when_binary_signal_drowns_in_noise(self):
+        """Continuous-return IC sees signal strength that binary
+        beat_spy obscures via the threshold transformation."""
+        # Tight return distribution around zero → most "beats" are noise.
+        df = _make_df_with_continuous_returns(n=400, signal_strength=0.3)
+
+        init_config({
+            "weight_optimizer": {
+                "default_weights": {"quant": 0.50, "qual": 0.50},
+                "max_single_change": 0.10,
+                "min_meaningful_change": 0.03,
+                "blend_factor": 0.20,
+                "confidence_low": 100,
+                "confidence_medium": 300,
+                "horizon_blend": {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50},
+                "blend_factor_min": 0.20,
+                "blend_factor_max": 0.50,
+                "blend_ramp_samples": 500,
+                "use_skill_composite_target": True,
+            }
+        })
+        ic_result = compute_weights(df, current_weights={"quant": 0.50, "qual": 0.50})
+
+        _init_default_config()  # reset to legacy
+        legacy_result = compute_weights(df, current_weights={"quant": 0.50, "qual": 0.50})
+
+        ic_quant = ic_result["correlations"]["quant"]["beat_spy_10d"] or 0.0
+        legacy_quant = legacy_result["correlations"]["quant"]["beat_spy_10d"] or 0.0
+        # IC should detect the quant signal more strongly than Pearson-on-binary.
+        assert abs(ic_quant) >= abs(legacy_quant)
+
+
+class TestShadowMode:
+
+    def _enable_skill_composite(self, enforce: bool):
+        init_config({
+            "weight_optimizer": {
+                "default_weights": {"quant": 0.50, "qual": 0.50},
+                "max_single_change": 0.10,
+                "min_meaningful_change": 0.03,
+                "blend_factor": 0.20,
+                "confidence_low": 100,
+                "confidence_medium": 300,
+                "horizon_blend": {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50},
+                "blend_factor_min": 0.20,
+                "blend_factor_max": 0.50,
+                "blend_ramp_samples": 500,
+                "use_skill_composite_target": True,
+                "enforce_skill_composite": enforce,
+            }
+        })
+
+    @patch("optimizer.weight_optimizer.boto3")
+    def test_skill_composite_without_enforce_writes_to_shadow_only(self, mock_boto3):
+        """When skill_composite is on but enforce is off → shadow path,
+        production scoring_weights.json is not overwritten."""
+        self._enable_skill_composite(enforce=False)
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_s3 = MagicMock()
+            mock_boto3.client.return_value = mock_s3
+
+            result = {
+                "status": "ok",
+                "confidence": "medium",
+                "oos_passed": True,
+                "suggested_weights": {"quant": 0.45, "qual": 0.55},
+                "changes": {"quant": -0.05, "qual": 0.05},
+                "n_samples": 200,
+                "fit_target": "skill_composite_ic",
+            }
+            outcome = apply_weights(result, bucket="test-bucket")
+            assert outcome["applied"] is False
+            assert "shadow mode" in outcome["reason"].lower()
+            # Live config key should NOT be written.
+            keys_written = [
+                call.kwargs.get("Key") for call in mock_s3.put_object.call_args_list
+            ]
+            assert "config/scoring_weights.json" not in keys_written
+            # Shadow archive WAS written.
+            assert any(
+                k and k.startswith("config/scoring_weights_shadow_history/")
+                for k in keys_written
+            )
+
+    @patch("optimizer.weight_optimizer.boto3")
+    def test_skill_composite_with_enforce_applies_to_production(self, mock_boto3):
+        """When skill_composite is on AND enforce is on → live path."""
+        self._enable_skill_composite(enforce=True)
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_s3 = MagicMock()
+            mock_boto3.client.return_value = mock_s3
+
+            result = {
+                "status": "ok",
+                "confidence": "medium",
+                "oos_passed": True,
+                "suggested_weights": {"quant": 0.45, "qual": 0.55},
+                "changes": {"quant": -0.05, "qual": 0.05},
+                "n_samples": 200,
+                "fit_target": "skill_composite_ic",
+            }
+            outcome = apply_weights(result, bucket="test-bucket")
+            assert outcome["applied"] is True
+            keys_written = [
+                call.kwargs.get("Key") for call in mock_s3.put_object.call_args_list
+            ]
+            assert "config/scoring_weights.json" in keys_written
+
+    @patch("optimizer.weight_optimizer.boto3")
+    def test_legacy_path_unaffected_by_enforce_flag(self, mock_boto3):
+        """When skill_composite is OFF, the enforce flag is irrelevant —
+        legacy callers see no behavior change."""
+        _init_default_config()  # use_skill_composite_target=False
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_s3 = MagicMock()
+            mock_boto3.client.return_value = mock_s3
+
+            result = {
+                "status": "ok",
+                "confidence": "medium",
+                "oos_passed": True,
+                "suggested_weights": {"quant": 0.45, "qual": 0.55},
+                "changes": {"quant": -0.05, "qual": 0.05},
+                "n_samples": 200,
+                "fit_target": "beat_spy_pearson",
+            }
+            outcome = apply_weights(result, bucket="test-bucket")
+            assert outcome["applied"] is True
