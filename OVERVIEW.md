@@ -57,6 +57,7 @@ Weekly system evaluator + autonomous parameter optimizer. Reads historical signa
 | Counterfactual rule fit — per-agent depth-≤3 decision-tree fit on captured `(input → decision)` pairs + CloudWatch `agent_counterfactual_rule_fit` metric (third leg of the agent-justification triple alongside cross-week clustering + cheap-model concordance) | [`replay/counterfactual.py`](replay/counterfactual.py) |
 | Replay CLI (`python -m replay.cli {single,batch,counterfactual} ...`) | [`replay/cli.py`](replay/cli.py) |
 | Concordance Lambda — weekly SF-driven entry point that wraps `replay.batch.compute_and_emit_concordance` | [`lambda_concordance/handler.py`](lambda_concordance/handler.py), [`lambda_concordance/Dockerfile`](lambda_concordance/Dockerfile), [`infrastructure/deploy_concordance.sh`](infrastructure/deploy_concordance.sh) |
+| Counterfactual Lambda — weekly SF-driven entry point that wraps `replay.counterfactual.compute_and_emit` | [`lambda_counterfactual/handler.py`](lambda_counterfactual/handler.py), [`lambda_counterfactual/Dockerfile`](lambda_counterfactual/Dockerfile), [`infrastructure/deploy_counterfactual.sh`](infrastructure/deploy_counterfactual.sh) |
 | 10y synthetic predictor backtest | [`synthetic/predictor_backtest.py`](synthetic/predictor_backtest.py) |
 | Synthetic signal generator | [`synthetic/signal_generator.py`](synthetic/signal_generator.py) |
 | Markdown + CSV + metrics.json + S3 upload | [`reporter.py`](reporter.py) |
