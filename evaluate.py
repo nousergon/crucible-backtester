@@ -59,6 +59,7 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis import veto_analysis
+from analysis import decision_capture_coverage
 from analysis import end_to_end
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
@@ -437,6 +438,19 @@ def _run_diagnostics(
         skip_if_missing=["research_db"],
     )
 
+    # Decision-capture coverage (Phase 2 transparency-inventory).
+    # Reads S3 only — no local DB inputs required, runs even when the
+    # research DB pull fails. Returns "no_recent_sf_run" when the S3
+    # capture tree is empty for the trailing week (e.g. a smoke run on
+    # a brand-new bucket).
+    results["decision_capture_coverage"] = tracker.run_module(
+        "decision_capture_coverage",
+        lambda: decision_capture_coverage.compute_decision_capture_coverage(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            run_date=config.get("_run_date"),
+        ),
+    )
+
     # Feature drift detection
     results["feature_drift"] = tracker.run_module(
         "feature_drift",
@@ -799,6 +813,9 @@ def main() -> None:
     _health_start = _time.time()
 
     config = load_config(args.config)
+    # Stash run_date on config so diagnostic modules that don't already
+    # take args directly (e.g. decision_capture_coverage) can read it.
+    config["_run_date"] = args.date
 
     # Preflight: AWS_REGION + S3 bucket reachable. Evaluation reads
     # simulation artifacts from S3 (no ArcticDB), so keep the check
@@ -976,6 +993,7 @@ def main() -> None:
             shadow_book=diagnostics.get("shadow_book"),
             exit_timing=diagnostics.get("exit_timing"),
             macro_eval=diagnostics.get("macro_eval"),
+            decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
             trigger_opt=opt_results.get("trigger_opt"),
             predictor_sizing=opt_results.get("predictor_sizing"),
             scanner_opt=opt_results.get("scanner_opt"),
@@ -1060,6 +1078,7 @@ def main() -> None:
             confusion_matrix=diagnostics.get("confusion_matrix"),
             post_trade=diagnostics.get("post_trade"),
             monte_carlo=diagnostics.get("monte_carlo"),
+            decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
         )
 
         # Save completeness manifest
