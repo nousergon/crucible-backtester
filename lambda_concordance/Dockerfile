@@ -1,0 +1,49 @@
+# Dockerfile — Lambda container image for weekly cheap-model concordance.
+#
+# Lightweight relative to the spot backtester: alpha-engine-lib +
+# langchain_anthropic + boto3, no LightGBM / vectorbt / ArcticDB.
+#
+# Build (from repo root):
+#   docker build --platform linux/amd64 -f lambda_concordance/Dockerfile -t alpha-engine-replay-concordance .
+#
+# Run locally (simulates Lambda):
+#   docker run -p 9000:8080 alpha-engine-replay-concordance
+#   curl -X POST http://localhost:9000/2015-03-31/functions/function/invocations \
+#        -d '{"dry_run": true, "window_days": 14}'
+
+FROM public.ecr.aws/lambda/python:3.12
+
+# Install git — required for `pip install git+https://...` of
+# alpha-engine-lib below. Same workaround the research Lambda uses
+# (Lambda Python 3.12 base image does not include git; surfaced in
+# the data-collector Lambda 2026-05-04 when the lib-public flip
+# moved off vendored copies). Image-size impact: ~25MB.
+RUN microdnf install -y git && microdnf clean all
+
+# Install dependencies. alpha-engine-lib v0.4.0 ships agent_schemas
+# (the canonical Pydantic contract surface that replay.runner
+# validates against). [flow_doctor] extra plumbs flow-doctor's logging
+# integration. No [arcticdb] / [rag] — concordance reads decision
+# artifacts from S3 only.
+COPY lambda_concordance/requirements-concordance.txt requirements-concordance.txt
+RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.4.0" && \
+    pip install --no-cache-dir -r requirements-concordance.txt && \
+    rm -rf /root/.cache/pip
+
+# Application code — mirror lambda_health's per-file COPY pattern.
+# Lambda Lambda task layout flattens lambda_concordance/handler.py to
+# /var/task/handler.py (handler resolves LAMBDA_TASK_ROOT). replay/
+# imports stay nested.
+COPY ssm_secrets.py .
+COPY preflight.py .
+COPY replay/ replay/
+
+# flow-doctor.yaml ships alongside the handler; handler.py resolves
+# the absolute path via LAMBDA_TASK_ROOT and passes it to
+# alpha_engine_lib.logging.setup_logging().
+COPY flow-doctor.yaml .
+
+COPY lambda_concordance/handler.py handler.py
+
+# Lambda handler entry point
+CMD ["handler.handler"]

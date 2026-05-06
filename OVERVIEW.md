@@ -55,6 +55,7 @@ Weekly system evaluator + autonomous parameter optimizer. Reads historical signa
 | Per-agent agreement scorers (cheap-model concordance signal) | [`replay/comparison.py`](replay/comparison.py) |
 | Batch replay — date-range × target-models iteration + per-`(agent_id, target_model)` concordance aggregation + CloudWatch `agent_cheap_model_concordance` metric emission + per-target-model summary persistence | [`replay/batch.py`](replay/batch.py) |
 | Replay CLI (`python -m replay.cli single ...` / `python -m replay.cli batch ...`) | [`replay/cli.py`](replay/cli.py) |
+| Concordance Lambda — weekly SF-driven entry point that wraps `replay.batch.compute_and_emit_concordance` | [`lambda_concordance/handler.py`](lambda_concordance/handler.py), [`lambda_concordance/Dockerfile`](lambda_concordance/Dockerfile), [`infrastructure/deploy_concordance.sh`](infrastructure/deploy_concordance.sh) |
 | 10y synthetic predictor backtest | [`synthetic/predictor_backtest.py`](synthetic/predictor_backtest.py) |
 | Synthetic signal generator | [`synthetic/signal_generator.py`](synthetic/signal_generator.py) |
 | Markdown + CSV + metrics.json + S3 upload | [`reporter.py`](reporter.py) |
