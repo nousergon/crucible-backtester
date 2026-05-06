@@ -122,6 +122,46 @@ def _ratio_to_grade(ratio: float | None, target: float = 0.75) -> float | None:
     return _clamp(raw)
 
 
+def _band_to_grade(value: float | None, floor: float, mid: float, ceiling: float) -> float | None:
+    """Linear map between three anchors: floor → 0, mid → 50, ceiling → 100.
+
+    For metrics where the meaningful operating range isn't pegged to 0 or 1
+    (Sortino, MFE/MAE ratio, normalized entropy), this gives a tunable
+    three-anchor mapping. Out-of-range values are clamped to [0, 100].
+    """
+    if value is None:
+        return None
+    if floor >= mid or mid >= ceiling:
+        raise ValueError(f"need floor < mid < ceiling, got {floor}/{mid}/{ceiling}")
+    if value <= floor:
+        return 0.0
+    if value >= ceiling:
+        return 100.0
+    if value <= mid:
+        raw = (value - floor) / (mid - floor) * 50.0
+    else:
+        raw = 50.0 + (value - mid) / (ceiling - mid) * 50.0
+    return _clamp(raw)
+
+
+def _cvar_to_grade(cvar_95: float | None, baseline: float = -0.04, ceiling: float = -0.01) -> float | None:
+    """Map CVaR(95%) (negative = worse tail) to a 0-100 grade.
+
+    Default anchors:
+      - baseline (-4% mean worst-5%-day return) → 30 (D+)
+      - ceiling  (-1% mean worst-5%-day return) → 95 (A)
+      - 0 or positive (no tail loss) → 100
+    """
+    if cvar_95 is None:
+        return None
+    if cvar_95 >= 0.0:
+        return 100.0
+    if cvar_95 <= baseline:
+        return 30.0
+    raw = 30.0 + (cvar_95 - baseline) / (ceiling - baseline) * 65.0
+    return _clamp(raw)
+
+
 def _weighted_avg(components: list[tuple[float, float | None]]) -> float | None:
     """Weighted average of (weight, grade) pairs, skipping Nones."""
     total_w = 0.0
@@ -208,8 +248,23 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     return {"grade": grade, "letter": _letter(grade), "detail": detail}
 
 
-def _grade_sector_team(team: dict) -> dict:
-    """Grade a single sector team from e2e_lift team_lift entry."""
+def _grade_sector_team(team: dict, team_metrics: dict | None = None) -> dict:
+    """Grade a single sector team from e2e_lift team_lift entry.
+
+    When ``team_metrics`` is provided for the team_id (the per-team
+    skilled-risk-taking metric stack: IC + expectancy + MFE/MAE +
+    risk-matched alpha vs both benchmarks), the composite uses those
+    inputs per the evaluator-revamp spec:
+      - 25% IC (rank correlation, conviction → forward return)
+      - 20% expectancy_per_unit_loss (R-multiple form)
+      - 15% MFE/MAE ratio (band 0.8 → 1.5 → 2.0)
+      - 20% alpha vs EW-high-vol benchmark (lift in pp)
+      - 20% alpha vs beta-matched SPY (lift in pp)
+
+    When ``team_metrics`` is absent, falls back to the legacy
+    precision/recall/lift composite — preserves backward compatibility
+    for callers that haven't been wired through to the new metrics yet.
+    """
     team_id = team.get("team_id", "unknown")
     n_picks = team.get("n_picks", 0)
 
@@ -219,6 +274,12 @@ def _grade_sector_team(team: dict) -> dict:
             "reason": f"only {n_picks} picks", "n_picks": n_picks,
         }
 
+    # ── New metric-stack path: skilled-risk-taking composite ────────────
+    metrics = (team_metrics or {}).get(team_id)
+    if isinstance(metrics, dict) and metrics:
+        return _grade_team_skill_composite(team_id, n_picks, team, metrics)
+
+    # ── Legacy path: lift + classification ──────────────────────────────
     lift_vs_sector = team.get("lift")
     lift_vs_quant = team.get("lift_vs_quant")
     clf = team.get("classification")
@@ -260,6 +321,80 @@ def _grade_sector_team(team: dict) -> dict:
     if lift_vs_quant is not None:
         detail["lift_vs_quant"] = f"{lift_vs_quant:+.2f}%"
     detail["n_picks"] = n_picks
+
+    return {
+        "team_id": team_id, "grade": grade, "letter": _letter(grade),
+        "detail": detail,
+    }
+
+
+def _grade_team_skill_composite(
+    team_id: str, n_picks: int, team: dict, metrics: dict,
+) -> dict:
+    """Skilled-risk-taking composite per evaluator-revamp spec.
+
+    Expects ``metrics`` to be a dict with sub-keys:
+      - ic: ICResult from compute_ic
+      - expectancy: ExpectancyResult from compute_expectancy
+      - excursion: ExcursionSummary from summarize_excursions
+      - alpha_vs_ew_high_vol: BenchmarkResult from compute_alpha_vs_benchmark
+      - alpha_vs_beta_spy: BenchmarkResult from compute_alpha_vs_benchmark
+
+    Any sub-metric absent or status != "ok" → that component drops out
+    of the composite (weighted avg skips Nones).
+    """
+    ic = metrics.get("ic") or {}
+    exp = metrics.get("expectancy") or {}
+    exc = metrics.get("excursion") or {}
+    ew = metrics.get("alpha_vs_ew_high_vol") or {}
+    bm = metrics.get("alpha_vs_beta_spy") or {}
+
+    ic_g = _ic_to_grade(ic.get("ic")) if ic.get("status") == "ok" else None
+    expectancy_g = _ratio_to_grade(
+        exp.get("expectancy_per_unit_loss"), target=0.4,
+    ) if exp.get("status") == "ok" else None
+    # MFE/MAE ratio: 0.8 = below floor (worse than YOLO), 1.5 = decent,
+    # 2.0+ = strong skilled risk-taking.
+    mfe_mae_g = _band_to_grade(
+        exc.get("mean_mfe_mae_ratio"), floor=0.8, mid=1.5, ceiling=2.0,
+    ) if exc.get("status") == "ok" else None
+    # Excess returns from compute_alpha_vs_benchmark are decimal fractions
+    # (e.g. 0.012 = +1.2%). Convert to percentage-points for _lift_to_grade
+    # which is calibrated on the pp scale used by lift_vs_sector etc.
+    ew_lift = ew.get("excess_return")
+    bm_lift = bm.get("excess_return")
+    ew_pp = ew_lift * 100.0 if isinstance(ew_lift, (int, float)) else None
+    bm_pp = bm_lift * 100.0 if isinstance(bm_lift, (int, float)) else None
+    ew_g = _lift_to_grade(ew_pp, floor=-3.0, ceiling=4.0)
+    bm_g = _lift_to_grade(bm_pp, floor=-3.0, ceiling=4.0)
+
+    grade = _weighted_avg([
+        (0.25, ic_g),
+        (0.20, expectancy_g),
+        (0.15, mfe_mae_g),
+        (0.20, ew_g),
+        (0.20, bm_g),
+    ])
+
+    detail: dict[str, str | float | int] = {"n_picks": n_picks}
+    if ic.get("ic") is not None:
+        detail["ic"] = round(ic["ic"], 3)
+    if exp.get("expectancy") is not None:
+        detail["expectancy"] = round(exp["expectancy"], 4)
+    if exp.get("expectancy_per_unit_loss") is not None:
+        detail["expectancy_per_unit_loss"] = round(exp["expectancy_per_unit_loss"], 3)
+    if exp.get("hit_rate") is not None:
+        detail["hit_rate"] = f"{exp['hit_rate']:.1%}"
+    if exp.get("win_loss_ratio") is not None:
+        detail["win_loss_ratio"] = round(exp["win_loss_ratio"], 2)
+    if exc.get("mean_mfe_mae_ratio") is not None:
+        detail["mfe_mae_ratio"] = round(exc["mean_mfe_mae_ratio"], 2)
+    if exc.get("pct_high_quality") is not None:
+        detail["pct_high_quality"] = f"{exc['pct_high_quality']:.1%}"
+    if ew_lift is not None:
+        detail["alpha_vs_ew_high_vol"] = f"{ew_pp:+.2f}%"
+    if bm_lift is not None:
+        detail["alpha_vs_beta_spy"] = f"{bm_pp:+.2f}%"
 
     return {
         "team_id": team_id, "grade": grade, "letter": _letter(grade),
@@ -700,37 +835,73 @@ def _grade_position_sizing(sizing_ab: dict | None) -> dict:
 
 def _grade_portfolio(signal_quality: dict | None,
                      portfolio_stats: dict | None) -> dict:
-    """Grade overall portfolio construction and performance."""
+    """Grade overall portfolio construction and performance.
+
+    When ``portfolio_stats`` includes the evaluator-revamp downside-aware
+    fields (``sortino_ratio``, ``cvar_95``, plus optionally an
+    ``information_ratio_spy`` populated upstream), the composite uses:
+      - 25% accuracy_10d  (selection accuracy, kept)
+      - 25% Sortino       (replaces Sharpe — penalises downside vol only)
+      - 15% Calmar        (annualised return / max drawdown)
+      - 15% CVaR(95%)     (tail-risk metric)
+      - 10% IR vs SPY     (only when supplied)
+      - 10% max_drawdown
+    Sharpe is still emitted in ``detail`` as a side-channel diagnostic
+    but is intentionally dropped from the composite — it penalises the
+    upside vol that a long-only risk-seeking strategy is *trying* to
+    capture, which is the wrong shape for grading.
+
+    Falls back to the legacy accuracy/alpha/Sharpe/DD weights when the
+    new fields are absent — preserves backward compatibility for older
+    portfolio_stats producers.
+    """
     overall = _safe_get(signal_quality, "overall") or {}
 
     acc_10d = overall.get("accuracy_10d")
     avg_alpha = overall.get("avg_alpha_10d")
-
     acc_g = _pct_to_grade(acc_10d, baseline=0.45, ceiling=0.70)
     alpha_g = _lift_to_grade(avg_alpha, floor=-2.0, ceiling=4.0) if avg_alpha is not None else None
 
-    # Portfolio simulation stats (Sharpe, drawdown)
     sharpe = _safe_get(portfolio_stats, "sharpe_ratio")
+    sortino = _safe_get(portfolio_stats, "sortino_ratio")
+    calmar = _safe_get(portfolio_stats, "calmar_ratio")
+    cvar = _safe_get(portfolio_stats, "cvar_95")
+    ir_spy = _safe_get(portfolio_stats, "information_ratio_spy")
     max_dd = _safe_get(portfolio_stats, "max_drawdown")
 
-    if sharpe is not None:
-        # Sharpe 0 → 30, 1.0 → 65, 2.0 → 95
-        sharpe_g = _clamp(30.0 + sharpe * 32.5)
-    else:
-        sharpe_g = None
+    # Legacy Sharpe → grade map kept for the fallback path + side-channel
+    # display. Sharpe 0 → 30, 1.0 → 65, 2.0 → 95.
+    sharpe_g = _clamp(30.0 + sharpe * 32.5) if sharpe is not None else None
+    # Sortino: 0 → 30, 1.5 → 65, 3.0 → 95 (Sortino runs higher than Sharpe
+    # because the denominator is smaller; calibrate the band accordingly).
+    sortino_g = _clamp(30.0 + sortino * 21.67) if sortino is not None else None
+    # Calmar: 0 → 30, 1.0 → 65, 3.0 → 95.
+    calmar_g = _clamp(30.0 + calmar * 21.67) if calmar is not None else None
+    cvar_g = _cvar_to_grade(cvar)
+    ir_g = (
+        _band_to_grade(ir_spy, floor=-1.0, mid=0.5, ceiling=2.0)
+        if ir_spy is not None else None
+    )
+    # max_dd: -5% → 85, -10% → 65, -20% → 30, -30% → 10.
+    dd_g = _clamp(95.0 + max_dd * 2.83) if max_dd is not None else None
 
-    if max_dd is not None:
-        # -5% → 85, -10% → 65, -20% → 30, -30% → 10
-        dd_g = _clamp(95.0 + max_dd * 2.83)  # max_dd is negative
+    use_new_stack = sortino is not None and cvar is not None
+    if use_new_stack:
+        grade = _weighted_avg([
+            (0.25, acc_g),
+            (0.25, sortino_g),
+            (0.15, calmar_g),
+            (0.15, cvar_g),
+            (0.10, ir_g),
+            (0.10, dd_g),
+        ])
     else:
-        dd_g = None
-
-    grade = _weighted_avg([
-        (0.30, acc_g),
-        (0.25, alpha_g),
-        (0.25, sharpe_g),
-        (0.20, dd_g),
-    ])
+        grade = _weighted_avg([
+            (0.30, acc_g),
+            (0.25, alpha_g),
+            (0.25, sharpe_g),
+            (0.20, dd_g),
+        ])
 
     detail = {}
     if acc_10d is not None:
@@ -739,8 +910,145 @@ def _grade_portfolio(signal_quality: dict | None,
         detail["avg_alpha_10d"] = f"{avg_alpha:+.2f}%"
     if sharpe is not None:
         detail["sharpe"] = f"{sharpe:.2f}"
+    if sortino is not None:
+        detail["sortino"] = f"{sortino:.2f}"
+    if calmar is not None:
+        detail["calmar"] = f"{calmar:.2f}"
+    if cvar is not None:
+        detail["cvar_95"] = f"{cvar:.2%}"
+    if ir_spy is not None:
+        detail["information_ratio_spy"] = f"{ir_spy:.2f}"
     if max_dd is not None:
         detail["max_drawdown"] = f"{max_dd:.1%}"
+
+    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+
+
+# ---------------------------------------------------------------------------
+# New evaluator-revamp graders (calibration / action entropy / excursion)
+# ---------------------------------------------------------------------------
+
+
+def _grade_calibration_diagnostics(calibration: dict | None) -> dict:
+    """Grade conviction-vs-realized calibration (reliability diagram quality).
+
+    Consumes the output of ``analysis.calibration_diagnostics.compute_calibration``.
+    Grade is driven by ECE: lower = better calibration. Bands match
+    the existing production_health.compute_calibration_validation labels:
+      - ECE < 0.05 → "good" → 90
+      - ECE < 0.10 → "acceptable" → 65
+      - ECE < 0.20 → "poor" → 35
+      - ECE ≥ 0.20 → 10
+    """
+    if not calibration or calibration.get("status") not in ("ok",):
+        return {
+            "grade": None, "letter": "N/A",
+            "reason": calibration.get("reason") if calibration else "no data",
+        }
+
+    ece = calibration.get("ece")
+    if ece is None:
+        return {"grade": None, "letter": "N/A", "reason": "ece missing"}
+
+    if ece < 0.05:
+        grade = 90.0
+    elif ece < 0.10:
+        grade = 65.0
+    elif ece < 0.20:
+        grade = 35.0
+    else:
+        grade = 10.0
+
+    detail: dict[str, Any] = {
+        "ece": round(ece, 4),
+        "n": calibration.get("n"),
+        "quality": calibration.get("quality"),
+    }
+    if calibration.get("brier_score") is not None:
+        detail["brier_score"] = calibration["brier_score"]
+    if calibration.get("bins"):
+        detail["n_bins"] = len(calibration["bins"])
+
+    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+
+
+def _grade_action_entropy(action_entropy: dict | None) -> dict:
+    """Grade action-stream Shannon entropy (BUY/HOLD/SELL distribution).
+
+    Consumes the output of ``analysis.action_entropy.compute_action_entropy``.
+    Catches degenerate-LLM-behavior failure modes (always-hold,
+    always-trade) that risk-adjusted return metrics don't see. Grade
+    is driven by ``entropy_normalized`` (in [0, 1]):
+      - 1.0 → 100 (perfectly uniform)
+      - alarm threshold (0.3 default) → 40 (concerning)
+      - 0.0 → 0 (single-action collapse)
+    The function honours the alarm flag emitted by the producer.
+    """
+    if not action_entropy or action_entropy.get("status") != "ok":
+        return {
+            "grade": None, "letter": "N/A",
+            "reason": "insufficient data",
+        }
+
+    h_norm = action_entropy.get("entropy_normalized")
+    grade = _band_to_grade(h_norm, floor=0.0, mid=0.3, ceiling=1.0)
+    if grade is not None and h_norm is not None and h_norm < 0.3:
+        # Pull below 40 explicitly when the alarm floor is breached
+        # (band floor=0.0/mid=0.3 already does this; this is a
+        # belt-and-suspenders check).
+        grade = min(grade, 40.0)
+
+    detail: dict[str, Any] = {}
+    if h_norm is not None:
+        detail["entropy_normalized"] = round(float(h_norm), 3)
+    if action_entropy.get("most_common") is not None:
+        detail["most_common"] = action_entropy["most_common"]
+    if action_entropy.get("most_common_fraction") is not None:
+        detail["most_common_fraction"] = f"{action_entropy['most_common_fraction']:.1%}"
+    if action_entropy.get("alarm") is not None:
+        detail["alarm"] = bool(action_entropy["alarm"])
+    if action_entropy.get("n") is not None:
+        detail["n"] = action_entropy["n"]
+
+    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+
+
+def _grade_excursion(excursion_summary: dict | None) -> dict:
+    """Grade per-trade MFE/MAE process quality.
+
+    Consumes the output of ``analysis.excursion.summarize_excursions``.
+    Composite over two indicators:
+      - mean_mfe_mae_ratio (60%) — band 0.8 → 1.5 → 2.0
+      - pct_high_quality (40%) — fraction of trades with ratio > 1.5;
+        banded 0 → 0.3 → 0.6 → 80
+    """
+    if not excursion_summary or excursion_summary.get("status") != "ok":
+        return {
+            "grade": None, "letter": "N/A",
+            "reason": "insufficient data",
+        }
+
+    ratio = excursion_summary.get("mean_mfe_mae_ratio")
+    pct = excursion_summary.get("pct_high_quality")
+
+    ratio_g = _band_to_grade(ratio, floor=0.8, mid=1.5, ceiling=2.0)
+    pct_g = _pct_to_grade(pct, baseline=0.30, ceiling=0.60)
+
+    grade = _weighted_avg([(0.60, ratio_g), (0.40, pct_g)])
+
+    detail: dict[str, Any] = {}
+    if ratio is not None:
+        detail["mean_mfe_mae_ratio"] = round(ratio, 3)
+    if excursion_summary.get("median_mfe_mae_ratio") is not None:
+        detail["median_mfe_mae_ratio"] = round(
+            excursion_summary["median_mfe_mae_ratio"], 3,
+        )
+    if pct is not None:
+        detail["pct_high_quality"] = f"{pct:.1%}"
+    if excursion_summary.get("pct_mfe_gt_mae") is not None:
+        detail["pct_mfe_gt_mae"] = f"{excursion_summary['pct_mfe_gt_mae']:.1%}"
+    if excursion_summary.get("n") is not None:
+        detail["n"] = excursion_summary["n"]
 
     return {"grade": grade, "letter": _letter(grade), "detail": detail}
 
@@ -764,6 +1072,11 @@ def compute_scorecard(
     portfolio_stats: dict | None = None,
     scanner_opt: dict | None = None,
     cio_opt: dict | None = None,
+    *,
+    team_metrics: dict | None = None,
+    calibration_diagnostics: dict | None = None,
+    action_entropy: dict | None = None,
+    excursion_summary: dict | None = None,
 ) -> dict:
     """Compute the unified system scorecard.
 
@@ -791,31 +1104,42 @@ def compute_scorecard(
     team_lift_list = _safe_get(e2e_lift, "team_lift") or []
     if not isinstance(team_lift_list, list):
         team_lift_list = []
-    teams = [_grade_sector_team(t) for t in team_lift_list]
+    teams = [_grade_sector_team(t, team_metrics=team_metrics) for t in team_lift_list]
 
     # Average team grade
     team_grades = [t["grade"] for t in teams if t.get("grade") is not None]
     avg_team_grade = sum(team_grades) / len(team_grades) if team_grades else None
 
+    # New: decision-quality grade — calibration of agent conviction vs realized.
+    calibration_grade = _grade_calibration_diagnostics(calibration_diagnostics)
+
+    # Recompose research with calibration when available; preserves
+    # existing weights when calibration is absent (calibration_grade.grade
+    # is None → _weighted_avg drops it from the average).
     research_grade = _weighted_avg([
         (0.10, scanner.get("grade")),
-        (0.30, avg_team_grade),
+        (0.25, avg_team_grade),
         (0.10, macro.get("grade")),
-        (0.25, cio.get("grade")),
-        (0.25, composite.get("grade")),
+        (0.20, cio.get("grade")),
+        (0.20, composite.get("grade")),
+        (0.15, calibration_grade.get("grade")),
     ])
+
+    research_components = {
+        "scanner": scanner,
+        "sector_teams": teams,
+        "sector_teams_avg": {"grade": avg_team_grade, "letter": _letter(avg_team_grade)},
+        "macro_agent": macro,
+        "cio": cio,
+        "composite_scoring": composite,
+    }
+    if calibration_diagnostics is not None:
+        research_components["calibration_diagnostics"] = calibration_grade
 
     research = {
         "grade": research_grade,
         "letter": _letter(research_grade),
-        "components": {
-            "scanner": scanner,
-            "sector_teams": teams,
-            "sector_teams_avg": {"grade": avg_team_grade, "letter": _letter(avg_team_grade)},
-            "macro_agent": macro,
-            "cio": cio,
-            "composite_scoring": composite,
-        },
+        "components": research_components,
     }
 
     # -----------------------------------------------------------------------
@@ -846,25 +1170,36 @@ def compute_scorecard(
     exits = _grade_exit_rules(exit_timing)
     sizing = _grade_position_sizing(sizing_ab)
     portfolio = _grade_portfolio(signal_quality, portfolio_stats)
+    # New: process-quality graders.
+    excursion_grade = _grade_excursion(excursion_summary)
+    entropy_grade = _grade_action_entropy(action_entropy)
 
     executor_grade = _weighted_avg([
-        (0.15, triggers.get("grade")),
-        (0.20, guard.get("grade")),
-        (0.20, exits.get("grade")),
-        (0.15, sizing.get("grade")),
-        (0.30, portfolio.get("grade")),
+        (0.10, triggers.get("grade")),
+        (0.15, guard.get("grade")),
+        (0.15, exits.get("grade")),
+        (0.10, sizing.get("grade")),
+        (0.25, portfolio.get("grade")),
+        (0.15, excursion_grade.get("grade")),
+        (0.10, entropy_grade.get("grade")),
     ])
+
+    executor_components = {
+        "entry_triggers": triggers,
+        "risk_guard": guard,
+        "exit_rules": exits,
+        "position_sizing": sizing,
+        "portfolio": portfolio,
+    }
+    if excursion_summary is not None:
+        executor_components["excursion"] = excursion_grade
+    if action_entropy is not None:
+        executor_components["action_entropy"] = entropy_grade
 
     executor = {
         "grade": executor_grade,
         "letter": _letter(executor_grade),
-        "components": {
-            "entry_triggers": triggers,
-            "risk_guard": guard,
-            "exit_rules": exits,
-            "position_sizing": sizing,
-            "portfolio": portfolio,
-        },
+        "components": executor_components,
     }
 
     # -----------------------------------------------------------------------
