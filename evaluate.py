@@ -888,6 +888,45 @@ def main() -> None:
             "coverage": portfolio_stats.get("coverage") if portfolio_stats else None,
         }
 
+        # Compute the evaluator-revamp metric bundles. Each piece
+        # graceful-degrades to insufficient_data when its inputs are
+        # missing, so calls are unconditional and the grading layer
+        # drops absent metrics from the composite.
+        from analysis.team_skill_metrics import (
+            compute_portfolio_calibration,
+            compute_portfolio_excursion_summary,
+            compute_team_metrics,
+        )
+
+        team_metrics = {}
+        portfolio_calibration = {"status": "insufficient_data"}
+        portfolio_excursion = {"status": "insufficient_data"}
+        try:
+            team_lift_for_metrics = (
+                diagnostics.get("e2e_lift") or {}
+            ).get("team_lift") or []
+            prices_for_metrics = config.get("_prices")
+            ohlc_for_metrics = config.get("_ohlcv_by_ticker")
+            spy_returns_for_metrics = None
+            spy_prices_for_metrics = config.get("_spy_prices")
+            if isinstance(spy_prices_for_metrics, pd.Series) and not spy_prices_for_metrics.empty:
+                spy_returns_for_metrics = spy_prices_for_metrics.pct_change().dropna()
+
+            team_metrics = compute_team_metrics(
+                team_lift=team_lift_for_metrics,
+                score_performance_df=df_base,
+                prices=prices_for_metrics,
+                spy_daily_returns=spy_returns_for_metrics,
+                ohlc=ohlc_for_metrics,
+                horizon_days=10,
+            )
+            portfolio_calibration = compute_portfolio_calibration(df_base)
+            portfolio_excursion = compute_portfolio_excursion_summary(
+                df_base, ohlc_for_metrics, horizon_days=10,
+            )
+        except Exception as e:
+            log.warning("evaluator-revamp metric bundle failed: %s", e)
+
         # Compute grading scorecard
         from analysis.grading import compute_scorecard
         grading_result = compute_scorecard(
@@ -905,6 +944,11 @@ def main() -> None:
             portfolio_stats=portfolio_stats,
             scanner_opt=opt_results.get("scanner_opt"),
             cio_opt=opt_results.get("cio_opt"),
+            team_metrics=team_metrics or None,
+            calibration_diagnostics=portfolio_calibration if portfolio_calibration.get("status") == "ok" else None,
+            excursion_summary=portfolio_excursion if portfolio_excursion.get("status") == "ok" else None,
+            # action_entropy left None until a decision-stream extraction
+            # source is wired in (PR 7 — regime indicator email).
         )
 
         # Build report using existing reporter (includes completeness)

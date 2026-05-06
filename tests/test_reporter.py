@@ -139,3 +139,87 @@ class TestBuildReport:
         )
         assert isinstance(md, str)
         assert len(md) > 50
+
+
+class TestSectionSkillVsBeta:
+    """The Skill vs. Beta panel (PR 4) — renders only when the
+    evaluator-revamp metrics are wired through."""
+
+    def test_renders_when_team_metrics_present(self):
+        from reporter import _section_skill_vs_beta
+        grading = {
+            "research": {
+                "components": {
+                    "sector_teams": [
+                        {
+                            "team_id": "tech",
+                            "grade": 75.0, "letter": "B+",
+                            "detail": {
+                                "ic": 0.06,
+                                "hit_rate": "58.0%",
+                                "win_loss_ratio": 1.6,
+                                "mfe_mae_ratio": 1.5,
+                                "alpha_vs_ew_high_vol": "+1.20%",
+                                "alpha_vs_beta_spy": "+0.80%",
+                                "n_picks": 12,
+                            },
+                        },
+                    ],
+                    "calibration_diagnostics": {
+                        "grade": 90.0, "letter": "A",
+                        "detail": {"ece": 0.04, "n": 200, "quality": "good"},
+                    },
+                },
+            },
+        }
+        lines = _section_skill_vs_beta(grading)
+        assert any("Skill vs. Beta" in l for l in lines)
+        assert any("Per-Team Skill Composite" in l for l in lines)
+        assert any("Calibration" in l for l in lines)
+        assert any("tech" in l.lower() for l in lines)
+        assert any("0.04" in l for l in lines)  # ECE
+
+    def test_returns_empty_when_legacy_team_path(self):
+        from reporter import _section_skill_vs_beta
+        grading = {
+            "research": {
+                "components": {
+                    "sector_teams": [
+                        {
+                            "team_id": "tech",
+                            "grade": 75.0, "letter": "B+",
+                            "detail": {
+                                "lift_vs_sector": "+2.50%",
+                                "lift_vs_quant": "+1.10%",
+                                "n_picks": 12,
+                            },
+                        },
+                    ],
+                },
+            },
+        }
+        # No team has IC + alpha_vs_*; calibration not provided.
+        # Should return [] so no header appears.
+        lines = _section_skill_vs_beta(grading)
+        assert lines == []
+
+    def test_renders_calibration_only_when_skill_teams_absent(self):
+        from reporter import _section_skill_vs_beta
+        grading = {
+            "research": {
+                "components": {
+                    "sector_teams": [],
+                    "calibration_diagnostics": {
+                        "grade": 65.0, "letter": "B",
+                        "detail": {"ece": 0.08, "n": 150, "quality": "acceptable"},
+                    },
+                },
+            },
+        }
+        lines = _section_skill_vs_beta(grading)
+        assert any("Calibration" in l for l in lines)
+        assert not any("Per-Team Skill Composite" in l for l in lines)
+
+    def test_returns_empty_grading_with_no_research(self):
+        from reporter import _section_skill_vs_beta
+        assert _section_skill_vs_beta({}) == []

@@ -138,8 +138,11 @@ def _section_scorecard(grading: dict) -> list[str]:
         ("macro_agent", "Macro Agent"),
         ("cio", "CIO"),
         ("composite_scoring", "Composite Scoring"),
+        ("calibration_diagnostics", "Calibration"),
     ]:
-        c = r_comps.get(comp_key, {})
+        c = r_comps.get(comp_key)
+        if c is None:
+            continue  # component not wired through in this run
         _append_component_row(lines, comp_label, c)
 
     # Sector teams
@@ -181,8 +184,12 @@ def _section_scorecard(grading: dict) -> list[str]:
         ("exit_rules", "Exit Rules"),
         ("position_sizing", "Position Sizing"),
         ("portfolio", "Portfolio"),
+        ("excursion", "MFE/MAE (Excursion)"),
+        ("action_entropy", "Action Entropy"),
     ]:
-        c = e_comps.get(comp_key, {})
+        c = e_comps.get(comp_key)
+        if c is None:
+            continue  # component not wired through in this run
         _append_component_row(lines, comp_label, c)
     lines.append("")
 
@@ -204,6 +211,93 @@ def _append_component_row(lines: list[str], label: str, comp: dict):
         lines.append(f"| {label} | {l} | {g:.0f} | {detail_str} |")
     else:
         lines.append(f"| {label} | N/A | — | {reason or 'insufficient data'} |")
+
+
+def _section_skill_vs_beta(grading: dict) -> list[str]:
+    """Skill vs. Beta panel — per-team skilled-risk-taking metrics + ECE.
+
+    Renders only when the evaluator-revamp metrics are wired through.
+    For each sector team, surfaces the four skill-composite signals that
+    answer "given the risk you took, did you outperform the dumb version?"
+    plus the system-wide calibration row.
+    """
+    research = grading.get("research", {})
+    r_comps = research.get("components", {})
+    teams = r_comps.get("sector_teams", []) or []
+
+    # Detect skill-composite teams: their detail has IC + at least one of
+    # alpha_vs_ew_high_vol / alpha_vs_beta_spy. If no team has those
+    # fields, the legacy lift-based path was used and this section
+    # has nothing skill-specific to render.
+    skill_teams = [
+        t for t in teams
+        if "ic" in (t.get("detail") or {})
+        and any(k in (t.get("detail") or {})
+                for k in ("alpha_vs_ew_high_vol", "alpha_vs_beta_spy"))
+    ]
+    calibration = r_comps.get("calibration_diagnostics")
+
+    if not skill_teams and not calibration:
+        return []
+
+    lines = ["## Skill vs. Beta", ""]
+    lines.append(
+        "_Risk-matched alpha + decision-quality diagnostics. Answers: "
+        "given the risk taken, did the agents outperform the dumb version "
+        "of taking that risk?_"
+    )
+    lines.append("")
+
+    if skill_teams:
+        lines.append("### Per-Team Skill Composite")
+        lines.append("")
+        lines.append(
+            "| Team | Grade | IC | Hit% | W/L | MFE/MAE | α vs EW-high-vol | α vs β-SPY |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for t in skill_teams:
+            tid = t.get("team_id", "?").replace("_", " ").title()
+            d = t.get("detail") or {}
+            grade = t.get("grade")
+            grade_str = f"{t.get('letter', 'N/A')} ({grade:.0f})" if grade is not None else "N/A"
+            lines.append(
+                f"| {tid} | {grade_str} "
+                f"| {d.get('ic', '—')} "
+                f"| {d.get('hit_rate', '—')} "
+                f"| {d.get('win_loss_ratio', '—')} "
+                f"| {d.get('mfe_mae_ratio', '—')} "
+                f"| {d.get('alpha_vs_ew_high_vol', '—')} "
+                f"| {d.get('alpha_vs_beta_spy', '—')} |"
+            )
+        lines.append("")
+
+    if calibration:
+        d = calibration.get("detail") or {}
+        ece = d.get("ece", "—")
+        n = d.get("n", "—")
+        quality = d.get("quality", "—")
+        grade = calibration.get("grade")
+        grade_str = (
+            f"{calibration.get('letter', 'N/A')} ({grade:.0f})"
+            if grade is not None else "N/A"
+        )
+        lines.append("### Calibration (Decision Quality)")
+        lines.append("")
+        lines.append(
+            f"_When agents say {{conviction}}%, do those picks actually win {{conviction}}%?_"
+        )
+        lines.append("")
+        lines.append(
+            f"- ECE: **{ece}** (lower = better calibrated)"
+        )
+        lines.append(f"- Quality label: **{quality}**")
+        lines.append(f"- Grade: {grade_str}")
+        lines.append(f"- n samples: {n}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    return lines
 
 
 def _scorecard_key_metric(mod: dict) -> str:
@@ -338,6 +432,13 @@ def build_report(
     # System Report Card (component grades)
     if grading and grading.get("status") in ("ok", "partial"):
         lines += _section_scorecard(grading)
+        # Skill vs. Beta panel — surfaces the per-team risk-matched
+        # alpha numbers + ECE detail when the evaluator-revamp metrics
+        # are wired through. Falls back to no-op when team_metrics
+        # isn't populated (PR 4 wiring).
+        skill_lines = _section_skill_vs_beta(grading)
+        if skill_lines:
+            lines += skill_lines
 
     # What Changed This Week (promotion decisions, twin sim, regression)
     lines += _section_what_changed(
