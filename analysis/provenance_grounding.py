@@ -452,10 +452,12 @@ def compute_provenance_grounding(
 
     # CloudWatch emission for the most-recent Saturday only — the rolling
     # window aggregates are derivable from CW's native rolling-stat math
-    # so we don't double-emit historical points.
+    # so we don't double-emit historical points. The boto3 client
+    # construction itself can raise (e.g. NoRegionError in CI without
+    # AWS_DEFAULT_REGION set), so it's wrapped together with the put.
     if emit_metrics and most_recent_summary["per_agent"]:
-        cw = cloudwatch_client or boto3.client("cloudwatch")
         try:
+            cw = cloudwatch_client or boto3.client("cloudwatch")
             _emit_provenance_metrics(
                 cw,
                 namespace=cw_namespace,

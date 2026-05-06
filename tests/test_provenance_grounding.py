@@ -392,6 +392,33 @@ class TestComputeProvenanceGrounding:
 
         cw.put_metric_data.assert_not_called()
 
+    def test_default_cw_client_creation_failure_does_not_break_compute(self, monkeypatch):
+        """When cloudwatch_client=None and boto3 can't construct a client
+        (e.g. CI without AWS_DEFAULT_REGION), the failure must be caught
+        so the JSON path still completes."""
+        from botocore.exceptions import NoRegionError
+
+        artifacts = {
+            "decision_artifacts/2026/05/09/macro_economist/run.json": {
+                "agent_output": {"tool_calls": [{"tool": "fetch_macro"}]},
+                "input_data_snapshot": {},
+            },
+        }
+        s3 = _mock_s3_with_artifacts(artifacts)
+
+        import analysis.provenance_grounding as mod
+        def _raise_no_region(service):
+            raise NoRegionError()
+        monkeypatch.setattr(mod.boto3, "client", _raise_no_region)
+
+        result = compute_provenance_grounding(
+            bucket="test-bucket", run_date="2026-05-10",
+            lookback_weeks=1, s3_client=s3,
+            # cloudwatch_client=None → forces boto3.client path
+        )
+        assert result["status"] == "ok"
+        assert "macro_economist" in result["per_agent"]
+
     def test_cw_emission_failure_does_not_break_compute(self):
         artifacts = {
             "decision_artifacts/2026/05/09/macro_economist/run.json": {
