@@ -59,7 +59,7 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis import veto_analysis
-from analysis import decision_capture_coverage
+from analysis import decision_capture_coverage, provenance_grounding
 from analysis import end_to_end
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
@@ -446,6 +446,17 @@ def _run_diagnostics(
     results["decision_capture_coverage"] = tracker.run_module(
         "decision_capture_coverage",
         lambda: decision_capture_coverage.compute_decision_capture_coverage(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            run_date=config.get("_run_date"),
+        ),
+    )
+
+    # Provenance grounding — fourth leg of agent-justification stack.
+    # Per-agent tool-call + input-trace metrics on captured artifacts.
+    # Reads S3 only — no local DB inputs required.
+    results["provenance_grounding"] = tracker.run_module(
+        "provenance_grounding",
+        lambda: provenance_grounding.compute_provenance_grounding(
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=config.get("_run_date"),
         ),
@@ -994,6 +1005,7 @@ def main() -> None:
             exit_timing=diagnostics.get("exit_timing"),
             macro_eval=diagnostics.get("macro_eval"),
             decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
+            provenance_grounding=diagnostics.get("provenance_grounding"),
             trigger_opt=opt_results.get("trigger_opt"),
             predictor_sizing=opt_results.get("predictor_sizing"),
             scanner_opt=opt_results.get("scanner_opt"),
@@ -1079,6 +1091,7 @@ def main() -> None:
             post_trade=diagnostics.get("post_trade"),
             monte_carlo=diagnostics.get("monte_carlo"),
             decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
+            provenance_grounding=diagnostics.get("provenance_grounding"),
         )
 
         # Save completeness manifest
