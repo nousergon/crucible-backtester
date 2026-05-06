@@ -3,7 +3,12 @@
 import pytest
 
 from analysis.grading import (
+    _band_to_grade,
     _clamp,
+    _cvar_to_grade,
+    _grade_action_entropy,
+    _grade_calibration_diagnostics,
+    _grade_excursion,
     _ic_to_grade,
     _letter,
     _lift_to_grade,
@@ -305,3 +310,297 @@ class TestComputeScorecard:
         veto = result["predictor"]["components"]["veto_gate"]
         assert "recall" in veto["detail"]
         assert "f1" in veto["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Evaluator-revamp helpers (PR 3): _band_to_grade + _cvar_to_grade
+# ---------------------------------------------------------------------------
+
+
+class TestBandToGrade:
+    def test_three_anchor_mapping(self):
+        # floor=0, mid=1, ceiling=2 → 0/50/100 at the anchors.
+        assert _band_to_grade(0.0, 0.0, 1.0, 2.0) == pytest.approx(0.0)
+        assert _band_to_grade(1.0, 0.0, 1.0, 2.0) == pytest.approx(50.0)
+        assert _band_to_grade(2.0, 0.0, 1.0, 2.0) == pytest.approx(100.0)
+        # Linear in each half.
+        assert _band_to_grade(0.5, 0.0, 1.0, 2.0) == pytest.approx(25.0)
+        assert _band_to_grade(1.5, 0.0, 1.0, 2.0) == pytest.approx(75.0)
+
+    def test_clamps_outside_range(self):
+        assert _band_to_grade(-5.0, 0.0, 1.0, 2.0) == 0.0
+        assert _band_to_grade(99.0, 0.0, 1.0, 2.0) == 100.0
+
+    def test_invalid_anchors_raise(self):
+        with pytest.raises(ValueError):
+            _band_to_grade(0.5, 1.0, 1.0, 2.0)  # floor == mid
+        with pytest.raises(ValueError):
+            _band_to_grade(0.5, 2.0, 1.0, 0.5)  # decreasing
+
+    def test_none_returns_none(self):
+        assert _band_to_grade(None, 0.0, 1.0, 2.0) is None
+
+
+class TestCvarToGrade:
+    def test_zero_or_positive_full_grade(self):
+        assert _cvar_to_grade(0.0) == 100.0
+        assert _cvar_to_grade(0.01) == 100.0
+
+    def test_baseline_anchor(self):
+        # Default baseline -4% → 30 (D+).
+        assert _cvar_to_grade(-0.04) == pytest.approx(30.0)
+
+    def test_ceiling_anchor(self):
+        # Default ceiling -1% → 95 (A).
+        assert _cvar_to_grade(-0.01) == pytest.approx(95.0)
+
+    def test_linear_in_band(self):
+        # Mid-point between -1% and -4% is -2.5% → halfway between 30 and 95 = 62.5.
+        assert _cvar_to_grade(-0.025) == pytest.approx(62.5)
+
+
+# ---------------------------------------------------------------------------
+# Evaluator-revamp graders (PR 3): calibration / action entropy / excursion
+# ---------------------------------------------------------------------------
+
+
+class TestGradeCalibrationDiagnostics:
+    def test_good_calibration_high_grade(self):
+        result = _grade_calibration_diagnostics({
+            "status": "ok", "ece": 0.03, "n": 200, "quality": "good",
+        })
+        assert result["grade"] == 90.0
+        assert result["letter"] == "A"
+
+    def test_poor_calibration_low_grade(self):
+        result = _grade_calibration_diagnostics({
+            "status": "ok", "ece": 0.25, "n": 200, "quality": "poor",
+        })
+        assert result["grade"] == 10.0
+        assert result["letter"] == "F"
+
+    def test_missing_ece(self):
+        result = _grade_calibration_diagnostics({"status": "ok"})
+        assert result["grade"] is None
+
+    def test_status_not_ok(self):
+        result = _grade_calibration_diagnostics({"status": "insufficient_data"})
+        assert result["grade"] is None
+
+    def test_none_input(self):
+        result = _grade_calibration_diagnostics(None)
+        assert result["grade"] is None
+
+
+class TestGradeActionEntropy:
+    def test_uniform_distribution_high_grade(self):
+        result = _grade_action_entropy({
+            "status": "ok", "entropy_normalized": 1.0, "n": 50,
+            "most_common": "BUY", "most_common_fraction": 0.34, "alarm": False,
+        })
+        assert result["grade"] == 100.0
+
+    def test_collapsed_distribution_low_grade(self):
+        result = _grade_action_entropy({
+            "status": "ok", "entropy_normalized": 0.0, "n": 50,
+            "most_common": "HOLD", "most_common_fraction": 1.0, "alarm": True,
+        })
+        assert result["grade"] == 0.0
+
+    def test_below_alarm_threshold_capped_at_40(self):
+        # entropy_norm = 0.2 → between 0 and 0.3 mid → grade ~33.3
+        # Should still be < 40 (alarm cap).
+        result = _grade_action_entropy({
+            "status": "ok", "entropy_normalized": 0.2, "n": 50,
+            "most_common": "HOLD", "most_common_fraction": 0.85, "alarm": True,
+        })
+        assert result["grade"] is not None
+        assert result["grade"] < 40.0
+        assert result["detail"]["alarm"] is True
+
+    def test_status_not_ok(self):
+        result = _grade_action_entropy({"status": "insufficient_data", "n": 5})
+        assert result["grade"] is None
+
+
+class TestGradeExcursion:
+    def test_high_quality_team_high_grade(self):
+        # mean_mfe_mae_ratio = 1.8 (between mid 1.5 and ceiling 2.0)
+        # pct_high_quality = 0.6 (at ceiling) → 95
+        result = _grade_excursion({
+            "status": "ok", "n": 30,
+            "mean_mfe_mae_ratio": 1.8,
+            "median_mfe_mae_ratio": 1.7,
+            "pct_high_quality": 0.6,
+            "pct_mfe_gt_mae": 0.7,
+        })
+        assert result["grade"] is not None
+        assert result["grade"] > 75.0
+
+    def test_low_quality_team_low_grade(self):
+        # ratio ≈ 1.0 (below mid 1.5), pct_high = 0.1 (below baseline 0.3)
+        result = _grade_excursion({
+            "status": "ok", "n": 30,
+            "mean_mfe_mae_ratio": 1.0,
+            "median_mfe_mae_ratio": 1.0,
+            "pct_high_quality": 0.1,
+            "pct_mfe_gt_mae": 0.3,
+        })
+        assert result["grade"] is not None
+        assert result["grade"] < 40.0
+
+    def test_status_not_ok(self):
+        result = _grade_excursion({"status": "insufficient_data", "n": 0})
+        assert result["grade"] is None
+
+
+# ---------------------------------------------------------------------------
+# compute_scorecard wiring for new graders + portfolio rewire
+# ---------------------------------------------------------------------------
+
+
+class TestComputeScorecardEvaluatorRevamp:
+    def test_calibration_appears_in_research_when_provided(self):
+        result = compute_scorecard(
+            calibration_diagnostics={
+                "status": "ok", "ece": 0.04, "n": 200, "quality": "good",
+            },
+        )
+        assert "calibration_diagnostics" in result["research"]["components"]
+        assert result["research"]["components"]["calibration_diagnostics"]["grade"] == 90.0
+
+    def test_calibration_absent_does_not_break_research(self):
+        # Pre-existing test pinned 'sector_teams' etc. — calibration must
+        # not appear when the kwarg is None.
+        result = compute_scorecard()
+        assert "calibration_diagnostics" not in result["research"]["components"]
+
+    def test_excursion_and_entropy_appear_in_executor_when_provided(self):
+        result = compute_scorecard(
+            excursion_summary={
+                "status": "ok", "n": 30,
+                "mean_mfe_mae_ratio": 1.6,
+                "median_mfe_mae_ratio": 1.5,
+                "pct_high_quality": 0.45,
+                "pct_mfe_gt_mae": 0.6,
+            },
+            action_entropy={
+                "status": "ok", "entropy_normalized": 0.85, "n": 50,
+                "most_common": "BUY", "most_common_fraction": 0.4, "alarm": False,
+            },
+        )
+        assert "excursion" in result["executor"]["components"]
+        assert "action_entropy" in result["executor"]["components"]
+        assert result["executor"]["components"]["excursion"]["grade"] is not None
+        assert result["executor"]["components"]["action_entropy"]["grade"] is not None
+
+    def test_portfolio_uses_sortino_path_when_new_fields_present(self):
+        result = compute_scorecard(
+            signal_quality={
+                "status": "ok",
+                "overall": {"accuracy_10d": 0.55, "avg_alpha_10d": 1.0, "n_10d": 50},
+                "by_score_bucket": [],
+            },
+            portfolio_stats={
+                "sharpe_ratio": 0.8, "sortino_ratio": 1.2, "calmar_ratio": 0.5,
+                "max_drawdown": -0.10, "cvar_95": -0.025, "total_return": 0.05,
+            },
+        )
+        portfolio_detail = result["executor"]["components"]["portfolio"]["detail"]
+        assert "sortino" in portfolio_detail
+        assert "cvar_95" in portfolio_detail
+        assert "calmar" in portfolio_detail
+        # Sharpe still emitted as side-channel diagnostic.
+        assert "sharpe" in portfolio_detail
+
+    def test_portfolio_falls_back_to_legacy_when_new_fields_absent(self):
+        result = compute_scorecard(
+            signal_quality={
+                "status": "ok",
+                "overall": {"accuracy_10d": 0.55, "avg_alpha_10d": 1.0, "n_10d": 50},
+                "by_score_bucket": [],
+            },
+            portfolio_stats={
+                "sharpe_ratio": 1.2, "max_drawdown": -0.10, "total_return": 0.10,
+            },
+        )
+        portfolio_detail = result["executor"]["components"]["portfolio"]["detail"]
+        # Legacy fields present
+        assert "sharpe" in portfolio_detail
+        assert "max_drawdown" in portfolio_detail
+        # New fields absent (not in input → not in detail)
+        assert "sortino" not in portfolio_detail
+        assert "cvar_95" not in portfolio_detail
+
+
+class TestSectorTeamSkillComposite:
+    def test_team_metrics_path_used_when_provided(self):
+        result = compute_scorecard(
+            e2e_lift={
+                "status": "ok",
+                "scanner_lift": {"lift": 1.0, "n_passing": 50, "n_universe": 900},
+                "team_lift": [
+                    {"team_id": "tech", "lift": 2.0, "lift_vs_quant": 1.0, "n_picks": 12},
+                ],
+                "cio_lift": {"lift": 1.0, "advance_avg": 1.5, "reject_avg": -0.5,
+                             "n_advance": 10, "n_reject": 8},
+                "cio_vs_ranking": {"lift": 0.5, "cio_beats_ranking": True, "n_dates": 8,
+                                   "n_picks": 10, "avg_overlap": 0.5,
+                                   "cio_avg": 1.5, "ranking_avg": 1.0},
+            },
+            team_metrics={
+                "tech": {
+                    "ic": {"status": "ok", "ic": 0.08, "n": 60, "n_buckets": 10},
+                    "expectancy": {
+                        "status": "ok", "n": 12, "hit_rate": 0.58,
+                        "avg_win": 0.05, "avg_loss": 0.03,
+                        "win_loss_ratio": 1.67, "expectancy": 0.018,
+                        "expectancy_per_unit_loss": 0.6,
+                    },
+                    "excursion": {
+                        "status": "ok", "n": 12, "mean_mfe_mae_ratio": 1.7,
+                        "median_mfe_mae_ratio": 1.6,
+                        "pct_mfe_gt_mae": 0.65, "pct_high_quality": 0.55,
+                    },
+                    "alpha_vs_ew_high_vol": {
+                        "status": "ok", "excess_return": 0.02,
+                        "information_ratio": 1.2,
+                    },
+                    "alpha_vs_beta_spy": {
+                        "status": "ok", "excess_return": 0.015,
+                        "information_ratio": 0.8,
+                    },
+                },
+            },
+        )
+        teams = result["research"]["components"]["sector_teams"]
+        tech = next(t for t in teams if t["team_id"] == "tech")
+        # Skill-composite detail keys (not legacy precision/recall/lift_vs_sector).
+        assert "ic" in tech["detail"]
+        assert "expectancy" in tech["detail"]
+        assert "mfe_mae_ratio" in tech["detail"]
+        assert "alpha_vs_ew_high_vol" in tech["detail"]
+        assert "alpha_vs_beta_spy" in tech["detail"]
+        assert tech["grade"] is not None
+
+    def test_team_metrics_absent_falls_back_to_legacy(self):
+        # No team_metrics kwarg → legacy path. Existing test contract.
+        result = compute_scorecard(
+            e2e_lift={
+                "status": "ok",
+                "scanner_lift": {"lift": 1.0, "n_passing": 50, "n_universe": 900},
+                "team_lift": [
+                    {"team_id": "tech", "lift": 2.0, "lift_vs_quant": 1.0, "n_picks": 12},
+                ],
+                "cio_lift": {"lift": 1.0, "advance_avg": 1.5, "reject_avg": -0.5,
+                             "n_advance": 10, "n_reject": 8},
+                "cio_vs_ranking": {"lift": 0.5, "cio_beats_ranking": True, "n_dates": 8,
+                                   "n_picks": 10, "avg_overlap": 0.5,
+                                   "cio_avg": 1.5, "ranking_avg": 1.0},
+            },
+        )
+        teams = result["research"]["components"]["sector_teams"]
+        tech = next(t for t in teams if t["team_id"] == "tech")
+        # Legacy detail keys.
+        assert "lift_vs_sector" in tech["detail"]
+        assert "lift_vs_quant" in tech["detail"]
