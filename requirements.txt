@@ -15,6 +15,11 @@ ib_insync~=0.9.86
 # call the model two different ways." Schema classes resolve via
 # alpha_engine_lib.agent_schemas.resolve_schema_for_agent.
 langchain-anthropic~=0.3
+# Counterfactual rule fit (replay/counterfactual.py) trains a shallow
+# decision tree (max_depth=3) on (agent_input → agent_decision) pairs
+# extracted from the captured DecisionArtifact corpus. >85% match rate
+# ⇒ the LLM is likely just running that tree at $X per call.
+scikit-learn~=1.4
 # alpha-engine-lib pulls in arcticdb + flow-doctor via extras; see
 # preflight.py and the `from alpha_engine_lib.logging import setup_logging`
 # call sites in backtest.py / evaluate.py / lambda_health/handler.py.
