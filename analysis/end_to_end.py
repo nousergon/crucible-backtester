@@ -495,6 +495,28 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
                         tn=sum(not s and not p for s, p in zip(selected, positive)),
                     )
 
+            # Emit the per-pick records so downstream metric modules
+            # (information_coefficient, expectancy, excursion, the
+            # team-daily-returns sleeve simulator) can consume the
+            # specific (ticker, eval_date) tuples without re-querying
+            # research.db. Conviction is forwarded when present in
+            # universe_returns; absent → None (older rows). Schema:
+            #   [{ticker, eval_date, return_5d, conviction|None}, ...]
+            picks_records: list[dict] = []
+            if not picks.empty:
+                pick_cols = ["ticker", "eval_date", "return_5d"]
+                if "conviction" in picks.columns:
+                    pick_cols.append("conviction")
+                for _, p in picks[pick_cols].iterrows():
+                    rec = {
+                        "ticker": p["ticker"],
+                        "eval_date": str(p["eval_date"]),
+                        "return_5d": float(p["return_5d"]) if pd.notna(p["return_5d"]) else None,
+                    }
+                    if "conviction" in pick_cols:
+                        rec["conviction"] = p["conviction"] if pd.notna(p["conviction"]) else None
+                    picks_records.append(rec)
+
             results.append({
                 "team_id": team_id,
                 "pick_avg": round(pick_avg, 4) if pick_avg is not None else None,
@@ -506,6 +528,7 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
                 "n_candidates": len(team_data),
                 "n_sector_universe": n_sector_universe,
                 "classification": clf,
+                "picks": picks_records,
             })
 
         return results

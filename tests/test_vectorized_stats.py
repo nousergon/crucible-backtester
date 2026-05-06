@@ -36,6 +36,8 @@ from synthetic.vectorized_stats import (
     compute_max_drawdown,
     compute_calmar_ratio,
     compute_spy_return,
+    compute_sortino_ratio,
+    compute_cvar,
     count_trades_from_buffer,
 )
 
@@ -108,6 +110,68 @@ class TestSharpeRatio:
         daily = rng.normal(-0.005, 0.015, size=(1, 500))
         out = compute_sharpe_ratio(daily)
         assert out[0] < 0
+
+
+class TestSortinoVectorized:
+    def test_hand_computed_negative_sortino(self):
+        # Single combo: 5 small losses + 95 small gains.
+        # mean = -0.00055, downside_var = 0.000055
+        # sortino_daily = -0.00055 / sqrt(0.000055) ≈ -0.07416
+        # annualized = sortino_daily * sqrt(252) ≈ -1.1772
+        r = np.array([
+            [-0.05, -0.04, -0.03, -0.02, -0.01] + [0.001] * 95
+        ])
+        out = compute_sortino_ratio(r, target=0.0)
+        expected = (-0.00055 / np.sqrt(0.000055)) * np.sqrt(252)
+        assert out[0] == pytest.approx(expected, rel=1e-6)
+
+    def test_zero_downside_returns_zero(self):
+        r = np.array([[0.01] * 50])
+        assert compute_sortino_ratio(r, target=0.0)[0] == 0.0
+
+    def test_short_series_returns_zero(self):
+        r = np.array([[0.01]])  # n_steps = 1
+        assert compute_sortino_ratio(r, target=0.0)[0] == 0.0
+
+    def test_multi_combo_vectorized(self):
+        # Combo 0: all positive (no downside) → 0
+        # Combo 1: hand-computed (same as scalar test)
+        r0 = [0.01] * 100
+        r1 = [-0.05, -0.04, -0.03, -0.02, -0.01] + [0.001] * 95
+        r = np.array([r0, r1])
+        out = compute_sortino_ratio(r, target=0.0)
+        expected_1 = (-0.00055 / np.sqrt(0.000055)) * np.sqrt(252)
+        assert out[0] == 0.0
+        assert out[1] == pytest.approx(expected_1, rel=1e-6)
+
+
+class TestCVaRVectorized:
+    def test_hand_computed(self):
+        r = np.array([
+            [-0.05, -0.04, -0.03, -0.02, -0.01] + [0.001] * 95
+        ])
+        out = compute_cvar(r, q=0.05)
+        # Worst 5: mean = -0.03
+        assert out[0] == pytest.approx(-0.03, rel=1e-9)
+
+    def test_short_series_returns_zero(self):
+        r = np.array([[-0.05, 0.01] * 5])  # n=10, min_n=20 for q=0.05
+        assert compute_cvar(r, q=0.05)[0] == 0.0
+
+    def test_invalid_q_raises(self):
+        r = np.array([[0.01] * 100])
+        with pytest.raises(ValueError):
+            compute_cvar(r, q=0.0)
+        with pytest.raises(ValueError):
+            compute_cvar(r, q=1.0)
+
+    def test_multi_combo_vectorized(self):
+        r0 = [0.01] * 100  # CVaR(95) of constant 0.01 = 0.01
+        r1 = [-0.05, -0.04, -0.03, -0.02, -0.01] + [0.001] * 95
+        r = np.array([r0, r1])
+        out = compute_cvar(r, q=0.05)
+        assert out[0] == pytest.approx(0.01, rel=1e-9)
+        assert out[1] == pytest.approx(-0.03, rel=1e-9)
 
 
 class TestMaxDrawdown:
@@ -275,11 +339,13 @@ class TestComputeVectorizedStats:
             combo_params=[{"min_score": 70}, {"min_score": 80}],
         )
 
-        # Column shape — must match prior vectorbt path's output
+        # Column shape — additive vs prior vectorbt path's output:
+        # sortino_ratio + cvar_95 added by evaluator-revamp PR 1.
         expected_cols = {
             "min_score", "status", "total_orders", "total_trades",
-            "win_rate", "total_return", "sharpe_ratio", "max_drawdown",
-            "calmar_ratio", "spy_return", "total_alpha",
+            "win_rate", "total_return", "sharpe_ratio", "sortino_ratio",
+            "max_drawdown", "calmar_ratio", "cvar_95",
+            "spy_return", "total_alpha",
         }
         assert set(df.columns) == expected_cols
         assert len(df) == 2

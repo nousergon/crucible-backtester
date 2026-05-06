@@ -116,6 +116,60 @@ def compute_sharpe_ratio(daily_returns: np.ndarray) -> np.ndarray:
     return sharpe
 
 
+def compute_sortino_ratio(daily_returns: np.ndarray, target: float = 0.0) -> np.ndarray:
+    """Per-combo annualized Sortino ratio (target = 0 by default).
+
+    Sortino vs Sharpe: numerator is mean excess (same), denominator is
+    downside RMS only — sqrt(mean(min(r - target, 0)**2)). Penalizes only
+    below-target volatility, the right shape for long-only risk-seeking
+    strategies where upside vol is the *goal*, not a cost.
+
+    Returns
+    -------
+    np.ndarray, shape [n_combos]
+
+    Combos with no below-target days return 0.0 (no downside, no
+    risk-adjusted denominator). Combos with fewer than 2 dates return 0.0.
+    """
+    n_combos, n_steps = daily_returns.shape
+    if n_steps < 2:
+        return np.zeros(n_combos, dtype=np.float64)
+    excess = daily_returns - target
+    downside = np.minimum(excess, 0.0)
+    downside_var = (downside * downside).mean(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sortino = np.where(
+            downside_var > 0,
+            excess.mean(axis=1) / np.sqrt(downside_var) * np.sqrt(_TRADING_DAYS_PER_YEAR),
+            0.0,
+        )
+    return sortino
+
+
+def compute_cvar(daily_returns: np.ndarray, q: float = 0.05) -> np.ndarray:
+    """Per-combo Conditional Value at Risk at the q-quantile.
+
+    CVaR_q = mean of the worst q-fraction of daily returns. Reported as
+    the raw return value — negative numbers indicate tail losses.
+
+    Returns
+    -------
+    np.ndarray, shape [n_combos]
+
+    Combos with fewer than ceil(1/q) observations return 0.0
+    (insufficient resolution to define the tail).
+    """
+    if not (0.0 < q < 1.0):
+        raise ValueError(f"q must be in (0, 1), got {q}")
+    n_combos, n_steps = daily_returns.shape
+    min_n = int(np.ceil(1.0 / q))
+    if n_steps < min_n:
+        return np.zeros(n_combos, dtype=np.float64)
+    n_tail = max(1, int(np.floor(n_steps * q)))
+    sorted_returns = np.sort(daily_returns, axis=1)
+    return sorted_returns[:, :n_tail].mean(axis=1)
+
+
 def compute_max_drawdown(nav_history: np.ndarray) -> np.ndarray:
     """Per-combo max drawdown (negative number; 0 if monotonically
     non-decreasing).
@@ -290,11 +344,14 @@ def compute_vectorized_stats(
         - all keys from combo_params
         - status ("ok" | "no_orders")
         - total_orders, total_trades, win_rate
-        - total_return, sharpe_ratio, max_drawdown, calmar_ratio
+        - total_return, sharpe_ratio, sortino_ratio,
+          max_drawdown, calmar_ratio, cvar_95
         - spy_return, total_alpha (None if no spy_prices)
 
-    Same columns as the prior vectorbt path's output; downstream
-    consumers (sweep_df persistence, optimizer) see zero schema change.
+    Schema is additive vs the prior vectorbt-path output: sortino_ratio
+    + cvar_95 are new columns required by the evaluator-revamp grading
+    rewire (see evaluator-revamp-260506.md). Existing consumers reading
+    sharpe_ratio / max_drawdown / calmar_ratio see zero behavioral change.
     """
     n_combos, n_dates = nav_history.shape
     combo_params_list = list(combo_params)
@@ -308,6 +365,8 @@ def compute_vectorized_stats(
     total_return = compute_total_return(nav_history, init_cash)
     daily_returns = compute_daily_returns(nav_history)
     sharpe = compute_sharpe_ratio(daily_returns)
+    sortino = compute_sortino_ratio(daily_returns)
+    cvar_95 = compute_cvar(daily_returns, q=0.05)
     max_drawdown = compute_max_drawdown(nav_history)
     calmar = compute_calmar_ratio(total_return, max_drawdown, n_dates)
 
@@ -344,8 +403,10 @@ def compute_vectorized_stats(
                 "win_rate": 0.0,
                 "total_return": 0.0,
                 "sharpe_ratio": 0.0,
+                "sortino_ratio": 0.0,
                 "max_drawdown": 0.0,
                 "calmar_ratio": 0.0,
+                "cvar_95": 0.0,
                 "spy_return": spy_value,
                 "total_alpha": (
                     -spy_value if spy_value is not None else None
@@ -360,8 +421,10 @@ def compute_vectorized_stats(
                 "win_rate": win_rate,
                 "total_return": float(total_return[combo_idx]),
                 "sharpe_ratio": float(sharpe[combo_idx]),
+                "sortino_ratio": float(sortino[combo_idx]),
                 "max_drawdown": float(max_drawdown[combo_idx]),
                 "calmar_ratio": float(calmar[combo_idx]),
+                "cvar_95": float(cvar_95[combo_idx]),
                 "spy_return": spy_value,
                 "total_alpha": total_alpha_per_combo[combo_idx],
             }
