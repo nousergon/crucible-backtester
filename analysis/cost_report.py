@@ -32,7 +32,7 @@ Failure posture:
   (the run-budget hard ceiling in alpha-engine-research PR 5a covers
   the fail-loud safety surface).
 
-Workstream design: ``alpha-engine-docs/private/ROADMAP.md`` line ~1708
+Workstream design: ``alpha-engine-config/private-docs/ROADMAP.md`` line ~1708
 (per-run LLM cost telemetry, PR 4-5 of 5).
 """
 
