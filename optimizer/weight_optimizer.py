@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 SUB_SCORES = ["quant", "qual"]
 S3_WEIGHTS_KEY = "config/scoring_weights.json"
+S3_SHADOW_WEIGHTS_PREFIX = "config/scoring_weights_shadow_history"
 
 # ── Fallback defaults (override via weight_optimizer section in config.yaml) ──
 _DEFAULT_WEIGHTS = {"quant": 0.50, "qual": 0.50}
@@ -245,6 +246,47 @@ def _compute_correlations(
     return correlations
 
 
+def _compute_ic_correlations(
+    data: pd.DataFrame, sub_cols: dict[str, str],
+) -> dict[str, dict[str, float | None]]:
+    """Compute Spearman IC of each sub-score against continuous returns.
+
+    Skill-composite fit target (per evaluator-revamp-260506.md). Replaces
+    the legacy Pearson-on-binary-beat-SPY signal — IC ranks picks by
+    return magnitude, so a +10% NVDA pick contributes more to the weight
+    signal than a +1% KO pick that happens to also beat SPY by a hair.
+    Same shape as ``_compute_correlations`` for drop-in substitution
+    upstream.
+
+    Targets ``return_10d`` and ``return_30d`` are continuous; the result
+    dict still keys by ``beat_spy_10d`` / ``beat_spy_30d`` so the rest
+    of the pipeline (`_validate_oos`, blend, write) treats it uniformly.
+    """
+    correlations: dict[str, dict] = {}
+    target_map = {"beat_spy_10d": "return_10d", "beat_spy_30d": "return_30d"}
+    for label, col in sub_cols.items():
+        corr: dict[str, float | None] = {}
+        for legacy_key, return_col in target_map.items():
+            if return_col not in data.columns:
+                corr[legacy_key] = None
+                continue
+            valid = data[[col, return_col]].dropna()
+            if (
+                len(valid) >= 10
+                and valid[col].std() > 1e-10
+                and valid[return_col].std() > 1e-10
+            ):
+                # Spearman = Pearson on ranks. Avoids requiring scipy here.
+                ranks_col = valid[col].rank()
+                ranks_ret = valid[return_col].rank()
+                r = float(ranks_col.corr(ranks_ret))
+                corr[legacy_key] = r if not pd.isna(r) else None
+            else:
+                corr[legacy_key] = None
+        correlations[label] = corr
+    return correlations
+
+
 def _validate_oos(
     train_correlations: dict,
     test_correlations: dict,
@@ -305,8 +347,17 @@ def compute_weights(
         return result  # early exit
     train_set, test_set, sub_cols, n = result
 
-    # Phase 2: Compute correlations on train set
-    correlations = _compute_correlations(train_set, sub_cols)
+    # Phase 2: Compute correlations on train set.
+    # The skill-composite fit target (evaluator-revamp-260506.md) uses
+    # Spearman IC against continuous returns instead of Pearson against
+    # binary beat_spy. Default off — flip via config.weight_optimizer
+    # `use_skill_composite_target: true` once shadow data validates the
+    # weight-shift direction.
+    use_skill_composite = bool(_cfg.get("use_skill_composite_target", False))
+    if use_skill_composite:
+        correlations = _compute_ic_correlations(train_set, sub_cols)
+    else:
+        correlations = _compute_correlations(train_set, sub_cols)
 
     # Derive suggested weights from horizon-blended correlations
     horizon = _cfg.get("horizon_blend", _HORIZON_BLEND)
@@ -349,8 +400,12 @@ def compute_weights(
         else "low"
     )
 
-    # Phase 3: Out-of-sample validation
-    test_correlations = _compute_correlations(test_set, sub_cols)
+    # Phase 3: Out-of-sample validation. Use the matching correlation
+    # estimator on the test set so train↔test parity is preserved.
+    if use_skill_composite:
+        test_correlations = _compute_ic_correlations(test_set, sub_cols)
+    else:
+        test_correlations = _compute_correlations(test_set, sub_cols)
     oos_passed, oos_degradation = _validate_oos(
         correlations, test_correlations, sub_cols, w10, w30,
     )
@@ -372,11 +427,13 @@ def compute_weights(
         "changes": changes,
         "blend_factor": round(blend, 3),
         "stability": stability,
+        "fit_target": "skill_composite_ic" if use_skill_composite else "beat_spy_pearson",
         "note": (
             f"Based on {n} signals (train={len(train_set)}, test={len(test_set)}). "
             f"Confidence: {confidence}. Blend factor: {blend:.2f}. "
             f"OOS degradation: {oos_degradation:.1%} "
             f"({'PASS' if oos_passed else 'FAIL — weights not applied'}). "
+            f"Fit target: {'IC vs return_10d/30d (skill composite)' if use_skill_composite else 'Pearson vs beat_spy (legacy)'}."
         ),
     }
 
@@ -497,7 +554,43 @@ def apply_weights(result: dict, bucket: str) -> dict:
         "updated_at": str(date.today()),
         "n_samples": result.get("n_samples"),
         "confidence": confidence,
+        "fit_target": result.get("fit_target", "beat_spy_pearson"),
     }
+
+    # Shadow mode (evaluator-revamp PR 6): when the skill-composite fit
+    # target is enabled but its `enforce` sub-flag is False, write the
+    # candidate weights to a shadow archive instead of the live config.
+    # Operator inspects shadow vs production weight deltas for ~4 weeks
+    # before flipping enforce → on (per evaluator-revamp-260506.md).
+    fit_target = result.get("fit_target", "beat_spy_pearson")
+    skill_composite_enabled = fit_target == "skill_composite_ic"
+    enforce_skill_composite = bool(_cfg.get("enforce_skill_composite", False))
+    shadow_only = skill_composite_enabled and not enforce_skill_composite
+
+    if shadow_only:
+        s3 = boto3.client("s3")
+        shadow_key = f"{S3_SHADOW_WEIGHTS_PREFIX}/{date.today().isoformat()}.json"
+        try:
+            s3.put_object(
+                Bucket=bucket,
+                Key=shadow_key,
+                Body=json.dumps(payload, indent=2),
+                ContentType="application/json",
+            )
+            logger.info(
+                "Skill-composite weights logged to shadow path "
+                "(enforce_skill_composite=False): s3://%s/%s",
+                bucket, shadow_key,
+            )
+        except Exception as e:
+            logger.warning("Shadow weights write failed (non-fatal): %s", e)
+        return {
+            "applied": False,
+            "reason": "shadow mode — skill_composite enabled, enforce_skill_composite=False",
+            "shadow_weights": suggested,
+            "shadow_key": shadow_key,
+            "fit_target": fit_target,
+        }
 
     from optimizer.rollback import save_previous
     save_previous(bucket, "scoring_weights")
@@ -512,8 +605,8 @@ def apply_weights(result: dict, bucket: str) -> dict:
             ContentType="application/json",
         )
         logger.info(
-            "Scoring weights updated in S3: %s (n=%s, confidence=%s)",
-            suggested, payload["n_samples"], confidence,
+            "Scoring weights updated in S3: %s (n=%s, confidence=%s, fit_target=%s)",
+            suggested, payload["n_samples"], confidence, fit_target,
         )
     except Exception as e:
         logger.error("CRITICAL: Failed to write scoring weights to S3: %s", e)
