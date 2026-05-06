@@ -78,6 +78,7 @@ _META_PREFIXES = (
 
 DEFAULT_BUCKET = "alpha-engine-research"
 DEFAULT_CAPTURE_PREFIX = "decision_artifacts"
+DEFAULT_CW_NAMESPACE = "AlphaEngine/Provenance"
 
 
 # ── Tool-call walker ────────────────────────────────────────────────────────
@@ -239,6 +240,73 @@ def _list_artifact_keys(
     return grouped
 
 
+def _emit_provenance_metrics(
+    cw: Any,
+    *,
+    namespace: str,
+    saturday: datetime,
+    per_agent: dict[str, dict[str, Any]],
+) -> None:
+    """Emit per-agent provenance metrics to CloudWatch.
+
+    Dimensioned by ``judged_agent_id`` to match the existing
+    ``agent_quality_score`` and ``agent_rationale_template_concentration``
+    streams so the dashboard can join across the agent-justification
+    quartet on a single dim.
+
+    Skip agents with zero artifacts — emitting NaN/0 datapoints for
+    missing agents would dilute the rolling-mean view of agents that did
+    run. The capture-coverage stream already surfaces missing agents.
+    """
+    metric_data: list[dict[str, Any]] = []
+    for agent_id, m in per_agent.items():
+        if m.get("n_artifacts", 0) == 0:
+            continue
+        dims = [{"Name": "judged_agent_id", "Value": agent_id}]
+        metric_data.extend([
+            {
+                "MetricName": "pct_zero_call_outputs",
+                "Dimensions": dims,
+                "Value": float(m["pct_zero_call_outputs"]),
+                "Unit": "Percent",
+                "Timestamp": saturday,
+            },
+            {
+                "MetricName": "mean_n_tool_calls",
+                "Dimensions": dims,
+                "Value": float(m["mean_n_tool_calls"]),
+                "Unit": "Count",
+                "Timestamp": saturday,
+            },
+            {
+                "MetricName": "mean_n_distinct_tools",
+                "Dimensions": dims,
+                "Value": float(m["mean_n_distinct_tools"]),
+                "Unit": "Count",
+                "Timestamp": saturday,
+            },
+            {
+                "MetricName": "mean_input_consumption_ratio",
+                "Dimensions": dims,
+                "Value": float(m["mean_input_consumption_ratio"]),
+                "Unit": "None",
+                "Timestamp": saturday,
+            },
+            {
+                "MetricName": "n_artifacts",
+                "Dimensions": dims,
+                "Value": float(m["n_artifacts"]),
+                "Unit": "Count",
+                "Timestamp": saturday,
+            },
+        ])
+
+    # CloudWatch put_metric_data accepts max 1000 metrics per call; chunk.
+    for i in range(0, len(metric_data), 20):
+        chunk = metric_data[i : i + 20]
+        cw.put_metric_data(Namespace=namespace, MetricData=chunk)
+
+
 def _read_artifact(s3: Any, *, bucket: str, key: str) -> dict[str, Any] | None:
     """Read + parse one captured artifact. Returns None on read/parse error
     so the aggregator can continue past one bad artifact."""
@@ -332,6 +400,9 @@ def compute_provenance_grounding(
     lookback_weeks: int = 8,
     capture_prefix: str = DEFAULT_CAPTURE_PREFIX,
     s3_client: Any = None,
+    cloudwatch_client: Any = None,
+    cw_namespace: str = DEFAULT_CW_NAMESPACE,
+    emit_metrics: bool = True,
 ) -> dict[str, Any]:
     """Compute per-agent provenance grounding metrics for the most recent
     Saturday SF run on or before ``run_date``, plus an N-week rolling
@@ -378,6 +449,32 @@ def compute_provenance_grounding(
         s3, bucket=bucket, capture_prefix=capture_prefix,
         saturday=most_recent,
     )
+
+    # CloudWatch emission for the most-recent Saturday only — the rolling
+    # window aggregates are derivable from CW's native rolling-stat math
+    # so we don't double-emit historical points. The boto3 client
+    # construction itself can raise (e.g. NoRegionError in CI without
+    # AWS_DEFAULT_REGION set), so it's wrapped together with the put.
+    if emit_metrics and most_recent_summary["per_agent"]:
+        try:
+            cw = cloudwatch_client or boto3.client("cloudwatch")
+            _emit_provenance_metrics(
+                cw,
+                namespace=cw_namespace,
+                saturday=most_recent,
+                per_agent=most_recent_summary["per_agent"],
+            )
+            logger.info(
+                "provenance_grounding: emitted metrics for %d agents to "
+                "CloudWatch namespace %s on %s",
+                len(most_recent_summary["per_agent"]), cw_namespace,
+                most_recent.strftime("%Y-%m-%d"),
+            )
+        except Exception as e:
+            logger.warning(
+                "provenance_grounding: CloudWatch emission failed: %s — "
+                "continuing with JSON artifact only", e,
+            )
 
     # Trailing window
     per_saturday: list[dict[str, Any]] = [most_recent_summary]
