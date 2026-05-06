@@ -369,8 +369,8 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.2.2" in text, (
-            "alpha-engine-lib should pin to v0.2.2 (matches the rest of "
-            "the flow-doctor wire-quality arc); update this test if the "
-            "pin moves further forward"
+        assert "@v0.4.0" in text, (
+            "alpha-engine-lib should pin to v0.4.0 (agent_schemas submodule "
+            "consumed by replay/runner.py); update this test if the pin "
+            "moves further forward"
         )
