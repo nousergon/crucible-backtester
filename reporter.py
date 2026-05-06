@@ -657,6 +657,7 @@ def save(
     post_trade: dict | None = None,
     monte_carlo: dict | None = None,
     decision_capture_coverage: dict | None = None,
+    provenance_grounding: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -711,6 +712,7 @@ def save(
         ("veto_analysis.json", veto_result),
         ("confusion_matrix.json", confusion_matrix),
         ("decision_capture_coverage.json", decision_capture_coverage),
+        ("provenance_grounding.json", provenance_grounding),
     ]:
         if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
