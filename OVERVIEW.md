@@ -53,7 +53,8 @@ Weekly system evaluator + autonomous parameter optimizer. Reads historical signa
 | Config rollback mechanism | [`optimizer/rollback.py`](optimizer/rollback.py) |
 | Replay harness — single-artifact runner (re-runs captured `DecisionArtifact` under target model via `langchain_anthropic.with_structured_output(SchemaClass)` against the canonical contract) | [`replay/runner.py`](replay/runner.py) |
 | Per-agent agreement scorers (cheap-model concordance signal) | [`replay/comparison.py`](replay/comparison.py) |
-| Replay CLI (`python -m replay.cli --artifact-key ... --target-model ...`) | [`replay/cli.py`](replay/cli.py) |
+| Batch replay — date-range × target-models iteration + per-`(agent_id, target_model)` concordance aggregation + CloudWatch `agent_cheap_model_concordance` metric emission + per-target-model summary persistence | [`replay/batch.py`](replay/batch.py) |
+| Replay CLI (`python -m replay.cli single ...` / `python -m replay.cli batch ...`) | [`replay/cli.py`](replay/cli.py) |
 | 10y synthetic predictor backtest | [`synthetic/predictor_backtest.py`](synthetic/predictor_backtest.py) |
 | Synthetic signal generator | [`synthetic/signal_generator.py`](synthetic/signal_generator.py) |
 | Markdown + CSV + metrics.json + S3 upload | [`reporter.py`](reporter.py) |
