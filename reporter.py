@@ -345,12 +345,20 @@ def _section_pipeline_health(health: dict) -> list[str]:
     else:
         lines.append(f"- Research DB: {db_status}")
 
-    # Simulation coverage
+    # Simulation coverage. Render `(degraded)` when the count fields
+    # aren't populated (e.g. evaluator-only runs that didn't re-execute
+    # backtest, where coverage is taken from prior artifacts but the
+    # sim/exp counts weren't carried through). Pre-2026-05-07 the
+    # fallback emitted "?/? dates (100%)" which read as a missing-data
+    # bug rather than a known-degraded mode.
     if health.get("coverage") is not None:
         cov = health["coverage"]
-        sim = health.get("dates_simulated", "?")
-        exp = health.get("dates_expected", "?")
-        lines.append(f"- Simulation coverage: {sim}/{exp} dates ({cov:.0%})")
+        sim = health.get("dates_simulated")
+        exp = health.get("dates_expected")
+        if sim is not None and exp is not None:
+            lines.append(f"- Simulation coverage: {sim}/{exp} dates ({cov:.0%})")
+        else:
+            lines.append(f"- Simulation coverage: {cov:.0%} (counts not carried through this run)")
 
     # Skip reasons
     if health.get("skip_reasons"):
@@ -469,6 +477,74 @@ def _section_provenance_grounding(grounding: dict) -> list[str]:
     return lines
 
 
+def _section_agent_justification(summary: dict) -> list[str]:
+    """Build the Agent Justification Stack section.
+
+    Aggregates the four eval-judge / agent-justification triple sources
+    (rubric scores, rationale clustering, replay concordance, counterfactual
+    rule fits). Pre-2026-05-07 SF reorder these results landed in S3 only
+    AFTER Evaluator's email was generated; the reorder + this section
+    surface them together for the operator's weekly review.
+
+    Each source renders one summary line. Per-agent detail lives at the
+    S3 paths called out in the section comment — kept out of the email
+    to avoid noise (an 8-agent x 4-source matrix would dominate).
+    """
+    lines = ["## Agent Justification Stack", ""]
+
+    judge = summary.get("judge", {})
+    if judge.get("status") == "ok":
+        lines.append(
+            f"- **Judge** (rubric scores) — {judge['n_scored']}/{judge['n_agents']} "
+            f"agents scored, mean **{judge['mean_score']:.2f}** "
+            f"(min {judge['min_score']:.2f}, max {judge['max_score']:.2f}) "
+            f"— SF: {judge.get('most_recent_sf_date', '?')}"
+        )
+    else:
+        lines.append(
+            f"- **Judge** — {judge.get('status', 'unknown')} "
+            f"(no rubric data within 14d of run_date)"
+        )
+
+    clust = summary.get("clustering", {})
+    if clust.get("status") == "ok" and clust.get("mean_top3_concentration") is not None:
+        lines.append(
+            f"- **Clustering** — {clust['n_agents']} agents, mean top-3 "
+            f"concentration **{clust['mean_top3_concentration']:.2f}** "
+            f"(week: {clust.get('most_recent_week', '?')})"
+        )
+    else:
+        lines.append("- **Clustering** — no recent rationale-cluster data")
+
+    cf = summary.get("counterfactual", {})
+    if cf.get("status") == "ok" and cf.get("mean_match_rate") is not None:
+        agents_str = ", ".join(cf.get("agents", [])) or "none"
+        lines.append(
+            f"- **Counterfactual** — {cf['n_agents']} agents fit, mean DT "
+            f"match rate **{cf['mean_match_rate']:.1%}** "
+            f"(agents: {agents_str}; week: {cf.get('most_recent_week', '?')})"
+        )
+    else:
+        lines.append("- **Counterfactual** — no recent rule-fit data")
+
+    conc = summary.get("concordance", {})
+    if conc.get("status") == "ok":
+        lines.append(
+            f"- **Concordance** — {conc['n_target_models']} target model(s) "
+            f"summarized (SF: {conc.get('most_recent_sf_date', '?')})"
+        )
+    else:
+        # Concordance Lambda may not have written summaries yet — section
+        # surfaces the gap rather than silently omitting it.
+        lines.append(
+            f"- **Concordance** — {conc.get('status', 'unknown')} "
+            f"(_replay_summary/ has no entries within lookback window)"
+        )
+
+    lines.append("")
+    return lines
+
+
 def build_report(
     run_date: str,
     signal_quality: dict,
@@ -495,6 +571,7 @@ def build_report(
     macro_eval: dict | None = None,
     decision_capture_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
+    agent_justification: dict | None = None,
     trigger_opt: dict | None = None,
     predictor_sizing: dict | None = None,
     scanner_opt: dict | None = None,
@@ -536,6 +613,9 @@ def build_report(
 
     if provenance_grounding:
         lines += _section_provenance_grounding(provenance_grounding)
+
+    if agent_justification:
+        lines += _section_agent_justification(agent_justification)
 
     # System Report Card (component grades)
     if grading and grading.get("status") in ("ok", "partial"):

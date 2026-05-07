@@ -426,19 +426,86 @@ def build_cost_section(
     """
     client = s3_client if s3_client is not None else boto3.client("s3")
     df = fetch_cost_parquet(run_date, bucket=bucket, s3_client=client)
-    if df is None:
-        return _empty_section(run_date, reason="parquet not found at expected key")
 
-    main_md = render_cost_report_markdown(df, run_date=run_date)
+    fallback_date: Optional[str] = None
+    if df is None:
+        # Fall back to the most-recent prior `_cost/{date}/cost.parquet`.
+        # Matches the same-shape "most-recent SF" pattern used by
+        # decision_capture_coverage and provenance_grounding — eval-only
+        # mid-week runs (e.g. 2026-05-07's evaluator triggered without
+        # Research re-running) have no aggregated cost parquet for
+        # today's date, but the operator still wants to see last
+        # Saturday's cost data labeled as such, not "no data available".
+        fallback_date = _find_most_recent_cost_date(
+            run_date, bucket=bucket, s3_client=client,
+        )
+        if fallback_date is not None:
+            df = fetch_cost_parquet(fallback_date, bucket=bucket, s3_client=client)
+        if df is None:
+            return _empty_section(run_date, reason="parquet not found at expected key")
+
+    cost_label_date = fallback_date or run_date
+    main_md = render_cost_report_markdown(df, run_date=cost_label_date)
+    if fallback_date is not None:
+        main_md = main_md.replace(
+            "## LLM cost report",
+            f"## LLM cost report\n\n_Showing most-recent captured run "
+            f"(`{fallback_date}`) — today's run_date `{run_date}` had no "
+            f"aggregated parquet, typically because Research didn't fire "
+            f"this run. Anomaly check below is also against this date._",
+        )
     current_total = float(df["cost_usd"].fillna(0).sum()) if "cost_usd" in df.columns else 0.0
     anomaly = detect_anomaly(
-        run_date, current_total, bucket=bucket, s3_client=client,
+        cost_label_date, current_total, bucket=bucket, s3_client=client,
     )
     if anomaly.get("status") == "anomaly":
         _emit_changelog_anomaly_entry(
-            anomaly, run_date=run_date, bucket=bucket, s3_client=client,
+            anomaly, run_date=cost_label_date, bucket=bucket, s3_client=client,
         )
     return main_md + "\n" + render_anomaly_section(anomaly)
+
+
+def _find_most_recent_cost_date(
+    run_date: str,
+    *,
+    bucket: str,
+    s3_client: Any,
+    max_lookback_days: int = 14,
+) -> Optional[str]:
+    """List `_cost/` prefix and return the most recent ISO date ≤ run_date
+    that has a `cost.parquet` object, within `max_lookback_days`.
+
+    Returns None when no parquet is found in the window — the caller
+    falls back to the empty-section placeholder.
+    """
+    base = date_type.fromisoformat(run_date)
+    try:
+        resp = s3_client.list_objects_v2(
+            Bucket=bucket,
+            Prefix="decision_artifacts/_cost/",
+            Delimiter="/",
+        )
+    except ClientError as exc:
+        logger.warning(
+            "[cost_report] _cost/ listing failed; cannot fall back to "
+            "most-recent date: %s", exc,
+        )
+        return None
+    candidates: list[str] = []
+    for cp in resp.get("CommonPrefixes") or []:
+        prefix = cp.get("Prefix", "")
+        # Format: "decision_artifacts/_cost/{YYYY-MM-DD}/"
+        try:
+            iso = prefix.rstrip("/").rsplit("/", 1)[-1]
+            d = date_type.fromisoformat(iso)
+        except ValueError:
+            continue
+        if d > base:
+            continue
+        if (base - d).days > max_lookback_days:
+            continue
+        candidates.append(iso)
+    return max(candidates) if candidates else None
 
 
 def _emit_changelog_anomaly_entry(
