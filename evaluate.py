@@ -60,6 +60,7 @@ import yaml
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis import veto_analysis
 from analysis import decision_capture_coverage, provenance_grounding
+from analysis import agent_justification
 from analysis import end_to_end
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
@@ -458,6 +459,21 @@ def _run_diagnostics(
     results["provenance_grounding"] = tracker.run_module(
         "provenance_grounding",
         lambda: provenance_grounding.compute_provenance_grounding(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            run_date=config.get("_run_date"),
+        ),
+        required_inputs={},
+    )
+
+    # Agent-justification stack summaries — judge / clustering / concordance /
+    # counterfactual aggregated across agents for the most-recent SF date.
+    # Pre-2026-05-07 reorder these Lambdas ran AFTER Evaluator so their
+    # outputs were absent from the email; the SF reorder moves them
+    # upstream of PredictorTraining so this loader has fresh data each
+    # week. S3-only reads; no DB inputs.
+    results["agent_justification"] = tracker.run_module(
+        "agent_justification",
+        lambda: agent_justification.summarize_all(
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=config.get("_run_date"),
         ),
@@ -1008,6 +1024,7 @@ def main() -> None:
             macro_eval=diagnostics.get("macro_eval"),
             decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
             provenance_grounding=diagnostics.get("provenance_grounding"),
+            agent_justification=diagnostics.get("agent_justification"),
             trigger_opt=opt_results.get("trigger_opt"),
             predictor_sizing=opt_results.get("predictor_sizing"),
             scanner_opt=opt_results.get("scanner_opt"),
@@ -1094,6 +1111,7 @@ def main() -> None:
             monte_carlo=diagnostics.get("monte_carlo"),
             decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
             provenance_grounding=diagnostics.get("provenance_grounding"),
+            agent_justification=diagnostics.get("agent_justification"),
         )
 
         # Save completeness manifest

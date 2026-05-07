@@ -190,13 +190,25 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
         direction_counts[d] = direction_counts.get(d, 0) + 1
 
     if not rows:
+        # Disambiguate against the Net veto value section's "221 DOWN
+        # predictions evaluated" — this analysis is the sweep of recently
+        # SCORED signals with realized 10d outcomes that happen to have
+        # overlapping predictions; the Net veto value section is the full
+        # corpus of resolved DOWN-direction predictions over an 8-week
+        # window. Different filters → different counts; reading them
+        # side-by-side without this context made today's email look
+        # contradictory.
+        n_window_signals = len(populated)
         return {
             "status": "no_down_predictions",
             "n_predictions_loaded": sum(len(v) for v in predictions_by_date.values()),
             "direction_distribution": direction_counts,
             "note": (
-                "No DOWN predictions found — veto gate has not been triggered. "
-                f"Direction distribution: {direction_counts}"
+                f"No DOWN predictions overlap with the {n_window_signals} recently-scored "
+                "signals that have realized 10d outcomes — veto gate sweep has nothing "
+                f"to fit on. Direction distribution in this overlap window: {direction_counts}. "
+                "(Note: the Net veto value section below evaluates a wider 8-week corpus of "
+                "resolved DOWN predictions and reports its own count separately.)"
             ),
         }
 

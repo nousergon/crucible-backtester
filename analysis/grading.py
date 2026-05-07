@@ -376,6 +376,31 @@ def _grade_team_skill_composite(
         (0.20, bm_g),
     ])
 
+    # When all five sub-metrics fail, the legacy fallback would render
+    # "insufficient data" with no n_picks context — Financials/Industrials/
+    # Technology in 2026-05-07's report card hit this path with 6/3/3 picks
+    # respectively, which read as a contradiction against the populated
+    # team-lift table below. Surface n_picks + which sub-metrics dropped
+    # so the operator can interpret the gap (usually IC needs ≥10 samples,
+    # benchmarks need EW-high-vol overlap).
+    if grade is None:
+        passed = [
+            label for label, g in (
+                ("ic", ic_g), ("expectancy", expectancy_g),
+                ("mfe_mae", mfe_mae_g),
+                ("alpha_vs_ew", ew_g), ("alpha_vs_beta_spy", bm_g),
+            ) if g is not None
+        ]
+        return {
+            "team_id": team_id, "grade": None, "letter": "N/A",
+            "reason": (
+                f"{n_picks} picks but 0/5 sub-metrics computable"
+                if not passed
+                else f"{n_picks} picks, only {len(passed)}/5 sub-metrics computable ({', '.join(passed)})"
+            ),
+            "n_picks": n_picks,
+        }
+
     detail: dict[str, str | float | int] = {"n_picks": n_picks}
     if ic.get("ic") is not None:
         detail["ic"] = round(ic["ic"], 3)
