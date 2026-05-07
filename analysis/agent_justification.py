@@ -119,8 +119,19 @@ def summarize_judge(
             "most_recent_sf_date": sf_date,
         }
 
-    # Read one rubric file per agent; aggregate the overall_score field.
-    scores: list[float] = []
+    # Read one rubric file per agent and aggregate the per-agent overall
+    # score. The actual rubric schema (verified against S3 2026-05-07)
+    # carries `dimension_scores` — a list of {dimension, score, reasoning}
+    # entries with per-dimension 1-5 ratings — NOT a top-level
+    # `overall_score`. Compute each agent's overall as the mean across
+    # its dimension scores; aggregate across agents.
+    #
+    # Skip rubrics where `judge_skip_reason` is non-null (judge bailed
+    # before scoring) and rubrics where dimension_scores is missing or
+    # empty. Counts these toward `n_agents` (presence) but not toward
+    # `n_scored` (data) so the email surfaces both the judge attempt rate
+    # and the successful scoring rate.
+    per_agent_scores: list[float] = []
     for agent_dir in agent_dirs:
         # Rubric files: {date}.{model}.json — list and pick the lexically last
         try:
@@ -137,9 +148,17 @@ def summarize_judge(
         rubric = _get_json(s3, bucket, latest_key)
         if rubric is None:
             continue
-        score = rubric.get("overall_score") or rubric.get("score")
-        if isinstance(score, (int, float)):
-            scores.append(float(score))
+        if rubric.get("judge_skip_reason"):
+            continue
+        dim_scores = rubric.get("dimension_scores") or []
+        per_dim = [
+            float(d["score"]) for d in dim_scores
+            if isinstance(d, dict) and isinstance(d.get("score"), (int, float))
+        ]
+        if not per_dim:
+            continue
+        per_agent_scores.append(sum(per_dim) / len(per_dim))
+    scores = per_agent_scores
 
     if not scores:
         return {
