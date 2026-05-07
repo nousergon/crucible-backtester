@@ -449,6 +449,7 @@ def _run_diagnostics(
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=config.get("_run_date"),
         ),
+        required_inputs={},
     )
 
     # Provenance grounding — fourth leg of agent-justification stack.
@@ -460,6 +461,7 @@ def _run_diagnostics(
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=config.get("_run_date"),
         ),
+        required_inputs={},
     )
 
     # Feature drift detection
