@@ -793,12 +793,35 @@ echo "════════════════════════�
 echo "  Backtest complete. Instance will be terminated."
 echo "═══════════════════════════════════════════════════════════════"
 
-# Emit CloudWatch heartbeat on successful completion
-aws cloudwatch put-metric-data \
-  --namespace "AlphaEngine" \
-  --metric-name "Heartbeat" \
-  --dimensions "Process=backtester" \
-  --value 1 --unit "Count" \
-  --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
-  && echo "Heartbeat emitted: backtester" \
-  || echo "WARNING: Failed to emit heartbeat (non-fatal)"
+# Per-stage CloudWatch heartbeats. Each stage gets its own heartbeat so
+# the Saturday SF can split backtest+parity (Backtester state) from
+# evaluator (Evaluator state) across two SF states without conflating
+# their alarms. Backtester heartbeat fires only when both backtest and
+# parity ran (parity is observability for backtest output — they form
+# one semantic unit). Evaluator heartbeat fires only when evaluator ran.
+# Stages listed in --skip-stages are excluded from heartbeat emission.
+_emit_heartbeat() {
+    local _process="$1"
+    aws cloudwatch put-metric-data \
+        --namespace "AlphaEngine" \
+        --metric-name "Heartbeat" \
+        --dimensions "Process=${_process}" \
+        --value 1 --unit "Count" \
+        --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
+        && echo "Heartbeat emitted: ${_process}" \
+        || echo "WARNING: Failed to emit heartbeat for ${_process} (non-fatal)"
+}
+
+_stage_in_skip() {
+    case ",${SKIP_STAGES}," in
+        *",$1,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if ! _stage_in_skip backtest && ! _stage_in_skip parity; then
+    _emit_heartbeat backtester
+fi
+if ! _stage_in_skip evaluator; then
+    _emit_heartbeat evaluator
+fi
