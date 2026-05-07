@@ -65,7 +65,19 @@ class TestSummarizeJudge:
         )
         assert out["status"] == "no_recent_sf_run"
 
-    def test_aggregates_overall_score_across_agents(self):
+    def test_aggregates_dimension_scores_across_agents(self):
+        """Each rubric file carries `dimension_scores` (list of per-dim
+        1-5 entries). Per-agent overall is the mean across dimensions;
+        global overall is the mean across agents.
+
+        Regression target: 2026-05-07 v2 quadfecta-email run rendered
+        "Judge — no rubric data within 14d of run_date" while six
+        agents had captured rubrics at decision_artifacts/_eval/
+        2026-05-07/. Looked like a judge-side producer gap — was
+        actually a consumer-side schema mismatch (the loader read
+        top-level `overall_score`/`score`, neither of which exists in
+        the actual rubric schema).
+        """
         s3 = _mock_s3_client(
             list_dirs={
                 "decision_artifacts/_eval/": ["2026-05-02"],
@@ -80,11 +92,33 @@ class TestSummarizeJudge:
                 ],
             },
             get_objects={
+                # agent_a: six dims, mean = 3.5
                 "decision_artifacts/_eval/2026-05-02/agent_a/2026-05-02.haiku.json": {
-                    "overall_score": 4.2,
+                    "schema_version": 1,
+                    "judged_agent_id": "agent_a",
+                    "judge_skip_reason": None,
+                    "dimension_scores": [
+                        {"dimension": "d1", "score": 4},
+                        {"dimension": "d2", "score": 3},
+                        {"dimension": "d3", "score": 4},
+                        {"dimension": "d4", "score": 3},
+                        {"dimension": "d5", "score": 3},
+                        {"dimension": "d6", "score": 4},
+                    ],
                 },
+                # agent_b: six dims, mean = 3.0
                 "decision_artifacts/_eval/2026-05-02/agent_b/2026-05-02.haiku.json": {
-                    "overall_score": 3.8,
+                    "schema_version": 1,
+                    "judged_agent_id": "agent_b",
+                    "judge_skip_reason": None,
+                    "dimension_scores": [
+                        {"dimension": "d1", "score": 3},
+                        {"dimension": "d2", "score": 3},
+                        {"dimension": "d3", "score": 3},
+                        {"dimension": "d4", "score": 3},
+                        {"dimension": "d5", "score": 3},
+                        {"dimension": "d6", "score": 3},
+                    ],
                 },
             },
         )
@@ -94,9 +128,45 @@ class TestSummarizeJudge:
         assert out["status"] == "ok"
         assert out["n_agents"] == 2
         assert out["n_scored"] == 2
+        assert out["mean_score"] == 3.25  # mean of agent-overalls [3.5, 3.0]
+        assert out["min_score"] == 3.0
+        assert out["max_score"] == 3.5
+
+    def test_skips_rubrics_with_judge_skip_reason(self):
+        """Rubrics where the judge bailed early (e.g. tool-equipped
+        alarm fired) carry `judge_skip_reason` and typically no
+        dimension_scores. These count toward n_agents (presence) but
+        not n_scored (data) so the email surfaces both rates."""
+        s3 = _mock_s3_client(
+            list_dirs={
+                "decision_artifacts/_eval/": ["2026-05-02"],
+                "decision_artifacts/_eval/2026-05-02/": ["agent_a", "agent_skipped"],
+            },
+            list_objects={
+                "decision_artifacts/_eval/2026-05-02/agent_a/": [
+                    "decision_artifacts/_eval/2026-05-02/agent_a/2026-05-02.haiku.json",
+                ],
+                "decision_artifacts/_eval/2026-05-02/agent_skipped/": [
+                    "decision_artifacts/_eval/2026-05-02/agent_skipped/2026-05-02.haiku.json",
+                ],
+            },
+            get_objects={
+                "decision_artifacts/_eval/2026-05-02/agent_a/2026-05-02.haiku.json": {
+                    "judge_skip_reason": None,
+                    "dimension_scores": [{"dimension": "d1", "score": 4}],
+                },
+                "decision_artifacts/_eval/2026-05-02/agent_skipped/2026-05-02.haiku.json": {
+                    "judge_skip_reason": "tool_equipped_alarm",
+                    "dimension_scores": [],
+                },
+            },
+        )
+        out = agent_justification.summarize_judge(
+            "test-bucket", "2026-05-07", s3_client=s3,
+        )
+        assert out["n_agents"] == 2
+        assert out["n_scored"] == 1
         assert out["mean_score"] == 4.0
-        assert out["min_score"] == 3.8
-        assert out["max_score"] == 4.2
 
 
 # ── Counterfactual + Clustering ───────────────────────────────────────────
