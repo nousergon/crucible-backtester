@@ -39,9 +39,11 @@ Workstream design: ``alpha-engine-config/private-docs/ROADMAP.md`` line ~1708
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
-from datetime import date as date_type, datetime, timedelta
+from datetime import date as date_type, datetime, timedelta, timezone
+from hashlib import sha1
 from typing import Any, Optional
 
 import boto3
@@ -57,6 +59,15 @@ _PARQUET_KEY_TEMPLATE = "decision_artifacts/_cost/{date}/cost.parquet"
 _ANOMALY_RATIO_ENV_VAR = "ALPHA_ENGINE_COST_ANOMALY_RATIO"
 _ANOMALY_RATIO_DEFAULT = 2.0
 _ANOMALY_BASELINE_WEEKS = 4  # rolling window per ROADMAP P5
+
+# Schema-1.0.0 changelog corpus (ROADMAP P0 sub-item 5 auto-population —
+# cost-anomaly half, 2026-05-07). When detect_anomaly() returns
+# status="anomaly", build_cost_section() writes one structured incident
+# entry to the same prefix the SNS-mirror + cloudwatch-mirror Lambdas
+# already populate, so the retro-mining filter + downstream aggregator
+# see cost spikes as first-class events.
+_CHANGELOG_PREFIX = "changelog/entries"
+_CHANGELOG_SCHEMA_VERSION = "1.0.0"
 
 
 # ── Markdown rendering ───────────────────────────────────────────────────
@@ -423,4 +434,128 @@ def build_cost_section(
     anomaly = detect_anomaly(
         run_date, current_total, bucket=bucket, s3_client=client,
     )
+    if anomaly.get("status") == "anomaly":
+        _emit_changelog_anomaly_entry(
+            anomaly, run_date=run_date, bucket=bucket, s3_client=client,
+        )
     return main_md + "\n" + render_anomaly_section(anomaly)
+
+
+def _emit_changelog_anomaly_entry(
+    anomaly: dict,
+    *,
+    run_date: str,
+    bucket: str,
+    s3_client: Any,
+) -> Optional[str]:
+    """Auto-populate the system-wide changelog with a cost-anomaly incident.
+
+    Closes ROADMAP P0 sub-item 5 (cost-anomaly half — Item 2 cost-telemetry
+    upstream is closed, so this hook is unblocked). Writes one structured
+    schema-1.0.0 entry to ``s3://{bucket}/changelog/entries/{date}/{event_id}.json``
+    so the corpus aggregator + retro-candidate filter see cost spikes
+    alongside SNS-mirror + cloudwatch-mirror entries.
+
+    Severity is **medium** — cost spikes are operational, not capital-at-risk.
+    The retro filter requires severity ∈ {high, critical} so these entries
+    don't pollute the candidate stream until an operator escalates via a
+    follow-up ``changelog-log`` entry.
+
+    Best-effort: any S3 write failure is logged at WARN and swallowed.
+    Cost-section rendering must not be blocked by changelog corruption —
+    the alert is also rendered into the email + WARN'd in the log, so
+    no signal is lost.
+
+    Returns the structured S3 key on success, or None on failure / no-op.
+    """
+    try:
+        ts = datetime.now(timezone.utc)
+        ts_utc = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+        entry_date = ts.strftime("%Y-%m-%d")
+        ts_id = ts_utc.replace(":", "-").rstrip("Z")
+        actor = "alpha-engine-cost-telemetry"
+        ratio = anomaly.get("ratio")
+        baseline_mean = anomaly.get("baseline_mean_usd")
+        current_total = anomaly.get("current_total_usd")
+        threshold = anomaly.get("threshold_ratio")
+
+        # event_id hashes on the run_date + ratio so re-running build_cost_section
+        # on the same date produces the same event_id (idempotent — re-runs
+        # overwrite rather than duplicate).
+        digest_input = f"{run_date}|{current_total}|{ratio}".encode()
+        event_hash = sha1(digest_input).hexdigest()[:7]
+        event_id = f"{ts_id}_{actor}_{event_hash}"
+
+        ratio_str = f"{ratio:.2f}x" if ratio is not None else "n/a"
+        baseline_str = f"${baseline_mean:.4f}" if baseline_mean is not None else "n/a"
+        current_str = f"${current_total:.4f}" if current_total is not None else "n/a"
+        threshold_str = f"{threshold:.2f}x" if threshold is not None else "n/a"
+        baseline_dates = anomaly.get("baseline_dates_found") or []
+        summary = (
+            f"LLM cost anomaly: {ratio_str} of "
+            f"{len(baseline_dates)}-week baseline "
+            f"(current={current_str}, baseline_mean={baseline_str}, "
+            f"threshold={threshold_str})"
+        )[:240]
+        description = (
+            f"Run date: {run_date}\n"
+            f"Current total cost: {current_str}\n"
+            f"Baseline mean: {baseline_str} "
+            f"(over {len(baseline_dates)} prior weeks: "
+            f"{', '.join(baseline_dates) if baseline_dates else 'none'})\n"
+            f"Ratio: {ratio_str} (threshold: {threshold_str})\n"
+            f"Detected by: alpha-engine-backtester analysis/cost_report.py::detect_anomaly\n"
+            f"Notification surface: evaluator email '## Anomaly detection' section + WARN log."
+        )
+
+        entry = {
+            "schema_version": _CHANGELOG_SCHEMA_VERSION,
+            "event_id": event_id,
+            "ts_utc": ts_utc,
+            "event_type": "incident",
+            "severity": "medium",
+            "subsystem": "telemetry",
+            "root_cause_category": "prompt_regression",  # most plausible default; operator overrides via follow-up
+            "resolution_type": None,
+            "started_at": None,
+            "detected_at": ts_utc,
+            "resolved_at": None,
+            "verified_at": None,
+            "summary": summary,
+            "description": description,
+            "resolution_notes": None,
+            "actor": actor,
+            "machine": "backtester:analysis/cost_report.py",
+            "source": "cost-anomaly-autoemit",
+            "auto_emitted": True,
+            "git_refs": [],
+            "prompt_version": None,
+            "run_id": run_date,
+            "eval_run_ref": None,
+            "cost_anomaly": {
+                "ratio": ratio,
+                "threshold_ratio": threshold,
+                "current_total_usd": current_total,
+                "baseline_mean_usd": baseline_mean,
+                "baseline_dates_found": baseline_dates,
+                "baseline_dates_missing": anomaly.get("baseline_dates_missing") or [],
+            },
+        }
+        key = f"{_CHANGELOG_PREFIX}/{entry_date}/{event_id}.json"
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(entry).encode("utf-8"),
+            ContentType="application/json",
+        )
+        logger.info(
+            "[cost_report] changelog auto-emit: s3://%s/%s ratio=%s threshold=%s",
+            bucket, key, ratio_str, threshold_str,
+        )
+        return key
+    except Exception as e:
+        logger.warning(
+            "[cost_report] changelog auto-emit failed (best-effort, swallowed): %s",
+            e,
+        )
+        return None

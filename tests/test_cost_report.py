@@ -573,3 +573,226 @@ class TestBuildCostSectionWithAnomaly:
         md = build_cost_section("2026-05-09", s3_client=stub)
         assert "ANOMALY DETECTED" in md
         assert "10.00x" in md  # 10.00 / 1.00 = 10×
+
+
+# ── Changelog auto-emit (ROADMAP P0 sub-item 5 cost-anomaly half) ─────────
+
+
+def _make_multi_date_stub_with_put(
+    date_to_df: dict[str, pd.DataFrame | None],
+) -> MagicMock:
+    """Like ``_make_multi_date_stub`` but also captures put_object calls.
+
+    Lets tests assert on whether the changelog auto-emit fired and what
+    payload it wrote, without mocking the full boto3 API surface.
+    """
+    stub = _make_multi_date_stub(date_to_df)
+    stub.put_object = MagicMock(return_value={"ETag": '"deadbeef"'})
+    return stub
+
+
+class TestChangelogAutoEmitOnAnomaly:
+    """Cost-anomaly auto-emit hook into the system-wide changelog corpus.
+
+    ROADMAP P0 line ~2154 sub-item 5 (cost-anomaly half — Item 2
+    cost-telemetry upstream is closed, this hook unblocked 2026-05-07).
+    """
+
+    def test_anomaly_status_writes_changelog_entry(self):
+        """When detect_anomaly returns status=anomaly, build_cost_section
+        writes one schema-1.0.0 incident entry to changelog/entries/."""
+        from analysis.cost_report import build_cost_section
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+        # Exactly one put_object call — the changelog auto-emit
+        assert stub.put_object.call_count == 1
+        call = stub.put_object.call_args_list[0]
+        assert call.kwargs["Bucket"] == "alpha-engine-research"
+        assert call.kwargs["Key"].startswith("changelog/entries/")
+        assert call.kwargs["Key"].endswith(".json")
+        assert call.kwargs["ContentType"] == "application/json"
+
+    def test_changelog_entry_payload_shape(self):
+        """The auto-emitted entry carries every schema-1.0.0 field the
+        SNS-mirror + cloudwatch-mirror Lambdas already populate, plus a
+        ``cost_anomaly`` block with the diagnostic numbers."""
+        import json as _json
+        from analysis.cost_report import build_cost_section
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+
+        body = _json.loads(stub.put_object.call_args_list[0].kwargs["Body"].decode())
+        assert body["schema_version"] == "1.0.0"
+        assert body["event_type"] == "incident"
+        assert body["severity"] == "medium"  # cost spike isn't capital-at-risk
+        assert body["subsystem"] == "telemetry"
+        assert body["root_cause_category"] == "prompt_regression"  # plausible default
+        assert body["source"] == "cost-anomaly-autoemit"
+        assert body["actor"] == "alpha-engine-cost-telemetry"
+        assert body["machine"] == "backtester:analysis/cost_report.py"
+        assert body["auto_emitted"] is True
+        assert body["run_id"] == "2026-05-09"
+        # Diagnostic block carries the ratio + baseline numbers
+        ca = body["cost_anomaly"]
+        assert ca["ratio"] == 10.0
+        assert ca["threshold_ratio"] == 2.0
+        assert ca["current_total_usd"] == 10.0
+        assert ca["baseline_mean_usd"] == 1.0
+        assert ca["baseline_dates_found"] == [
+            "2026-05-02", "2026-04-25", "2026-04-18", "2026-04-11",
+        ]
+        # event_id format mirrors the SNS-mirror + cloudwatch-mirror scheme
+        parts = body["event_id"].split("_")
+        assert len(parts) == 3  # ts_actor_hash
+        assert parts[1] == "alpha-engine-cost-telemetry"
+        assert len(parts[2]) == 7  # 7-hex sha1 prefix
+
+    def test_ok_status_does_not_emit_changelog_entry(self):
+        """No anomaly → no put_object call. Quiet weeks stay quiet."""
+        from analysis.cost_report import build_cost_section
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=0.01),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=0.01),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+        assert stub.put_object.call_count == 0
+
+    def test_no_baseline_does_not_emit_changelog_entry(self):
+        """First-run state (no priors) → status=no_baseline → no auto-emit."""
+        from analysis.cost_report import build_cost_section
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            # All priors absent → no_baseline path
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+        assert stub.put_object.call_count == 0
+
+    def test_alerting_disabled_does_not_emit_changelog_entry(self, monkeypatch):
+        """Threshold ≤ 0 → status=alerting_disabled → no auto-emit."""
+        from analysis.cost_report import build_cost_section
+
+        monkeypatch.setenv("ALPHA_ENGINE_COST_ANOMALY_RATIO", "0")
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+        assert stub.put_object.call_count == 0
+
+    def test_changelog_write_failure_does_not_break_cost_section(self):
+        """S3 put_object exception is logged + swallowed; build_cost_section
+        still returns the markdown (cost-section rendering must not be
+        blocked by changelog corruption — alert is still in email + log)."""
+        from analysis.cost_report import build_cost_section
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        stub.put_object = MagicMock(side_effect=ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+            "PutObject",
+        ))
+        # No exception raised; markdown still produced
+        md = build_cost_section("2026-05-09", s3_client=stub)
+        assert "ANOMALY DETECTED" in md
+
+    def test_event_id_idempotent_on_same_inputs(self):
+        """Re-running build_cost_section with the same anomaly inputs
+        produces the same event_id (and the same S3 key — overwrite, not
+        duplicate)."""
+        from analysis.cost_report import _emit_changelog_anomaly_entry
+
+        anomaly = {
+            "current_total_usd": 10.0,
+            "baseline_mean_usd": 1.0,
+            "ratio": 10.0,
+            "threshold_ratio": 2.0,
+            "baseline_dates_found": ["2026-05-02"],
+            "baseline_dates_missing": [],
+            "is_anomaly": True,
+            "status": "anomaly",
+        }
+        stub_a = MagicMock()
+        stub_b = MagicMock()
+        # Same run_date + ratio + total → same event_hash → same event_id
+        # tail (the timestamp prefix differs by wall-clock; we check the hash)
+        _emit_changelog_anomaly_entry(anomaly, run_date="2026-05-09",
+                                      bucket="alpha-engine-research", s3_client=stub_a)
+        _emit_changelog_anomaly_entry(anomaly, run_date="2026-05-09",
+                                      bucket="alpha-engine-research", s3_client=stub_b)
+        key_a = stub_a.put_object.call_args.kwargs["Key"]
+        key_b = stub_b.put_object.call_args.kwargs["Key"]
+        # Hash segment (last 7 hex chars before .json) is identical
+        hash_a = key_a.rsplit("_", 1)[-1].split(".")[0]
+        hash_b = key_b.rsplit("_", 1)[-1].split(".")[0]
+        assert hash_a == hash_b
