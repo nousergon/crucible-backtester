@@ -430,6 +430,45 @@ def _section_decision_capture_coverage(coverage: dict) -> list[str]:
     return lines
 
 
+def _section_provenance_grounding(grounding: dict) -> list[str]:
+    """Build Provenance Grounding section.
+
+    Fourth leg of agent-justification stack — measures per-agent tool-call
+    + input-trace coverage on captured artifacts. Lives next to
+    decision_capture_coverage since both are pre-analytics observability
+    surfaces (one counts presence, the other counts tool-equipped quality).
+    """
+    lines = ["## Provenance Grounding", ""]
+
+    if grounding.get("status") == "no_recent_sf_run":
+        lines.append(f"> {grounding.get('reason', 'no Saturday SF run found')}")
+        lines.append("")
+        return lines
+    if grounding.get("status") != "ok":
+        err = grounding.get("error", "unknown error")
+        lines.append(f"> Provenance computation skipped: {err}")
+        lines.append("")
+        return lines
+
+    sf_date = grounding.get("most_recent_sf_date", "?")
+    n_artifacts = grounding.get("n_total_artifacts_read", 0)
+    lines.append(f"- Most-recent SF: **{sf_date}** — {n_artifacts} artifacts read")
+
+    alarms = grounding.get("tool_equipped_alarms", []) or []
+    if alarms:
+        lines.append(f"- ⚠️ Tool-equipped alarms: {len(alarms)} agent(s)")
+        for a in alarms[:5]:
+            lines.append(f"  - {a}")
+
+    rolling = grounding.get("rolling", {})
+    n_sat = rolling.get("n_saturdays_with_data", 0)
+    if n_sat >= 2:
+        lines.append(f"- Rolling window: {n_sat} Saturday(s) with provenance data")
+
+    lines.append("")
+    return lines
+
+
 def build_report(
     run_date: str,
     signal_quality: dict,
@@ -455,6 +494,7 @@ def build_report(
     exit_timing: dict | None = None,
     macro_eval: dict | None = None,
     decision_capture_coverage: dict | None = None,
+    provenance_grounding: dict | None = None,
     trigger_opt: dict | None = None,
     predictor_sizing: dict | None = None,
     scanner_opt: dict | None = None,
@@ -493,6 +533,9 @@ def build_report(
     # are pre-analytics observability surfaces, not analysis findings.
     if decision_capture_coverage:
         lines += _section_decision_capture_coverage(decision_capture_coverage)
+
+    if provenance_grounding:
+        lines += _section_provenance_grounding(provenance_grounding)
 
     # System Report Card (component grades)
     if grading and grading.get("status") in ("ok", "partial"):
