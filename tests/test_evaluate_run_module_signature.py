@@ -115,24 +115,26 @@ def test_completeness_tracker_run_module_signature_is_stable():
 # for a new diagnostic — different consumer.
 
 
-def _collect_build_report_kwargs(tree: ast.AST) -> set[str]:
-    """Find the build_report(...) call in evaluate.py and return its kwargs.
+def _collect_call_kwargs(tree: ast.AST, func_name: str) -> set[str]:
+    """Find every `<func_name>(...)` call (bare or attribute) and return
+    the union of all kwargs across call sites.
 
-    There's a single call site; if there ever are multiple, this returns
-    the union (over-permissive but still catches missing kwargs).
+    Over-permissive on purpose: if a future PR adds a second call site
+    with extra kwargs, the test still flags any kwarg that the function
+    signature doesn't declare. Catches the missing-kwarg class for any
+    call site, not just the first.
     """
     kwargs: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        # Match either bare `build_report(...)` or `mod.build_report(...)`
-        called_name = None
+        called = None
         if isinstance(func, ast.Name):
-            called_name = func.id
+            called = func.id
         elif isinstance(func, ast.Attribute):
-            called_name = func.attr
-        if called_name != "build_report":
+            called = func.attr
+        if called != func_name:
             continue
         for kw in node.keywords:
             if kw.arg:
@@ -140,33 +142,42 @@ def _collect_build_report_kwargs(tree: ast.AST) -> set[str]:
     return kwargs
 
 
-def test_build_report_accepts_every_kwarg_evaluate_passes():
-    """evaluate.py's build_report(...) call must only use kwargs that
-    reporter.build_report() declares.
+@pytest.mark.parametrize("consumer_name", ["build_report", "save"])
+def test_reporter_consumers_accept_every_kwarg_evaluate_passes(consumer_name: str):
+    """evaluate.py's calls into reporter.py's diagnostic-consuming
+    functions must only use kwargs those functions declare.
 
-    Regression target: 2026-05-07 v3 SF validation crashed with
-    `TypeError: build_report() got an unexpected keyword argument
-    'provenance_grounding'`. The diagnostic was producer-fixed (added
-    `required_inputs={}`) but consumer-unfixed — the kwarg cascaded
-    through evaluate.py into build_report(), which didn't know about it.
-    Static check catches both halves of this class.
+    Regression chain that motivated this:
+    - 2026-05-07 v3 SF (PR #153): `build_report() got an unexpected
+      keyword argument 'provenance_grounding'` — diagnostic was
+      producer-fixed (PR #151) but build_report consumer was unfixed.
+    - 2026-05-07 v4 SF (PR #154 follow-up): `save() got an unexpected
+      keyword argument 'agent_justification'` — same bug class, save()
+      is a SECOND consumer of the diagnostics dict. Caught the
+      build_report side via the original preflight; missed save()
+      because the static check only inspected one call site.
+
+    This parametrized test now covers BOTH consumers; adding a third
+    (e.g. `email_report` if reporter.py grows one) is a single-line
+    addition to the parametrize list.
     """
     source = EVALUATE_PY.read_text()
     tree = ast.parse(source)
-    passed = _collect_build_report_kwargs(tree)
+    passed = _collect_call_kwargs(tree, consumer_name)
     assert passed, (
-        "Could not locate build_report(...) call in evaluate.py — has the "
-        "API moved? Update _collect_build_report_kwargs."
+        f"Could not locate {consumer_name}(...) call in evaluate.py — has "
+        "the API moved? Update _collect_call_kwargs or the parametrize list."
     )
 
-    from reporter import build_report
-    declared = set(inspect.signature(build_report).parameters.keys())
+    import reporter
+    consumer = getattr(reporter, consumer_name)
+    declared = set(inspect.signature(consumer).parameters.keys())
 
     missing = passed - declared
     assert not missing, (
-        "evaluate.py passes kwargs to build_report() that the function "
+        f"evaluate.py passes kwargs to {consumer_name}() that the function "
         "doesn't declare — call will TypeError at runtime. Add these "
-        "parameters to reporter.build_report's signature (with "
-        "`<name>: dict | None = None` defaults to keep the call optional):\n"
+        f"parameters to reporter.{consumer_name}'s signature "
+        "(`<name>: dict | None = None` for diagnostic dicts):\n"
         + "\n".join(f"  - {name}" for name in sorted(missing))
     )
