@@ -96,3 +96,77 @@ def test_completeness_tracker_run_module_signature_is_stable():
         "the static evaluate.py preflight test is redundant and can be "
         "removed (or kept as documentation-of-intent)."
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: build_report consumer accepts every kwarg evaluate.py passes
+# ---------------------------------------------------------------------------
+#
+# Static AST check — extracts the kwargs passed to build_report(...) at the
+# evaluate.py call site, then asserts reporter.build_report's signature
+# accepts each one. The 2026-05-07 v3 validation hit a sibling regression
+# class to the run_module bug: a new diagnostic ("provenance_grounding")
+# was added to the diagnostics dict and forwarded into build_report() at
+# evaluate.py:1010, but build_report's signature hadn't been updated, so
+# the call raised `TypeError: build_report() got an unexpected keyword
+# argument 'provenance_grounding'`. evaluator ran cleanly through all 13
+# diagnostic modules + 11 optimizers before crashing at the report
+# builder. Same root cause as the run_module bug — incomplete plumbing
+# for a new diagnostic — different consumer.
+
+
+def _collect_build_report_kwargs(tree: ast.AST) -> set[str]:
+    """Find the build_report(...) call in evaluate.py and return its kwargs.
+
+    There's a single call site; if there ever are multiple, this returns
+    the union (over-permissive but still catches missing kwargs).
+    """
+    kwargs: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # Match either bare `build_report(...)` or `mod.build_report(...)`
+        called_name = None
+        if isinstance(func, ast.Name):
+            called_name = func.id
+        elif isinstance(func, ast.Attribute):
+            called_name = func.attr
+        if called_name != "build_report":
+            continue
+        for kw in node.keywords:
+            if kw.arg:
+                kwargs.add(kw.arg)
+    return kwargs
+
+
+def test_build_report_accepts_every_kwarg_evaluate_passes():
+    """evaluate.py's build_report(...) call must only use kwargs that
+    reporter.build_report() declares.
+
+    Regression target: 2026-05-07 v3 SF validation crashed with
+    `TypeError: build_report() got an unexpected keyword argument
+    'provenance_grounding'`. The diagnostic was producer-fixed (added
+    `required_inputs={}`) but consumer-unfixed — the kwarg cascaded
+    through evaluate.py into build_report(), which didn't know about it.
+    Static check catches both halves of this class.
+    """
+    source = EVALUATE_PY.read_text()
+    tree = ast.parse(source)
+    passed = _collect_build_report_kwargs(tree)
+    assert passed, (
+        "Could not locate build_report(...) call in evaluate.py — has the "
+        "API moved? Update _collect_build_report_kwargs."
+    )
+
+    from reporter import build_report
+    declared = set(inspect.signature(build_report).parameters.keys())
+
+    missing = passed - declared
+    assert not missing, (
+        "evaluate.py passes kwargs to build_report() that the function "
+        "doesn't declare — call will TypeError at runtime. Add these "
+        "parameters to reporter.build_report's signature (with "
+        "`<name>: dict | None = None` defaults to keep the call optional):\n"
+        + "\n".join(f"  - {name}" for name in sorted(missing))
+    )
