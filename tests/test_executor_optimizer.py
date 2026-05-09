@@ -2,8 +2,10 @@
 
 Two ranking paths are tested:
 - Legacy (Sharpe-with-drawdown) — default behavior, unchanged from pre-revamp.
-- Skill-composite (alpha-primary + sortino-tiebreaker) — gated by
-  ``executor_optimizer.use_skill_composite_target`` config flag.
+- Skill-composite (sortino-primary + alpha-tiebreaker) — gated by
+  ``executor_optimizer.use_skill_composite_target`` config flag. Sortino
+  is the skilled-risk-taking signal (downside-aware return); total_alpha
+  vs SPY is presentation framing kept as tiebreaker only.
 
 Production-vs-shadow promotion paths are also tested via mocked S3.
 """
@@ -29,7 +31,7 @@ def _init_default_config(extra: dict | None = None):
         "executor_optimizer": {
             "min_valid_combos": 2,
             "min_sharpe_improvement": 0.05,
-            "min_alpha_improvement": 0.05,
+            "min_sortino_improvement": 0.05,
             "min_trades_to_promote": 0,  # disable trade-count gate for these tests
             "drawdown_penalty_weight": 0.5,
         }
@@ -43,18 +45,20 @@ def _make_sweep_df(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# Three combos with different (alpha, sharpe) profiles, illustrating exactly
-# the divergence the email surfaced — high Sharpe doesn't imply high alpha.
+# Three combos with deliberately divergent (sharpe, sortino, alpha) profiles
+# so each ranking path picks a different combo. This pins the design intent:
+#   - Legacy → highest Sharpe-minus-drawdown (combo A).
+#   - Skill-composite → highest Sortino (combo B); alpha is tiebreaker only.
 COMBOS = [
-    # combo A: highest Sharpe (legacy ranking would pick this), bad alpha
+    # combo A: highest Sharpe (legacy picks this), modest Sortino, bad alpha
     {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
      "sharpe_ratio": 0.70, "total_alpha": -2.5, "sortino_ratio": 0.85,
      "max_drawdown": -0.05, "total_trades": 100},
-    # combo B: highest alpha (skill ranking would pick this), modest Sharpe
+    # combo B: highest Sortino (skill picks this), modest Sharpe, positive alpha
     {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
      "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.95,
      "max_drawdown": -0.10, "total_trades": 80},
-    # combo C: middle ground
+    # combo C: middle on every axis
     {"atr_multiplier": 2.5, "min_score": 70, "max_position_pct": 0.05,
      "sharpe_ratio": 0.60, "total_alpha": -0.50, "sortino_ratio": 0.70,
      "max_drawdown": -0.08, "total_trades": 90},
@@ -114,85 +118,103 @@ class TestLegacyRanking:
 
 
 class TestSkillCompositeRanking:
-    """When use_skill_composite_target is on, ranks by alpha + sortino."""
+    """When use_skill_composite_target is on, ranks by sortino + alpha."""
 
-    def test_flag_on_switches_to_alpha_path(self):
+    def test_flag_on_switches_to_skill_path(self):
         _init_default_config({"use_skill_composite_target": True})
         df = _make_sweep_df(COMBOS)
         result = recommend(df, base_config={})
         assert result["fit_target"] == "skill_composite"
 
-    def test_skill_picks_highest_alpha_not_highest_sharpe(self):
-        """The exact divergence the 2026-05-09 email surfaced — alpha-first
-        ranking selects combo B (highest alpha) over combo A (highest Sharpe).
-        """
+    def test_skill_picks_highest_sortino_not_highest_sharpe(self):
+        """The exact divergence the 2026-05-09 email surfaced. Combo A has
+        higher Sharpe (0.70 vs 0.55) but combo B has higher Sortino (0.95
+        vs 0.85) — skill_composite picks B because Sortino rewards skilled
+        risk-taking, Sharpe doesn't."""
         _init_default_config({"use_skill_composite_target": True})
         df = _make_sweep_df(COMBOS)
         result = recommend(df, base_config={})
         assert result["status"] == "ok"
-        # Combo B has highest alpha (0.30) — picked by skill_composite even
-        # though combo A has higher Sharpe.
         assert result["recommended_params"]["atr_multiplier"] == 2.0
-        assert result["best_alpha"] == 0.30
-        # Sortino is reported alongside but doesn't drive selection
-        # when alpha rankings are unambiguous.
         assert result["best_sortino"] == 0.95
+        # Alpha is reported (presentation tiebreaker) but didn't drive selection.
+        assert result["best_alpha"] == 0.30
 
-    def test_skill_sortino_breaks_alpha_ties(self):
+    def test_skill_alpha_breaks_sortino_ties(self):
         _init_default_config({"use_skill_composite_target": True})
         rows = [
             {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
-             "sortino_ratio": 0.6, "total_trades": 50},
-            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.9, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.30,
              "sortino_ratio": 0.9, "total_trades": 50},
         ]
         df = _make_sweep_df(rows)
         result = recommend(df, base_config={})
-        # Same alpha → sortino tiebreaker → atr_multiplier=3.0 wins.
+        # Same Sortino → alpha tiebreaker → atr_multiplier=3.0 wins.
         assert result["recommended_params"]["atr_multiplier"] == 3.0
 
-    def test_skill_negative_alpha_blocks(self):
-        """Mirrors the negative-Sharpe guard but on the alpha axis. The
-        2026-05-09 email's 'Best alpha: −258.8%' would trip this gate."""
+    def test_skill_negative_sortino_blocks(self):
+        """Mirrors the negative-Sharpe guard but on the skilled-risk-taking
+        axis. A config whose downside-aware return is loss-making shouldn't
+        be auto-promoted regardless of Sharpe or alpha."""
         _init_default_config({"use_skill_composite_target": True})
         rows = [
-            {**r, "total_alpha": -1.0 - (i * 0.1)}
+            {**r, "sortino_ratio": -0.5 - (i * 0.1)}
             for i, r in enumerate(COMBOS)
         ]
         df = _make_sweep_df(rows)
         result = recommend(df, base_config={})
-        assert result["status"] == "negative_alpha"
-        # Best alpha across all combos is the highest (least-negative).
-        assert result["best_alpha"] == -1.0
+        assert result["status"] == "negative_sortino"
+        # Best sortino across all combos is the highest (least-negative).
+        assert result["best_sortino"] == -0.5
 
     def test_skill_no_improvement_blocks(self):
         _init_default_config({
             "use_skill_composite_target": True,
-            "min_alpha_improvement": 0.20,  # need 20% alpha lift
+            "min_sortino_improvement": 0.20,  # need 20% sortino lift
         })
         rows = [
             {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.50,
-             "sortino_ratio": 0.6, "total_trades": 50},
+             "sortino_ratio": 0.50, "total_trades": 50},
             {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.51,
-             "sortino_ratio": 0.6, "total_trades": 50},
+             "sortino_ratio": 0.51, "total_trades": 50},
         ]
         df = _make_sweep_df(rows)
         result = recommend(df, base_config={}, current_params={
             "atr_multiplier": 2.0,
         })
-        # Best alpha (0.51) only 2% better than baseline (0.50) — below 20% gate.
+        # Best Sortino (0.51) only 2% better than baseline (0.50) — below 20% gate.
         assert result["status"] == "no_improvement"
 
-    def test_skill_missing_alpha_column_returns_insufficient(self):
+    def test_skill_negative_alpha_does_not_block(self):
+        """Sortino > 0 with negative SPY-alpha is ALLOWED to promote — alpha
+        vs SPY is presentation framing, not a gate. A high-vol portfolio
+        with positive downside-aware return but a flat/down-market period
+        relative to SPY can still be the right risk-taking config."""
         _init_default_config({"use_skill_composite_target": True})
         rows = [
-            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_trades": 50},
-            {"atr_multiplier": 3.0, "sharpe_ratio": 0.6, "total_trades": 50},
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": -0.10,
+             "sortino_ratio": 0.80, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": -0.50,
+             "sortino_ratio": 0.50, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 3.0})
+        # Negative alpha across the board, but Sortino is positive and improving.
+        assert result["status"] == "ok"
+        assert result["recommended_params"]["atr_multiplier"] == 2.0
+        assert result["best_alpha"] == -0.10  # presentation only
+
+    def test_skill_missing_sortino_column_returns_insufficient(self):
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.1, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.6, "total_alpha": 0.2, "total_trades": 50},
         ]
         df = _make_sweep_df(rows)
         result = recommend(df, base_config={})
         assert result["status"] == "insufficient_data"
-        assert "total_alpha" in result["note"]
+        assert "sortino_ratio" in result["note"]
 
 
 # ── Apply: shadow vs production write paths ──────────────────────────────────

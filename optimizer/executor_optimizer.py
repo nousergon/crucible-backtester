@@ -11,9 +11,13 @@ in config (default: legacy):
 - **Legacy (Sharpe-with-drawdown):** ``_combined_score = sharpe_ratio
   - drawdown_penalty_weight × |max_drawdown|``. Stamps
   ``fit_target="sharpe_legacy"``. Pre-evaluator-revamp behavior.
-- **Skill-composite:** ranks by ``total_alpha`` (primary) with
-  ``sortino_ratio`` as tiebreaker. Stamps ``fit_target="skill_composite"``.
-  Mirrors the evaluator-revamp 2026-05-06 fit-target switch already shipped
+- **Skill-composite:** ranks by ``sortino_ratio`` (primary, skilled
+  downside-aware return) with ``total_alpha`` as tiebreaker. Stamps
+  ``fit_target="skill_composite"``. Aligns with the evaluator-revamp
+  2026-05-06 metric stack — Sortino + CVaR + risk-matched-alpha are the
+  skilled-risk-taking signals; raw alpha vs SPY is presentation framing
+  ("did we beat the market") that doesn't reward taking the right risk
+  per unit of downside variance. Mirrors the activation pattern shipped
   for ``weight_optimizer`` (PR #145 / PR 6 of evaluator revamp).
 
 Promotion to live S3 (``config/executor_params.json``) is gated by
@@ -104,7 +108,7 @@ FACTORY_DEFAULTS = {
 # ── Fallback defaults (override via executor_optimizer section in config.yaml) ──
 _MIN_VALID_COMBOS = 5
 _MIN_SHARPE_IMPROVEMENT = 0.10
-_MIN_ALPHA_IMPROVEMENT = 0.05
+_MIN_SORTINO_IMPROVEMENT = 0.05
 _MIN_TRADES_TO_PROMOTE = 50
 
 # Module-level config ref — set by init_config() from backtest.py
@@ -255,27 +259,32 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     use_skill_composite = bool(_cfg.get("use_skill_composite_target", False))
 
     if use_skill_composite:
-        # Skill-composite ranking: total_alpha (primary) + sortino_ratio
-        # (tiebreaker). Falls back to alpha alone if sortino unavailable.
-        if "total_alpha" not in valid.columns:
+        # Skill-composite ranking: sortino_ratio (primary, skilled
+        # downside-aware return) + total_alpha (tiebreaker, presentation).
+        # Sortino aligns with the evaluator-revamp metric stack: it rewards
+        # configs that extract return per unit of *downside* variance — the
+        # exact "intelligent risk-taking" signal. Alpha vs SPY is kept as a
+        # tiebreaker because among Sortino-equivalent configs, beating SPY
+        # is weakly preferable for end-user-headline framing.
+        if "sortino_ratio" not in valid.columns:
             return {
                 "status": "insufficient_data",
                 "note": (
                     "use_skill_composite_target is on but sweep produced no "
-                    "total_alpha column — cannot rank by alpha."
+                    "sortino_ratio column — cannot rank by skill-composite."
                 ),
                 "fit_target": "skill_composite",
             }
-        valid_alpha = valid["total_alpha"].notna().sum()
-        if valid_alpha == 0:
+        valid_sortino = valid["sortino_ratio"].notna().sum()
+        if valid_sortino == 0:
             return {
                 "status": "insufficient_data",
-                "note": "All total_alpha values are NaN — cannot rank by alpha.",
+                "note": "All sortino_ratio values are NaN — cannot rank by skill-composite.",
                 "fit_target": "skill_composite",
             }
-        sort_cols = ["total_alpha"]
-        if "sortino_ratio" in valid.columns:
-            sort_cols.append("sortino_ratio")
+        sort_cols = ["sortino_ratio"]
+        if "total_alpha" in valid.columns:
+            sort_cols.append("total_alpha")
         valid = valid.sort_values(sort_cols, ascending=False)
         fit_target = "skill_composite"
     else:
@@ -311,13 +320,13 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     baseline_sortino = _safe_float(baseline_row.get("sortino_ratio"))
 
     if use_skill_composite:
-        # Improvement gate is alpha-based when ranking is alpha-first.
-        if baseline_alpha is None or best_alpha is None:
+        # Improvement gate is sortino-based when ranking is sortino-first.
+        if baseline_sortino is None or best_sortino is None:
             improvement_pct = 0.0
-        elif baseline_alpha == 0:
-            improvement_pct = float("inf") if best_alpha > 0 else 0.0
+        elif baseline_sortino == 0:
+            improvement_pct = float("inf") if best_sortino > 0 else 0.0
         else:
-            improvement_pct = (best_alpha - baseline_alpha) / abs(baseline_alpha)
+            improvement_pct = (best_sortino - baseline_sortino) / abs(baseline_sortino)
     else:
         if baseline_sharpe == 0:
             improvement_pct = float("inf") if best_sharpe > 0 else 0.0
@@ -366,34 +375,34 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     }
 
     if use_skill_composite:
-        # Guard: never auto-apply params from a negative-alpha optimization.
-        # Mirrors the negative-Sharpe guard but on the alpha-first ranking
-        # axis — promotes the principle that the system's stated objective
-        # (Alpha = Portfolio − SPY) is what gates auto-tuning.
-        if best_alpha is None:
+        # Guard: never auto-apply params from a negative-Sortino optimization.
+        # Negative Sortino = the strategy's downside-aware return is loss-making.
+        # Mirrors the negative-Sharpe guard but on the skilled-risk-taking axis.
+        if best_sortino is None:
             return {
                 "status": "insufficient_data",
                 **common_fields,
-                "note": "Best combo has no total_alpha — cannot evaluate skill-composite gate.",
+                "note": "Best combo has no sortino_ratio — cannot evaluate skill-composite gate.",
             }
-        if best_alpha < 0:
+        if best_sortino < 0:
             return {
-                "status": "negative_alpha",
+                "status": "negative_sortino",
                 **common_fields,
                 "note": (
-                    f"Best alpha ({best_alpha:.4f}) is negative — all combos underperformed SPY. "
-                    f"Refusing to auto-apply. Review signal quality and backtest data before tuning."
+                    f"Best Sortino ({best_sortino:.4f}) is negative — every combo's "
+                    f"downside-aware return is loss-making. Refusing to auto-apply. "
+                    f"Review signal quality and backtest data before tuning."
                 ),
             }
 
-        min_improvement = _cfg.get("min_alpha_improvement", _MIN_ALPHA_IMPROVEMENT)
+        min_improvement = _cfg.get("min_sortino_improvement", _MIN_SORTINO_IMPROVEMENT)
         if improvement_pct < min_improvement:
             return {
                 "status": "no_improvement",
                 **common_fields,
                 "note": (
-                    f"Best alpha ({best_alpha:.4f}) only {improvement_pct:.1%} better than "
-                    f"baseline ({baseline_alpha:.4f}). Need {min_improvement:.0%}+ to recommend."
+                    f"Best Sortino ({best_sortino:.4f}) only {improvement_pct:.1%} better than "
+                    f"baseline ({baseline_sortino:.4f}). Need {min_improvement:.0%}+ to recommend."
                 ),
             }
 
@@ -402,9 +411,10 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
             **common_fields,
             "n_combos_tested": len(valid),
             "note": (
-                f"Best combo improves alpha by {improvement_pct:.1%} "
-                f"({baseline_alpha:.4f} → {best_alpha:.4f}) across {len(valid)} combos "
-                f"(skill_composite ranking: alpha primary, sortino tiebreaker)."
+                f"Best combo improves Sortino by {improvement_pct:.1%} "
+                f"({baseline_sortino:.4f} → {best_sortino:.4f}) across {len(valid)} combos "
+                f"(skill_composite ranking: sortino primary, alpha tiebreaker; "
+                f"best_alpha={best_alpha} shown for presentation framing only)."
             ),
         }
 
@@ -529,16 +539,16 @@ def validate_holdout(
         return result
 
     holdout_sharpe = holdout_stats.get("sharpe_ratio")
-    holdout_alpha = holdout_stats.get("total_alpha")
+    holdout_sortino = holdout_stats.get("sortino_ratio")
     fit_target = result.get("fit_target", "sharpe_legacy")
 
     # Pick the metric matching the recommend()-side ranking axis. Skill-composite
-    # ranks by alpha-first, so the holdout-stability check follows alpha; legacy
-    # ranks by Sharpe, so the holdout check follows Sharpe.
+    # ranks by sortino-first, so the holdout-stability check follows sortino;
+    # legacy ranks by Sharpe, so the holdout check follows Sharpe.
     if fit_target == "skill_composite":
-        metric_name = "alpha"
-        holdout_value = holdout_alpha
-        train_value = result.get("best_alpha", 0)
+        metric_name = "Sortino"
+        holdout_value = holdout_sortino
+        train_value = result.get("best_sortino", 0)
     else:
         metric_name = "Sharpe"
         holdout_value = holdout_sharpe
