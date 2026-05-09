@@ -206,6 +206,15 @@ def apply(result: dict, bucket: str) -> dict:
     # Always produce the artifact — captures every invocation for audit.
     produce_artifact(result, bucket)
 
+    # Cutover gate: when assembler.cutover_enabled is true, the assembler
+    # is the sole writer of the live key.
+    from optimizer.assembler import is_cutover_enabled
+    if is_cutover_enabled():
+        return {
+            "applied": False,
+            "reason": "cutover_mode — assembler is sole live writer",
+        }
+
     if result.get("status") != "ok":
         return {"applied": False, "reason": f"status={result.get('status')}"}
 

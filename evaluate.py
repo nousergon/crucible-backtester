@@ -861,6 +861,16 @@ def main() -> None:
     veto_analysis.init_config(config)
     research_optimizer.init_config(config)
 
+    # Set the assembler-cutover flag from config — when true, individual
+    # optimizers' apply() skip their legacy live-key writes and the
+    # assembler becomes the sole writer of config/{config_type}.json.
+    # Default false so this PR ships the cutover mechanism dark; flip via
+    # alpha-engine-config/backtester/config.yaml under the `assembler:` section.
+    from optimizer.assembler import set_cutover_enabled as _set_cutover_enabled
+    _set_cutover_enabled(
+        config.get("assembler", {}).get("cutover_enabled", False),
+    )
+
     # Initialize data sources and check availability
     avail = _init_data_sources(args, config)
     logger.info("Data availability: %s", {k: v for k, v in avail.items()})
@@ -907,15 +917,18 @@ def main() -> None:
             diagnostics=diagnostics,
         )
 
-    # ── Assembler (shadow-only PR 3 of optimizer-artifact-assembler arc) ─
+    # ── Assembler (optimizer-artifact-assembler arc) ────────────────────
     # Reads the per-optimizer recommendation artifacts written by each
-    # optimizer's apply() during this run + applies merge precedence and
-    # writes config/executor_params/{config_type}/assembled/{date}.json
-    # for audit. Live key is NOT touched — that's PR 4's flag-gated cutover.
-    # Failure is non-fatal: the assembler is observation-only at this PR.
+    # optimizer's apply() during this run, applies merge precedence, and
+    # writes config/{config_type}/assembled/{date}.json for audit. When
+    # `assembler.cutover_enabled` is true in config, the assembler ALSO
+    # writes the live key + _previous snapshot + dated history — and the
+    # individual optimizers' apply() paths skip their legacy live writes
+    # (gated by ``optimizer.assembler.is_cutover_enabled()``).
+    # Failure is non-fatal: the assembler must not break the pipeline.
     if run_optimizers and not args.freeze:
         try:
-            from optimizer.assembler import assemble
+            from optimizer.assembler import assemble, is_cutover_enabled
             bucket = config.get("signals_bucket", "alpha-engine-research")
             assemble_result = assemble(
                 bucket=bucket,
@@ -924,19 +937,20 @@ def main() -> None:
                 write_assembled=True,
             )
             logger.info(
-                "Assembler shadow run: status=%s, promoting=%d, frozen_restored=%d",
+                "Assembler run: status=%s, promoting=%d, frozen_restored=%d, "
+                "cutover=%s",
                 assemble_result.status,
                 sum(
                     1 for v in assemble_result.artifacts_seen.values()
                     if v["promotion_intent"] == "promote"
                 ),
                 len(assemble_result.frozen_keys_restored),
+                "ON" if is_cutover_enabled() else "OFF (shadow)",
             )
         except Exception as e:
-            # Shadow-mode assembler failure must not break the pipeline.
+            # Assembler failure must not break the pipeline.
             logger.warning(
-                "Assembler shadow run failed (non-fatal — observation only): %s",
-                e,
+                "Assembler run failed (non-fatal — pipeline continues): %s", e,
             )
 
     # ── Regression detection ─────────────────────────────────────────────

@@ -85,6 +85,28 @@ DEFAULT_PRECEDENCE = {
     },
 }
 
+# Module-level cutover flag. Toggled via ``set_cutover_enabled()`` at
+# pipeline startup (called from evaluate.py / backtest.py after they load
+# config). When true, individual optimizers' ``apply()`` skips the legacy
+# live-key write and the assembler becomes the sole writer of
+# ``config/{config_type}.json`` + the rollback ``_previous`` snapshot.
+# Default False — PR 4 ships the cutover mechanism dark; alpha-engine-config
+# flips ``assembler.cutover_enabled`` to true in a separate operator step
+# after at least one shadow Sat SF cycle has validated the assembled output.
+_CUTOVER_ENABLED = False
+
+
+def set_cutover_enabled(enabled: bool) -> None:
+    """Set the global cutover flag. Called once per process at startup."""
+    global _CUTOVER_ENABLED
+    _CUTOVER_ENABLED = bool(enabled)
+
+
+def is_cutover_enabled() -> bool:
+    """Return the current cutover flag. Read by each optimizer's ``apply()``
+    to decide whether to skip its legacy live-key write."""
+    return _CUTOVER_ENABLED
+
 
 AssemblerStatus = Literal["ok", "no_artifacts", "all_skip"]
 
@@ -210,10 +232,11 @@ def assemble(
     precedence_config: dict | None = None,
     s3_client: Any = None,
     write_assembled: bool = True,
+    cutover_enabled: bool | None = None,
 ) -> AssemblerResult:
     """Read all per-optimizer recommendation artifacts for the date, merge
-    them via precedence, and (under shadow mode) write the assembled audit
-    artifact.
+    them via precedence, and write the assembled audit artifact (and,
+    under cutover mode, the live key + rollback snapshot).
 
     Args:
         bucket: S3 bucket name.
@@ -226,19 +249,22 @@ def assemble(
             If None, uses ``DEFAULT_PRECEDENCE[config_type]``.
         s3_client: Optional boto3 client (test injection).
         write_assembled: If True (default), writes
-            ``config/{config_type}/assembled/{run_date}.json`` with the
-            merge result. PR 3 leaves this default-True so shadow-mode
-            audit is always emitted.
+            ``config/{config_type}/assembled/{run_date}.json`` audit
+            artifact regardless of cutover mode.
+        cutover_enabled: If True, additionally writes the live key
+            ``config/{config_type}.json`` + the rollback snapshot
+            ``config/{config_type}_previous.json`` + the dated history
+            ``config/{config_type}_history/{run_date}.json``. If None
+            (default), reads the module-level ``_CUTOVER_ENABLED`` flag
+            set by ``set_cutover_enabled()`` at process startup. The
+            individual optimizers' ``apply()`` paths read the same flag
+            and skip their legacy live writes when it's true — so when
+            cutover is on, the assembler is the sole writer.
 
     Returns:
         AssemblerResult capturing assembled_params + merge_summary +
-        artifacts_seen + status.
-
-    Note:
-        Live key is **not** written by this function. PR 4 of the assembler
-        arc will introduce a separate ``cutover_apply()`` (or extend this
-        function with a flag) that promotes the assembled output to the
-        live key behind a feature flag.
+        artifacts_seen + status. Cutover S3 writes happen as side effects;
+        ``result.notes`` records whether cutover writes occurred.
     """
     s3 = s3_client or boto3.client("s3")
     cfg = precedence_config or DEFAULT_PRECEDENCE.get(config_type, {})
@@ -340,7 +366,96 @@ def assemble(
     if write_assembled:
         _write_assembled_audit(result, bucket, s3)
 
+    cutover_active = (
+        is_cutover_enabled() if cutover_enabled is None else bool(cutover_enabled)
+    )
+    if cutover_active and result.status == "ok":
+        cutover_outcome = _cutover_apply(result, bucket, s3)
+        result.notes = (result.notes + " " + cutover_outcome).strip()
+
     return result
+
+
+def _cutover_apply(
+    result: AssemblerResult, bucket: str, s3_client,
+) -> str:
+    """Promote the assembled config to the live key under cutover mode.
+
+    Three S3 writes:
+    1. Snapshot current live → ``config/{config_type}_previous.json``
+       (subsumes ``optimizer/rollback.save_previous`` so regression rollback
+       still works under the new single-writer regime).
+    2. Write assembled_params (plus ``updated_at`` stamp matching legacy
+       payload convention) → live key ``config/{config_type}.json``.
+    3. Mirror the live write to ``config/{config_type}_history/{run_date}.json``
+       (matches the legacy dated-history convention; preserves audit trail
+       expected by operators inspecting weekly history).
+
+    Returns a human-readable note for ``result.notes``. All three writes
+    are best-effort — failures log warn and are recorded in the note;
+    they don't raise. The shadow audit artifact is the authoritative
+    record; live-key write failures are visible via that artifact.
+    """
+    config_type = result.config_type
+    live_key = f"config/{config_type}.json"
+    previous_key = f"config/{config_type}_previous.json"
+    history_key = f"config/{config_type}_history/{result.run_date}.json"
+
+    # 1. Snapshot current live → _previous (rollback safety)
+    try:
+        s3_client.copy_object(
+            Bucket=bucket,
+            CopySource={"Bucket": bucket, "Key": live_key},
+            Key=previous_key,
+        )
+        logger.info(
+            "Cutover: snapshotted live → s3://%s/%s", bucket, previous_key,
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+            logger.info(
+                "Cutover: no current live config to snapshot (first cutover run)",
+            )
+        else:
+            logger.warning(
+                "Cutover: failed to snapshot live → _previous: %s "
+                "(continuing — live write below)", e,
+            )
+
+    # 2. Write assembled → live key (with updated_at stamp matching legacy
+    #    payload shape so consumer Lambdas see no schema drift).
+    payload = dict(result.assembled_params)
+    payload["updated_at"] = result.run_date
+    payload["assembled_by"] = "optimizer.assembler"
+    body = json.dumps(payload, indent=2)
+    try:
+        s3_client.put_object(
+            Bucket=bucket, Key=live_key, Body=body, ContentType="application/json",
+        )
+        logger.info(
+            "Cutover: wrote live config to s3://%s/%s (assembler=sole writer)",
+            bucket, live_key,
+        )
+    except Exception as e:
+        logger.error(
+            "Cutover: CRITICAL failure writing live key s3://%s/%s: %s",
+            bucket, live_key, e,
+        )
+        return f"cutover_failed: live write — {e}"
+
+    # 3. Mirror to dated history (matches legacy convention).
+    try:
+        s3_client.put_object(
+            Bucket=bucket, Key=history_key, Body=body, ContentType="application/json",
+        )
+        logger.info("Cutover: wrote dated history s3://%s/%s", bucket, history_key)
+    except Exception as e:
+        logger.warning(
+            "Cutover: failed to write dated history s3://%s/%s: %s "
+            "(non-fatal — live write succeeded)", bucket, history_key, e,
+        )
+
+    return f"cutover_applied: live={live_key}, previous_snapshot={previous_key}"
 
 
 def _write_assembled_audit(

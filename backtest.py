@@ -3337,6 +3337,15 @@ def _init_pipeline(args: argparse.Namespace, config: dict) -> None:
     """
     executor_optimizer.init_config(config)
 
+    # Set the assembler-cutover flag from config — when true, executor
+    # optimizer's apply() skips its legacy live-key writes (the assembler
+    # in evaluate.py becomes the sole writer of config/executor_params.json).
+    # Default false; flip via alpha-engine-config under the `assembler:` section.
+    from optimizer.assembler import set_cutover_enabled as _set_cutover_enabled
+    _set_cutover_enabled(
+        config.get("assembler", {}).get("cutover_enabled", False),
+    )
+
     if args.db:
         config["research_db"] = args.db
         logger.info("Using local research.db: %s", args.db)
