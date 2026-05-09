@@ -21,6 +21,7 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 S3_PARAMS_KEY = "config/predictor_params.json"
+S3_SHADOW_PREFIX = "config/predictor_params_shadow_history"
 
 # ── Fallback defaults (override via veto_analysis section in config.yaml) ──
 _CONFIDENCE_THRESHOLDS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
@@ -29,6 +30,7 @@ _MIN_PREDICTIONS = 30
 _MIN_VETO_DECISIONS = 10
 _MIN_THRESHOLD_CHANGE = 0.10
 _COST_PENALTY_WEIGHT = 0.30
+_MIN_LIFT_OVER_BASE_RATE = 0.05  # 5pp lift gate (legacy + skill modes)
 
 # Module-level config ref — set by init_config() from backtest.py
 _cfg: dict = {}
@@ -356,19 +358,39 @@ def _select_best_threshold(
             ),
         }
 
-    max_missed = max(abs(t["missed_alpha"]) for t in scoreable) or 1.0
-    for t in scoreable:
-        cost_penalty = cost_weight * (abs(t["missed_alpha"]) / max_missed)
-        t["_score"] = t["precision"] - cost_penalty
+    # Ranking: legacy (precision − cost_penalty × |missed_alpha|) vs
+    # skill-composite (F1 with confidence-bounded lift gate). Mirrors the
+    # weight_optimizer + executor_optimizer fit-target switch shipped 2026-05-09.
+    # Per Brian: alpha vs SPY is presentation framing, not an optimizer fit
+    # target — skill-composite ranking drops the `missed_alpha` cost term
+    # and ranks on F1 (precision × recall harmonic mean), which rewards
+    # catching real underperformers without the alpha-axis pollution.
+    use_skill_composite = bool(_cfg.get("use_skill_composite_target", False))
 
-    best = max(scoreable, key=lambda t: t["_score"])
+    if use_skill_composite:
+        # F1 may be None when recall is undefined (no actual underperformers
+        # in the corpus yet) — fall back to precision in that case.
+        for t in scoreable:
+            t["_score"] = t.get("f1") if t.get("f1") is not None else t["precision"]
+        best = max(scoreable, key=lambda t: t["_score"])
+        fit_target = "skill_composite"
+    else:
+        max_missed = max(abs(t["missed_alpha"]) for t in scoreable) or 1.0
+        for t in scoreable:
+            cost_penalty = cost_weight * (abs(t["missed_alpha"]) / max_missed)
+            t["_score"] = t["precision"] - cost_penalty
+        best = max(scoreable, key=lambda t: t["_score"])
+        fit_target = "precision_minus_alpha_cost_legacy"
+
     recommended = best["confidence"]
 
     # Insufficient lift gate: if best lift < 5pp, don't recommend
     best_lift = best.get("lift", 0.0)
-    if best_lift is not None and best_lift < 0.05:
+    min_lift = _cfg.get("min_lift_over_base_rate", _MIN_LIFT_OVER_BASE_RATE)
+    if best_lift is not None and best_lift < min_lift:
         return {
             "status": "insufficient_lift",
+            "fit_target": fit_target,
             "current_threshold": current_default,
             "base_rate": round(base_rate, 4),
             "n_down_predictions": n_down,
@@ -377,26 +399,62 @@ def _select_best_threshold(
             "recommended_threshold": recommended,
             "recommendation_reason": (
                 f"Best threshold {recommended:.2f} has precision {best['precision']:.1%} "
-                f"but lift over base rate is only {best_lift:.1%} (need 5%+). "
-                f"Base rate: {base_rate:.1%}."
+                f"but lift over base rate is only {best_lift:.1%} "
+                f"(need {min_lift:.0%}+). Base rate: {base_rate:.1%}."
             ),
         }
 
-    # Cost sensitivity analysis: sweep cost_weight values
-    cost_sensitivity_weights = [0.15, 0.30, 0.50, 0.70]
-    cost_sensitivity_results = {}
-    for cw in cost_sensitivity_weights:
-        for t in scoreable:
-            cp = cw * (abs(t["missed_alpha"]) / max_missed)
-            t[f"_score_{cw}"] = t["precision"] - cp
-        cw_best = max(scoreable, key=lambda t: t[f"_score_{cw}"])
-        cost_sensitivity_results[str(cw)] = cw_best["confidence"]
+    # DSR-style confidence-bounded lift gate (skill-composite mode only).
+    # Workstream D bullet 3 of evaluator-revamp-260506.md: don't promote a
+    # threshold whose precision lift is statistically indistinguishable from
+    # zero. Implemented as: precision_ci_95 lower bound must beat base_rate.
+    # This gate fires AFTER the point-estimate lift gate above.
+    if use_skill_composite:
+        ci_lower = None
+        ci = best.get("precision_ci_95")
+        if isinstance(ci, (list, tuple)) and len(ci) >= 2:
+            ci_lower = ci[0]
+        if ci_lower is not None and ci_lower <= base_rate:
+            return {
+                "status": "insufficient_confidence",
+                "fit_target": fit_target,
+                "current_threshold": current_default,
+                "base_rate": round(base_rate, 4),
+                "n_down_predictions": n_down,
+                "n_predictions_loaded": n_preds_loaded,
+                "thresholds": threshold_results,
+                "recommended_threshold": recommended,
+                "recommendation_reason": (
+                    f"Best threshold {recommended:.2f} has precision {best['precision']:.1%} "
+                    f"with 95% CI lower bound {ci_lower:.1%} which does not exceed "
+                    f"base rate {base_rate:.1%} — lift is statistically indistinguishable "
+                    f"from zero. Need more vetoes for confidence-bounded promotion."
+                ),
+            }
 
-    unique_thresholds = set(cost_sensitivity_results.values())
-    cost_sensitivity = "high" if len(unique_thresholds) > 2 else "low" if len(unique_thresholds) == 1 else "moderate"
+    # Cost sensitivity analysis: sweep cost_weight values. Legacy-only —
+    # under skill_composite mode the cost penalty isn't part of the
+    # ranking, so the sensitivity table is meaningless.
+    cost_sensitivity_results: dict = {}
+    cost_sensitivity = "n/a (skill_composite mode)"
+    if not use_skill_composite:
+        cost_sensitivity_weights = [0.15, 0.30, 0.50, 0.70]
+        for cw in cost_sensitivity_weights:
+            for t in scoreable:
+                cp = cw * (abs(t["missed_alpha"]) / max_missed)
+                t[f"_score_{cw}"] = t["precision"] - cp
+            cw_best = max(scoreable, key=lambda t: t[f"_score_{cw}"])
+            cost_sensitivity_results[str(cw)] = cw_best["confidence"]
+        unique_thresholds = set(cost_sensitivity_results.values())
+        cost_sensitivity = (
+            "high" if len(unique_thresholds) > 2
+            else "low" if len(unique_thresholds) == 1
+            else "moderate"
+        )
 
     return {
         "status": "ok",
+        "fit_target": fit_target,
         "current_threshold": current_default,
         "base_rate": round(base_rate, 4),
         "n_down_predictions": n_down,
@@ -407,7 +465,8 @@ def _select_best_threshold(
             f"Confidence {recommended:.2f}: precision {best['precision']:.1%} "
             f"(lift +{best_lift:.1%} over {base_rate:.1%} base rate) "
             f"with {best['missed_alpha']:.4f} missed alpha "
-            f"({best['n_vetoes']} vetoes, {best['true_negatives']} correct)"
+            f"({best['n_vetoes']} vetoes, {best['true_negatives']} correct) "
+            f"[fit_target={fit_target}]"
         ),
         "cost_sensitivity": cost_sensitivity,
         "cost_sensitivity_details": cost_sensitivity_results,
@@ -435,8 +494,21 @@ def apply(result: dict, bucket: str) -> dict:
     """
     Write recommended veto threshold to S3 if guardrails pass.
 
-    Writes to s3://{bucket}/config/predictor_params.json and archives
-    to config/predictor_params_history/{date}.json.
+    Two write paths, mirroring the executor_optimizer cutover pattern:
+
+    - **Production** (default and any time ``fit_target`` is the legacy
+      ranking, OR ``enforce_skill_composite`` is true under skill mode):
+      writes to ``config/predictor_params.json`` (live) +
+      ``config/predictor_params_history/{date}.json`` (audit).
+    - **Shadow** (skill ranking computed but ``enforce_skill_composite``
+      is false): writes to
+      ``config/predictor_params_shadow_history/{date}.json`` only —
+      live config is unchanged. Lets the skill_composite ranking
+      validate against a few Sat SF cycles before becoming authoritative.
+
+    Returns ``{"applied": True, ...}`` on production write,
+    ``{"applied": False, "reason": ..., "shadow_key": ...}`` on shadow
+    write or guardrail rejection.
     """
     if result.get("status") != "ok":
         return {"applied": False, "reason": f"status={result.get('status')}"}
@@ -461,8 +533,13 @@ def apply(result: dict, bucket: str) -> dict:
             ),
         }
 
+    fit_target = result.get("fit_target", "precision_minus_alpha_cost_legacy")
+    enforce_skill_composite = bool(_cfg.get("enforce_skill_composite", False))
+    shadow_only = fit_target == "skill_composite" and not enforce_skill_composite
+
     payload = {
         "veto_confidence": recommended,
+        "fit_target": fit_target,
         "precision": next(
             (t["precision"] for t in result.get("thresholds", [])
              if t["confidence"] == recommended), None
@@ -475,15 +552,43 @@ def apply(result: dict, bucket: str) -> dict:
         "recommendation_reason": result.get("recommendation_reason"),
     }
 
-    from optimizer.rollback import save_previous
-    save_previous(bucket, "predictor_params")
-
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
 
+    if shadow_only:
+        shadow_key = f"{S3_SHADOW_PREFIX}/{date.today().isoformat()}.json"
+        try:
+            s3.put_object(
+                Bucket=bucket, Key=shadow_key, Body=body, ContentType="application/json",
+            )
+            logger.info(
+                "Veto threshold written to shadow archive "
+                "(enforce_skill_composite=False): s3://%s/%s",
+                bucket, shadow_key,
+            )
+        except Exception as e:
+            logger.error("Failed to write veto threshold shadow archive: %s", e)
+            return {"applied": False, "reason": f"shadow S3 write failed: {e}"}
+        return {
+            "applied": False,
+            "reason": (
+                "shadow mode — fit_target=skill_composite, "
+                "enforce_skill_composite=False"
+            ),
+            "shadow_key": shadow_key,
+            "fit_target": fit_target,
+            "veto_confidence": recommended,
+        }
+
+    from optimizer.rollback import save_previous
+    save_previous(bucket, "predictor_params")
+
     try:
         s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
-        logger.info("Predictor veto threshold updated in S3: %s", recommended)
+        logger.info(
+            "Predictor veto threshold updated in S3: %s (fit_target=%s)",
+            recommended, fit_target,
+        )
     except Exception as e:
         logger.error("CRITICAL: Failed to write predictor params to S3: %s", e)
         return {"applied": False, "reason": f"S3 write failed: {e}"}
@@ -497,6 +602,7 @@ def apply(result: dict, bucket: str) -> dict:
 
     return {
         "applied": True,
+        "fit_target": fit_target,
         "veto_confidence": recommended,
         "previous": current,
     }
