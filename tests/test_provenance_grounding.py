@@ -166,18 +166,31 @@ class TestAgentMetrics:
 
 
 class TestToolEquippedAgents:
-    def test_includes_macro_and_all_sectors(self):
+    def test_includes_macro_and_all_sector_quant_qual(self):
+        """sector_quant + sector_qual are the tool-bearing sub-stages.
+        sector_peer_review is a synthesizer (no fetch tools)."""
         assert "macro_economist" in TOOL_EQUIPPED_AGENTS
         for sector in ("consumer", "defensives", "financials",
                        "healthcare", "industrials", "technology"):
-            assert f"sector_team:{sector}" in TOOL_EQUIPPED_AGENTS
+            assert f"sector_quant:{sector}" in TOOL_EQUIPPED_AGENTS
+            assert f"sector_qual:{sector}" in TOOL_EQUIPPED_AGENTS
+            # peer_review is a synthesizer — excluded from the alarm.
+            assert f"sector_peer_review:{sector}" not in TOOL_EQUIPPED_AGENTS
 
     def test_excludes_synthesizers(self):
         # CIO + peer_review are synthesizers — legitimate zero-call agents
         assert "ic_cio" not in TOOL_EQUIPPED_AGENTS
+        for sector in ("consumer", "defensives", "financials",
+                       "healthcare", "industrials", "technology"):
+            assert f"sector_peer_review:{sector}" not in TOOL_EQUIPPED_AGENTS
 
-    def test_canonical_set_is_8(self):
-        assert len(CANONICAL_AGENTS) == 8
+    def test_tool_equipped_size_is_13(self):
+        # 1 macro + 6 sector_quant + 6 sector_qual = 13
+        assert len(TOOL_EQUIPPED_AGENTS) == 13
+
+    def test_canonical_set_is_20(self):
+        # 1 macro + 1 ic_cio + 6 sectors × 3 sub-stages = 20
+        assert len(CANONICAL_AGENTS) == 20
 
 
 # ── compute_provenance_grounding (top-level) ────────────────────────────────
@@ -224,21 +237,20 @@ class TestComputeProvenanceGrounding:
         assert result["status"] == "error"
 
     def test_basic_compute_one_saturday(self):
-        # Sat 2026-05-09 with 1 ic_cio + 1 sector_team:technology artifact
+        # Sat 2026-05-09 with 1 ic_cio + 1 sector_quant:technology artifact
+        # (the per-stage write site)
         artifacts = {
             "decision_artifacts/2026/05/09/ic_cio/run1.json": {
                 "agent_output": {"team_id": "cio"},
                 "input_data_snapshot": {"candidates": []},
             },
-            "decision_artifacts/2026/05/09/sector_team:technology/run1.json": {
+            "decision_artifacts/2026/05/09/sector_quant:technology/run1.json": {
                 "agent_output": {
                     "team_id": "technology",
-                    "quant_output": {
-                        "tool_calls": [
-                            {"tool": "screen_by_volume"},
-                            {"tool": "fetch_news"},
-                        ]
-                    },
+                    "tool_calls": [
+                        {"tool": "screen_by_volume"},
+                        {"tool": "fetch_news"},
+                    ],
                 },
                 "input_data_snapshot": {"team_id": "technology", "market_regime": "bull"},
             },
@@ -255,14 +267,48 @@ class TestComputeProvenanceGrounding:
         assert result["n_total_artifacts_read"] == 2
         # ic_cio = synthesizer, no tools, NOT in tool_equipped → not alarmed
         assert "ic_cio" not in result["tool_equipped_alarms"]
-        # sector_team:technology made 2 tool calls → not alarmed either
-        assert "sector_team:technology" not in result["tool_equipped_alarms"]
+        # sector_quant:technology made 2 tool calls → not alarmed either
+        assert "sector_quant:technology" not in result["tool_equipped_alarms"]
 
-        tech = result["per_agent"]["sector_team:technology"]
+        tech = result["per_agent"]["sector_quant:technology"]
         assert tech["n_artifacts"] == 1
         assert tech["mean_n_tool_calls"] == 2.0
         assert tech["mean_n_distinct_tools"] == 2.0
         assert tech["pct_zero_call_outputs"] == 0.0
+
+    def test_zero_call_alarm_fires_on_sector_quant(self):
+        """A sector_quant:{sector} artifact with zero tool calls is a
+        hallucination signal — it must trigger the tool-equipped alarm."""
+        artifacts = {
+            "decision_artifacts/2026/05/09/sector_quant:financials/run.json": {
+                "agent_output": {"team_id": "financials"},  # no tool_calls
+                "input_data_snapshot": {"team_id": "financials"},
+            },
+        }
+        s3 = _mock_s3_with_artifacts(artifacts)
+        result = compute_provenance_grounding(
+            bucket="test-bucket", run_date="2026-05-10",
+            lookback_weeks=1, s3_client=s3,
+        )
+        assert result["status"] == "ok"
+        assert "sector_quant:financials" in result["tool_equipped_alarms"]
+
+    def test_peer_review_zero_calls_does_not_alarm(self):
+        """sector_peer_review:* is a synthesizer — zero tool calls is
+        the expected steady state, NOT an alarm."""
+        artifacts = {
+            "decision_artifacts/2026/05/09/sector_peer_review:technology/run.json": {
+                "agent_output": {"team_id": "technology"},  # no tool_calls
+                "input_data_snapshot": {"team_id": "technology"},
+            },
+        }
+        s3 = _mock_s3_with_artifacts(artifacts)
+        result = compute_provenance_grounding(
+            bucket="test-bucket", run_date="2026-05-10",
+            lookback_weeks=1, s3_client=s3,
+        )
+        assert result["status"] == "ok"
+        assert "sector_peer_review:technology" not in result["tool_equipped_alarms"]
 
     def test_tool_equipped_alarm_fires_on_zero_calls(self):
         # macro_economist with zero tool calls → alarm
@@ -285,15 +331,15 @@ class TestComputeProvenanceGrounding:
     def test_meta_prefixes_excluded(self):
         # _eval/, _replay/, etc. should not be counted as agent artifacts
         artifacts = {
-            "decision_artifacts/2026/05/09/sector_team:tech/run1.json": {
+            "decision_artifacts/2026/05/09/sector_quant:technology/run1.json": {
                 "agent_output": {"tool_calls": [{"tool": "x"}]},
                 "input_data_snapshot": {},
             },
-            "decision_artifacts/2026/05/09/_eval/sector_team:tech/run1.json": {
+            "decision_artifacts/2026/05/09/_eval/sector_quant:technology/run1.json": {
                 "agent_output": {},
                 "input_data_snapshot": {},
             },
-            "decision_artifacts/2026/05/09/_replay/sector_team:tech/run1.json": {
+            "decision_artifacts/2026/05/09/_replay/sector_quant:technology/run1.json": {
                 "agent_output": {},
                 "input_data_snapshot": {},
             },
@@ -304,7 +350,7 @@ class TestComputeProvenanceGrounding:
             lookback_weeks=1, s3_client=s3,
         )
         assert result["n_total_artifacts_read"] == 1
-        assert list(result["per_agent"].keys()) == ["sector_team:tech"]
+        assert list(result["per_agent"].keys()) == ["sector_quant:technology"]
 
     def test_thesis_update_excluded_from_canonical(self):
         # thesis_update:* is variable-cardinality, excluded from per_agent
@@ -328,14 +374,12 @@ class TestComputeProvenanceGrounding:
 
     def test_cw_metrics_emitted_for_most_recent_saturday(self):
         artifacts = {
-            "decision_artifacts/2026/05/09/sector_team:technology/run.json": {
+            "decision_artifacts/2026/05/09/sector_quant:technology/run.json": {
                 "agent_output": {
-                    "quant_output": {
-                        "tool_calls": [
-                            {"tool": "screen_by_volume"},
-                            {"tool": "fetch_news"},
-                        ]
-                    }
+                    "tool_calls": [
+                        {"tool": "screen_by_volume"},
+                        {"tool": "fetch_news"},
+                    ],
                 },
                 "input_data_snapshot": {"team_id": "technology"},
             },
@@ -367,10 +411,10 @@ class TestComputeProvenanceGrounding:
             "n_artifacts",
         }
 
-        # Every datapoint dim'd by judged_agent_id = sector_team:technology
+        # Every datapoint dim'd by judged_agent_id = sector_quant:technology
         assert all(
             m["Dimensions"][0]["Name"] == "judged_agent_id"
-            and m["Dimensions"][0]["Value"] == "sector_team:technology"
+            and m["Dimensions"][0]["Value"] == "sector_quant:technology"
             for m in all_metrics
         )
 
@@ -440,14 +484,14 @@ class TestComputeProvenanceGrounding:
         assert "macro_economist" in result["per_agent"]
 
     def test_rolling_aggregate_per_agent(self):
-        # Multiple Saturdays with sector_team:tech captures
+        # Multiple Saturdays with sector_quant:tech captures
         artifacts = {}
         for date_str in ("2026/04/25", "2026/05/02", "2026/05/09"):
             artifacts[
-                f"decision_artifacts/{date_str}/sector_team:technology/run.json"
+                f"decision_artifacts/{date_str}/sector_quant:technology/run.json"
             ] = {
                 "agent_output": {
-                    "quant_output": {"tool_calls": [{"tool": "x"}, {"tool": "y"}]}
+                    "tool_calls": [{"tool": "x"}, {"tool": "y"}],
                 },
                 "input_data_snapshot": {"team_id": "technology"},
             }
@@ -456,7 +500,7 @@ class TestComputeProvenanceGrounding:
             bucket="test-bucket", run_date="2026-05-10",
             lookback_weeks=4, s3_client=s3,
         )
-        rolling_tech = result["rolling"]["per_agent"]["sector_team:technology"]
+        rolling_tech = result["rolling"]["per_agent"]["sector_quant:technology"]
         assert rolling_tech["n_saturdays"] == 3
         assert rolling_tech["n_artifacts_total"] == 3
         assert rolling_tech["n_distinct_tools"] == 2
