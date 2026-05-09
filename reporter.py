@@ -637,21 +637,35 @@ def build_report(
     )
     lines += [""]
 
-    # Signal quality summary
-    lines += _section_signal_quality(signal_quality)
-    lines += [""]
+    # Signal quality + dependent sections (Score threshold / Regime /
+    # Sub-score attribution) all derive from research_db. When the
+    # caller signals signal_quality.status == "skipped" — typically
+    # because backtest.py's simulation email path doesn't load
+    # research.db (that's evaluator territory) — suppress all four
+    # sections rather than render misleading n=0 tables / "Deferred
+    # until Week 4+" placeholders that imply data shortage when really
+    # this email kind doesn't compute them. Closes Items D + L1907 of
+    # the 2026-05-09 P2 ROADMAP entry.
+    sq_skipped = (
+        isinstance(signal_quality, dict)
+        and signal_quality.get("status") == "skipped"
+    )
+    if not sq_skipped:
+        # Signal quality summary
+        lines += _section_signal_quality(signal_quality)
+        lines += [""]
 
-    # Score threshold analysis
-    lines += _section_score_analysis(score_analysis)
-    lines += [""]
+        # Score threshold analysis
+        lines += _section_score_analysis(score_analysis)
+        lines += [""]
 
-    # Regime breakdown
-    lines += _section_regime(regime_analysis)
-    lines += [""]
+        # Regime breakdown
+        lines += _section_regime(regime_analysis)
+        lines += [""]
 
-    # Attribution
-    lines += _section_attribution(attribution)
-    lines += [""]
+        # Attribution
+        lines += _section_attribution(attribution)
+        lines += [""]
 
     # Alpha magnitude distribution
     if alpha_dist and alpha_dist.get("status") == "ok":
@@ -1339,7 +1353,7 @@ def _section_confusion_matrix(result: dict) -> list[str]:
 
 def _section_predictor_backtest(stats: dict) -> list[str]:
     """Build report section for predictor-only backtest results."""
-    lines = ["## Predictor-Only Backtest (2y historical)"]
+    lines = ["## Layer-1A Momentum-Only Synthetic Backtest (10y component sanity check)"]
     status = stats.get("status", "unknown")
 
     if status in ("insufficient_data", "error"):
@@ -1357,6 +1371,14 @@ def _section_predictor_backtest(stats: dict) -> list[str]:
 
     meta = stats.get("predictor_metadata", {})
     lines += [
+        "",
+        "> **Component-level sanity check** — measures the Layer-1A momentum GBM "
+        "in isolation; **not the production v3 ensemble** (which combines momentum "
+        "+ volatility + research-score calibrator via a Layer-2 Ridge meta-learner "
+        "that already downweights momentum to ~0). Production ensemble performance "
+        "lives in `Mode 2 — Portfolio simulation` above and the live trades.db "
+        "EOD email — interpret figures here as diagnosing the momentum component, "
+        "not the system.",
         "",
         f"_GBM-only signals (no LLM research component). "
         f"{meta.get('n_tickers', 'N/A')} tickers, "
@@ -1387,24 +1409,48 @@ def _section_predictor_backtest(stats: dict) -> list[str]:
 
 def _section_param_sweep_predictor(df) -> list[str]:
     """Build report section for predictor-only param sweep results."""
-    lines = ["## Predictor param sweep — top combinations by total alpha", ""]
-    param_cols = [c for c in df.columns if c not in [
-        "total_return", "total_alpha", "spy_return", "sharpe_ratio", "max_drawdown",
-        "calmar_ratio", "total_trades", "win_rate", "status", "dates_simulated",
-        "total_orders", "note", "error",
-    ]]
-    stat_cols = [c for c in ["total_alpha", "sharpe_ratio", "total_return", "spy_return", "max_drawdown", "win_rate"] if c in df.columns]
+    # All known non-parameter columns. Includes the evaluator-revamp
+    # additions (sortino_ratio, cvar_95, calmar_ratio) so they don't
+    # leak into param_cols and confuse the operator about which columns
+    # are tunable params vs derived metrics.
+    NON_PARAM_COLS = {
+        "total_return", "total_alpha", "spy_return", "sharpe_ratio",
+        "sortino_ratio", "cvar_95", "calmar_ratio",
+        "max_drawdown", "total_trades", "win_rate",
+        "status", "dates_simulated", "total_orders", "note", "error",
+    }
+    param_cols = [c for c in df.columns if c not in NON_PARAM_COLS]
+
+    # Render the most-informative stat columns alongside params, in a fixed
+    # order. ``total_alpha`` first (presentation), Sortino + CVaR second
+    # (skilled-risk-taking metric stack from the 2026-05-06 evaluator
+    # revamp), then Sharpe + return + drawdown + win rate.
+    PREFERRED_STAT_ORDER = [
+        "total_alpha", "sortino_ratio", "cvar_95",
+        "sharpe_ratio", "total_return", "spy_return", "max_drawdown", "win_rate",
+    ]
+    stat_cols = [c for c in PREFERRED_STAT_ORDER if c in df.columns]
+
+    # Header is honest about the rendered ranking. Sweep is sorted by
+    # total_alpha (primary) per ``param_sweep.py::_run_combos``; surface
+    # that explicitly so "by total alpha" doesn't read as misleading
+    # when the alpha column is suppressed for narrowness.
+    sort_label = "total_alpha" if "total_alpha" in df.columns else "sharpe_ratio"
+    lines = [f"## Predictor param sweep — top combinations (sorted by {sort_label})", ""]
+
     show_cols = param_cols + stat_cols
     header = "| " + " | ".join(show_cols) + " |"
     sep    = "| " + " | ".join("---" for _ in show_cols) + " |"
     lines += [header, sep]
+    PCT_COLS = {"total_return", "total_alpha", "spy_return", "max_drawdown", "win_rate"}
+    FMT_COLS = {"sharpe_ratio", "sortino_ratio", "cvar_95", "calmar_ratio"}
     for _, row in df.head(10).iterrows():
         cells = []
         for c in show_cols:
             v = row.get(c)
-            if c in ("total_return", "total_alpha", "spy_return", "max_drawdown", "win_rate"):
+            if c in PCT_COLS:
                 cells.append(_pct(v))
-            elif c in ("sharpe_ratio",):
+            elif c in FMT_COLS:
                 cells.append(_fmt(v))
             else:
                 cells.append(str(v) if v is not None else "—")
@@ -1579,9 +1625,20 @@ def _section_executor_recommendations(result: dict) -> list[str]:
     if baseline_rank is not None:
         baseline_note = f" Baseline: combo #{baseline_rank} of {n_combos} (closest to current S3 params)."
 
+    # Render only params the sweep actually exercised — params without
+    # baseline AND recommended values are absent from this run's grid;
+    # showing them as `—`/`—`/`—` rows pollutes the table with
+    # uninformative entries (operator already knows the factory default
+    # via the SAFE_PARAMS source). Matches the "drop unswept rows"
+    # cleanup from the 2026-05-09 P2 ROADMAP entry.
+    swept_keys = sorted(set(list(baseline.keys()) + list(recommended.keys())))
+    n_factory = len(factory)
+    n_swept = len(swept_keys)
+
     lines += [
         "",
-        f"_Tested {n_combos} parameter combinations. "
+        f"_Tested {n_combos} parameter combinations across {n_swept} of "
+        f"{n_factory} safe-to-tune params. "
         f"Sharpe improvement: {improvement:.1%} "
         f"({result.get('baseline_sharpe', 0):.4f} → {result.get('best_sharpe', 0):.4f})"
         f"{alpha_str}.{baseline_note}_",
@@ -1589,8 +1646,7 @@ def _section_executor_recommendations(result: dict) -> list[str]:
         "| Parameter | Default | Current (S3) | Recommended | Drift from default |",
         "|-----------|---------|--------------|-------------|-------------------|",
     ]
-    all_keys = sorted(set(list(baseline.keys()) + list(recommended.keys()) + list(factory.keys())))
-    for k in all_keys:
+    for k in swept_keys:
         d = factory.get(k)
         b = baseline.get(k)
         r = recommended.get(k)
@@ -1603,6 +1659,18 @@ def _section_executor_recommendations(result: dict) -> list[str]:
         else:
             drift_str = "—"
         lines.append(f"| {k} | {d_str} | {b_str} | {r_str} | {drift_str} |")
+
+    # Footer: name the params that were NOT in this sweep grid so the
+    # operator can see what's intentionally untouched vs accidentally
+    # absent. Empty list when the grid covers everything.
+    unswept = sorted(set(factory.keys()) - set(swept_keys))
+    if unswept:
+        lines += [
+            "",
+            f"> **Not in sweep grid** ({len(unswept)} of {n_factory}): "
+            f"{', '.join(f'`{k}`' for k in unswept)}. "
+            "Operator-tunable via `analysis/param_sweep.py` grid.",
+        ]
 
     lines += ["", f"> {result.get('note', '')}"]
 
