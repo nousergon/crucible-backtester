@@ -248,8 +248,10 @@ def sweep(
             seed (int, optional).
 
     Returns:
-        DataFrame with one row per parameter combination, sorted by sharpe_ratio.
-        Sweep metadata stored in df.attrs for reporting.
+        DataFrame with one row per parameter combination, sorted by
+        ``total_alpha`` (primary) with ``sharpe_ratio`` as tiebreaker
+        (per the sort applied by ``_run_combos``). Sweep metadata stored
+        in df.attrs for reporting.
     """
     settings = sweep_settings or {}
     mode = settings.get("mode", _DEFAULT_SWEEP_MODE)

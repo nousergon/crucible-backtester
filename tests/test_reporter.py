@@ -1,4 +1,5 @@
 """Unit tests for reporter.py — pipeline health section and report structure."""
+import pandas as pd
 import pytest
 
 from reporter import _section_pipeline_health, build_report
@@ -139,6 +140,197 @@ class TestBuildReport:
         )
         assert isinstance(md, str)
         assert len(md) > 50
+
+
+class TestReporterCleanupBundle:
+    """Closes the 4 reporter-side items from the 2026-05-09 P2 ROADMAP entry
+    + the related L1907 / L1913 entries:
+
+    - L1907: Mode 1 / Score threshold / Regime / Sub-score attribution
+      sections suppressed entirely when signal_quality.status == "skipped"
+      (the simulation email path; research_db isn't loaded there).
+    - L1913: predictor-only backtest header renamed from
+      \"(2y historical)\" → \"Layer-1A Momentum-Only Synthetic Backtest
+      (10y component sanity check)\" + disclaimer block.
+    - Item B: executor-recommendations table drops rows for params not in
+      the sweep grid; footer names them explicitly.
+    - Item C: predictor param sweep header is honest about sort axis;
+      sortino_ratio + cvar_95 + calmar_ratio rendered as stat columns,
+      not param columns.
+    """
+
+    def test_skipped_signal_quality_suppresses_4_sections(self):
+        md = build_report(
+            run_date="2026-05-09",
+            signal_quality={"status": "skipped"},
+            regime_analysis=[],
+            score_analysis=[],
+            attribution={"status": "skipped"},
+        )
+        # All 4 derived sections suppressed — no headers anywhere.
+        assert "## Mode 1" not in md
+        assert "## Score threshold analysis" not in md
+        assert "## Regime analysis" not in md
+        assert "## Sub-score attribution" not in md
+        # Headline still present (other sections still render).
+        assert "# Alpha Engine Backtest Report" in md
+
+    def test_ok_signal_quality_keeps_sections(self):
+        md = build_report(
+            run_date="2026-05-09",
+            signal_quality={
+                "status": "ok",
+                "overall": {"accuracy_10d": 0.62, "n_10d": 80},
+            },
+            regime_analysis=[],
+            score_analysis=[],
+            attribution={"status": "ok"},
+        )
+        assert "## Mode 1" in md
+        # Score / Regime / Sub-score render (with their own deferred-fallback
+        # bodies for empty rows lists — that's existing behavior).
+        assert "## Score threshold analysis" in md
+        assert "## Regime analysis" in md
+        assert "## Sub-score attribution" in md
+
+    def test_predictor_backtest_header_renamed_with_disclaimer(self):
+        md = build_report(
+            run_date="2026-05-09",
+            signal_quality={"status": "skipped"},
+            regime_analysis=[],
+            score_analysis=[],
+            attribution={"status": "skipped"},
+            predictor_stats={
+                "status": "ok",
+                "total_alpha": -3.085,
+                "total_return": 0.053,
+                "spy_return": 3.137,
+                "sharpe_ratio": 0.191,
+                "predictor_metadata": {
+                    "n_tickers": 904,
+                    "n_dates": 2500,
+                    "date_range_start": "2016-05-31",
+                    "date_range_end": "2026-05-08",
+                    "top_n_per_day": 20,
+                    "min_score": 70,
+                },
+            },
+        )
+        # Header renamed.
+        assert "Layer-1A Momentum-Only Synthetic Backtest" in md
+        assert "10y component sanity check" in md
+        assert "(2y historical)" not in md
+        # Disclaimer block present.
+        assert "Component-level sanity check" in md
+        assert "not the production v3 ensemble" in md
+
+    def test_executor_recommendations_drop_unswept_rows(self):
+        from reporter import _section_executor_recommendations
+        # Sweep covered 5 of 16 params; baseline + recommended only have
+        # those 5 keys; factory has all 16.
+        result = {
+            "status": "ok",
+            "n_combos_tested": 60,
+            "improvement_pct": 0.063,
+            "baseline_sharpe": 0.6439,
+            "best_sharpe": 0.6842,
+            "best_alpha": -2.5881,
+            "baseline_combo_rank": 2,
+            "factory_defaults": {
+                "atr_multiplier": 2.5, "min_score": 70, "max_position_pct": 0.05,
+                "time_decay_reduce_days": 7, "time_decay_exit_days": 14,
+                # The "—" rows from today's email — present in factory, NOT in sweep:
+                "atr_sizing_target_risk": 0.02,
+                "confidence_sizing_min": 0.70,
+                "confidence_sizing_range": 0.60,
+                "correlation_block_threshold": 0.80,
+                "earnings_proximity_days": 5,
+                "earnings_sizing_reduction": 0.50,
+                "momentum_exit_threshold": -15.0,
+                "momentum_gate_threshold": -5.0,
+                "profit_take_pct": 0.25,
+                "reduce_fraction": 0.50,
+                "staleness_decay_per_day": 0.03,
+            },
+            "baseline_params": {
+                "atr_multiplier": 2.0, "min_score": 75, "max_position_pct": 0.10,
+                "time_decay_reduce_days": 7, "time_decay_exit_days": 10,
+            },
+            "recommended_params": {
+                "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+                "time_decay_reduce_days": 7, "time_decay_exit_days": 15,
+            },
+            "apply_result": {"applied": True},
+        }
+        md = "\n".join(_section_executor_recommendations(result))
+
+        # Swept params render as rows.
+        assert "atr_multiplier" in md
+        assert "time_decay_exit_days" in md
+        # Unswept params are NOT rendered as rows (no `—`/`—`/`—` clutter).
+        # They WILL appear in the footer's "Not in sweep grid" list — assert
+        # the row count is restricted, not full key presence.
+        row_lines = [
+            line for line in md.split("\n")
+            if line.startswith("| atr_") or line.startswith("| confidence_")
+            or line.startswith("| earnings_") or line.startswith("| momentum_")
+            or line.startswith("| profit_") or line.startswith("| reduce_")
+            or line.startswith("| staleness_") or line.startswith("| correlation_")
+        ]
+        # Only atr_multiplier swept among the atr_*; the others appear in footer not rows.
+        swept_row_lines = [r for r in row_lines if "| atr_multiplier |" in r]
+        assert len(swept_row_lines) == 1
+        unswept_row_lines = [
+            r for r in row_lines
+            if "| atr_sizing_target_risk |" in r
+            or "| confidence_sizing_min |" in r
+            or "| earnings_proximity_days |" in r
+        ]
+        assert len(unswept_row_lines) == 0
+
+        # Header reflects coverage: "5 of 16".
+        assert "5 of 16" in md
+        # Footer names the unswept set.
+        assert "Not in sweep grid" in md
+        assert "atr_sizing_target_risk" in md
+        assert "confidence_sizing_min" in md
+
+    def test_predictor_param_sweep_renders_sortino_cvar_as_stats_not_params(self):
+        from reporter import _section_param_sweep_predictor
+        df = pd.DataFrame([
+            {
+                "min_score": 75, "max_position_pct": 0.10,
+                "atr_multiplier": 3.0, "time_decay_exit_days": 15,
+                "total_alpha": -2.58,    # presentation column
+                "sortino_ratio": 0.97,   # skill-aligned (PR #141 evaluator-revamp)
+                "cvar_95": -0.0105,
+                "sharpe_ratio": 0.68,
+            },
+            {
+                "min_score": 75, "max_position_pct": 0.10,
+                "atr_multiplier": 2.0, "time_decay_exit_days": 10,
+                "total_alpha": -2.59,
+                "sortino_ratio": 0.92,
+                "cvar_95": -0.0104,
+                "sharpe_ratio": 0.69,
+            },
+        ])
+        md = "\n".join(_section_param_sweep_predictor(df))
+        # Header names the sort axis explicitly (not just "by total alpha").
+        assert "sorted by total_alpha" in md
+        # Header column row contains stat columns in the preferred order.
+        # sortino_ratio + cvar_95 must NOT be in param_cols position.
+        header_row = next(
+            line for line in md.split("\n") if line.startswith("| min_score")
+        )
+        # Param cols come first; stat cols after. total_alpha position is
+        # past time_decay_exit_days but before sortino_ratio.
+        params_end = header_row.index("time_decay_exit_days")
+        alpha_pos = header_row.index("total_alpha")
+        sortino_pos = header_row.index("sortino_ratio")
+        cvar_pos = header_row.index("cvar_95")
+        # Stats appear after the last param column, in the documented order.
+        assert params_end < alpha_pos < sortino_pos < cvar_pos
 
 
 class TestOptimizerStatusFiltering:
