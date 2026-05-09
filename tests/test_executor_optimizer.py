@@ -10,6 +10,7 @@ Two ranking paths are tested:
 
 Production-vs-shadow promotion paths are also tested via mocked S3.
 """
+import json
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -20,6 +21,7 @@ from optimizer.executor_optimizer import (
     S3_SHADOW_PREFIX,
     apply,
     init_config,
+    produce_artifact,
     recommend,
 )
 
@@ -315,3 +317,189 @@ class TestApplyShadowVsProduction:
         assert body["fit_target"] == "skill_composite"
         assert body["best_alpha"] == 0.30
         assert body["best_sortino"] == 0.95
+
+
+class TestProduceArtifact:
+    """``produce_artifact`` writes the per-optimizer recommendation artifact
+    at ``config/executor_params/recommendations/{date}/from_executor_optimizer.json``.
+    Foundation for the optimizer-artifact-assembler arc — see
+    ``optimizer-artifact-assembler-260509.md``.
+
+    During the dual-write window (PRs 1-3 of the arc), ``apply()`` calls
+    ``produce_artifact`` AND continues to write the legacy live key. After
+    the cutover (PR 4), ``apply()`` will be reduced to ``produce_artifact``
+    only and the assembler becomes the sole writer of the live key.
+    """
+
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_produce_artifact_writes_to_canonical_key(self, mock_boto3):
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        result = {
+            "status": "ok",
+            "fit_target": "skill_composite",
+            "recommended_params": {"atr_multiplier": 3.0, "min_score": 75},
+            "best_sortino": 0.95,
+            "best_alpha": 0.30,
+            "best_sharpe": 0.55,
+            "improvement_pct": 0.10,
+            "n_combos_tested": 60,
+            "note": "test recommendation",
+        }
+        outcome = produce_artifact(result, bucket="test-bucket")
+        assert outcome["written"] is True
+        # Key is config-type prefixed; date is dynamic so we match by suffix.
+        assert outcome["key"].startswith("config/executor_params/recommendations/")
+        assert outcome["key"].endswith("/from_executor_optimizer.json")
+        s3.put_object.assert_called_once()
+
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_produce_artifact_stamps_promotion_intent(self, mock_boto3):
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+
+        # Status ok with apply_result.applied=True → promote
+        produce_artifact({
+            "status": "ok",
+            "apply_result": {"applied": True},
+            "fit_target": "skill_composite",
+            "recommended_params": {},
+        }, bucket="test-bucket")
+        body = json.loads(s3.put_object.call_args.kwargs["Body"])
+        assert body["promotion_intent"] == "promote"
+
+        # Status ok with apply_result.applied=False → shadow
+        produce_artifact({
+            "status": "ok",
+            "apply_result": {"applied": False, "reason": "shadow mode"},
+            "fit_target": "skill_composite",
+            "recommended_params": {},
+        }, bucket="test-bucket")
+        body = json.loads(s3.put_object.call_args.kwargs["Body"])
+        assert body["promotion_intent"] == "shadow"
+
+        # Non-ok status → skip (artifact still written for audit)
+        produce_artifact({
+            "status": "negative_sortino",
+            "fit_target": "skill_composite",
+            "recommended_params": {},
+        }, bucket="test-bucket")
+        body = json.loads(s3.put_object.call_args.kwargs["Body"])
+        assert body["promotion_intent"] == "skip"
+
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_produce_artifact_carries_diagnostics(self, mock_boto3):
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        result = {
+            "status": "ok",
+            "fit_target": "skill_composite",
+            "recommended_params": {"atr_multiplier": 3.0},
+            "best_sortino": 0.95,
+            "best_alpha": 0.30,
+            "best_sharpe": 0.55,
+            "improvement_pct": 0.10,
+            "n_combos_tested": 60,
+        }
+        produce_artifact(result, bucket="test-bucket")
+        body = json.loads(s3.put_object.call_args.kwargs["Body"])
+        assert body["diagnostic"]["best_sortino"] == 0.95
+        assert body["diagnostic"]["best_alpha"] == 0.30
+        assert body["diagnostic"]["improvement_pct"] == 0.10
+        assert body["diagnostic"]["n_combos_tested"] == 60
+        assert body["recommendation_kind"] == "full_replace"
+
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_produce_artifact_swallows_s3_errors_non_fatal(self, mock_boto3):
+        # During dual-write window, artifact write failure must NOT break
+        # the legacy live write path. produce_artifact returns a non-fatal
+        # error dict and logs a warning.
+        s3 = MagicMock()
+        s3.put_object.side_effect = Exception("S3 disconnected")
+        mock_boto3.client.return_value = s3
+        outcome = produce_artifact({
+            "status": "ok",
+            "fit_target": "skill_composite",
+            "recommended_params": {},
+        }, bucket="test-bucket")
+        assert outcome["written"] is False
+        assert "S3 disconnected" in outcome["reason"]
+
+
+class TestApplyWritesArtifactInDualWriteMode:
+    """During PR 1's dual-write window, every ``apply()`` invocation must
+    write BOTH the legacy live key (or shadow archive) AND the new
+    recommendation artifact. Pin both writes happen for every status path.
+    """
+
+    def _ok_result(self) -> dict:
+        return {
+            "status": "ok",
+            "fit_target": "sharpe_legacy",
+            "recommended_params": {"atr_multiplier": 2.0, "min_score": 70},
+            "best_sharpe": 0.55,
+            "best_alpha": 0.30,
+            "best_sortino": 0.95,
+            "improvement_pct": 0.10,
+            "n_combos_tested": 60,
+        }
+
+    @patch("optimizer.executor_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_legacy_apply_path_also_writes_artifact(self, mock_artifact_boto3, mock_apply_boto3):
+        _init_default_config()
+        legacy_s3 = MagicMock()
+        artifact_s3 = MagicMock()
+        mock_apply_boto3.client.return_value = legacy_s3
+        mock_artifact_boto3.client.return_value = artifact_s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(self._ok_result(), bucket="test-bucket")
+
+        # Legacy live + history writes happened (existing behavior).
+        assert outcome["applied"] is True
+        legacy_keys = [c.kwargs["Key"] for c in legacy_s3.put_object.call_args_list]
+        assert S3_PARAMS_KEY in legacy_keys
+
+        # Artifact write happened (new behavior).
+        artifact_keys = [c.kwargs["Key"] for c in artifact_s3.put_object.call_args_list]
+        assert any(
+            k.startswith("config/executor_params/recommendations/")
+            and k.endswith("/from_executor_optimizer.json")
+            for k in artifact_keys
+        )
+
+    @patch("optimizer.executor_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_non_ok_status_still_writes_artifact(self, mock_artifact_boto3, mock_apply_boto3):
+        # negative_sortino path: apply() returns early, but artifact
+        # should still be written for audit — promotion_intent="skip".
+        _init_default_config({"use_skill_composite_target": True})
+        legacy_s3 = MagicMock()
+        artifact_s3 = MagicMock()
+        mock_apply_boto3.client.return_value = legacy_s3
+        mock_artifact_boto3.client.return_value = artifact_s3
+
+        bad_result = {
+            "status": "negative_sortino",
+            "fit_target": "skill_composite",
+            "recommended_params": {"atr_multiplier": 3.0},
+            "best_sortino": -0.5,
+            "best_alpha": -1.0,
+        }
+        outcome = apply(bad_result, bucket="test-bucket")
+        assert outcome["applied"] is False
+
+        # Artifact written even though apply refused to promote.
+        artifact_keys = [c.kwargs["Key"] for c in artifact_s3.put_object.call_args_list]
+        assert any(
+            k.startswith("config/executor_params/recommendations/")
+            and k.endswith("/from_executor_optimizer.json")
+            for k in artifact_keys
+        )
+        # Intent stamped as skip.
+        artifact_call = next(
+            c for c in artifact_s3.put_object.call_args_list
+            if c.kwargs["Key"].endswith("/from_executor_optimizer.json")
+        )
+        body = json.loads(artifact_call.kwargs["Body"])
+        assert body["promotion_intent"] == "skip"

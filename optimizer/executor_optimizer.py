@@ -600,6 +600,71 @@ def validate_holdout(
     return result
 
 
+def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> dict:
+    """
+    Convert an executor_optimizer ``recommend()`` result into a typed
+    ``RecommendationArtifact`` and write it to S3 at
+    ``config/executor_params/recommendations/{date}/from_executor_optimizer.json``.
+
+    Part of the optimizer-artifact-assembler arc — see
+    ``alpha-engine-docs/private/optimizer-artifact-assembler-260509.md``.
+    Always writes regardless of ``result.status`` so the audit trail
+    captures every optimizer invocation, including no-improvement /
+    insufficient-data / negative-sortino paths. The assembler ignores
+    artifacts with ``promotion_intent="skip"`` for merge purposes.
+
+    Args:
+        result: dict from ``recommend()``. May or may not have
+            ``apply_result`` populated yet (artifact records intent).
+        bucket: S3 bucket name.
+        run_id: Optional UUID for this artifact. Generated if absent.
+
+    Returns:
+        ``{"written": True, "key": str}`` on success;
+        ``{"written": False, "reason": str}`` on non-fatal failure (logged
+        warn; caller continues with legacy live write).
+    """
+    from optimizer.recommendation_artifact import (
+        RecommendationArtifact, derive_promotion_intent, today_iso, write_artifact,
+    )
+
+    try:
+        diagnostic = {
+            k: result.get(k)
+            for k in (
+                "status", "best_sharpe", "best_alpha", "best_sortino",
+                "baseline_sharpe", "baseline_alpha", "baseline_sortino",
+                "improvement_pct", "n_combos_tested", "baseline_combo_rank",
+                "baseline_distance", "n_closer_combos",
+                "holdout_sharpe", "holdout_sortino", "holdout_ratio",
+                "holdout_passed",
+            )
+            if result.get(k) is not None
+        }
+        artifact = RecommendationArtifact(
+            fit_target=result.get("fit_target", "sharpe_legacy"),
+            optimizer_name="executor_optimizer",
+            run_date=today_iso(),
+            recommendation_kind="full_replace",
+            recommended_params=result.get("recommended_params", {}),
+            promotion_intent=derive_promotion_intent(result),
+            diagnostic=diagnostic,
+            notes=result.get("note", "") or "",
+        )
+        if run_id is not None:
+            artifact.run_id = run_id
+        key = write_artifact(artifact, bucket, config_type="executor_params")
+        return {"written": True, "key": key, "run_id": artifact.run_id}
+    except Exception as e:
+        # Non-fatal during dual-write window: the legacy live write still
+        # happens via apply()'s existing logic. The artifact is additive.
+        logger.warning(
+            "Failed to write executor_optimizer recommendation artifact: %s "
+            "(non-fatal — legacy live write still proceeds)", e,
+        )
+        return {"written": False, "reason": str(e)}
+
+
 def apply(result: dict, bucket: str) -> dict:
     """
     Write recommended executor params to S3 if recommendation is valid.
@@ -613,6 +678,13 @@ def apply(result: dict, bucket: str) -> dict:
       only. Used when ``fit_target == "skill_composite"`` AND
       ``enforce_skill_composite`` is false. Live config is unchanged.
 
+    Additionally — and unconditionally — produces a per-optimizer
+    recommendation artifact at
+    ``config/executor_params/recommendations/{date}/from_executor_optimizer.json``
+    via ``produce_artifact()``. Part of the optimizer-artifact-assembler
+    arc; the artifact is additive (no behavior change to the legacy live
+    write) and is consumed by the future assembler module.
+
     Args:
         result: dict from recommend().
         bucket: S3 bucket name.
@@ -620,6 +692,10 @@ def apply(result: dict, bucket: str) -> dict:
     Returns:
         {"applied": True, ...} or {"applied": False, "reason": ...}
     """
+    # Produce the per-optimizer recommendation artifact regardless of
+    # outcome — captures every invocation for audit. Non-fatal on failure.
+    produce_artifact(result, bucket)
+
     if result.get("status") != "ok":
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
