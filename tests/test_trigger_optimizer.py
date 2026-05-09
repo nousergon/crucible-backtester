@@ -8,12 +8,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from optimizer.assembler import set_cutover_enabled
 from optimizer.trigger_optimizer import (
     S3_PARAMS_KEY,
     _build_overlay_params,
     apply,
     produce_artifact,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_cutover_flag():
+    """Reset assembler cutover flag around each test."""
+    set_cutover_enabled(False)
+    yield
+    set_cutover_enabled(False)
 
 
 # ── _build_overlay_params ────────────────────────────────────────────────────
@@ -183,3 +192,36 @@ class TestApplyDualWrite:
         )
         body = json.loads(artifact_call.kwargs["Body"])
         assert body["promotion_intent"] == "skip"
+
+
+class TestApplyCutoverSkip:
+    """When assembler cutover is enabled, trigger_optimizer's legacy
+    read-modify-write of executor_params.json is skipped — the assembler
+    is the sole writer."""
+
+    @patch("optimizer.trigger_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_cutover_enabled_skips_legacy_live_write(
+        self, mock_artifact_boto3, mock_apply_boto3,
+    ):
+        set_cutover_enabled(True)
+        legacy_s3 = MagicMock()
+        artifact_s3 = MagicMock()
+        mock_apply_boto3.client.return_value = legacy_s3
+        mock_artifact_boto3.client.return_value = artifact_s3
+
+        result = {"status": "ok", "disabled_triggers": ["pullback"]}
+        outcome = apply(result, bucket="test-bucket")
+        assert outcome["applied"] is False
+        assert "cutover_mode" in outcome["reason"]
+
+        # Legacy NEVER read or wrote the live key.
+        assert legacy_s3.put_object.call_args_list == []
+        assert legacy_s3.get_object.call_args_list == []
+
+        # Artifact still written.
+        artifact_writes = [
+            c for c in artifact_s3.put_object.call_args_list
+            if c.kwargs["Key"].endswith("/from_trigger_optimizer.json")
+        ]
+        assert len(artifact_writes) == 1

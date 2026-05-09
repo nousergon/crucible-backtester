@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from optimizer.assembler import set_cutover_enabled
 from optimizer.executor_optimizer import (
     S3_PARAMS_KEY,
     S3_SHADOW_PREFIX,
@@ -24,6 +25,15 @@ from optimizer.executor_optimizer import (
     produce_artifact,
     recommend,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_cutover_flag():
+    """Always reset the assembler cutover flag around each test so
+    set_cutover_enabled(True) in one test never leaks into the next."""
+    set_cutover_enabled(False)
+    yield
+    set_cutover_enabled(False)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -503,3 +513,68 @@ class TestApplyWritesArtifactInDualWriteMode:
         )
         body = json.loads(artifact_call.kwargs["Body"])
         assert body["promotion_intent"] == "skip"
+
+
+class TestApplyCutoverSkip:
+    """When ``optimizer.assembler.is_cutover_enabled()`` returns True,
+    the legacy live-key write path is skipped — the assembler is the sole
+    writer of ``config/executor_params.json``. The artifact write is
+    unaffected (still required for the assembler to read)."""
+
+    def _ok_result(self) -> dict:
+        return {
+            "status": "ok",
+            "fit_target": "sharpe_legacy",
+            "recommended_params": {"atr_multiplier": 2.0, "min_score": 70},
+            "best_sharpe": 0.55,
+            "best_alpha": 0.30,
+            "best_sortino": 0.95,
+            "improvement_pct": 0.10,
+            "n_combos_tested": 60,
+        }
+
+    @patch("optimizer.executor_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_cutover_enabled_skips_legacy_live_write(
+        self, mock_artifact_boto3, mock_apply_boto3,
+    ):
+        _init_default_config()
+        set_cutover_enabled(True)
+        legacy_s3 = MagicMock()
+        artifact_s3 = MagicMock()
+        mock_apply_boto3.client.return_value = legacy_s3
+        mock_artifact_boto3.client.return_value = artifact_s3
+
+        outcome = apply(self._ok_result(), bucket="test-bucket")
+
+        assert outcome["applied"] is False
+        assert "cutover_mode" in outcome["reason"]
+        # Legacy NEVER touched live or history keys.
+        assert legacy_s3.put_object.call_args_list == []
+        # Artifact STILL written (assembler will read it).
+        artifact_keys = [c.kwargs["Key"] for c in artifact_s3.put_object.call_args_list]
+        assert any(
+            k.endswith("/from_executor_optimizer.json") for k in artifact_keys
+        )
+
+    @patch("optimizer.executor_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_cutover_disabled_default_keeps_legacy_write(
+        self, mock_artifact_boto3, mock_apply_boto3,
+    ):
+        # Belt-and-suspenders: confirms the autouse fixture's reset works
+        # AND that with the flag off, legacy still writes (PR 1 behavior
+        # preserved when assembler hasn't taken over yet).
+        _init_default_config()
+        # Flag is False by default per fixture; do not call set_cutover_enabled.
+        legacy_s3 = MagicMock()
+        artifact_s3 = MagicMock()
+        mock_apply_boto3.client.return_value = legacy_s3
+        mock_artifact_boto3.client.return_value = artifact_s3
+
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(self._ok_result(), bucket="test-bucket")
+
+        assert outcome["applied"] is True
+        legacy_keys = [c.kwargs["Key"] for c in legacy_s3.put_object.call_args_list]
+        assert S3_PARAMS_KEY in legacy_keys

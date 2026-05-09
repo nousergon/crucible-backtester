@@ -17,8 +17,20 @@ from optimizer.assembler import (
     _apply_artifact_to_base,
     _read_current_live,
     assemble,
+    is_cutover_enabled,
+    set_cutover_enabled,
 )
 from optimizer.recommendation_artifact import RecommendationArtifact
+
+
+@pytest.fixture(autouse=True)
+def _reset_cutover_flag():
+    """Reset the module-level cutover flag to False before AND after each
+    test in this module. Prevents one test's set_cutover_enabled(True) from
+    leaking into the next."""
+    set_cutover_enabled(False)
+    yield
+    set_cutover_enabled(False)
 
 
 def _stub_s3_for_assemble(
@@ -508,3 +520,190 @@ class TestDefaultPrecedence:
             "trigger_optimizer",
         ]
         assert cfg["freeze_keys"] == []
+
+
+class TestCutoverFlag:
+
+    def test_default_is_false(self):
+        # Asserted via the autouse fixture's reset; this just pins the
+        # public default semantics.
+        assert is_cutover_enabled() is False
+
+    def test_set_and_read(self):
+        set_cutover_enabled(True)
+        assert is_cutover_enabled() is True
+        set_cutover_enabled(False)
+        assert is_cutover_enabled() is False
+
+
+class TestAssembleCutoverMode:
+    """When cutover_enabled=True (or module flag is set), the assembler is
+    the sole writer of the live key. Three writes happen on a successful
+    merge: snapshot live → _previous, write assembled → live, mirror to
+    dated history."""
+
+    def test_cutover_writes_live_previous_and_history_keys(self):
+        current_live = {"atr_multiplier": 2.0, "min_score": 70}
+        artifacts = {
+            "executor_optimizer": _make_executor_artifact({
+                "atr_multiplier": 3.0, "min_score": 75,
+            }),
+        }
+        s3 = _stub_s3_for_assemble(current_live, artifacts)
+        result = assemble(
+            "test-bucket", "executor_params", "2026-05-09",
+            s3_client=s3, write_assembled=True, cutover_enabled=True,
+        )
+        assert result.status == "ok"
+
+        # 1. _previous snapshot via copy_object from current live
+        copy_calls = s3.copy_object.call_args_list
+        assert len(copy_calls) == 1
+        assert copy_calls[0].kwargs["Key"] == "config/executor_params_previous.json"
+        assert copy_calls[0].kwargs["CopySource"] == {
+            "Bucket": "test-bucket", "Key": "config/executor_params.json",
+        }
+
+        # 2. Live key written with assembled_params + updated_at/assembled_by stamps
+        live_calls = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params.json"
+        ]
+        assert len(live_calls) == 1
+        live_body = json.loads(live_calls[0].kwargs["Body"])
+        assert live_body["atr_multiplier"] == 3.0
+        assert live_body["min_score"] == 75
+        assert live_body["updated_at"] == "2026-05-09"
+        assert live_body["assembled_by"] == "optimizer.assembler"
+
+        # 3. Dated history written
+        history_calls = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params_history/2026-05-09.json"
+        ]
+        assert len(history_calls) == 1
+
+        # 4. Audit artifact ALSO written (write_assembled=True)
+        audit_calls = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params/assembled/2026-05-09.json"
+        ]
+        assert len(audit_calls) == 1
+
+        # Notes capture cutover application
+        assert "cutover_applied" in result.notes
+
+    def test_cutover_disabled_does_not_touch_live(self):
+        # Explicit cutover_enabled=False: shadow-only — no live key write.
+        current_live = {"atr_multiplier": 2.0}
+        artifacts = {
+            "executor_optimizer": _make_executor_artifact({"atr_multiplier": 3.0}),
+        }
+        s3 = _stub_s3_for_assemble(current_live, artifacts)
+        assemble(
+            "test-bucket", "executor_params", "2026-05-09",
+            s3_client=s3, write_assembled=True, cutover_enabled=False,
+        )
+        # No copy_object (no _previous snapshot)
+        assert s3.copy_object.call_args_list == []
+        # No live key write
+        live_writes = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params.json"
+        ]
+        assert live_writes == []
+
+    def test_cutover_enabled_via_module_flag_when_param_is_none(self):
+        # When cutover_enabled param is None (default), assemble() reads the
+        # module-level flag set by set_cutover_enabled(). Pinned so the
+        # production wiring (set once at startup) actually drives the cutover.
+        set_cutover_enabled(True)
+        current_live = {"atr_multiplier": 2.0}
+        artifacts = {
+            "executor_optimizer": _make_executor_artifact({"atr_multiplier": 3.0}),
+        }
+        s3 = _stub_s3_for_assemble(current_live, artifacts)
+        assemble(
+            "test-bucket", "executor_params", "2026-05-09",
+            s3_client=s3, write_assembled=True,  # cutover_enabled NOT passed
+        )
+        live_writes = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params.json"
+        ]
+        assert len(live_writes) == 1
+
+    def test_cutover_with_no_prior_live_first_run(self):
+        # First-ever cutover run: no current live config. The copy_object
+        # call gets NoSuchKey (logged info, not raised). Live key still
+        # gets written with the assembled output.
+        current_live = None  # → triggers NoSuchKey in stub
+        artifacts = {
+            "executor_optimizer": _make_executor_artifact({"atr_multiplier": 3.0}),
+        }
+        s3 = _stub_s3_for_assemble(current_live, artifacts)
+        # Make copy_object raise NoSuchKey to simulate first-cutover.
+        s3.copy_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "CopyObject",
+        )
+        result = assemble(
+            "test-bucket", "executor_params", "2026-05-09",
+            s3_client=s3, write_assembled=False, cutover_enabled=True,
+        )
+        # No prior live to snapshot, but the live write still landed.
+        live_writes = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params.json"
+        ]
+        assert len(live_writes) == 1
+        assert "cutover_applied" in result.notes
+
+    def test_cutover_skips_when_status_not_ok(self):
+        # status=all_skip → cutover branch should NOT write live (the
+        # assembled_params is the unchanged base, but per design we don't
+        # rewrite the live key with itself).
+        current_live = {"atr_multiplier": 2.0}
+        artifacts = {
+            "executor_optimizer": _make_executor_artifact(
+                {"atr_multiplier": 3.0}, intent="skip",
+            ),
+        }
+        s3 = _stub_s3_for_assemble(current_live, artifacts)
+        result = assemble(
+            "test-bucket", "executor_params", "2026-05-09",
+            s3_client=s3, write_assembled=False, cutover_enabled=True,
+        )
+        assert result.status == "all_skip"
+        live_writes = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params.json"
+        ]
+        assert live_writes == []
+        assert s3.copy_object.call_args_list == []
+
+    def test_cutover_live_write_failure_recorded_in_notes(self):
+        current_live = {"atr_multiplier": 2.0}
+        artifacts = {
+            "executor_optimizer": _make_executor_artifact({"atr_multiplier": 3.0}),
+        }
+        s3 = _stub_s3_for_assemble(current_live, artifacts)
+
+        # Make ONLY the live-key put fail; audit + history put succeed.
+        original_put = s3.put_object.side_effect
+
+        def fail_live_put(*args, **kwargs):
+            if kwargs.get("Key") == "config/executor_params.json":
+                raise Exception("S3 disconnected on live write")
+            # Fall back to MagicMock default behavior.
+            return MagicMock()
+
+        s3.put_object.side_effect = fail_live_put
+        result = assemble(
+            "test-bucket", "executor_params", "2026-05-09",
+            s3_client=s3, write_assembled=False, cutover_enabled=True,
+        )
+        # Result still status=ok; the failure is captured in notes for
+        # operator visibility (the audit artifact is the authoritative record
+        # if it was written).
+        assert "cutover_failed" in result.notes
+        assert "S3 disconnected" in result.notes

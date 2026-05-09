@@ -696,6 +696,19 @@ def apply(result: dict, bucket: str) -> dict:
     # outcome — captures every invocation for audit. Non-fatal on failure.
     produce_artifact(result, bucket)
 
+    # Cutover gate: when assembler.cutover_enabled is true, the assembler
+    # is the sole writer of the live key. Skip the legacy live + history +
+    # shadow writes. The artifact is already produced above; the assembler
+    # reads it during its merge.
+    from optimizer.assembler import is_cutover_enabled
+    if is_cutover_enabled():
+        return {
+            "applied": False,
+            "reason": "cutover_mode — assembler is sole live writer",
+            "fit_target": result.get("fit_target", "sharpe_legacy"),
+            "params": result.get("recommended_params", {}),
+        }
+
     if result.get("status") != "ok":
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
