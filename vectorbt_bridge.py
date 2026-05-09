@@ -160,6 +160,24 @@ def portfolio_stats(pf: vbt.Portfolio, spy_prices: pd.Series | None = None) -> d
     sortino = _compute_sortino_ratio(daily_returns)
     cvar_95 = _compute_cvar(daily_returns, q=0.05)
 
+    # Probabilistic Sharpe Ratio — confidence that the true Sharpe > 0
+    # given the observed sample (Bailey & López de Prado 2012). Computed
+    # inline so it survives the parquet round-trip into sweep_df as a
+    # scalar (the daily_returns Series doesn't). Used by
+    # executor_optimizer.recommend()'s skill-composite mode as a
+    # confidence gate before live promotion.
+    psr_scalar: float | None = None
+    try:
+        from analysis.dsr import compute_psr
+        psr_result = compute_psr(daily_returns, sharpe_benchmark=0.0)
+        if psr_result.get("status") == "ok":
+            psr_scalar = float(psr_result["psr"])
+    except Exception:
+        # PSR is best-effort — failure to compute (e.g. degenerate
+        # returns) must not break portfolio_stats. None signals "not
+        # available" to downstream gates.
+        psr_scalar = None
+
     stats = {
         "total_return": total_return,
         "sharpe_ratio": float(pf.sharpe_ratio()),
@@ -167,6 +185,7 @@ def portfolio_stats(pf: vbt.Portfolio, spy_prices: pd.Series | None = None) -> d
         "max_drawdown": float(pf.max_drawdown()),
         "calmar_ratio": float(pf.calmar_ratio()),
         "cvar_95": cvar_95,
+        "psr": psr_scalar,
         "total_trades": int(pf.trades.count()),
         "win_rate": float(pf.trades.win_rate()),
         "daily_returns": daily_returns,

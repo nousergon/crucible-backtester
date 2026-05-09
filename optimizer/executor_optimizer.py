@@ -113,6 +113,11 @@ _MIN_VALID_COMBOS = 5
 _MIN_SHARPE_IMPROVEMENT = 0.10
 _MIN_SORTINO_IMPROVEMENT = 0.05
 _MIN_TRADES_TO_PROMOTE = 50
+# Probabilistic Sharpe Ratio threshold — confidence that true SR > 0.
+# 0.95 = 95% confidence. Used by skill-composite mode as a DSR-style
+# gate before live promotion. Mirrors the precision_ci_95 gate from the
+# veto skill-composite cutover (alpha-engine-backtester #166).
+_MIN_PSR = 0.95
 
 # Module-level config ref — set by init_config() from backtest.py
 _cfg: dict = {}
@@ -407,10 +412,39 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
                 ),
             }
 
+        # Probabilistic Sharpe Ratio gate — confidence-bounded promotion.
+        # Workstream D bullet 3 of evaluator-revamp-260506.md: don't promote
+        # a combo whose Sharpe is statistically indistinguishable from zero
+        # given its sample size + skewness/kurtosis. PSR is computed inline
+        # in vectorbt_bridge.portfolio_stats() and flows through sweep_df
+        # as a scalar column. None means PSR couldn't be computed (e.g.
+        # < 30 daily-return observations) — skip the gate in that case
+        # (insufficient data is the baseline-data signal, not a gate).
+        # Mirrors the precision_ci_95 gate in the veto skill-composite
+        # cutover (alpha-engine-backtester #166).
+        best_psr = best_row.get("psr") if "psr" in valid.columns else None
+        if best_psr is not None and not pd.isna(best_psr):
+            min_psr = _cfg.get("min_psr", _MIN_PSR)
+            if float(best_psr) < min_psr:
+                return {
+                    "status": "insufficient_psr_confidence",
+                    **common_fields,
+                    "best_psr": _safe_float(best_psr),
+                    "note": (
+                        f"Best Sortino combo has PSR={float(best_psr):.3f} "
+                        f"(P(true Sharpe > 0)) — below {min_psr:.2f} threshold. "
+                        f"Refusing to auto-apply: improvement is statistically "
+                        f"indistinguishable from zero given the sample size. "
+                        f"Need more sweep history before confidence-bounded "
+                        f"promotion."
+                    ),
+                }
+
         return {
             "status": "ok",
             **common_fields,
             "n_combos_tested": len(valid),
+            "best_psr": _safe_float(best_psr) if best_psr is not None else None,
             "note": (
                 f"Best combo improves Sortino by {improvement_pct:.1%} "
                 f"({baseline_sortino:.4f} → {best_sortino:.4f}) across {len(valid)} combos "
