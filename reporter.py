@@ -1068,10 +1068,22 @@ def _section_what_changed(
 ) -> list[str]:
     """Build the 'What Changed This Week' section — promotion decisions + twin sim."""
 
-    def _decision_for(label: str, result: dict | None) -> tuple:
-        """Classify optimizer result into (label, decision, reason)."""
+    def _decision_for(label: str, result: dict | None) -> tuple | None:
+        """Classify optimizer result into (label, decision, reason).
+
+        Returns None when ``result is None`` so the caller can omit the row
+        entirely. ``result is None`` indicates the optimizer wasn't computed
+        on this code path — e.g. the simulation email (`backtest.py`) does
+        not run the weight or veto optimizers (those run in `evaluate.py`'s
+        evaluator email). Rendering the row as "NOT RUN" was misleading
+        because it implied the optimizer was skipped within *this* run when
+        really it belongs to a different email entirely. When the optimizer
+        is skipped within its own run (e.g. research_db missing), the path
+        below produces a non-None result dict with status="skipped" and
+        renders as "SKIPPED" with the skip reason.
+        """
         if result is None:
-            return (label, "NOT RUN", "mode not included in this run")
+            return None
         status = result.get("status", "unknown")
         apply = result.get("apply_result", {})
         if apply.get("applied"):
@@ -1094,9 +1106,12 @@ def _section_what_changed(
             return (label, "DEFERRED", f"status={status}")
 
     decisions = [
-        _decision_for("Scoring weights", weight_result),
-        _decision_for("Executor params", executor_rec),
-        _decision_for("Veto threshold", veto_result),
+        d for d in (
+            _decision_for("Scoring weights", weight_result),
+            _decision_for("Executor params", executor_rec),
+            _decision_for("Veto threshold", veto_result),
+        )
+        if d is not None
     ]
 
     has_twin_sim = executor_rec and executor_rec.get("twin_sim", {}).get("status") == "ok"
@@ -1104,16 +1119,21 @@ def _section_what_changed(
 
     lines = ["## What Changed This Week", ""]
 
-    # Promotion decisions table — always shown
-    lines += [
-        "### Optimizer Status",
-        "",
-        "| Optimizer | Decision | Detail |",
-        "|-----------|----------|--------|",
-    ]
-    for label, decision, reason in decisions:
-        lines.append(f"| {label} | {decision} | {reason} |")
-    lines += [""]
+    # Promotion decisions table — only shown when at least one optimizer
+    # produced a result on this code path. The simulation email
+    # (`backtest.py`) only runs the executor optimizer, so weight + veto
+    # rows are filtered above; the evaluator email (`evaluate.py`) runs
+    # all three.
+    if decisions:
+        lines += [
+            "### Optimizer Status",
+            "",
+            "| Optimizer | Decision | Detail |",
+            "|-----------|----------|--------|",
+        ]
+        for label, decision, reason in decisions:
+            lines.append(f"| {label} | {decision} | {reason} |")
+        lines += [""]
 
     # Twin simulation results
     if has_twin_sim:

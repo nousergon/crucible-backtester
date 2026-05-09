@@ -141,6 +141,95 @@ class TestBuildReport:
         assert len(md) > 50
 
 
+class TestOptimizerStatusFiltering:
+    """The simulation email (`backtest.py`) does not run the weight or
+    veto optimizers — those run in `evaluate.py`'s evaluator email. The
+    Optimizer Status section should filter out None results so we don't
+    misleadingly render "NOT RUN — mode not included in this run" for
+    optimizers that belong to a different code path entirely."""
+
+    def test_simulation_email_only_renders_executor_row(self):
+        """Backtester simulation email passes only `executor_rec`. The
+        Optimizer Status table should show ONE row (Executor params),
+        not three with two stub "NOT RUN" entries.
+        """
+        md = build_report(
+            run_date="2026-05-09",
+            signal_quality={"status": "skipped"},
+            regime_analysis=[],
+            score_analysis=[],
+            attribution={"status": "skipped"},
+            executor_rec={
+                "status": "ok",
+                "fit_target": "sharpe_legacy",
+                "apply_result": {"applied": True},
+            },
+            # weight_result + veto_result deliberately omitted (None default)
+        )
+        assert "### Optimizer Status" in md
+        assert "Executor params" in md
+        assert "PROMOTED" in md
+        # Phantom rows for optimizers that weren't computed on this path
+        # must not render.
+        assert "Scoring weights" not in md
+        assert "Veto threshold" not in md
+        assert "NOT RUN" not in md
+        assert "mode not included in this run" not in md
+
+    def test_evaluator_email_renders_all_three_rows(self):
+        """Evaluator email passes all three results. All three rows render."""
+        md = build_report(
+            run_date="2026-05-09",
+            signal_quality={"status": "skipped"},
+            regime_analysis=[],
+            score_analysis=[],
+            attribution={"status": "skipped"},
+            weight_result={"status": "ok", "apply_result": {"applied": True}},
+            veto_result={"status": "ok", "apply_result": {"applied": False, "reason": "no improvement"}},
+            executor_rec={"status": "ok", "apply_result": {"applied": True}},
+        )
+        assert "### Optimizer Status" in md
+        assert "Scoring weights" in md
+        assert "Executor params" in md
+        assert "Veto threshold" in md
+
+    def test_skipped_optimizer_renders_as_skipped_not_filtered(self):
+        """When an optimizer ran on this path but skipped due to missing
+        inputs (e.g. research_db unavailable → tracker.run_module returns
+        a `{"status": "skipped"}` dict), the row SHOULD render as SKIPPED
+        — that's a different code-path event from the simulation-email
+        case where the optimizer wasn't on this path at all (None).
+        """
+        md = build_report(
+            run_date="2026-05-09",
+            signal_quality={"status": "skipped"},
+            regime_analysis=[],
+            score_analysis=[],
+            attribution={"status": "skipped"},
+            weight_result={"status": "skipped", "note": "research_db unavailable"},
+            executor_rec={"status": "ok", "apply_result": {"applied": True}},
+        )
+        # The skipped optimizer renders as SKIPPED with reason — it ran on
+        # this path, just produced no output.
+        assert "Scoring weights" in md
+        assert "SKIPPED" in md
+        assert "research_db unavailable" in md
+
+    def test_optimizer_status_section_omitted_when_no_results(self):
+        """When NO optimizer results are passed (e.g. failure path before
+        any optimizer ran), the Optimizer Status section header should not
+        render at all — no empty table."""
+        md = build_report(
+            run_date="2026-05-09",
+            signal_quality={"status": "skipped"},
+            regime_analysis=[],
+            score_analysis=[],
+            attribution={"status": "skipped"},
+            # No weight, veto, OR executor passed.
+        )
+        assert "### Optimizer Status" not in md
+
+
 class TestSectionSkillVsBeta:
     """The Skill vs. Beta panel (PR 4) — renders only when the
     evaluator-revamp metrics are wired through."""
