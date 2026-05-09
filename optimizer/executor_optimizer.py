@@ -2,8 +2,25 @@
 executor_optimizer.py — recommend optimal executor parameters from param sweep results.
 
 Reads the param sweep DataFrame (grid search over risk + strategy params),
-extracts the best-performing combination by Sharpe ratio, and writes
-recommendations to S3 for the Executor Lambda to read on cold-start.
+extracts the best-performing combination, and writes recommendations to S3
+for the Executor Lambda to read on cold-start.
+
+Two ranking paths, gated by ``executor_optimizer.use_skill_composite_target``
+in config (default: legacy):
+
+- **Legacy (Sharpe-with-drawdown):** ``_combined_score = sharpe_ratio
+  - drawdown_penalty_weight × |max_drawdown|``. Stamps
+  ``fit_target="sharpe_legacy"``. Pre-evaluator-revamp behavior.
+- **Skill-composite:** ranks by ``total_alpha`` (primary) with
+  ``sortino_ratio`` as tiebreaker. Stamps ``fit_target="skill_composite"``.
+  Mirrors the evaluator-revamp 2026-05-06 fit-target switch already shipped
+  for ``weight_optimizer`` (PR #145 / PR 6 of evaluator revamp).
+
+Promotion to live S3 (``config/executor_params.json``) is gated by
+``executor_optimizer.enforce_skill_composite``: when the skill-composite
+ranking is computed but enforcement is off, ``apply()`` writes to a shadow
+archive at ``config/executor_params_shadow_history/{date}.json`` instead.
+This mirrors the two-stage activation pattern from ``weight_optimizer``.
 
 Only safe-to-tune params are recommended; drawdown circuit breaker and
 sector/equity limits are excluded from auto-tuning.
@@ -39,6 +56,7 @@ def _to_native(v):
     return v
 
 S3_PARAMS_KEY = "config/executor_params.json"
+S3_SHADOW_PREFIX = "config/executor_params_shadow_history"
 
 # Params safe to auto-tune via sweep results.
 # Excluded: drawdown_circuit_breaker, max_sector_pct, max_equity_pct (too dangerous)
@@ -86,6 +104,7 @@ FACTORY_DEFAULTS = {
 # ── Fallback defaults (override via executor_optimizer section in config.yaml) ──
 _MIN_VALID_COMBOS = 5
 _MIN_SHARPE_IMPROVEMENT = 0.10
+_MIN_ALPHA_IMPROVEMENT = 0.05
 _MIN_TRADES_TO_PROMOTE = 50
 
 # Module-level config ref — set by init_config() from backtest.py
@@ -155,7 +174,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     Extract best executor params from param sweep results.
 
     Args:
-        sweep_df: DataFrame from param_sweep.sweep(), sorted by sharpe_ratio desc.
+        sweep_df: DataFrame from param_sweep.sweep().
         base_config: Base config dict (used for current/baseline values).
         current_params: Current executor params from S3 (the values the system is
             actually using). When provided, the sweep baseline is the combo closest
@@ -164,13 +183,17 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
 
     Returns:
         {
-            "status": "ok" | "insufficient_data" | "no_improvement",
+            "status": "ok" | "insufficient_data" | "no_improvement" | ...,
+            "fit_target": "sharpe_legacy" | "skill_composite",
             "baseline_params": {...},
             "recommended_params": {...},
             "factory_defaults": {...},
             "baseline_sharpe": float,
             "best_sharpe": float,
+            "best_alpha": float | None,
+            "baseline_alpha": float | None,
             "improvement_pct": float,
+            ...
         }
     """
     if sweep_df is None or sweep_df.empty:
@@ -226,21 +249,52 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
                 ),
             }
 
-    # Multi-metric ranking: Sharpe is primary, but penalize excessive drawdown.
-    # Combined score = sharpe_ratio - drawdown_penalty_weight * max_drawdown
-    # This prevents promoting fragile param sets where one big win masks many losses.
-    dd_penalty_weight = _cfg.get("drawdown_penalty_weight", 0.5)
-    if "max_drawdown" in valid.columns:
-        valid["_combined_score"] = (
-            valid["sharpe_ratio"]
-            - dd_penalty_weight * valid["max_drawdown"].fillna(0).abs()
-        )
+    # Ranking: legacy (Sharpe-with-drawdown) vs skill-composite (alpha-first)
+    # — gated by `use_skill_composite_target` config. Mirrors the
+    # weight_optimizer fit-target switch shipped 2026-05-06 (PR #145).
+    use_skill_composite = bool(_cfg.get("use_skill_composite_target", False))
+
+    if use_skill_composite:
+        # Skill-composite ranking: total_alpha (primary) + sortino_ratio
+        # (tiebreaker). Falls back to alpha alone if sortino unavailable.
+        if "total_alpha" not in valid.columns:
+            return {
+                "status": "insufficient_data",
+                "note": (
+                    "use_skill_composite_target is on but sweep produced no "
+                    "total_alpha column — cannot rank by alpha."
+                ),
+                "fit_target": "skill_composite",
+            }
+        valid_alpha = valid["total_alpha"].notna().sum()
+        if valid_alpha == 0:
+            return {
+                "status": "insufficient_data",
+                "note": "All total_alpha values are NaN — cannot rank by alpha.",
+                "fit_target": "skill_composite",
+            }
+        sort_cols = ["total_alpha"]
+        if "sortino_ratio" in valid.columns:
+            sort_cols.append("sortino_ratio")
+        valid = valid.sort_values(sort_cols, ascending=False)
+        fit_target = "skill_composite"
     else:
-        valid["_combined_score"] = valid["sharpe_ratio"]
-    valid = valid.sort_values("_combined_score", ascending=False)
+        # Legacy multi-metric ranking: Sharpe primary, penalize drawdown.
+        # Combined score = sharpe_ratio - drawdown_penalty_weight * |max_drawdown|
+        # This prevents promoting fragile param sets where one big win masks many losses.
+        dd_penalty_weight = _cfg.get("drawdown_penalty_weight", 0.5)
+        if "max_drawdown" in valid.columns:
+            valid["_combined_score"] = (
+                valid["sharpe_ratio"]
+                - dd_penalty_weight * valid["max_drawdown"].fillna(0).abs()
+            )
+        else:
+            valid["_combined_score"] = valid["sharpe_ratio"]
+        valid = valid.sort_values("_combined_score", ascending=False)
+        fit_target = "sharpe_legacy"
 
     # Baseline: find the combo closest to current S3 params (iterative learning).
-    # Falls back to worst combo by Sharpe if no current_params provided.
+    # Falls back to worst combo by ranking metric if no current_params provided.
     if current_params:
         baseline_row = _find_closest_combo(valid, param_cols, current_params)
     else:
@@ -250,14 +304,25 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     best_row = valid.iloc[0]
     best_sharpe = best_row["sharpe_ratio"]
 
-    # Alpha metrics (informational — not used for gating)
+    # Alpha + Sortino — informational under legacy, gating under skill-composite.
     best_alpha = _safe_float(best_row.get("total_alpha"))
     baseline_alpha = _safe_float(baseline_row.get("total_alpha"))
+    best_sortino = _safe_float(best_row.get("sortino_ratio"))
+    baseline_sortino = _safe_float(baseline_row.get("sortino_ratio"))
 
-    if baseline_sharpe == 0:
-        improvement_pct = float("inf") if best_sharpe > 0 else 0.0
+    if use_skill_composite:
+        # Improvement gate is alpha-based when ranking is alpha-first.
+        if baseline_alpha is None or best_alpha is None:
+            improvement_pct = 0.0
+        elif baseline_alpha == 0:
+            improvement_pct = float("inf") if best_alpha > 0 else 0.0
+        else:
+            improvement_pct = (best_alpha - baseline_alpha) / abs(baseline_alpha)
     else:
-        improvement_pct = (best_sharpe - baseline_sharpe) / abs(baseline_sharpe)
+        if baseline_sharpe == 0:
+            improvement_pct = float("inf") if best_sharpe > 0 else 0.0
+        else:
+            improvement_pct = (best_sharpe - baseline_sharpe) / abs(baseline_sharpe)
 
     recommended = {col: best_row[col] for col in param_cols if pd.notna(best_row[col])}
     # Convert numpy types to native Python
@@ -284,6 +349,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         baseline_dist = 0.0
 
     common_fields = {
+        "fit_target": fit_target,
         "baseline_params": baseline,
         "recommended_params": recommended,
         "factory_defaults": FACTORY_DEFAULTS.copy(),
@@ -291,12 +357,58 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         "best_sharpe": round(float(best_sharpe), 4),
         "best_alpha": best_alpha,
         "baseline_alpha": baseline_alpha,
+        "best_sortino": best_sortino,
+        "baseline_sortino": baseline_sortino,
         "improvement_pct": round(improvement_pct, 4),
         "baseline_combo_rank": baseline_combo_rank,
         "baseline_distance": round(float(baseline_dist), 4),
         "n_closer_combos": n_closer_combos,
     }
 
+    if use_skill_composite:
+        # Guard: never auto-apply params from a negative-alpha optimization.
+        # Mirrors the negative-Sharpe guard but on the alpha-first ranking
+        # axis — promotes the principle that the system's stated objective
+        # (Alpha = Portfolio − SPY) is what gates auto-tuning.
+        if best_alpha is None:
+            return {
+                "status": "insufficient_data",
+                **common_fields,
+                "note": "Best combo has no total_alpha — cannot evaluate skill-composite gate.",
+            }
+        if best_alpha < 0:
+            return {
+                "status": "negative_alpha",
+                **common_fields,
+                "note": (
+                    f"Best alpha ({best_alpha:.4f}) is negative — all combos underperformed SPY. "
+                    f"Refusing to auto-apply. Review signal quality and backtest data before tuning."
+                ),
+            }
+
+        min_improvement = _cfg.get("min_alpha_improvement", _MIN_ALPHA_IMPROVEMENT)
+        if improvement_pct < min_improvement:
+            return {
+                "status": "no_improvement",
+                **common_fields,
+                "note": (
+                    f"Best alpha ({best_alpha:.4f}) only {improvement_pct:.1%} better than "
+                    f"baseline ({baseline_alpha:.4f}). Need {min_improvement:.0%}+ to recommend."
+                ),
+            }
+
+        return {
+            "status": "ok",
+            **common_fields,
+            "n_combos_tested": len(valid),
+            "note": (
+                f"Best combo improves alpha by {improvement_pct:.1%} "
+                f"({baseline_alpha:.4f} → {best_alpha:.4f}) across {len(valid)} combos "
+                f"(skill_composite ranking: alpha primary, sortino tiebreaker)."
+            ),
+        }
+
+    # ── Legacy Sharpe-with-drawdown path ──
     # Guard: never auto-apply params from a negative-Sharpe optimization.
     # A negative best Sharpe means every combo lost money — the "best" is just
     # the least bad, and auto-applying it can silently break live trading.
@@ -410,55 +522,67 @@ def validate_holdout(
 
     try:
         holdout_stats = sim_fn(holdout_config)
-        holdout_sharpe = holdout_stats.get("sharpe_ratio")
     except Exception as e:
         logger.warning("Holdout validation failed: %s", e)
         result["holdout_passed"] = True
         result["holdout_note"] = f"Holdout simulation error: {e}"
         return result
 
-    if holdout_sharpe is None:
+    holdout_sharpe = holdout_stats.get("sharpe_ratio")
+    holdout_alpha = holdout_stats.get("total_alpha")
+    fit_target = result.get("fit_target", "sharpe_legacy")
+
+    # Pick the metric matching the recommend()-side ranking axis. Skill-composite
+    # ranks by alpha-first, so the holdout-stability check follows alpha; legacy
+    # ranks by Sharpe, so the holdout check follows Sharpe.
+    if fit_target == "skill_composite":
+        metric_name = "alpha"
+        holdout_value = holdout_alpha
+        train_value = result.get("best_alpha", 0)
+    else:
+        metric_name = "Sharpe"
+        holdout_value = holdout_sharpe
+        train_value = result.get("best_sharpe", 0)
+
+    if holdout_value is None:
         result["holdout_passed"] = True
-        result["holdout_note"] = "Holdout produced no Sharpe — skipped validation"
+        result["holdout_note"] = f"Holdout produced no {metric_name} — skipped validation"
         return result
 
-    best_sharpe = result.get("best_sharpe", 0)
+    result[f"holdout_{metric_name.lower()}"] = round(float(holdout_value), 4)
 
-    # Gate: both train and holdout Sharpe must be positive
-    if best_sharpe < 0:
-        result["holdout_sharpe"] = round(float(holdout_sharpe), 4)
+    # Gate: both train and holdout metric must be positive
+    if train_value is None or train_value < 0:
         result["holdout_ratio"] = 0.0
         result["holdout_passed"] = False
         result["status"] = "holdout_failed"
         result["holdout_note"] = (
-            f"Train Sharpe is negative ({best_sharpe:.4f}) — "
+            f"Train {metric_name} is non-positive ({train_value}) — "
             f"cannot validate holdout ratio"
         )
         logger.warning("Executor optimizer holdout failed: %s", result["holdout_note"])
         return result
 
-    ratio = holdout_sharpe / best_sharpe if best_sharpe != 0 else 0.0
-
-    result["holdout_sharpe"] = round(float(holdout_sharpe), 4)
+    ratio = holdout_value / train_value if train_value != 0 else 0.0
     result["holdout_ratio"] = round(ratio, 4)
-    result["holdout_passed"] = ratio >= 0.50 and holdout_sharpe > 0
+    result["holdout_passed"] = ratio >= 0.50 and holdout_value > 0
 
     if not result["holdout_passed"]:
         result["status"] = "holdout_failed"
-        if holdout_sharpe <= 0:
+        if holdout_value <= 0:
             result["holdout_note"] = (
-                f"Holdout Sharpe is negative ({holdout_sharpe:.4f}) — "
+                f"Holdout {metric_name} is non-positive ({holdout_value:.4f}) — "
                 f"strategy is loss-making on holdout set"
             )
         else:
             result["holdout_note"] = (
-                f"Holdout Sharpe ({holdout_sharpe:.4f}) is {ratio:.0%} of train "
-                f"({best_sharpe:.4f}) — need >= 50%"
+                f"Holdout {metric_name} ({holdout_value:.4f}) is {ratio:.0%} of train "
+                f"({train_value:.4f}) — need >= 50%"
             )
         logger.warning("Executor optimizer holdout failed: %s", result["holdout_note"])
     else:
         result["holdout_note"] = (
-            f"Holdout Sharpe ({holdout_sharpe:.4f}) is {ratio:.0%} of train — PASS"
+            f"Holdout {metric_name} ({holdout_value:.4f}) is {ratio:.0%} of train — PASS"
         )
         logger.info("Executor optimizer holdout passed: %s", result["holdout_note"])
 
@@ -469,8 +593,14 @@ def apply(result: dict, bucket: str) -> dict:
     """
     Write recommended executor params to S3 if recommendation is valid.
 
-    Writes to s3://{bucket}/config/executor_params.json and archives
-    to config/executor_params_history/{date}.json.
+    Two write paths:
+    - **Production:** ``s3://{bucket}/config/executor_params.json`` (live)
+      + ``config/executor_params_history/{date}.json`` (audit). Used when
+      ``fit_target == "sharpe_legacy"`` OR when ``enforce_skill_composite``
+      is true.
+    - **Shadow:** ``s3://{bucket}/config/executor_params_shadow_history/{date}.json``
+      only. Used when ``fit_target == "skill_composite"`` AND
+      ``enforce_skill_composite`` is false. Live config is unchanged.
 
     Args:
         result: dict from recommend().
@@ -486,24 +616,59 @@ def apply(result: dict, bucket: str) -> dict:
     if not recommended:
         return {"applied": False, "reason": "no recommended params"}
 
+    fit_target = result.get("fit_target", "sharpe_legacy")
+    enforce_skill_composite = bool(_cfg.get("enforce_skill_composite", False))
+    shadow_only = fit_target == "skill_composite" and not enforce_skill_composite
+
     payload = {
         **recommended,
         "updated_at": str(date.today()),
+        "fit_target": fit_target,
         "best_sharpe": result.get("best_sharpe"),
         "best_alpha": result.get("best_alpha"),
+        "best_sortino": result.get("best_sortino"),
         "improvement_pct": result.get("improvement_pct"),
         "n_combos_tested": result.get("n_combos_tested"),
     }
 
-    from optimizer.rollback import save_previous
-    save_previous(bucket, "executor_params")
-
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
 
+    if shadow_only:
+        shadow_key = f"{S3_SHADOW_PREFIX}/{date.today().isoformat()}.json"
+        try:
+            s3.put_object(
+                Bucket=bucket, Key=shadow_key, Body=body, ContentType="application/json"
+            )
+            logger.info(
+                "Executor params written to shadow archive (enforce_skill_composite=False): "
+                "s3://%s/%s",
+                bucket, shadow_key,
+            )
+        except Exception as e:
+            logger.error("Failed to write executor params shadow archive: %s", e)
+            return {"applied": False, "reason": f"shadow S3 write failed: {e}"}
+        return {
+            "applied": False,
+            "reason": "shadow mode — fit_target=skill_composite, enforce_skill_composite=False",
+            "shadow_key": shadow_key,
+            "fit_target": fit_target,
+            "params": recommended,
+            "best_sharpe": result.get("best_sharpe"),
+            "best_alpha": result.get("best_alpha"),
+            "best_sortino": result.get("best_sortino"),
+            "improvement_pct": result.get("improvement_pct"),
+        }
+
+    from optimizer.rollback import save_previous
+    save_previous(bucket, "executor_params")
+
     try:
         s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
-        logger.info("Executor params updated in S3: %s", recommended)
+        logger.info(
+            "Executor params updated in S3: %s (fit_target=%s)",
+            recommended, fit_target,
+        )
     except Exception as e:
         logger.error("CRITICAL: Failed to write executor params to S3: %s", e)
         return {"applied": False, "reason": f"S3 write failed: {e}"}
@@ -517,8 +682,10 @@ def apply(result: dict, bucket: str) -> dict:
 
     return {
         "applied": True,
+        "fit_target": fit_target,
         "params": recommended,
         "best_sharpe": result.get("best_sharpe"),
         "best_alpha": result.get("best_alpha"),
+        "best_sortino": result.get("best_sortino"),
         "improvement_pct": result.get("improvement_pct"),
     }

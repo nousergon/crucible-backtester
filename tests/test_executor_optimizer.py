@@ -1,0 +1,284 @@
+"""Unit tests for optimizer.executor_optimizer — guardrail logic, no S3 calls.
+
+Two ranking paths are tested:
+- Legacy (Sharpe-with-drawdown) — default behavior, unchanged from pre-revamp.
+- Skill-composite (alpha-primary + sortino-tiebreaker) — gated by
+  ``executor_optimizer.use_skill_composite_target`` config flag.
+
+Production-vs-shadow promotion paths are also tested via mocked S3.
+"""
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
+import pytest
+
+from optimizer.executor_optimizer import (
+    S3_PARAMS_KEY,
+    S3_SHADOW_PREFIX,
+    apply,
+    init_config,
+    recommend,
+)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _init_default_config(extra: dict | None = None):
+    cfg = {
+        "executor_optimizer": {
+            "min_valid_combos": 2,
+            "min_sharpe_improvement": 0.05,
+            "min_alpha_improvement": 0.05,
+            "min_trades_to_promote": 0,  # disable trade-count gate for these tests
+            "drawdown_penalty_weight": 0.5,
+        }
+    }
+    if extra:
+        cfg["executor_optimizer"].update(extra)
+    init_config(cfg)
+
+
+def _make_sweep_df(rows: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(rows)
+
+
+# Three combos with different (alpha, sharpe) profiles, illustrating exactly
+# the divergence the email surfaced — high Sharpe doesn't imply high alpha.
+COMBOS = [
+    # combo A: highest Sharpe (legacy ranking would pick this), bad alpha
+    {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+     "sharpe_ratio": 0.70, "total_alpha": -2.5, "sortino_ratio": 0.85,
+     "max_drawdown": -0.05, "total_trades": 100},
+    # combo B: highest alpha (skill ranking would pick this), modest Sharpe
+    {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+     "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.95,
+     "max_drawdown": -0.10, "total_trades": 80},
+    # combo C: middle ground
+    {"atr_multiplier": 2.5, "min_score": 70, "max_position_pct": 0.05,
+     "sharpe_ratio": 0.60, "total_alpha": -0.50, "sortino_ratio": 0.70,
+     "max_drawdown": -0.08, "total_trades": 90},
+]
+
+
+# ── Legacy path (default — flag off) ─────────────────────────────────────────
+
+
+class TestLegacyRanking:
+    """When use_skill_composite_target is off (default), behavior unchanged."""
+
+    def test_default_off_uses_legacy_path(self):
+        _init_default_config()
+        df = _make_sweep_df(COMBOS)
+        result = recommend(df, base_config={})
+        assert result["status"] == "ok"
+        assert result["fit_target"] == "sharpe_legacy"
+
+    def test_legacy_picks_highest_sharpe_minus_drawdown(self):
+        _init_default_config()
+        df = _make_sweep_df(COMBOS)
+        result = recommend(df, base_config={})
+        # Combo A has the highest Sharpe (0.70) — even with drawdown penalty
+        # (0.05 × 0.5 = 0.025 → score 0.675), it beats B (0.55 - 0.05 = 0.50)
+        # and C (0.60 - 0.04 = 0.56). Legacy ranking picks combo A.
+        assert result["recommended_params"]["atr_multiplier"] == 3.0
+        assert result["best_sharpe"] == 0.7
+        # Alpha is negative for combo A — but legacy doesn't gate on it.
+        assert result["best_alpha"] == -2.5
+
+    def test_legacy_negative_sharpe_blocks(self):
+        _init_default_config()
+        rows = [
+            {**r, "sharpe_ratio": -0.1} for r in COMBOS
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={})
+        assert result["status"] == "negative_sharpe"
+
+    def test_legacy_no_improvement_blocks(self):
+        _init_default_config()
+        # All combos within 1% of each other on Sharpe → fails 5% gate.
+        rows = [
+            {**r, "sharpe_ratio": 0.5 + (i * 0.001)}
+            for i, r in enumerate(COMBOS)
+        ]
+        df = _make_sweep_df(rows)
+        # Pass current_params close to combo C → baseline ~ best.
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 2.5, "min_score": 70, "max_position_pct": 0.05,
+        })
+        assert result["status"] == "no_improvement"
+
+
+# ── Skill-composite path (flag on) ───────────────────────────────────────────
+
+
+class TestSkillCompositeRanking:
+    """When use_skill_composite_target is on, ranks by alpha + sortino."""
+
+    def test_flag_on_switches_to_alpha_path(self):
+        _init_default_config({"use_skill_composite_target": True})
+        df = _make_sweep_df(COMBOS)
+        result = recommend(df, base_config={})
+        assert result["fit_target"] == "skill_composite"
+
+    def test_skill_picks_highest_alpha_not_highest_sharpe(self):
+        """The exact divergence the 2026-05-09 email surfaced — alpha-first
+        ranking selects combo B (highest alpha) over combo A (highest Sharpe).
+        """
+        _init_default_config({"use_skill_composite_target": True})
+        df = _make_sweep_df(COMBOS)
+        result = recommend(df, base_config={})
+        assert result["status"] == "ok"
+        # Combo B has highest alpha (0.30) — picked by skill_composite even
+        # though combo A has higher Sharpe.
+        assert result["recommended_params"]["atr_multiplier"] == 2.0
+        assert result["best_alpha"] == 0.30
+        # Sortino is reported alongside but doesn't drive selection
+        # when alpha rankings are unambiguous.
+        assert result["best_sortino"] == 0.95
+
+    def test_skill_sortino_breaks_alpha_ties(self):
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.6, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.9, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={})
+        # Same alpha → sortino tiebreaker → atr_multiplier=3.0 wins.
+        assert result["recommended_params"]["atr_multiplier"] == 3.0
+
+    def test_skill_negative_alpha_blocks(self):
+        """Mirrors the negative-Sharpe guard but on the alpha axis. The
+        2026-05-09 email's 'Best alpha: −258.8%' would trip this gate."""
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {**r, "total_alpha": -1.0 - (i * 0.1)}
+            for i, r in enumerate(COMBOS)
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={})
+        assert result["status"] == "negative_alpha"
+        # Best alpha across all combos is the highest (least-negative).
+        assert result["best_alpha"] == -1.0
+
+    def test_skill_no_improvement_blocks(self):
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "min_alpha_improvement": 0.20,  # need 20% alpha lift
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.50,
+             "sortino_ratio": 0.6, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.51,
+             "sortino_ratio": 0.6, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 2.0,
+        })
+        # Best alpha (0.51) only 2% better than baseline (0.50) — below 20% gate.
+        assert result["status"] == "no_improvement"
+
+    def test_skill_missing_alpha_column_returns_insufficient(self):
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.6, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={})
+        assert result["status"] == "insufficient_data"
+        assert "total_alpha" in result["note"]
+
+
+# ── Apply: shadow vs production write paths ──────────────────────────────────
+
+
+class TestApplyShadowVsProduction:
+    """The two-stage activation: skill_composite computed → shadow archive
+    until enforce_skill_composite is also flipped."""
+
+    def _ok_result(self, fit_target: str) -> dict:
+        return {
+            "status": "ok",
+            "fit_target": fit_target,
+            "recommended_params": {"atr_multiplier": 2.0, "min_score": 70},
+            "best_sharpe": 0.55,
+            "best_alpha": 0.30,
+            "best_sortino": 0.95,
+            "improvement_pct": 0.10,
+            "n_combos_tested": 60,
+        }
+
+    @patch("optimizer.executor_optimizer.boto3")
+    def test_legacy_writes_to_production_key(self, mock_boto3):
+        _init_default_config()  # enforce_skill_composite default false
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(self._ok_result("sharpe_legacy"), bucket="test-bucket")
+        assert outcome["applied"] is True
+        # First put_object: live key. Second: history archive.
+        keys_written = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        assert S3_PARAMS_KEY in keys_written
+        assert any("executor_params_history" in k for k in keys_written)
+        # Did NOT write to shadow archive.
+        assert not any(S3_SHADOW_PREFIX in k for k in keys_written)
+
+    @patch("optimizer.executor_optimizer.boto3")
+    def test_skill_without_enforce_writes_to_shadow_only(self, mock_boto3):
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "enforce_skill_composite": False,
+        })
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        outcome = apply(self._ok_result("skill_composite"), bucket="test-bucket")
+        assert outcome["applied"] is False
+        assert "shadow mode" in outcome["reason"].lower()
+        assert outcome["fit_target"] == "skill_composite"
+        # Shadow key was written; live key was NOT.
+        keys_written = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        assert any(S3_SHADOW_PREFIX in k for k in keys_written)
+        assert S3_PARAMS_KEY not in keys_written
+
+    @patch("optimizer.executor_optimizer.boto3")
+    def test_skill_with_enforce_writes_to_production(self, mock_boto3):
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "enforce_skill_composite": True,
+        })
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(self._ok_result("skill_composite"), bucket="test-bucket")
+        assert outcome["applied"] is True
+        assert outcome["fit_target"] == "skill_composite"
+        keys_written = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        assert S3_PARAMS_KEY in keys_written
+        # No shadow write when enforced.
+        assert not any(S3_SHADOW_PREFIX in k for k in keys_written)
+
+    @patch("optimizer.executor_optimizer.boto3")
+    def test_apply_payload_includes_fit_target_and_alpha(self, mock_boto3):
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "enforce_skill_composite": True,
+        })
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            apply(self._ok_result("skill_composite"), bucket="test-bucket")
+        # Inspect the body written to the production key.
+        live_calls = [c for c in s3.put_object.call_args_list
+                      if c.kwargs["Key"] == S3_PARAMS_KEY]
+        assert len(live_calls) == 1
+        import json
+        body = json.loads(live_calls[0].kwargs["Body"])
+        assert body["fit_target"] == "skill_composite"
+        assert body["best_alpha"] == 0.30
+        assert body["best_sortino"] == 0.95
