@@ -148,6 +148,27 @@ class AssemblerResult:
         return asdict(self)
 
 
+def read_assembled(
+    bucket: str, config_type: str, run_date: str, s3_client=None,
+) -> dict | None:
+    """Read the assembled audit artifact for a given config_type + run_date.
+
+    Returns the parsed dict (an ``AssemblerResult.to_dict()`` body) or
+    ``None`` if no audit artifact exists for that date. Used by the
+    rollback audit to capture what would-have-been the assembled config
+    when a rollback fires.
+    """
+    s3 = s3_client or boto3.client("s3")
+    key = f"config/{config_type}/assembled/{run_date}.json"
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+            return None
+        raise
+
+
 def _read_current_live(
     bucket: str, config_type: str, s3_client,
 ) -> tuple[dict, bool]:
