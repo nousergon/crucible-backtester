@@ -907,6 +907,38 @@ def main() -> None:
             diagnostics=diagnostics,
         )
 
+    # ── Assembler (shadow-only PR 3 of optimizer-artifact-assembler arc) ─
+    # Reads the per-optimizer recommendation artifacts written by each
+    # optimizer's apply() during this run + applies merge precedence and
+    # writes config/executor_params/{config_type}/assembled/{date}.json
+    # for audit. Live key is NOT touched — that's PR 4's flag-gated cutover.
+    # Failure is non-fatal: the assembler is observation-only at this PR.
+    if run_optimizers and not args.freeze:
+        try:
+            from optimizer.assembler import assemble
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            assemble_result = assemble(
+                bucket=bucket,
+                config_type="executor_params",
+                run_date=args.date,
+                write_assembled=True,
+            )
+            logger.info(
+                "Assembler shadow run: status=%s, promoting=%d, frozen_restored=%d",
+                assemble_result.status,
+                sum(
+                    1 for v in assemble_result.artifacts_seen.values()
+                    if v["promotion_intent"] == "promote"
+                ),
+                len(assemble_result.frozen_keys_restored),
+            )
+        except Exception as e:
+            # Shadow-mode assembler failure must not break the pipeline.
+            logger.warning(
+                "Assembler shadow run failed (non-fatal — observation only): %s",
+                e,
+            )
+
     # ── Regression detection ─────────────────────────────────────────────
     regression_result = _run_regression(
         config, tracker, sq_result,
