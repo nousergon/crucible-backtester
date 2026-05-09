@@ -538,7 +538,13 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
 
 
 def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
-    """CIO lift (2d): ADVANCE stocks vs. all sector recommendations."""
+    """CIO lift (2d): ADVANCE stocks vs. all sector recommendations.
+
+    Emits per-bucket stdev so downstream optimizers can compute a
+    Welch-style confidence bound on whether ``advance_avg < all_recs_avg``
+    is statistically distinguishable from sampling noise. Without this,
+    the CIO-fallback recommendation triggers on small-sample noise.
+    """
     try:
         ce_filter = date_filter.replace("eval_date", "ce.eval_date") if date_filter else ""
         ce = pd.read_sql_query(
@@ -557,6 +563,16 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
 
         reject = merged[merged["cio_decision"] == "REJECT"]
         reject_avg = float(reject["return_5d"].mean()) if not reject.empty else None
+
+        # Welch-style inputs: stdev (ddof=1) of return_5d per bucket. Only
+        # meaningful at n ≥ 2; emit None otherwise so the consumer skips
+        # the confidence check rather than dividing by zero.
+        def _std(s):
+            v = s.dropna()
+            return float(v.std(ddof=1)) if len(v) >= 2 else None
+        all_recs_std = _std(merged["return_5d"])
+        advance_std = _std(advance["return_5d"]) if not advance.empty else None
+        reject_std = _std(reject["return_5d"]) if not reject.empty else None
 
         # Classification: selected=CIO advanced, positive=beat SPY
         clf = None
@@ -581,6 +597,9 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
             "n_recs": len(merged),
             "n_advance": len(advance),
             "n_reject": len(reject),
+            "all_recs_std_5d": round(all_recs_std, 4) if all_recs_std is not None else None,
+            "advance_std_5d": round(advance_std, 4) if advance_std is not None else None,
+            "reject_std_5d": round(reject_std, 4) if reject_std is not None else None,
             "classification": clf,
         }
     except sqlite3.OperationalError:
