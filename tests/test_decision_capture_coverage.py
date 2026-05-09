@@ -27,6 +27,7 @@ from analysis.decision_capture_coverage import (
     CANONICAL_AGENTS,
     CANONICAL_SECTORS,
     N_CANONICAL,
+    SECTOR_SUB_STAGES,
     compute_decision_capture_coverage,
     _list_agent_artifact_counts,
     _saturday_coverage_for,
@@ -52,7 +53,10 @@ def _build_s3_stub(keys: list[str]) -> MagicMock:
     return s3
 
 
-# Helper: build the canonical 8-key set for a given Saturday partition.
+# Helper: build the full per-stage key set for a given Saturday partition.
+# 1 macro + 1 ic_cio + 6 sectors × 3 sub-stages = 20 artifact keys, which
+# virtualize to 8 canonical agents (sector_team:{sector} present iff all
+# 3 sub-stages emitted).
 def _canonical_keys(date: str) -> list[str]:
     """date format: 'YYYY/MM/DD'."""
     keys = [
@@ -60,8 +64,17 @@ def _canonical_keys(date: str) -> list[str]:
         f"decision_artifacts/{date}/ic_cio/run.json",
     ]
     for sector in CANONICAL_SECTORS:
-        keys.append(f"decision_artifacts/{date}/sector_team:{sector}/run.json")
+        for stage in SECTOR_SUB_STAGES:
+            keys.append(f"decision_artifacts/{date}/{stage}:{sector}/run.json")
     return keys
+
+
+def _sub_stage_keys(date: str, sector: str) -> list[str]:
+    """All 3 sub-stage keys for one sector on one Saturday."""
+    return [
+        f"decision_artifacts/{date}/{stage}:{sector}/run.json"
+        for stage in SECTOR_SUB_STAGES
+    ]
 
 
 # ── Constants sanity ─────────────────────────────────────────────────────────
@@ -84,16 +97,18 @@ class TestListAgentArtifactCounts:
     def test_groups_by_agent_id(self):
         from datetime import datetime
         keys = _canonical_keys("2026/05/02") + [
-            "decision_artifacts/2026/05/02/sector_team:technology/run2.json",
+            "decision_artifacts/2026/05/02/sector_quant:technology/run2.json",
         ]
         s3 = _build_s3_stub(keys)
         counts = _list_agent_artifact_counts(
             s3, bucket="b", capture_prefix="decision_artifacts",
             date=datetime(2026, 5, 2),
         )
-        # 8 canonical agents, technology has 2 runs.
+        # 1 macro + 1 ic_cio + 18 sub-stage entries, technology quant has 2 runs.
         assert counts["macro_economist"] == 1
-        assert counts["sector_team:technology"] == 2
+        assert counts["sector_quant:technology"] == 2
+        assert counts["sector_qual:technology"] == 1
+        assert counts["sector_peer_review:technology"] == 1
 
     def test_excludes_meta_prefixes(self):
         from datetime import datetime
@@ -117,7 +132,8 @@ class TestListAgentArtifactCounts:
         assert "_replay" not in counts
         assert "_cost" not in counts
         assert "_analysis" not in counts
-        assert sum(counts.values()) == 8  # canonical only
+        # 1 macro + 1 ic_cio + 6 sectors × 3 sub-stages = 20 canonical artifacts.
+        assert sum(counts.values()) == 20
 
     def test_empty_partition_returns_empty_dict(self):
         from datetime import datetime
@@ -145,12 +161,19 @@ class TestSaturdayCoverageFor:
         assert result["n_canonical_expected"] == 8
         assert all(v["present"] for v in result["per_agent"].values())
 
-    def test_missing_one_agent_is_875_pct(self):
-        """7/8 canonical agents present → 87.5%."""
+    def test_missing_one_sector_team_is_875_pct(self):
+        """7/8 canonical agents present → 87.5%. Dropping all 3
+        sub-stages of one sector should fail that sector's virtual
+        ``present`` check."""
         from datetime import datetime
         keys = _canonical_keys("2026/05/02")
-        # Drop sector_team:technology
-        keys = [k for k in keys if "sector_team:technology" not in k]
+        # Drop all 3 technology sub-stages.
+        keys = [
+            k for k in keys
+            if not any(
+                f"/{stage}:technology/" in k for stage in SECTOR_SUB_STAGES
+            )
+        ]
         s3 = _build_s3_stub(keys)
         result = _saturday_coverage_for(
             s3, bucket="b", capture_prefix="decision_artifacts",
@@ -159,6 +182,46 @@ class TestSaturdayCoverageFor:
         assert result["coverage_pct"] == 87.5
         assert result["per_agent"]["sector_team:technology"]["present"] is False
         assert result["per_agent"]["macro_economist"]["present"] is True
+
+    def test_partial_sub_stages_keep_sector_absent(self):
+        """If only 2 of 3 sub-stages emit for a sector, the virtual
+        ``sector_team:{sector}`` is NOT present — partial captures
+        signal an interrupted pipeline, not a successful decision."""
+        from datetime import datetime
+        keys = _canonical_keys("2026/05/02")
+        # Drop only the peer_review sub-stage for technology, leaving
+        # quant + qual artifacts in place.
+        keys = [
+            k for k in keys
+            if "/sector_peer_review:technology/" not in k
+        ]
+        s3 = _build_s3_stub(keys)
+        result = _saturday_coverage_for(
+            s3, bucket="b", capture_prefix="decision_artifacts",
+            saturday=datetime(2026, 5, 2),
+        )
+        # Coverage drops by exactly one sector — 7/8.
+        assert result["coverage_pct"] == 87.5
+        tech_entry = result["per_agent"]["sector_team:technology"]
+        assert tech_entry["present"] is False
+        assert tech_entry["sub_stages"] == {
+            "sector_quant": 1, "sector_qual": 1, "sector_peer_review": 0,
+        }
+        # n_artifacts reflects what DID land — useful for the email body.
+        assert tech_entry["n_artifacts"] == 2
+
+    def test_sub_stage_ids_not_uncategorized(self):
+        """Sub-stage IDs (sector_quant:*, sector_qual:*, sector_peer_review:*)
+        roll up into the virtual sector_team:{sector} entry — they must
+        not appear in the uncategorized list."""
+        from datetime import datetime
+        s3 = _build_s3_stub(_canonical_keys("2026/05/02"))
+        result = _saturday_coverage_for(
+            s3, bucket="b", capture_prefix="decision_artifacts",
+            saturday=datetime(2026, 5, 2),
+        )
+        assert result["uncategorized_agents"] == []
+        assert result["coverage_pct"] == 100.0
 
     def test_thesis_update_counted_separately(self):
         """thesis_update:* artifacts are reported as a count, never in
@@ -252,7 +315,13 @@ class TestComputeDecisionCaptureCoverage:
     def test_partial_canonical_drops_below_99(self):
         """7/8 → 87.5% < 99%, so this trips the inventory gate."""
         keys = _canonical_keys("2026/05/02")
-        keys = [k for k in keys if "sector_team:industrials" not in k]
+        # Drop all 3 industrials sub-stages.
+        keys = [
+            k for k in keys
+            if not any(
+                f"/{stage}:industrials/" in k for stage in SECTOR_SUB_STAGES
+            )
+        ]
         s3 = _build_s3_stub(keys)
         result = compute_decision_capture_coverage(
             bucket="b", run_date="2026-05-02",
@@ -266,8 +335,13 @@ class TestComputeDecisionCaptureCoverage:
         """Two Saturdays of data: 5/2 (100%) + 4/25 (87.5%) → mean 93.75%."""
         keys_502 = _canonical_keys("2026/05/02")
         keys_425 = _canonical_keys("2026/04/25")
-        # Drop one canonical from 4/25
-        keys_425 = [k for k in keys_425 if "sector_team:financials" not in k]
+        # Drop all 3 financials sub-stages from 4/25.
+        keys_425 = [
+            k for k in keys_425
+            if not any(
+                f"/{stage}:financials/" in k for stage in SECTOR_SUB_STAGES
+            )
+        ]
         s3 = _build_s3_stub(keys_502 + keys_425)
         result = compute_decision_capture_coverage(
             bucket="b", run_date="2026-05-02",
