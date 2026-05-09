@@ -228,6 +228,84 @@ class TestSkillCompositeRanking:
         assert result["recommended_params"]["atr_multiplier"] == 2.0
         assert result["best_alpha"] == -0.10  # presentation only
 
+    def test_skill_blocks_when_psr_below_threshold(self):
+        """PSR confidence gate (Workstream D bullet 3): refuse to promote
+        when best combo's Probabilistic Sharpe Ratio < min_psr threshold —
+        Sharpe is statistically indistinguishable from zero given the
+        sample size + skewness/kurtosis."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "min_psr": 0.95,
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.6, "psr": 0.60,  # 60% confidence — far below 0.95
+             "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.30,
+             "sortino_ratio": 0.9, "psr": 0.65,
+             "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 2.0})
+        assert result["status"] == "insufficient_psr_confidence"
+        assert "PSR=0.650" in result["note"]
+        assert result["best_psr"] == 0.65
+
+    def test_skill_promotes_when_psr_clears_threshold(self):
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "min_psr": 0.95,
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.6, "psr": 0.92,
+             "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.30,
+             "sortino_ratio": 0.9, "psr": 0.97,  # clears 0.95
+             "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 2.0})
+        assert result["status"] == "ok"
+        assert result["best_psr"] == 0.97
+
+    def test_skill_psr_absent_skips_gate(self):
+        """When PSR isn't in sweep_df (older sweep runs / vectorbt_bridge
+        couldn't compute due to <30 obs), the PSR gate is skipped. Other
+        gates (negative-sortino, no_improvement) still apply."""
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.6, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.30,
+             "sortino_ratio": 0.9, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 2.0})
+        # No psr column at all → gate skipped → ok status.
+        assert result["status"] == "ok"
+        assert result["best_psr"] is None
+
+    def test_legacy_path_does_not_apply_psr_gate(self):
+        """PSR gate is skill-composite-only. Legacy path proceeds even with
+        low PSR — preserves pre-cutover behavior."""
+        _init_default_config()  # legacy default
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.6, "max_drawdown": -0.05,
+             "psr": 0.30,  # low — skill mode would block; legacy ignores
+             "total_trades": 100},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.6, "total_alpha": 0.30,
+             "sortino_ratio": 0.7, "max_drawdown": -0.05,
+             "psr": 0.30,
+             "total_trades": 100},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 2.0})
+        # Legacy ignores PSR — promotes on Sharpe-with-drawdown ranking.
+        assert result["status"] == "ok"
+        assert result["fit_target"] == "sharpe_legacy"
+
     def test_skill_missing_sortino_column_returns_insufficient(self):
         _init_default_config({"use_skill_composite_target": True})
         rows = [
