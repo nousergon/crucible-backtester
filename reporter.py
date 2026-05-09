@@ -1615,9 +1615,7 @@ def _section_executor_recommendations(result: dict) -> list[str]:
     recommended = result.get("recommended_params", {})
     factory = result.get("factory_defaults", {})
     improvement = result.get("improvement_pct", 0)
-
-    best_alpha = result.get("best_alpha")
-    alpha_str = f" | Best alpha: {best_alpha:.1%}" if best_alpha is not None else ""
+    fit_target = result.get("fit_target", "sharpe_legacy")
 
     baseline_rank = result.get("baseline_combo_rank")
     n_combos = result.get("n_combos_tested", "?")
@@ -1625,23 +1623,66 @@ def _section_executor_recommendations(result: dict) -> list[str]:
     if baseline_rank is not None:
         baseline_note = f" Baseline: combo #{baseline_rank} of {n_combos} (closest to current S3 params)."
 
+    # Sweep coverage — needed by the caption below.
+    swept_keys = sorted(set(list(baseline.keys()) + list(recommended.keys())))
+    n_factory = len(factory)
+    n_swept = len(swept_keys)
+
+    # Caption text branches on fit_target. Skill-composite mode leads
+    # with Sortino + PSR (the gating axes); raw alpha vs SPY surfaces as
+    # a presentation-only stat per Brian's 2026-05-09 framing
+    # ("alpha vs SPY is presentation, not the optimizer's fit target").
+    # Legacy (Sharpe-with-drawdown) mode preserves the pre-cutover
+    # caption shape exactly.
+    if fit_target == "skill_composite":
+        best_sortino = result.get("best_sortino")
+        baseline_sortino = result.get("baseline_sortino")
+        best_psr = result.get("best_psr")
+        best_alpha = result.get("best_alpha")
+
+        sortino_str = ""
+        if best_sortino is not None and baseline_sortino is not None:
+            sortino_str = (
+                f"Sortino improvement: {improvement:.1%} "
+                f"({baseline_sortino:.4f} → {best_sortino:.4f})"
+            )
+        elif best_sortino is not None:
+            sortino_str = f"Best Sortino: {best_sortino:.4f}"
+
+        psr_str = (
+            f" | PSR (P(true SR>0)): {best_psr:.3f}"
+            if best_psr is not None else ""
+        )
+        alpha_str = (
+            f" | Alpha vs SPY: {best_alpha:+.1%} (presentation only)"
+            if best_alpha is not None else ""
+        )
+
+        caption = (
+            f"_Tested {n_combos} parameter combinations across {n_swept} of "
+            f"{n_factory} safe-to-tune params (fit_target=`skill_composite`). "
+            f"{sortino_str}{psr_str}{alpha_str}.{baseline_note}_"
+        )
+    else:
+        best_alpha = result.get("best_alpha")
+        alpha_str = f" | Best alpha: {best_alpha:.1%}" if best_alpha is not None else ""
+        caption = (
+            f"_Tested {n_combos} parameter combinations across {n_swept} of "
+            f"{n_factory} safe-to-tune params. "
+            f"Sharpe improvement: {improvement:.1%} "
+            f"({result.get('baseline_sharpe', 0):.4f} → {result.get('best_sharpe', 0):.4f})"
+            f"{alpha_str}.{baseline_note}_"
+        )
+
     # Render only params the sweep actually exercised — params without
     # baseline AND recommended values are absent from this run's grid;
     # showing them as `—`/`—`/`—` rows pollutes the table with
     # uninformative entries (operator already knows the factory default
     # via the SAFE_PARAMS source). Matches the "drop unswept rows"
     # cleanup from the 2026-05-09 P2 ROADMAP entry.
-    swept_keys = sorted(set(list(baseline.keys()) + list(recommended.keys())))
-    n_factory = len(factory)
-    n_swept = len(swept_keys)
-
     lines += [
         "",
-        f"_Tested {n_combos} parameter combinations across {n_swept} of "
-        f"{n_factory} safe-to-tune params. "
-        f"Sharpe improvement: {improvement:.1%} "
-        f"({result.get('baseline_sharpe', 0):.4f} → {result.get('best_sharpe', 0):.4f})"
-        f"{alpha_str}.{baseline_note}_",
+        caption,
         "",
         "| Parameter | Default | Current (S3) | Recommended | Drift from default |",
         "|-----------|---------|--------------|-------------|-------------------|",

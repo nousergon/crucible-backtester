@@ -295,6 +295,71 @@ class TestReporterCleanupBundle:
         assert "atr_sizing_target_risk" in md
         assert "confidence_sizing_min" in md
 
+    def test_executor_recommendations_caption_skill_mode_leads_with_sortino_and_psr(self):
+        """When fit_target=skill_composite, the caption surfaces Sortino +
+        PSR as the gating axes; alpha vs SPY is labeled presentation-only.
+        Mirrors the post-2026-05-09 framing that alpha is not the
+        optimizer's fit target."""
+        from reporter import _section_executor_recommendations
+        result = {
+            "status": "ok",
+            "fit_target": "skill_composite",
+            "n_combos_tested": 60,
+            "improvement_pct": 0.47,  # Sortino improvement
+            "baseline_sortino": 0.65,
+            "best_sortino": 0.95,
+            "best_psr": 0.97,
+            "best_alpha": -2.59,  # presentation only
+            "best_sharpe": 0.55,
+            "baseline_sharpe": 0.50,
+            "baseline_combo_rank": 2,
+            "factory_defaults": {"atr_multiplier": 2.5, "min_score": 70},
+            "baseline_params": {"atr_multiplier": 2.0, "min_score": 75},
+            "recommended_params": {"atr_multiplier": 3.0, "min_score": 75},
+            "apply_result": {"applied": True},
+        }
+        md = "\n".join(_section_executor_recommendations(result))
+        # Skill-mode caption surfaces Sortino + PSR explicitly.
+        assert "Sortino improvement: 47" in md
+        assert "0.6500 → 0.9500" in md
+        assert "PSR (P(true SR>0)): 0.970" in md
+        # Alpha vs SPY clearly labeled as presentation-only.
+        assert "Alpha vs SPY:" in md
+        assert "presentation only" in md
+        # fit_target stamped in caption for operator visibility.
+        assert "skill_composite" in md
+        # Legacy "Sharpe improvement" phrasing must NOT appear under skill mode.
+        assert "Sharpe improvement:" not in md
+
+    def test_executor_recommendations_caption_legacy_mode_unchanged(self):
+        """Legacy fit_target preserves the pre-cutover caption shape exactly
+        (Sharpe improvement + Best alpha as the headline numbers)."""
+        from reporter import _section_executor_recommendations
+        result = {
+            "status": "ok",
+            "fit_target": "sharpe_legacy",
+            "n_combos_tested": 60,
+            "improvement_pct": 0.063,  # Sharpe improvement
+            "baseline_sharpe": 0.6439,
+            "best_sharpe": 0.6842,
+            "best_alpha": -2.5881,
+            "baseline_combo_rank": 2,
+            "factory_defaults": {"atr_multiplier": 2.5},
+            "baseline_params": {"atr_multiplier": 2.0},
+            "recommended_params": {"atr_multiplier": 3.0},
+            "apply_result": {"applied": True},
+        }
+        md = "\n".join(_section_executor_recommendations(result))
+        # Legacy caption — Sharpe improvement leads, alpha is unlabeled
+        # (no "presentation only" tag). Identical to pre-cutover output.
+        assert "Sharpe improvement: 6.3%" in md
+        assert "0.6439 → 0.6842" in md
+        assert "Best alpha:" in md
+        # Skill-mode-specific text must NOT appear under legacy.
+        assert "PSR" not in md
+        assert "presentation only" not in md
+        assert "skill_composite" not in md
+
     def test_predictor_param_sweep_renders_sortino_cvar_as_stats_not_params(self):
         from reporter import _section_param_sweep_predictor
         df = pd.DataFrame([
