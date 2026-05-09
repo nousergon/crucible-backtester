@@ -24,15 +24,23 @@ captured per-held-stock and reported as a count alongside, not in the
 coverage denominator (the held-stock cardinality varies week-to-week
 with portfolio composition).
 
+Sector-team virtualization: the research pipeline writes one artifact
+per sub-stage (``sector_quant:{sector}``, ``sector_qual:{sector}``,
+``sector_peer_review:{sector}``) rather than one composite
+``sector_team:{sector}`` artifact. The canonical 8-agent denominator
+stays semantically meaningful (one decision per team), but the
+"present" check rolls up the 3 sub-stage artifacts: a sector counts as
+captured iff all 3 sub-stages have ≥1 artifact. Sub-stage IDs are
+classified, not surfaced as uncategorized.
+
 S3 contract:
 
   decision_artifacts/{YYYY}/{MM}/{DD}/{agent_id}/{run_id}.json
 
   agent_id ∈ {macro_economist, ic_cio,
-              sector_team:consumer, sector_team:defensives,
-              sector_team:financials, sector_team:healthcare,
-              sector_team:industrials, sector_team:technology,
-              thesis_update:<ticker>}
+              sector_quant:<sector>, sector_qual:<sector>,
+              sector_peer_review:<sector>,
+              thesis_update:<sector>:<ticker>}
 
   Meta-prefixes (excluded from coverage): _eval/, _eval_judge_only/,
               _replay/, _replay_summary/, _cost/, _cost_raw/,
@@ -71,6 +79,16 @@ Coverage % is computed against this fixed set. thesis_update varies with
 portfolio composition and is reported separately."""
 
 N_CANONICAL = len(CANONICAL_AGENTS)  # 8
+
+# The research pipeline writes 3 artifacts per sector team — one per
+# sub-stage. ``sector_team:{sector}`` is treated as a virtual aggregate
+# in this module: present iff every sub-stage emitted ≥1 artifact.
+SECTOR_SUB_STAGES: tuple[str, ...] = (
+    "sector_quant", "sector_qual", "sector_peer_review",
+)
+_SECTOR_SUB_STAGE_PREFIXES: tuple[str, ...] = tuple(
+    f"{stage}:" for stage in SECTOR_SUB_STAGES
+)
 
 # Meta-prefixes under decision_artifacts/{Y}/{M}/{D}/ that aren't agent
 # captures — exclude when listing for coverage.
@@ -147,9 +165,24 @@ def _saturday_coverage_for(
     per_agent: dict[str, dict[str, Any]] = {}
     n_present = 0
     for agent in CANONICAL_AGENTS:
-        n = counts.get(agent, 0)
-        present = n >= 1
-        per_agent[agent] = {"present": present, "n_artifacts": n}
+        if agent.startswith("sector_team:"):
+            sector = agent.split(":", 1)[1]
+            sub_stage_counts = {
+                stage: counts.get(f"{stage}:{sector}", 0)
+                for stage in SECTOR_SUB_STAGES
+            }
+            # Virtual present: every sub-stage emitted ≥1 artifact.
+            present = all(c >= 1 for c in sub_stage_counts.values())
+            n = sum(sub_stage_counts.values())
+            per_agent[agent] = {
+                "present": present,
+                "n_artifacts": n,
+                "sub_stages": sub_stage_counts,
+            }
+        else:
+            n = counts.get(agent, 0)
+            present = n >= 1
+            per_agent[agent] = {"present": present, "n_artifacts": n}
         if present:
             n_present += 1
 
@@ -159,10 +192,14 @@ def _saturday_coverage_for(
     )
 
     # Anything else is uncategorized — flag for visibility (a new agent
-    # type rolling out, or a typo in the agent_id).
+    # type rolling out, or a typo in the agent_id). Sector sub-stage IDs
+    # roll up into the virtual sector_team:{sector} entry, so they
+    # don't count as uncategorized.
     uncategorized = sorted(
         agent for agent in counts
-        if agent not in CANONICAL_AGENTS and not agent.startswith("thesis_update:")
+        if agent not in CANONICAL_AGENTS
+        and not agent.startswith("thesis_update:")
+        and not agent.startswith(_SECTOR_SUB_STAGE_PREFIXES)
     )
 
     coverage_pct = (n_present / N_CANONICAL) * 100.0
@@ -294,8 +331,15 @@ def compute_decision_capture_coverage(
             continue
         # Only include Saturdays that had any captures — empty Saturdays
         # mean the SF didn't run / failed before capture, not 0% coverage.
+        # ``n_canonical_present`` only fires for fully-virtualized sector
+        # teams (all 3 sub-stages), so partial-success Saturdays surface
+        # via the per_agent n_artifacts check.
+        any_per_agent_artifacts = any(
+            entry.get("n_artifacts", 0) > 0
+            for entry in summary["per_agent"].values()
+        )
         if (
-            summary["n_canonical_present"] > 0
+            any_per_agent_artifacts
             or summary["thesis_update_count"] > 0
             or summary["uncategorized_agents"]
         ):

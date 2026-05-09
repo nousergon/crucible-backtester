@@ -23,14 +23,16 @@ Design:
 - Pure consumer-side. Reads ``decision_artifacts/{Y}/{M}/{D}/{agent_id}/
   {run_id}.json`` and computes metrics. No new schema, no prompt change,
   no LLM tax on the production path.
-- Tool calls live in nested paths (sector_teams stash them under
-  ``agent_output.quant_output.tool_calls`` and ``qual_output.tool_calls``
-  because the team is a sub-graph). The extractor walks the agent_output
-  dict and aggregates every ``tool_calls`` list it encounters.
-- Tool-equipped agents (sector_quant, sector_qual, macro_economist) are
-  flagged when a captured artifact has zero tool calls. CIO + peer_review
-  legitimately make zero tool calls (synthesizers, no fetch tools), so
-  they're excluded from the alarm denominator.
+- Sector teams write one artifact per sub-stage
+  (``sector_quant:{sector}``, ``sector_qual:{sector}``,
+  ``sector_peer_review:{sector}``); each artifact's ``agent_output``
+  carries that sub-stage's own tool calls. The walker still aggregates
+  every ``tool_calls`` list it encounters in case a future schema nests
+  them.
+- Tool-equipped agents (``macro_economist``, ``sector_quant:*``,
+  ``sector_qual:*``) are flagged when a captured artifact has zero tool
+  calls. ``ic_cio`` and ``sector_peer_review:*`` are synthesizers (no
+  fetch tools), so they're excluded from the alarm denominator.
 
 Returns the standard backtester-evaluator status dict so the existing
 ``CompletenessTracker.run_module`` pattern handles it without bespoke
@@ -57,18 +59,29 @@ CANONICAL_SECTORS = (
     "healthcare", "industrials", "technology",
 )
 
+# Per-stage canonical set: 1 macro + 1 ic_cio + 3 sub-stages × 6 sectors
+# = 20. Provenance is reported per-stage because tool distributions and
+# zero-call alarms are stage-specific (e.g., sector_quant uses screening
+# tools, sector_qual uses RAG / news fetch, sector_peer_review is a
+# synthesizer with none). For the composite "did this team's decision
+# get captured?" question, see ``decision_capture_coverage.py`` which
+# virtualizes ``sector_team:{sector}`` over the same 3 sub-stages.
 CANONICAL_AGENTS: tuple[str, ...] = (
     "macro_economist",
     "ic_cio",
-    *(f"sector_team:{s}" for s in CANONICAL_SECTORS),
+    *(f"sector_quant:{s}" for s in CANONICAL_SECTORS),
+    *(f"sector_qual:{s}" for s in CANONICAL_SECTORS),
+    *(f"sector_peer_review:{s}" for s in CANONICAL_SECTORS),
 )
 
-# Agents that are EXPECTED to invoke tools. Zero tool calls on these is a
-# hallucination signal. CIO + peer_review legitimately have zero (they're
-# synthesizers operating on aggregated team output, no fetch tools).
+# Agents that are EXPECTED to invoke tools. Zero tool calls on these is
+# a hallucination signal. ic_cio + sector_peer_review:* are synthesizers
+# (operate on aggregated team output, no fetch tools) and are therefore
+# excluded from the alarm denominator.
 TOOL_EQUIPPED_AGENTS: frozenset[str] = frozenset({
     "macro_economist",
-    *(f"sector_team:{s}" for s in CANONICAL_SECTORS),
+    *(f"sector_quant:{s}" for s in CANONICAL_SECTORS),
+    *(f"sector_qual:{s}" for s in CANONICAL_SECTORS),
 })
 
 _META_PREFIXES = (
