@@ -119,8 +119,93 @@ def analyze(trigger_scorecard: dict) -> dict:
     }
 
 
+def _build_overlay_params(result: dict) -> tuple[dict, list[str]]:
+    """Compute the field_overlay payload this optimizer wants applied.
+
+    Returns (params_dict, overlay_keys). Used by both ``apply()`` (legacy
+    read-modify-write path) and ``produce_artifact()`` (single source of
+    truth for what this optimizer recommends).
+    """
+    params = {
+        "disabled_triggers": result.get("disabled_triggers", []),
+        "disabled_triggers_updated_at": str(date.today()),
+    }
+    return params, list(params.keys())
+
+
+def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> dict:
+    """
+    Convert a trigger_optimizer ``recommend()`` result into a typed
+    ``RecommendationArtifact`` and write it to S3 at
+    ``config/executor_params/recommendations/{date}/from_trigger_optimizer.json``.
+
+    Part of the optimizer-artifact-assembler arc — see
+    ``alpha-engine-docs/private/optimizer-artifact-assembler-260509.md``.
+    Always writes regardless of ``result.status`` so the audit trail
+    captures every invocation. Uses ``field_overlay`` kind because this
+    optimizer touches the ``disabled_triggers`` field set without
+    replacing the broader executor_params block.
+
+    Returns ``{"written": True, "key": str}`` on success or
+    ``{"written": False, "reason": str}`` on non-fatal failure.
+    """
+    from optimizer.recommendation_artifact import (
+        RecommendationArtifact, derive_promotion_intent, today_iso, write_artifact,
+    )
+
+    try:
+        if result.get("status") == "ok":
+            params, overlay_keys = _build_overlay_params(result)
+            intent = derive_promotion_intent(result)
+        else:
+            params = {}
+            overlay_keys = None
+            intent = "skip"
+
+        diagnostic = {
+            k: result.get(k)
+            for k in (
+                "status", "total_evaluated", "min_trades_threshold",
+                "recommendations",
+            )
+            if result.get(k) is not None
+        }
+        artifact = RecommendationArtifact(
+            fit_target="entry_timing_alpha",
+            optimizer_name="trigger_optimizer",
+            run_date=today_iso(),
+            recommendation_kind="field_overlay",
+            recommended_params=params,
+            overlay_keys=overlay_keys,
+            promotion_intent=intent,
+            diagnostic=diagnostic,
+            notes=result.get("note", "") or "",
+        )
+        if run_id is not None:
+            artifact.run_id = run_id
+        key = write_artifact(artifact, bucket, config_type="executor_params")
+        return {"written": True, "key": key, "run_id": artifact.run_id}
+    except Exception as e:
+        logger.warning(
+            "Failed to write trigger_optimizer recommendation artifact: %s "
+            "(non-fatal — legacy live write still proceeds)", e,
+        )
+        return {"written": False, "reason": str(e)}
+
+
 def apply(result: dict, bucket: str) -> dict:
-    """Write disabled_triggers list to executor_params.json on S3."""
+    """Write disabled_triggers list to executor_params.json on S3.
+
+    Additionally — and unconditionally — produces a per-optimizer
+    recommendation artifact at
+    ``config/executor_params/recommendations/{date}/from_trigger_optimizer.json``
+    via ``produce_artifact()``. Part of the optimizer-artifact-assembler
+    arc; the artifact is additive (no behavior change to the legacy live
+    write) and is consumed by the future assembler module.
+    """
+    # Always produce the artifact — captures every invocation for audit.
+    produce_artifact(result, bucket)
+
     if result.get("status") != "ok":
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
@@ -138,8 +223,8 @@ def apply(result: dict, bucket: str) -> dict:
     if set(disable_list) == set(current_disabled):
         return {"applied": False, "reason": "no change from current disabled list"}
 
-    current["disabled_triggers"] = disable_list
-    current["disabled_triggers_updated_at"] = str(date.today())
+    overlay_params, _ = _build_overlay_params(result)
+    current.update(overlay_params)
 
     body = json.dumps(current, indent=2)
     s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
