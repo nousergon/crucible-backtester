@@ -816,7 +816,9 @@ def _run_regression(
             save_promotion_baseline(bucket, current_metrics, promoted)
 
         if current_metrics and not freeze:
-            return check_regression(bucket, current_metrics, config) or {"status": "ok"}
+            return check_regression(
+                bucket, current_metrics, config, run_date=run_date,
+            ) or {"status": "ok"}
         return {"status": "ok", "note": "frozen or no metrics"}
 
     return tracker.run_module(
