@@ -11,14 +11,17 @@ in config (default: legacy):
 - **Legacy (Sharpe-with-drawdown):** ``_combined_score = sharpe_ratio
   - drawdown_penalty_weight × |max_drawdown|``. Stamps
   ``fit_target="sharpe_legacy"``. Pre-evaluator-revamp behavior.
-- **Skill-composite:** ranks by ``sortino_ratio`` (primary, skilled
-  downside-aware return) with ``total_alpha`` as tiebreaker. Stamps
-  ``fit_target="skill_composite"``. Aligns with the evaluator-revamp
-  2026-05-06 metric stack — Sortino + CVaR + risk-matched-alpha are the
-  skilled-risk-taking signals; raw alpha vs SPY is presentation framing
-  ("did we beat the market") that doesn't reward taking the right risk
-  per unit of downside variance. Mirrors the activation pattern shipped
-  for ``weight_optimizer`` (PR #145 / PR 6 of evaluator revamp).
+- **Skill-composite:** ranks by ``sortino_ratio`` — skilled downside-aware
+  return — with no tiebreaker. Stamps ``fit_target="skill_composite"``.
+  Aligns with the evaluator-revamp 2026-05-06 metric stack: Sortino, CVaR,
+  risk-matched-alpha are the skilled-risk-taking signals; raw alpha vs SPY
+  is presentation framing ("did we beat the market") that doesn't reward
+  taking the right risk per unit of downside variance. Alpha still appears
+  in the result dict + S3 payload for operator display — it just doesn't
+  drive the ranking. Exact-Sortino ties are effectively measure-zero on a
+  continuous-param sweep; pandas stable-sort resolves them deterministically.
+  Mirrors the activation pattern shipped for ``weight_optimizer``
+  (PR #145 / PR 6 of evaluator revamp).
 
 Promotion to live S3 (``config/executor_params.json``) is gated by
 ``executor_optimizer.enforce_skill_composite``: when the skill-composite
@@ -259,13 +262,14 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     use_skill_composite = bool(_cfg.get("use_skill_composite_target", False))
 
     if use_skill_composite:
-        # Skill-composite ranking: sortino_ratio (primary, skilled
-        # downside-aware return) + total_alpha (tiebreaker, presentation).
-        # Sortino aligns with the evaluator-revamp metric stack: it rewards
-        # configs that extract return per unit of *downside* variance — the
-        # exact "intelligent risk-taking" signal. Alpha vs SPY is kept as a
-        # tiebreaker because among Sortino-equivalent configs, beating SPY
-        # is weakly preferable for end-user-headline framing.
+        # Skill-composite ranking: sortino_ratio only — skilled downside-aware
+        # return. Sortino aligns with the evaluator-revamp metric stack: it
+        # rewards configs that extract return per unit of *downside* variance —
+        # the exact "intelligent risk-taking" signal. Alpha vs SPY surfaces in
+        # the result dict for operator display but does not drive ranking;
+        # raw alpha is end-user-headline framing, not the optimizer's fit
+        # target. Exact-Sortino ties are effectively measure-zero on a
+        # continuous-param sweep; pandas stable-sort handles them deterministically.
         if "sortino_ratio" not in valid.columns:
             return {
                 "status": "insufficient_data",
@@ -282,10 +286,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
                 "note": "All sortino_ratio values are NaN — cannot rank by skill-composite.",
                 "fit_target": "skill_composite",
             }
-        sort_cols = ["sortino_ratio"]
-        if "total_alpha" in valid.columns:
-            sort_cols.append("total_alpha")
-        valid = valid.sort_values(sort_cols, ascending=False)
+        valid = valid.sort_values("sortino_ratio", ascending=False)
         fit_target = "skill_composite"
     else:
         # Legacy multi-metric ranking: Sharpe primary, penalize drawdown.
@@ -413,8 +414,8 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
             "note": (
                 f"Best combo improves Sortino by {improvement_pct:.1%} "
                 f"({baseline_sortino:.4f} → {best_sortino:.4f}) across {len(valid)} combos "
-                f"(skill_composite ranking: sortino primary, alpha tiebreaker; "
-                f"best_alpha={best_alpha} shown for presentation framing only)."
+                f"(skill_composite ranking: sortino only; "
+                f"best_alpha={best_alpha} shown for operator display, not gating)."
             ),
         }
 

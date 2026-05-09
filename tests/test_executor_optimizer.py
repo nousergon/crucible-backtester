@@ -2,10 +2,11 @@
 
 Two ranking paths are tested:
 - Legacy (Sharpe-with-drawdown) — default behavior, unchanged from pre-revamp.
-- Skill-composite (sortino-primary + alpha-tiebreaker) — gated by
+- Skill-composite (sortino only, no tiebreaker) — gated by
   ``executor_optimizer.use_skill_composite_target`` config flag. Sortino
   is the skilled-risk-taking signal (downside-aware return); total_alpha
-  vs SPY is presentation framing kept as tiebreaker only.
+  vs SPY surfaces in the result dict for operator display but doesn't
+  drive ranking. Exact-Sortino ties are deferred to pandas stable-sort.
 
 Production-vs-shadow promotion paths are also tested via mocked S3.
 """
@@ -140,8 +141,16 @@ class TestSkillCompositeRanking:
         # Alpha is reported (presentation tiebreaker) but didn't drive selection.
         assert result["best_alpha"] == 0.30
 
-    def test_skill_alpha_breaks_sortino_ties(self):
+    def test_skill_exact_sortino_ties_resolve_via_stable_sort(self):
+        """Sortino-only ranking: exact ties (rare on continuous sweeps) defer
+        to pandas stable-sort — original DataFrame order preserved among
+        equal Sortinos. Higher alpha does NOT win; alpha is presentation,
+        not a ranking axis.
+        """
         _init_default_config({"use_skill_composite_target": True})
+        # Both rows have identical Sortino (0.9). Higher-alpha row is SECOND
+        # in the input. Stable sort preserves original order → first row wins
+        # despite second having higher alpha.
         rows = [
             {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
              "sortino_ratio": 0.9, "total_trades": 50},
@@ -150,8 +159,10 @@ class TestSkillCompositeRanking:
         ]
         df = _make_sweep_df(rows)
         result = recommend(df, base_config={})
-        # Same Sortino → alpha tiebreaker → atr_multiplier=3.0 wins.
-        assert result["recommended_params"]["atr_multiplier"] == 3.0
+        # Stable sort: first-found-among-equals wins; alpha is irrelevant to ranking.
+        assert result["recommended_params"]["atr_multiplier"] == 2.0
+        # Alpha still surfaces in the result for operator display.
+        assert result["best_alpha"] == 0.10
 
     def test_skill_negative_sortino_blocks(self):
         """Mirrors the negative-Sharpe guard but on the skilled-risk-taking
