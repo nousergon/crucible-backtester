@@ -59,6 +59,19 @@ OUTCOMES_GRADED_SQL = (
     "(correct IS NOT NULL OR correct_5d IS NOT NULL)"
 )
 
+# Active production horizon for rolling analytics. Must match
+# `labeling.forward_days` in alpha-engine-config/predictor/predictor.yaml —
+# bump in lockstep with any future horizon migration. Rolling IC / hit-rate /
+# value-of-veto reads on predictor_outcomes scope to this horizon so the
+# transition window doesn't blend pre-cutover (5d arithmetic) and
+# post-cutover (21d log) rows, whose distributions differ by both scale
+# (variance ~√(21/5)) and label semantics. Backfill / historical-range
+# reads (e.g. weight optimizer cross-era sweeps) should NOT use this filter.
+ACTIVE_HORIZON_DAYS = 21
+CURRENT_HORIZON_FILTER_SQL = (
+    f"COALESCE(horizon_days, 5) = {ACTIVE_HORIZON_DAYS}"
+)
+
 
 # ── Phase markers ────────────────────────────────────────────────────────────
 #

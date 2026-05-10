@@ -27,6 +27,7 @@ import pandas as pd
 
 from pipeline_common import (
     ALPHA_COALESCE_SQL,
+    CURRENT_HORIZON_FILTER_SQL,
     HORIZON_COALESCE_SQL,
     OUTCOMES_RESOLVED_SQL,
 )
@@ -74,7 +75,9 @@ def compute_veto_value(
             f"{HORIZON_COALESCE_SQL} AS horizon_days, "
             "p_down "
             "FROM predictor_outcomes "
-            f"WHERE predicted_direction = 'DOWN' AND {OUTCOMES_RESOLVED_SQL}",
+            f"WHERE predicted_direction = 'DOWN' "
+            f"  AND {OUTCOMES_RESOLVED_SQL} "
+            f"  AND {CURRENT_HORIZON_FILTER_SQL}",
             conn,
         )
         conn.close()
@@ -152,9 +155,12 @@ def compute_veto_value(
             ) if not grp.empty else 0,
         })
 
-    # Multi-horizon snapshot: surface which horizons contributed to this
-    # veto-value computation (reads `horizon_days` from the row metadata —
-    # 21 for canonical-21d post-cutover, 5 for legacy rows).
+    # Single-horizon snapshot post 2026-05-10 filter: rolling-analytics reads
+    # scope to ACTIVE_HORIZON_DAYS via CURRENT_HORIZON_FILTER_SQL so the
+    # transition window doesn't mix 5d-arith and 21d-log distributions.
+    # `horizons_seen` is retained for the forensic trail; expect a single
+    # value during normal operation, multiple only if a horizon migration
+    # is in progress and the filter constant was bumped mid-cycle.
     horizons_seen = sorted(po["horizon_days"].dropna().unique().tolist())
 
     return {

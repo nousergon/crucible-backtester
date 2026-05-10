@@ -25,6 +25,7 @@ import pandas as pd
 
 from pipeline_common import (
     ALPHA_COALESCE_SQL,
+    CURRENT_HORIZON_FILTER_SQL,
     HORIZON_COALESCE_SQL,
     OUTCOMES_RESOLVED_SQL,
 )
@@ -77,7 +78,9 @@ def compute_confusion_matrix(
             f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
             f"{HORIZON_COALESCE_SQL} AS horizon_days "
             "FROM predictor_outcomes "
-            f"WHERE predicted_direction IS NOT NULL AND {OUTCOMES_RESOLVED_SQL}",
+            f"WHERE predicted_direction IS NOT NULL "
+            f"  AND {OUTCOMES_RESOLVED_SQL} "
+            f"  AND {CURRENT_HORIZON_FILTER_SQL}",
             conn,
         )
         conn.close()

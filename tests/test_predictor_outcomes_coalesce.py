@@ -20,8 +20,10 @@ import pandas as pd
 import pytest
 
 from pipeline_common import (
+    ACTIVE_HORIZON_DAYS,
     ALPHA_COALESCE_SQL,
     CORRECT_COALESCE_SQL,
+    CURRENT_HORIZON_FILTER_SQL,
     HORIZON_COALESCE_SQL,
     OUTCOMES_GRADED_SQL,
     OUTCOMES_RESOLVED_SQL,
@@ -149,3 +151,47 @@ def test_graded_predicate_matches_either_column():
         ).fetchall()
     found = {r[0] for r in rows}
     assert found == {"A", "B"}
+
+
+# -- Current-horizon filter for rolling analytics -----------------------------
+
+
+def test_current_horizon_filter_excludes_legacy_5d_rows():
+    """CURRENT_HORIZON_FILTER_SQL scopes rolling analytics to the active
+    production horizon so the 21d-log distribution isn't mixed with the
+    legacy 5d-arith distribution during the transition window."""
+    db = _create_db()
+    # Active horizon row (21d log canonical)
+    _insert(
+        db, symbol="NEW", prediction_date="2026-05-10",
+        actual_log_alpha=0.03, horizon_days=ACTIVE_HORIZON_DAYS, correct=1,
+    )
+    # Legacy 5d row (NULL horizon_days → COALESCE → 5 → filtered out)
+    _insert(
+        db, symbol="OLD", prediction_date="2026-04-01",
+        actual_5d_return=1.5, correct_5d=1,
+    )
+    # Pathological row with explicit non-active horizon (e.g. 10d) → filtered
+    _insert(
+        db, symbol="MID", prediction_date="2026-04-15",
+        actual_log_alpha=0.02, horizon_days=10, correct=1,
+    )
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            f"SELECT symbol FROM predictor_outcomes "
+            f"WHERE {OUTCOMES_RESOLVED_SQL} AND {CURRENT_HORIZON_FILTER_SQL}"
+        ).fetchall()
+    found = {r[0] for r in rows}
+    assert found == {"NEW"}
+
+
+def test_active_horizon_days_matches_production_config():
+    """Smoke gate: ACTIVE_HORIZON_DAYS must match
+    alpha-engine-config/predictor/predictor.yaml `labeling.forward_days`.
+    If this fails, the constant was bumped without updating production
+    config (or vice versa) — fix the mismatch before rolling out."""
+    assert ACTIVE_HORIZON_DAYS == 21, (
+        "ACTIVE_HORIZON_DAYS drifted from production forward_days=21. "
+        "Bump in lockstep with predictor.yaml when migrating horizons."
+    )

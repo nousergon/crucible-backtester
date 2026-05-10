@@ -1399,9 +1399,19 @@ def _section_confusion_matrix(result: dict) -> list[str]:
     lines = ["## Predictor confusion matrix (UP / FLAT / DOWN)"]
     n = result.get("n", 0)
     acc = result.get("accuracy")
+    horizons = result.get("horizons_days") or []
+    horizon_label = f"{horizons[0]}d" if len(horizons) == 1 else "21d"
+    up_thresh = result.get("up_threshold")
+    thresh_str = f"±{up_thresh:.3f}" if up_thresh is not None else "±0.005"
     lines += [
         "",
         f"_{n} resolved predictions. Overall directional accuracy: {_pct(acc)}_",
+        "",
+        f"> ⓘ Direction labels (UP / FLAT / DOWN) classified from "
+        f"**log-domain decimal** alpha at the {horizon_label} horizon "
+        f"(threshold {thresh_str}). Sample is scoped to the active "
+        f"production horizon — expect sparse n during the ~4-week post-cutover "
+        f"window (2026-05-09 → ~2026-06-06).",
         "",
     ]
 
@@ -1939,12 +1949,21 @@ def _section_score_calibration(result: dict) -> list[str]:
 
 def _section_veto_value(result: dict) -> list[str]:
     """Build net veto value in dollars section."""
+    horizons = result.get("horizons_days") or []
+    horizon_label = f"{horizons[0]}d" if len(horizons) == 1 else "21d"
     lines = [
         "## Net veto value",
         "",
         f"_{result['n_vetoes']} DOWN predictions evaluated "
         f"({result['n_correct']} correct, {result['n_incorrect']} incorrect). "
         f"Precision: {_pct(result.get('precision'))}_",
+        "",
+        f"> ⓘ α values below are **log-domain decimal** at {horizon_label} horizon "
+        f"(post 2026-05-09 21d canonical cutover). At small magnitudes the "
+        f"displayed pp ≈ arithmetic %; tail values diverge (e.g. -10pp log ≈ "
+        f"-9.5% arithmetic). Sample is scoped to the active horizon and will "
+        f"be sparse for the first ~4 weeks post-cutover until 21d outcomes "
+        f"accumulate.",
         "",
         "| Metric | Value |",
         "|--------|-------|",
@@ -1953,7 +1972,7 @@ def _section_veto_value(result: dict) -> list[str]:
         f"| **Net veto value** | **${result['net_veto_value']:,.0f}** |",
         f"| Avg loss avoided per veto | ${result['avg_loss_avoided']:,.0f} |",
         f"| Avg alpha foregone per miss | ${result['avg_alpha_foregone']:,.0f} |",
-        f"| Avg vetoed stock alpha (5d) | {result.get('avg_veto_alpha_pct', 0):+.2f}pp |",
+        f"| Avg vetoed stock α ({horizon_label}, log-domain) | {result.get('avg_veto_alpha_pct', 0):+.2f}pp |",
     ]
 
     by_conf = result.get("by_confidence", [])
