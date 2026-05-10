@@ -10,7 +10,9 @@ Requires: predictor_outcomes (predictions), score_performance or universe_return
 (actual returns), and executor context (position sizing).
 
 Data sources:
-  - predictor_outcomes in research.db (predictions with actual_5d_return)
+  - predictor_outcomes in research.db (predictions with canonical alpha —
+    `actual_log_alpha` for new rows, legacy `actual_5d_return` for old rows;
+    pipeline_common.ALPHA_COALESCE_SQL normalizes both to decimal scale)
   - executor_shadow_book in trades.db (blocked entries with intended_dollars)
   - universe_returns in research.db (forward returns for all stocks)
 """
@@ -22,6 +24,12 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+
+from pipeline_common import (
+    ALPHA_COALESCE_SQL,
+    HORIZON_COALESCE_SQL,
+    OUTCOMES_RESOLVED_SQL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +69,12 @@ def compute_veto_value(
 
         po = pd.read_sql_query(
             "SELECT symbol, prediction_date, predicted_direction, "
-            "prediction_confidence, actual_5d_return, p_down "
+            "prediction_confidence, "
+            f"{ALPHA_COALESCE_SQL} AS actual_alpha, "
+            f"{HORIZON_COALESCE_SQL} AS horizon_days, "
+            "p_down "
             "FROM predictor_outcomes "
-            "WHERE predicted_direction = 'DOWN' AND actual_5d_return IS NOT NULL",
+            f"WHERE predicted_direction = 'DOWN' AND {OUTCOMES_RESOLVED_SQL}",
             conn,
         )
         conn.close()
@@ -94,7 +105,10 @@ def compute_veto_value(
         except Exception:
             pass
 
-    # actual_5d_return is stored as percentage points (market-relative alpha)
+    # `actual_alpha` is decimal alpha (decimal log-units for new rows post
+    # canonical-21d cutover; arithmetic-decimal for old rows where the
+    # SQL COALESCE divided actual_5d_return / 100). Dollar impact is the
+    # naive linear product — accurate at small magnitudes where log(1+r) ≈ r.
     po["position_dollars"] = po.apply(
         lambda r: shadow_sizes.get(
             (r["symbol"], r["prediction_date"]),
@@ -103,11 +117,10 @@ def compute_veto_value(
         axis=1,
     )
 
-    # Dollar impact: actual_5d_return is in pct points, divide by 100
-    po["dollar_impact"] = po["position_dollars"] * po["actual_5d_return"] / 100.0
+    po["dollar_impact"] = po["position_dollars"] * po["actual_alpha"]
 
-    correct = po[po["actual_5d_return"] < 0]  # stock underperformed → veto was right
-    incorrect = po[po["actual_5d_return"] >= 0]  # stock outperformed → veto missed alpha
+    correct = po[po["actual_alpha"] < 0]  # stock underperformed → veto was right
+    incorrect = po[po["actual_alpha"] >= 0]  # stock outperformed → veto missed alpha
 
     total_losses_avoided = float(correct["dollar_impact"].abs().sum()) if not correct.empty else 0
     total_alpha_foregone = float(incorrect["dollar_impact"].sum()) if not incorrect.empty else 0
@@ -125,8 +138,8 @@ def compute_veto_value(
         grp = po[po["conf_bucket"] == bucket]
         if grp.empty:
             continue
-        grp_correct = grp[grp["actual_5d_return"] < 0]
-        grp_incorrect = grp[grp["actual_5d_return"] >= 0]
+        grp_correct = grp[grp["actual_alpha"] < 0]
+        grp_incorrect = grp[grp["actual_alpha"] >= 0]
         by_confidence.append({
             "confidence_range": str(bucket),
             "n_vetoes": len(grp),
@@ -139,6 +152,11 @@ def compute_veto_value(
             ) if not grp.empty else 0,
         })
 
+    # Multi-horizon snapshot: surface which horizons contributed to this
+    # veto-value computation (reads `horizon_days` from the row metadata —
+    # 21 for canonical-21d post-cutover, 5 for legacy rows).
+    horizons_seen = sorted(po["horizon_days"].dropna().unique().tolist())
+
     return {
         "status": "ok",
         "n_vetoes": len(po),
@@ -150,6 +168,8 @@ def compute_veto_value(
         "net_veto_value": round(net_value, 2),
         "avg_loss_avoided": round(total_losses_avoided / len(correct), 2) if len(correct) > 0 else 0,
         "avg_alpha_foregone": round(total_alpha_foregone / len(incorrect), 2) if len(incorrect) > 0 else 0,
-        "avg_veto_alpha_pct": round(float(po["actual_5d_return"].mean()), 2),
+        # avg_veto_alpha is now decimal (×100 to read as percentage)
+        "avg_veto_alpha_pct": round(float(po["actual_alpha"].mean()) * 100.0, 2),
+        "horizons_days": [int(h) for h in horizons_seen],
         "by_confidence": by_confidence,
     }

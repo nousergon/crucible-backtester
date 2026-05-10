@@ -52,8 +52,9 @@ def test_join_outcomes_with_features_exact_date_match():
     outcomes = pd.DataFrame({
         "symbol": ["AAPL"],
         "prediction_date": pd.to_datetime(["2026-04-02"]),
-        "actual_5d_return": [1.5],
+        "canonical_actual": [1.5],
         "actual": [1.5],
+        "horizon_days": [21],
     })
 
     joined = _join_outcomes_with_features(outcomes, features)
@@ -73,8 +74,9 @@ def test_join_outcomes_with_features_nearest_prior_date():
     outcomes = pd.DataFrame({
         "symbol": ["AAPL"],
         "prediction_date": pd.to_datetime(["2026-04-02"]),
-        "actual_5d_return": [1.5],
+        "canonical_actual": [1.5],
         "actual": [1.5],
+        "horizon_days": [21],
     })
 
     joined = _join_outcomes_with_features(outcomes, features)
@@ -104,7 +106,7 @@ def test_join_outcomes_missing_ticker():
 
 @pytest.fixture
 def mock_db(tmp_path):
-    """Create a temp SQLite DB with predictor_outcomes data."""
+    """Create a temp SQLite DB with predictor_outcomes data (post-2026-05-09 schema)."""
     db_path = str(tmp_path / "research.db")
     conn = sqlite3.connect(db_path)
     conn.execute("""
@@ -118,11 +120,15 @@ def mock_db(tmp_path):
             score_modifier_applied REAL DEFAULT 0.0,
             actual_5d_return REAL,
             correct_5d INTEGER,
+            actual_log_alpha REAL,
+            horizon_days INTEGER,
+            correct INTEGER,
             UNIQUE(symbol, prediction_date)
         )
     """)
 
-    # Insert 30 resolved outcomes for 3 tickers
+    # Insert 30 resolved outcomes for 3 tickers populated under canonical
+    # post-cutover schema (actual_log_alpha set, horizon_days=21).
     np.random.seed(42)
     tickers = ["AAPL", "MSFT", "GOOGL"]
     dates = pd.bdate_range("2026-02-15", periods=10)
@@ -131,9 +137,11 @@ def mock_db(tmp_path):
             actual = round(np.random.normal(0, 2), 4)
             conn.execute(
                 "INSERT INTO predictor_outcomes (symbol, prediction_date, predicted_direction, "
-                "prediction_confidence, p_up, p_down, actual_5d_return, correct_5d) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (ticker, d.strftime("%Y-%m-%d"), "UP", 0.65, 0.65, 0.15, actual, 1 if actual > 0 else 0),
+                "prediction_confidence, p_up, p_down, "
+                "actual_log_alpha, horizon_days, correct) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ticker, d.strftime("%Y-%m-%d"), "UP", 0.65, 0.65, 0.15,
+                 actual, 21, 1 if actual > 0 else 0),
             )
     conn.commit()
     conn.close()
@@ -154,7 +162,8 @@ def test_compute_feature_drift_skips_insufficient_outcomes(tmp_path):
             id INTEGER PRIMARY KEY, symbol TEXT, prediction_date TEXT,
             predicted_direction TEXT, prediction_confidence REAL,
             p_up REAL, p_flat REAL, p_down REAL,
-            score_modifier_applied REAL, actual_5d_return REAL, correct_5d INTEGER
+            score_modifier_applied REAL, actual_5d_return REAL, correct_5d INTEGER,
+            actual_log_alpha REAL, horizon_days INTEGER, correct INTEGER
         )
     """)
     conn.commit()
@@ -173,7 +182,7 @@ def test_compute_feature_drift_detects_sign_flip(mock_boto, mock_arctic, mock_tr
     # Build feature data that anti-correlates with actual returns for rsi_14
     conn = sqlite3.connect(mock_db)
     outcomes = pd.read_sql_query(
-        "SELECT symbol, prediction_date, actual_5d_return FROM predictor_outcomes",
+        "SELECT symbol, prediction_date, actual_log_alpha FROM predictor_outcomes",
         conn,
     )
     conn.close()
@@ -182,7 +191,7 @@ def test_compute_feature_drift_detects_sign_flip(mock_boto, mock_arctic, mock_tr
     for ticker in outcomes["symbol"].unique():
         ticker_rows = outcomes[outcomes["symbol"] == ticker].copy()
         dates = pd.to_datetime(ticker_rows["prediction_date"])
-        actuals = ticker_rows["actual_5d_return"].values
+        actuals = ticker_rows["actual_log_alpha"].values
 
         features[ticker] = pd.DataFrame(
             {
@@ -211,7 +220,7 @@ def test_compute_feature_drift_stable(mock_boto, mock_arctic, mock_training_ics,
     """All features correlated with actuals — should be stable."""
     conn = sqlite3.connect(mock_db)
     outcomes = pd.read_sql_query(
-        "SELECT symbol, prediction_date, actual_5d_return FROM predictor_outcomes",
+        "SELECT symbol, prediction_date, actual_log_alpha FROM predictor_outcomes",
         conn,
     )
     conn.close()
@@ -220,7 +229,7 @@ def test_compute_feature_drift_stable(mock_boto, mock_arctic, mock_training_ics,
     for ticker in outcomes["symbol"].unique():
         ticker_rows = outcomes[outcomes["symbol"] == ticker].copy()
         dates = pd.to_datetime(ticker_rows["prediction_date"])
-        actuals = ticker_rows["actual_5d_return"].values
+        actuals = ticker_rows["actual_log_alpha"].values
 
         features[ticker] = pd.DataFrame(
             {

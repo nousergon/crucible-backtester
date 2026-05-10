@@ -195,9 +195,16 @@ class TestAssemblerArcEndToEnd:
             },
         })
 
+        # Pin today_iso to RUN_DATE so the artifact key the test asserts on
+        # matches regardless of UTC clock at run time. recommendation_artifact
+        # exposes today_iso() specifically as a patch seam — without this,
+        # CI runs that cross the UTC midnight boundary land the artifact at
+        # `{tomorrow}/...` while the assertion looks for `{RUN_DATE}/...`.
         with patch("optimizer.executor_optimizer.boto3") as exec_boto3, \
              patch("optimizer.recommendation_artifact.boto3") as art_boto3, \
-             patch("optimizer.rollback.boto3") as rb_boto3:
+             patch("optimizer.rollback.boto3") as rb_boto3, \
+             patch("optimizer.recommendation_artifact.today_iso",
+                   return_value=self.RUN_DATE):
             exec_boto3.client.return_value = s3
             art_boto3.client.return_value = s3
             rb_boto3.client.return_value = s3
@@ -339,9 +346,16 @@ class TestAssemblerArcEndToEnd:
             },
         })
 
+        # Pin today_iso to RUN_DATE so the artifact key the test asserts on
+        # matches regardless of UTC clock at run time. recommendation_artifact
+        # exposes today_iso() specifically as a patch seam — without this,
+        # CI runs that cross the UTC midnight boundary land the artifact at
+        # `{tomorrow}/...` while the assertion looks for `{RUN_DATE}/...`.
         with patch("optimizer.executor_optimizer.boto3") as exec_boto3, \
              patch("optimizer.recommendation_artifact.boto3") as art_boto3, \
-             patch("optimizer.rollback.boto3") as rb_boto3:
+             patch("optimizer.rollback.boto3") as rb_boto3, \
+             patch("optimizer.recommendation_artifact.today_iso",
+                   return_value=self.RUN_DATE):
             exec_boto3.client.return_value = s3
             art_boto3.client.return_value = s3
             rb_boto3.client.return_value = s3

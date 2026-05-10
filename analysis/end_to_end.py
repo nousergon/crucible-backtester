@@ -196,7 +196,12 @@ def build_attribution_table(
             po.prediction_confidence,
             po.p_up,
             po.p_down,
-            po.actual_5d_return AS predictor_actual_5d
+            -- Canonical alpha (decimal scale) at the row's horizon-of-record.
+            -- Post predictor 21d migration (2026-05-09): `actual_log_alpha`
+            -- is decimal log-units at horizon_days; legacy `actual_5d_return`
+            -- is pct points at 5d (divide by 100 to align scale).
+            COALESCE(po.actual_log_alpha, po.actual_5d_return / 100.0) AS predictor_actual_alpha,
+            COALESCE(po.horizon_days, 5) AS predictor_horizon_days
         FROM universe_returns ur
         LEFT JOIN scanner_evaluations se
             ON ur.ticker = se.ticker AND ur.eval_date = se.eval_date

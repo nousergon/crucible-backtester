@@ -5,10 +5,17 @@ Computes a 3x3 confusion matrix (UP/FLAT/DOWN predicted vs actual) from
 predictor_outcomes. Reveals whether the model confuses flat with directional
 or reverses direction.
 
-Actual direction is derived from actual_5d_return:
-  UP:   actual_5d_return > +0.5%
-  DOWN: actual_5d_return < -0.5%
+Actual direction is derived from canonical alpha (decimal scale —
+`actual_log_alpha` for new rows post Track A cutover, or
+`actual_5d_return / 100` for legacy rows; pipeline_common.ALPHA_COALESCE_SQL
+normalizes both):
+  UP:   canonical_actual > up_threshold (default 0.005, ≈ 0.5% decimal)
+  DOWN: canonical_actual < -up_threshold
   FLAT: otherwise
+
+Caller can override `up_threshold` to match a specific config (e.g.
+predictor.yaml's `cfg.UP_THRESHOLD`) so the threshold is the source of
+truth, not a hardcoded module constant.
 """
 
 import logging
@@ -16,25 +23,43 @@ import sqlite3
 
 import pandas as pd
 
+from pipeline_common import (
+    ALPHA_COALESCE_SQL,
+    HORIZON_COALESCE_SQL,
+    OUTCOMES_RESOLVED_SQL,
+)
+
 logger = logging.getLogger(__name__)
 
-# Thresholds for mapping continuous return to directional label
-_UP_THRESHOLD = 0.005    # +0.5%
-_DOWN_THRESHOLD = -0.005  # -0.5%
+# Default magnitude classifying UP/DOWN. Decimal scale (0.005 = 0.5%).
+# Caller can override via the `up_threshold` parameter on
+# `compute_confusion_matrix` so the threshold lives in caller config
+# (predictor.yaml's UP_THRESHOLD), not as a hardcoded module constant.
+_DEFAULT_UP_THRESHOLD = 0.005
 
 DIRECTIONS = ["UP", "FLAT", "DOWN"]
 
 
-def _actual_direction(ret: float) -> str:
-    if ret > _UP_THRESHOLD:
+def _actual_direction(ret: float, up_threshold: float = _DEFAULT_UP_THRESHOLD) -> str:
+    """Classify continuous decimal return as UP/FLAT/DOWN with a symmetric ±band."""
+    if ret > up_threshold:
         return "UP"
-    elif ret < _DOWN_THRESHOLD:
+    elif ret < -up_threshold:
         return "DOWN"
     return "FLAT"
 
 
-def compute_confusion_matrix(db_path: str, min_samples: int = 30) -> dict:
+def compute_confusion_matrix(
+    db_path: str,
+    min_samples: int = 30,
+    up_threshold: float = _DEFAULT_UP_THRESHOLD,
+) -> dict:
     """Compute a 3x3 confusion matrix from predictor_outcomes.
+
+    Args:
+        up_threshold: decimal magnitude classifying UP/DOWN. Defaults to
+            0.005 (0.5%). Production callers should pass `cfg.UP_THRESHOLD`
+            from predictor.yaml so the threshold is config-driven.
 
     Returns:
         status: "ok" | "insufficient_data" | "error"
@@ -42,13 +67,17 @@ def compute_confusion_matrix(db_path: str, min_samples: int = 30) -> dict:
         matrix: {predicted: {actual: count}} e.g. {"UP": {"UP": 40, "FLAT": 15, "DOWN": 5}}
         accuracy: overall directional accuracy
         per_class: {direction: {precision, recall, f1, n_predicted, n_actual}}
+        up_threshold: the threshold used (echoed back for forensic trail)
+        horizons_days: list of horizons present in the underlying rows
     """
     try:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql_query(
-            "SELECT predicted_direction, actual_5d_return "
+            "SELECT predicted_direction, "
+            f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
+            f"{HORIZON_COALESCE_SQL} AS horizon_days "
             "FROM predictor_outcomes "
-            "WHERE predicted_direction IS NOT NULL AND actual_5d_return IS NOT NULL",
+            f"WHERE predicted_direction IS NOT NULL AND {OUTCOMES_RESOLVED_SQL}",
             conn,
         )
         conn.close()
@@ -62,7 +91,9 @@ def compute_confusion_matrix(db_path: str, min_samples: int = 30) -> dict:
             "min_required": min_samples,
         }
 
-    df["actual_direction"] = df["actual_5d_return"].apply(_actual_direction)
+    df["actual_direction"] = df["canonical_actual"].apply(
+        lambda r: _actual_direction(r, up_threshold=up_threshold)
+    )
 
     # Build confusion matrix
     matrix = {}
@@ -100,10 +131,14 @@ def compute_confusion_matrix(db_path: str, min_samples: int = 30) -> dict:
             "tp": tp,
         }
 
+    horizons_seen = sorted(df["horizon_days"].dropna().unique().tolist())
+
     return {
         "status": "ok",
         "n": n,
         "accuracy": round(accuracy, 4) if accuracy is not None else None,
         "matrix": matrix,
         "per_class": per_class,
+        "up_threshold": up_threshold,
+        "horizons_days": [int(h) for h in horizons_seen],
     }

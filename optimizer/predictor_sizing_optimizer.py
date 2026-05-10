@@ -1,11 +1,14 @@
 """
 predictor_sizing_optimizer.py — recommend using p_up for position sizing.
 
-Computes rank IC of predictor p_up vs realized 5-day returns from
+Computes rank IC of predictor p_up vs realized canonical alpha from
 predictor_outcomes. If IC is consistently positive over sufficient samples,
 recommends enabling p_up-weighted position sizing in the executor.
 
-Min-data gate: requires >= 30 resolved predictions with 5d returns.
+Reads canonical alpha via pipeline_common.ALPHA_COALESCE_SQL — decimal-
+scale `actual_log_alpha` for new rows post 2026-05-09 21d migration,
+or `actual_5d_return / 100` for legacy rows. Min-data gate: requires
+>= 30 resolved predictions.
 """
 
 import json
@@ -15,6 +18,12 @@ from datetime import date
 
 import boto3
 import pandas as pd
+
+from pipeline_common import (
+    ALPHA_COALESCE_SQL,
+    HORIZON_COALESCE_SQL,
+    OUTCOMES_RESOLVED_SQL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +54,12 @@ def analyze(research_db_path: str) -> dict:
     try:
         conn = sqlite3.connect(research_db_path)
         df = pd.read_sql_query(
-            """
-            SELECT prediction_date, symbol, p_up, actual_5d_return
-            FROM predictor_outcomes
-            WHERE p_up IS NOT NULL AND actual_5d_return IS NOT NULL
-            ORDER BY prediction_date
-            """,
+            "SELECT prediction_date, symbol, p_up, "
+            f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
+            f"{HORIZON_COALESCE_SQL} AS horizon_days "
+            "FROM predictor_outcomes "
+            f"WHERE p_up IS NOT NULL AND {OUTCOMES_RESOLVED_SQL} "
+            "ORDER BY prediction_date",
             conn,
         )
         conn.close()
@@ -65,7 +74,7 @@ def analyze(research_db_path: str) -> dict:
         }
 
     # Overall rank IC
-    overall_ic = float(df["p_up"].corr(df["actual_5d_return"], method="spearman"))
+    overall_ic = float(df["p_up"].corr(df["canonical_actual"], method="spearman"))
 
     # Weekly IC for rolling consistency check
     df["week"] = pd.to_datetime(df["prediction_date"]).dt.isocalendar().week.astype(int)
@@ -76,7 +85,7 @@ def analyze(research_db_path: str) -> dict:
     weekly_ic = []
     for yw, group in df.groupby("year_week"):
         if len(group) >= 5:
-            ic = float(group["p_up"].corr(group["actual_5d_return"], method="spearman"))
+            ic = float(group["p_up"].corr(group["canonical_actual"], method="spearman"))
             weekly_ic.append({"week": yw, "ic": round(ic, 4), "n": len(group)})
 
     positive_weeks = sum(1 for w in weekly_ic if w["ic"] > 0)
@@ -100,8 +109,8 @@ def analyze(research_db_path: str) -> dict:
 
     # Compute value-add: p_up-weighted return vs equal-weight return
     df["rank_pct"] = df.groupby("prediction_date")["p_up"].rank(pct=True)
-    weighted_return = (df["rank_pct"] * df["actual_5d_return"]).mean()
-    equal_weight_return = df["actual_5d_return"].mean()
+    weighted_return = (df["rank_pct"] * df["canonical_actual"]).mean()
+    equal_weight_return = df["canonical_actual"].mean()
     sizing_lift = weighted_return - equal_weight_return
 
     return {

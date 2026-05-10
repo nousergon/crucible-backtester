@@ -112,8 +112,14 @@ def compute_attribution(df: pd.DataFrame) -> dict:
                     r, p = pearsonr(valid["_net_pred"], valid[outcome_col])
                     predictor_corr[outcome_col] = round(float(r), 4)
                     predictor_pvals[outcome_col] = round(float(p), 4)
-    if "correct_5d" in populated.columns:
-        resolved = pd.to_numeric(populated["correct_5d"], errors="coerce").dropna()
+    # Predictor hit rate: read horizon-agnostic `correct` (post 2026-05-09
+    # migration) preferred, fall back to legacy `correct_5d`.
+    correct_col = (
+        "correct" if "correct" in populated.columns else
+        ("correct_5d" if "correct_5d" in populated.columns else None)
+    )
+    if correct_col is not None:
+        resolved = pd.to_numeric(populated[correct_col], errors="coerce").dropna()
         if len(resolved) >= 10:
             predictor_hit_rate = round(float(resolved.mean()), 4)
             from analysis.signal_quality import _wilson_ci

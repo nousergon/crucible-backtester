@@ -27,6 +27,13 @@ import boto3
 import numpy as np
 import pandas as pd
 
+from pipeline_common import (
+    ALPHA_COALESCE_SQL,
+    CORRECT_COALESCE_SQL,
+    HORIZON_COALESCE_SQL,
+    OUTCOMES_GRADED_SQL,
+)
+
 log = logging.getLogger(__name__)
 
 _MIN_SAMPLES = 10
@@ -57,8 +64,12 @@ def compute_production_health(
     conn = sqlite3.connect(db_path)
     df = pd.read_sql_query(
         "SELECT symbol, prediction_date, predicted_direction, prediction_confidence, "
-        "p_up, p_down, actual_5d_return, correct_5d "
-        "FROM predictor_outcomes WHERE correct_5d IS NOT NULL AND prediction_date >= ?",
+        "p_up, p_down, "
+        f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
+        f"{CORRECT_COALESCE_SQL} AS canonical_correct, "
+        f"{HORIZON_COALESCE_SQL} AS horizon_days "
+        "FROM predictor_outcomes "
+        f"WHERE {OUTCOMES_GRADED_SQL} AND prediction_date >= ?",
         conn,
         params=(cutoff,),
     )
@@ -70,8 +81,8 @@ def compute_production_health(
 
     # ── Rolling IC & hit rate ────────────────────────────────────────────────
     df["net_signal"] = pd.to_numeric(df["p_up"], errors="coerce").fillna(0) - pd.to_numeric(df["p_down"], errors="coerce").fillna(0)
-    df["actual"] = pd.to_numeric(df["actual_5d_return"], errors="coerce")
-    df["correct"] = pd.to_numeric(df["correct_5d"], errors="coerce")
+    df["actual"] = pd.to_numeric(df["canonical_actual"], errors="coerce")
+    df["correct"] = pd.to_numeric(df["canonical_correct"], errors="coerce")
 
     hit_rate = float(df["correct"].mean())
 
@@ -142,7 +153,9 @@ def _compute_regime_ic(df: pd.DataFrame, bucket: str) -> dict[str, float | None]
     df = df.copy()
     df["regime"] = df["prediction_date"].map(regime_by_date)
     df["net_signal"] = pd.to_numeric(df["p_up"], errors="coerce").fillna(0) - pd.to_numeric(df["p_down"], errors="coerce").fillna(0)
-    df["actual"] = pd.to_numeric(df["actual_5d_return"], errors="coerce")
+    # canonical_actual already computed by the SELECT in compute_production_health;
+    # _compute_regime_ic receives the same DataFrame so the column is present.
+    df["actual"] = pd.to_numeric(df["canonical_actual"], errors="coerce")
 
     regime_ic = {}
     for regime in ["bull", "neutral", "bear", "caution"]:
@@ -256,8 +269,9 @@ def compute_calibration_validation(
 
     conn = sqlite3.connect(db_path)
     df = pd.read_sql_query(
-        "SELECT prediction_confidence, correct_5d "
-        "FROM predictor_outcomes WHERE correct_5d IS NOT NULL AND prediction_date >= ?",
+        f"SELECT prediction_confidence, {CORRECT_COALESCE_SQL} AS canonical_correct "
+        "FROM predictor_outcomes "
+        f"WHERE {OUTCOMES_GRADED_SQL} AND prediction_date >= ?",
         conn,
         params=(cutoff,),
     )
@@ -267,7 +281,7 @@ def compute_calibration_validation(
         return {"status": "skipped", "reason": "insufficient_samples", "n": len(df)}
 
     df["confidence"] = pd.to_numeric(df["prediction_confidence"], errors="coerce")
-    df["correct"] = pd.to_numeric(df["correct_5d"], errors="coerce")
+    df["correct"] = pd.to_numeric(df["canonical_correct"], errors="coerce")
     df = df.dropna(subset=["confidence", "correct"])
 
     # ── Bin by confidence ────────────────────────────────────────────────────
