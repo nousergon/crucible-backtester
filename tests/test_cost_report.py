@@ -348,12 +348,24 @@ class TestPreviousWeeklyDates:
 
 
 class TestDetectAnomaly:
-    def test_no_baseline_when_all_priors_missing(self):
+    """Legacy classification semantics — preserved by passing
+    ``inventory=_stub_inventory(include_row=False)`` so the
+    pre-telemetry floor is disabled and every prior date competes for
+    the baseline equally. The new pre-telemetry-aware behavior is
+    covered by ``TestPreTelemetryBaselineClassification`` below.
+    """
+
+    @pytest.fixture
+    def no_floor_inventory(self) -> dict:
+        return _stub_inventory(include_row=False)
+
+    def test_no_baseline_when_all_priors_missing(self, no_floor_inventory):
         from analysis.cost_report import detect_anomaly
 
         stub = _make_multi_date_stub({})  # nothing exists
         result = detect_anomaly(
             "2026-05-09", current_total_cost_usd=0.50, s3_client=stub,
+            inventory=no_floor_inventory,
         )
         assert result["status"] == "no_baseline"
         assert result["is_anomaly"] is False
@@ -361,7 +373,7 @@ class TestDetectAnomaly:
         assert result["baseline_dates_found"] == []
         assert len(result["baseline_dates_missing"]) == 4
 
-    def test_ok_when_under_threshold(self):
+    def test_ok_when_under_threshold(self, no_floor_inventory):
         from analysis.cost_report import detect_anomaly
 
         # Baseline averages $0.50; current $0.60 = 1.2x < 2.0× threshold.
@@ -377,6 +389,7 @@ class TestDetectAnomaly:
         })
         result = detect_anomaly(
             "2026-05-09", current_total_cost_usd=0.60, s3_client=stub,
+            inventory=no_floor_inventory,
         )
         assert result["status"] == "ok"
         assert result["is_anomaly"] is False
@@ -384,7 +397,7 @@ class TestDetectAnomaly:
         assert result["ratio"] == pytest.approx(1.2)
         assert len(result["baseline_dates_found"]) == 4
 
-    def test_anomaly_when_over_threshold(self, caplog):
+    def test_anomaly_when_over_threshold(self, caplog, no_floor_inventory):
         from analysis.cost_report import detect_anomaly
 
         # Baseline averages $0.50; current $1.50 = 3.0x > 2.0× threshold.
@@ -401,6 +414,7 @@ class TestDetectAnomaly:
         with caplog.at_level("WARNING"):
             result = detect_anomaly(
                 "2026-05-09", current_total_cost_usd=1.50, s3_client=stub,
+                inventory=no_floor_inventory,
             )
         assert result["status"] == "anomaly"
         assert result["is_anomaly"] is True
@@ -409,7 +423,7 @@ class TestDetectAnomaly:
         assert any("anomaly" in r.message for r in caplog.records)
         assert any("3.00x" in r.message for r in caplog.records)
 
-    def test_partial_baseline_uses_available_dates(self):
+    def test_partial_baseline_uses_available_dates(self, no_floor_inventory):
         """If 2 of 4 priors are missing, baseline is mean of the 2 found."""
         from analysis.cost_report import detect_anomaly
 
@@ -428,6 +442,7 @@ class TestDetectAnomaly:
         })
         result = detect_anomaly(
             "2026-05-09", current_total_cost_usd=0.55, s3_client=stub,
+            inventory=no_floor_inventory,
         )
         assert result["status"] == "ok"
         assert result["baseline_mean_usd"] == pytest.approx(0.50)  # (0.40 + 0.60) / 2
@@ -945,15 +960,17 @@ class TestChangelogAutoEmitOnAnomaly:
         assert body["machine"] == "backtester:analysis/cost_report.py"
         assert body["auto_emitted"] is True
         assert body["run_id"] == "2026-05-09"
-        # Diagnostic block carries the ratio + baseline numbers
+        # Diagnostic block carries the ratio + baseline numbers.
+        # Note: build_cost_section reads the substrate inventory's
+        # cost_telemetry effective_date (2026-05-02 in lib v0.7.1+);
+        # 4/25, 4/18, 4/11 are pre-telemetry → excluded from the
+        # baseline. Only 5/2 contributes; mean stays $1.00.
         ca = body["cost_anomaly"]
         assert ca["ratio"] == 10.0
         assert ca["threshold_ratio"] == 2.0
         assert ca["current_total_usd"] == 10.0
         assert ca["baseline_mean_usd"] == 1.0
-        assert ca["baseline_dates_found"] == [
-            "2026-05-02", "2026-04-25", "2026-04-18", "2026-04-11",
-        ]
+        assert ca["baseline_dates_found"] == ["2026-05-02"]
         # event_id format mirrors the SNS-mirror + cloudwatch-mirror scheme
         parts = body["event_id"].split("_")
         assert len(parts) == 3  # ts_actor_hash
