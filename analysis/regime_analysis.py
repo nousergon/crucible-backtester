@@ -1,8 +1,10 @@
 """
 regime_analysis.py — split signal accuracy metrics by market_regime.
 
-Joins score_performance with macro_snapshots (from research.db) to answer:
-"Does signal quality vary meaningfully across bull/neutral/bear/caution regimes?"
+Reads market_regime from the canonical score_performance column (populated
+by alpha-engine-data signal_returns collector post research migration #12,
+2026-05-08). Pre-migration rows with NULL market_regime are silently
+excluded from regime-split metrics.
 
 Data availability: requires score_performance to be populated (Week 4+).
 """
@@ -20,30 +22,42 @@ logger = logging.getLogger(__name__)
 
 def load_with_regime(db_path: str) -> pd.DataFrame:
     """
-    Load score_performance joined to macro_snapshots on score_date.
+    Load score_performance with the canonical market_regime column.
 
-    Returns DataFrame with all score_performance columns plus market_regime.
+    Pre-2026-05-10 this function did a LEFT JOIN against macro_snapshots
+    to source market_regime. That join broke on Saturday 2026-05-09:
+    research migration #12 had added market_regime as a column on
+    score_performance, so ``SELECT sp.*, ms.market_regime`` returned
+    two columns named market_regime; pandas surfaced df["market_regime"]
+    as a DataFrame (not a Series) and the downstream logger / accuracy
+    split crashed with ``TypeError: %d format: a real number is
+    required, not Series``. macro_snapshots was also 7+ weeks stale
+    (latest 2026-03-16), so the join had been contributing nothing for
+    recent rows anyway.
+
+    Single canonical source removes both failure modes.
     """
     path = Path(db_path).expanduser()
     conn = sqlite3.connect(path)
     try:
         df = pd.read_sql_query(
-            """
-            SELECT sp.*, ms.market_regime
-            FROM score_performance sp
-            LEFT JOIN macro_snapshots ms ON date(sp.score_date) = ms.date
-            ORDER BY sp.score_date
-            """,
+            "SELECT * FROM score_performance ORDER BY score_date",
             conn,
             parse_dates=["score_date", "eval_date_10d", "eval_date_30d"],
         )
     finally:
         conn.close()
 
+    if "market_regime" not in df.columns:
+        # Pre-migration #12 schema. Inject the column as all-NULL so
+        # downstream accuracy_by_regime treats it as "insufficient data"
+        # rather than KeyError.
+        df["market_regime"] = pd.NA
+
     logger.info(
-        "Loaded %d score_performance rows with regime data (%d with regime populated)",
+        "Loaded %d score_performance rows (%d with market_regime populated)",
         len(df),
-        df["market_regime"].notna().sum(),
+        int(df["market_regime"].notna().sum()),
     )
     return df
 
@@ -55,6 +69,9 @@ def accuracy_by_regime(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> list
     Returns list of dicts, one per regime, each with the same structure as
     signal_quality._compute_slice_metrics().
     """
+    if "market_regime" not in df.columns:
+        return []
+
     populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
     populated_10d = df[df["beat_spy_10d"].notna()]
     populated_30d = df[df["beat_spy_30d"].notna()]
