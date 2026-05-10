@@ -480,6 +480,83 @@ def _section_provenance_grounding(grounding: dict) -> list[str]:
     return lines
 
 
+def _section_quant_rank_quality(quality: dict) -> list[str]:
+    """Build Quant Rank Quality section.
+
+    Per-sector ``corr(quant_rank, return_5d)`` over a rolling 8-week
+    window. Negative correlations = skilled (rank #1 → highest return);
+    positive = anti-skill (rank #1 → lowest return). The 2026-05-09
+    post-mortem found healthcare/industrials/tech at +0.33-0.36 — this
+    section surfaces that drift weekly so it doesn't recur in silence.
+    """
+    lines = ["## Quant Rank Quality", ""]
+
+    if quality.get("status") == "no_data":
+        lines.append(f"> {quality.get('reason', 'no team_candidates rows in window')}")
+        lines.append("")
+        return lines
+    if quality.get("status") != "ok":
+        err = quality.get("error", "unknown error")
+        lines.append(f"> Quant rank quality skipped: {err}")
+        lines.append("")
+        return lines
+
+    win_start = quality.get("window_start", "?")
+    win_end = quality.get("window_end", "?")
+    overall_rank = quality.get("overall_rank_corr")
+    overall_score = quality.get("overall_score_corr")
+    n_obs = quality.get("n_total_obs", 0)
+    threshold = quality.get("anti_skill_threshold", 0.10)
+    anti_skill = quality.get("anti_skill_teams", []) or []
+
+    overall_flag = "✅" if (overall_rank is not None and overall_rank < 0) else (
+        "⚠️" if (overall_rank is not None and overall_rank > threshold) else "🟡"
+    )
+    overall_str = f"{overall_rank:+.3f}" if overall_rank is not None else "—"
+    lines.append(
+        f"- Window: **{win_start}** → **{win_end}** ({n_obs} obs)"
+    )
+    lines.append(
+        f"- {overall_flag} Overall rank corr: **{overall_str}** "
+        f"(score corr: {overall_score:+.3f})" if overall_score is not None
+        else f"- {overall_flag} Overall rank corr: **{overall_str}**"
+    )
+    lines.append(
+        f"  *Negative = skilled ranker; positive = anti-skill (top picks "
+        f"underperform). Threshold for alarm: > +{threshold:.2f}.*"
+    )
+
+    if anti_skill:
+        lines.append(f"- ⚠️ Anti-skill teams (corr > +{threshold:.2f}): "
+                     f"**{', '.join(anti_skill)}**")
+
+    # Per-team table.
+    per_team = quality.get("per_team", []) or []
+    if per_team:
+        lines.append("")
+        lines.append("| Team | Rank corr | Score corr | Top-3 hit-rate | n_obs |")
+        lines.append("|---|---|---|---|---|")
+        for entry in per_team:
+            rc = entry.get("rank_corr")
+            sc = entry.get("score_corr")
+            hr = entry.get("hit_rate_top3")
+            n = entry.get("n_obs", 0)
+            rc_str = f"{rc:+.3f}" if rc is not None else "—"
+            sc_str = f"{sc:+.3f}" if sc is not None else "—"
+            hr_str = f"{hr:.0f}%" if hr is not None else "—"
+            flag = ""
+            if rc is not None and rc > threshold:
+                flag = " ⚠️"
+            elif rc is not None and rc < -threshold:
+                flag = " ✅"
+            lines.append(
+                f"| {entry['team_id']}{flag} | {rc_str} | {sc_str} | {hr_str} | {n} |"
+            )
+
+    lines.append("")
+    return lines
+
+
 def _section_agent_justification(summary: dict) -> list[str]:
     """Build the Agent Justification Stack section.
 
@@ -574,6 +651,7 @@ def build_report(
     macro_eval: dict | None = None,
     decision_capture_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
+    quant_rank_quality: dict | None = None,
     agent_justification: dict | None = None,
     trigger_opt: dict | None = None,
     predictor_sizing: dict | None = None,
@@ -616,6 +694,9 @@ def build_report(
 
     if provenance_grounding:
         lines += _section_provenance_grounding(provenance_grounding)
+
+    if quant_rank_quality:
+        lines += _section_quant_rank_quality(quant_rank_quality)
 
     if agent_justification:
         lines += _section_agent_justification(agent_justification)
@@ -798,6 +879,7 @@ def save(
     monte_carlo: dict | None = None,
     decision_capture_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
+    quant_rank_quality: dict | None = None,
     agent_justification: dict | None = None,
 ) -> Path:
     """
@@ -854,6 +936,7 @@ def save(
         ("confusion_matrix.json", confusion_matrix),
         ("decision_capture_coverage.json", decision_capture_coverage),
         ("provenance_grounding.json", provenance_grounding),
+        ("quant_rank_quality.json", quant_rank_quality),
         ("agent_justification.json", agent_justification),
     ]:
         if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
