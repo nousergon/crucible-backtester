@@ -4,7 +4,12 @@ from unittest.mock import patch, MagicMock
 
 import pandas as pd
 
-from optimizer.weight_optimizer import compute_weights, apply_weights, init_config
+from optimizer.weight_optimizer import (
+    apply_weights,
+    compute_weights,
+    init_config,
+    load_with_subscores,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -405,3 +410,101 @@ class TestShadowMode:
             }
             outcome = apply_weights(result, bucket="test-bucket")
             assert outcome["applied"] is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# load_with_subscores — canonical (score_performance) vs S3 backfill paths.
+# Regression for the 2026-05-09 P0: research.db migration #12 added
+# quant_score/qual_score to score_performance, so df arrives carrying those
+# columns. The pre-fix merge collided with the S3 sub_df and produced
+# quant_score_x / quant_score_y, then crashed on merged[["quant_score","qual_score"]].
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestLoadWithSubscoresCanonicalSource:
+
+    @patch("optimizer.weight_optimizer.boto3")
+    def test_canonical_fully_populated_skips_s3(self, mock_boto3):
+        """Post-migration df with no NULL sub-scores: no S3 round-trip,
+        returned columns are quant_score/qual_score (not _x/_y)."""
+        df = pd.DataFrame([
+            {"symbol": "AAPL", "score_date": "2026-05-01",
+             "quant_score": 72.0, "qual_score": 65.0, "beat_spy_10d": 1},
+            {"symbol": "MSFT", "score_date": "2026-05-01",
+             "quant_score": 80.0, "qual_score": 70.0, "beat_spy_10d": 0},
+        ])
+        mock_s3 = MagicMock()
+        mock_boto3.client.return_value = mock_s3
+
+        out = load_with_subscores(df, bucket="test-bucket")
+
+        assert "quant_score" in out.columns
+        assert "qual_score" in out.columns
+        assert "quant_score_x" not in out.columns
+        assert "quant_score_y" not in out.columns
+        assert out.loc[out["symbol"] == "AAPL", "quant_score"].iloc[0] == 72.0
+        mock_s3.get_object.assert_not_called()
+
+    @patch("optimizer.weight_optimizer.boto3")
+    def test_canonical_partial_null_backfilled_from_s3(self, mock_boto3):
+        """Mix of canonical-populated + canonical-NULL rows: canonical values
+        win; only NULL rows pick up S3 values. No _x/_y suffix leakage."""
+        import json
+
+        df = pd.DataFrame([
+            {"symbol": "AAPL", "score_date": "2026-05-01",
+             "quant_score": 72.0, "qual_score": 65.0, "beat_spy_10d": 1},
+            {"symbol": "MSFT", "score_date": "2026-05-01",
+             "quant_score": None, "qual_score": None, "beat_spy_10d": 0},
+        ])
+        signals_json = {
+            "signals": {
+                "AAPL": {"sub_scores": {"quant": 11.0, "qual": 12.0}},
+                "MSFT": {"sub_scores": {"quant": 88.0, "qual": 77.0}},
+            }
+        }
+        body = MagicMock()
+        body.read.return_value = json.dumps(signals_json).encode()
+        mock_s3 = MagicMock()
+        mock_s3.get_object.return_value = {"Body": body}
+        mock_boto3.client.return_value = mock_s3
+
+        out = load_with_subscores(df, bucket="test-bucket")
+
+        assert "quant_score_x" not in out.columns
+        assert "quant_score_s3" not in out.columns
+        aapl = out[out["symbol"] == "AAPL"].iloc[0]
+        msft = out[out["symbol"] == "MSFT"].iloc[0]
+        # Canonical row preserved.
+        assert aapl["quant_score"] == 72.0
+        assert aapl["qual_score"] == 65.0
+        # NULL row backfilled.
+        assert msft["quant_score"] == 88.0
+        assert msft["qual_score"] == 77.0
+
+    @patch("optimizer.weight_optimizer.boto3")
+    def test_legacy_df_without_canonical_columns_still_merges(self, mock_boto3):
+        """Pre-migration DataFrames (no quant_score/qual_score columns) take
+        the original merge path: S3 sub_df is joined directly."""
+        import json
+
+        df = pd.DataFrame([
+            {"symbol": "AAPL", "score_date": "2026-05-01", "beat_spy_10d": 1},
+        ])
+        signals_json = {
+            "signals": {
+                "AAPL": {"sub_scores": {"quant": 55.0, "qual": 50.0}},
+            }
+        }
+        body = MagicMock()
+        body.read.return_value = json.dumps(signals_json).encode()
+        mock_s3 = MagicMock()
+        mock_s3.get_object.return_value = {"Body": body}
+        mock_boto3.client.return_value = mock_s3
+
+        out = load_with_subscores(df, bucket="test-bucket")
+
+        assert out["quant_score"].iloc[0] == 55.0
+        assert out["qual_score"].iloc[0] == 50.0
+        assert "quant_score_x" not in out.columns
+        assert "quant_score_y" not in out.columns
