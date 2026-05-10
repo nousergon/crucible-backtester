@@ -31,7 +31,17 @@ class TestActualDirection:
 
 class TestComputeConfusionMatrix:
     def _create_db(self, rows):
-        """Create a temp DB with predictor_outcomes data."""
+        """Create a temp DB with predictor_outcomes data.
+
+        Rows tuple shape: (symbol, prediction_date, predicted_direction,
+        prediction_confidence, actual_alpha_decimal). The 5th element is
+        written into `actual_log_alpha` (canonical decimal log-units) so
+        downstream COALESCE returns it as the canonical actual return.
+        Schema includes both new (actual_log_alpha/horizon_days/correct)
+        and legacy (actual_5d_return/correct_5d) columns post predictor
+        21d migration (alpha-engine-research v13 + alpha-engine-data PR
+        #198).
+        """
         f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         conn = sqlite3.connect(f.name)
         conn.execute(
@@ -39,13 +49,15 @@ class TestComputeConfusionMatrix:
             "id INTEGER PRIMARY KEY, symbol TEXT, prediction_date TEXT, "
             "predicted_direction TEXT, prediction_confidence REAL, "
             "p_up REAL, p_flat REAL, p_down REAL, "
-            "actual_5d_return REAL, correct_5d INTEGER)"
+            "actual_5d_return REAL, correct_5d INTEGER, "
+            "actual_log_alpha REAL, horizon_days INTEGER, correct INTEGER)"
         )
         for r in rows:
             conn.execute(
                 "INSERT INTO predictor_outcomes (symbol, prediction_date, predicted_direction, "
-                "prediction_confidence, actual_5d_return) VALUES (?, ?, ?, ?, ?)",
-                r,
+                "prediction_confidence, actual_log_alpha, horizon_days) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (*r, 21),
             )
         conn.commit()
         conn.close()

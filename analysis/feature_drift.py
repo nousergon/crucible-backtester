@@ -26,6 +26,12 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
+from pipeline_common import (
+    ALPHA_COALESCE_SQL,
+    HORIZON_COALESCE_SQL,
+    OUTCOMES_RESOLVED_SQL,
+)
+
 log = logging.getLogger(__name__)
 
 _MIN_SAMPLES = 20  # minimum resolved outcomes to compute drift
@@ -55,8 +61,11 @@ def compute_feature_drift(
 
     conn = sqlite3.connect(db_path)
     outcomes = pd.read_sql_query(
-        "SELECT symbol, prediction_date, actual_5d_return "
-        "FROM predictor_outcomes WHERE actual_5d_return IS NOT NULL AND prediction_date >= ?",
+        "SELECT symbol, prediction_date, "
+        f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
+        f"{HORIZON_COALESCE_SQL} AS horizon_days "
+        "FROM predictor_outcomes "
+        f"WHERE {OUTCOMES_RESOLVED_SQL} AND prediction_date >= ?",
         conn,
         params=(cutoff,),
     )
@@ -66,7 +75,7 @@ def compute_feature_drift(
         log.info("Feature drift: %d resolved outcomes (< %d minimum) — skipping", len(outcomes), _MIN_SAMPLES)
         return {"status": "skipped", "reason": "insufficient_samples", "n": len(outcomes)}
 
-    outcomes["actual"] = pd.to_numeric(outcomes["actual_5d_return"], errors="coerce")
+    outcomes["actual"] = pd.to_numeric(outcomes["canonical_actual"], errors="coerce")
     outcomes["prediction_date"] = pd.to_datetime(outcomes["prediction_date"])
 
     # ── Load feature values from ArcticDB ────────────────────────────────────
@@ -82,7 +91,9 @@ def compute_feature_drift(
         return {"status": "skipped", "reason": "insufficient_joined_data", "n": len(joined)}
 
     # ── Identify feature columns ────────────────────────────────────────────
-    non_feature_cols = {"symbol", "prediction_date", "actual_5d_return", "actual"}
+    non_feature_cols = {
+        "symbol", "prediction_date", "canonical_actual", "actual", "horizon_days",
+    }
     feature_cols = [c for c in joined.columns if c not in non_feature_cols]
 
     if not feature_cols:
@@ -243,8 +254,9 @@ def _join_outcomes_with_features(
         combined = {
             "symbol": ticker,
             "prediction_date": pred_date,
-            "actual_5d_return": row["actual_5d_return"],
+            "canonical_actual": row["canonical_actual"],
             "actual": row["actual"],
+            "horizon_days": row.get("horizon_days"),
         }
         combined.update(feat_row.to_dict())
         rows.append(combined)

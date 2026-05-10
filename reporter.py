@@ -44,10 +44,13 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
         sp_earliest = conn.execute("SELECT MIN(score_date) FROM score_performance").fetchone()[0] or "—"
         sp_latest = conn.execute("SELECT MAX(score_date) FROM score_performance").fetchone()[0] or "—"
 
-        # predictor_outcomes counts
+        # predictor_outcomes counts (horizon-agnostic post 2026-05-09 migration —
+        # rows resolved under the legacy 5d-only path expose `correct_5d`;
+        # rows from canonical-21d backfill expose `correct`)
         po_total = conn.execute("SELECT COUNT(*) FROM predictor_outcomes").fetchone()[0]
         po_resolved = conn.execute(
-            "SELECT COUNT(*) FROM predictor_outcomes WHERE correct_5d IS NOT NULL"
+            "SELECT COUNT(*) FROM predictor_outcomes "
+            "WHERE correct IS NOT NULL OR correct_5d IS NOT NULL"
         ).fetchone()[0]
         po_dates = conn.execute(
             "SELECT COUNT(DISTINCT prediction_date) FROM predictor_outcomes"

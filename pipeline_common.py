@@ -32,6 +32,34 @@ _MIN_IC_SAMPLES = 10
 _IC_STD_EPSILON = 1e-8
 
 
+# ── Predictor outcomes column-canonicalization helpers ───────────────────────
+#
+# Predictor 21d canonical-alpha migration (2026-05-09; plan at
+# alpha-engine-docs/private/predictor-21d-migration-260509.md). New rows after
+# alpha-engine-data PR #198 populate horizon-agnostic columns
+# (actual_log_alpha, horizon_days, correct) — log-domain decimal alpha at the
+# row's horizon-of-record (21d post Track A cutover). Old rows retain
+# legacy columns (actual_5d_return in pct points, correct_5d at 5d horizon).
+#
+# Readers MUST use these COALESCE expressions in SQL so downstream computation
+# stays scale-uniform across the transition window. Legacy `actual_5d_return`
+# is divided by 100 inline so the result is decimal — same scale as the
+# log-domain new column. log(1+r) ≈ r for small r, so the threshold/IC math
+# works on either representation without per-row branching.
+#
+# The legacy fallback retires in PR F (~4 weeks of parallel writes); these
+# fragments simplify to the new column at that point.
+ALPHA_COALESCE_SQL = "COALESCE(actual_log_alpha, actual_5d_return / 100.0)"
+CORRECT_COALESCE_SQL = "COALESCE(correct, correct_5d)"
+HORIZON_COALESCE_SQL = "COALESCE(horizon_days, 5)"
+OUTCOMES_RESOLVED_SQL = (
+    "(actual_log_alpha IS NOT NULL OR actual_5d_return IS NOT NULL)"
+)
+OUTCOMES_GRADED_SQL = (
+    "(correct IS NOT NULL OR correct_5d IS NOT NULL)"
+)
+
+
 # ── Phase markers ────────────────────────────────────────────────────────────
 #
 # Structured begin/end log lines around each pipeline phase so any timeout
@@ -647,7 +675,11 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
         cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
         conn = _sqlite3.connect(db_path)
         df = pd.read_sql_query(
-            "SELECT * FROM predictor_outcomes WHERE correct_5d IS NOT NULL "
+            "SELECT *, "
+            f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
+            f"{CORRECT_COALESCE_SQL} AS canonical_correct, "
+            f"{HORIZON_COALESCE_SQL} AS canonical_horizon "
+            f"FROM predictor_outcomes WHERE {OUTCOMES_GRADED_SQL} "
             "AND prediction_date >= ?",
             conn,
             params=(cutoff,),
@@ -661,13 +693,13 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
         logger.info("push_predictor_rolling_metrics: < 5 resolved outcomes, skipping S3 update")
         return
 
-    hit_rate = float(pd.to_numeric(df["correct_5d"], errors="coerce").mean())
+    hit_rate = float(pd.to_numeric(df["canonical_correct"], errors="coerce").mean())
 
     df["net_signal"] = (
         pd.to_numeric(df["p_up"], errors="coerce").fillna(0)
         - pd.to_numeric(df["p_down"], errors="coerce").fillna(0)
     )
-    df["actual"] = pd.to_numeric(df["actual_5d_return"], errors="coerce")
+    df["actual"] = pd.to_numeric(df["canonical_actual"], errors="coerce")
     valid = df.dropna(subset=["net_signal", "actual"])
     ic_30d = None
     ic_ir_30d = None
