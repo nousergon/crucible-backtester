@@ -59,7 +59,7 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis import veto_analysis
-from analysis import decision_capture_coverage, provenance_grounding
+from analysis import decision_capture_coverage, provenance_grounding, quant_rank_quality
 from analysis import agent_justification
 from analysis import end_to_end
 from analysis import trigger_scorecard, alpha_distribution, veto_value
@@ -463,6 +463,22 @@ def _run_diagnostics(
             run_date=config.get("_run_date"),
         ),
         required_inputs={},
+    )
+
+    # Quant rank quality — per-sector corr(quant_rank, return_5d) over a
+    # rolling 8-week window. Surfaces "is the technical scorer's
+    # ranking even ordering correctly?" before drift compounds. The
+    # 2026-05-09 evaluator-email post-mortem found healthcare/industrials/
+    # tech rank-correlations at +0.33-0.36 (anti-skill); without this
+    # diagnostic running weekly the inversion was caught only in
+    # retrospect via per-stage decomposition.
+    results["quant_rank_quality"] = tracker.run_module(
+        "quant_rank_quality",
+        lambda: quant_rank_quality.compute_quant_rank_quality(
+            db_path=config.get("research_db"),
+            run_date=config.get("_run_date"),
+        ),
+        required_inputs={"research_db": config.get("research_db")},
     )
 
     # Agent-justification stack summaries — judge / clustering / concordance /
@@ -1087,6 +1103,7 @@ def main() -> None:
             macro_eval=diagnostics.get("macro_eval"),
             decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
             provenance_grounding=diagnostics.get("provenance_grounding"),
+            quant_rank_quality=diagnostics.get("quant_rank_quality"),
             agent_justification=diagnostics.get("agent_justification"),
             trigger_opt=opt_results.get("trigger_opt"),
             predictor_sizing=opt_results.get("predictor_sizing"),
@@ -1175,6 +1192,7 @@ def main() -> None:
             monte_carlo=diagnostics.get("monte_carlo"),
             decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
             provenance_grounding=diagnostics.get("provenance_grounding"),
+            quant_rank_quality=diagnostics.get("quant_rank_quality"),
             agent_justification=diagnostics.get("agent_justification"),
         )
 
