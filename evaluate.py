@@ -67,7 +67,7 @@ from analysis import shadow_book as shadow_book_analysis
 from analysis import exit_timing, macro_eval
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
 from optimizer import trigger_optimizer, predictor_sizing_optimizer
-from optimizer import scanner_optimizer, pipeline_optimizer
+from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 from completeness import CompletenessTracker
@@ -655,6 +655,21 @@ def _run_optimizers(
         skip_if_missing=["e2e_lift"],
     )
 
+    # Tech weight ablation — per-sector recommendation by sub-score
+    # rank-correlation grid search. Recommendation-only; pairs with
+    # PR-A's quant_rank_quality diagnostic + PR-B's research v15
+    # sub-score persistence. Status="insufficient_data" until ≥30 rows
+    # per team have populated sub-scores.
+    results["tech_weight_ablation"] = tracker.run_module(
+        "tech_weight_ablation",
+        lambda: tech_weight_ablation.compute_tech_weight_ablation(
+            db_path=config.get("research_db"),
+            run_date=config.get("_run_date"),
+        ),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
     # Executor optimizer (needs sweep_df from simulation)
     sweep_df = config.get("_sweep_df")
     predictor_sweep_df = config.get("_predictor_sweep_df")
@@ -1095,6 +1110,7 @@ def main() -> None:
             scanner_opt=opt_results.get("scanner_opt"),
             team_opt=opt_results.get("team_opt"),
             cio_opt=opt_results.get("cio_opt"),
+            tech_weight_ablation=opt_results.get("tech_weight_ablation"),
             grading=grading_result,
             confusion_matrix=diagnostics.get("confusion_matrix"),
             post_trade=diagnostics.get("post_trade"),
