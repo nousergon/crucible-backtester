@@ -58,17 +58,40 @@ def load_with_subscores(
 
     Reads sub_scores from the signals dict in each signals.json file.
 
+    Post-migration #12 (research.db, 2026-05-08), score_performance carries
+    quant_score / qual_score as canonical columns; this path becomes a
+    backfill-only round-trip for legacy rows with NULL sub-scores.
+
     Args:
         df:              score_performance DataFrame (from signal_quality.load_score_performance).
         bucket:          S3 bucket containing signals/{date}/signals.json.
         signals_prefix:  S3 prefix for signals files (default "signals").
 
     Returns:
-        DataFrame with quant_score, qual_score columns added.
-        Rows where sub-scores could not be resolved are kept but have NaN sub-scores.
+        DataFrame with quant_score, qual_score columns populated. Canonical
+        values from score_performance take precedence; S3 fills only NULLs.
+        Rows where neither source resolves are kept with NaN sub-scores.
     """
     if df.empty:
         return df
+
+    has_canonical = "quant_score" in df.columns and "qual_score" in df.columns
+    if has_canonical:
+        nulls = df["quant_score"].isna() | df["qual_score"].isna()
+        if not nulls.any():
+            logger.info(
+                "Sub-scores fully populated from score_performance (%d rows); "
+                "skipping S3 backfill.",
+                len(df),
+            )
+            return df
+        logger.info(
+            "Sub-scores present on score_performance for %d/%d rows; "
+            "backfilling %d NULL rows from S3.",
+            (~nulls).sum(),
+            len(df),
+            nulls.sum(),
+        )
 
     dates = df["score_date"].unique().tolist()
     logger.info("Loading sub-scores for %d signal dates from S3...", len(dates))
@@ -150,7 +173,19 @@ def load_with_subscores(
             rows.append({"symbol": symbol, "score_date": d, **{f"{k}_score": v for k, v in sub.items()}})
 
     sub_df = pd.DataFrame(rows)
-    merged = df.merge(sub_df, on=["symbol", "score_date"], how="left")
+    if has_canonical:
+        # score_performance owns the fact; S3 only fills NULLs. Suffix the S3
+        # columns, COALESCE canonical → S3, drop the suffix.
+        merged = df.merge(
+            sub_df, on=["symbol", "score_date"], how="left", suffixes=("", "_s3")
+        )
+        for col in ("quant_score", "qual_score"):
+            s3_col = f"{col}_s3"
+            if s3_col in merged.columns:
+                merged[col] = merged[col].fillna(merged[s3_col])
+                merged = merged.drop(columns=[s3_col])
+    else:
+        merged = df.merge(sub_df, on=["symbol", "score_date"], how="left")
     filled = merged[["quant_score", "qual_score"]].notna().any(axis=1).sum()
     logger.info("Sub-scores matched for %d/%d score_performance rows", filled, len(merged))
     return merged
