@@ -360,8 +360,7 @@ class TestColdStartDeferral:
 
 class TestLibVersionPin:
     """alpha-engine-lib must be pinned to a stable tag, not a floating
-    branch. The pin should match the executor / predictor / data PRs
-    in this arc (v0.2.2). Drift = silent breakage class.
+    branch. Drift = silent breakage class.
     """
 
     def test_requirements_pins_lib_to_stable_tag(self):
@@ -369,8 +368,8 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.4.0" in text, (
-            "alpha-engine-lib should pin to v0.4.0 (agent_schemas submodule "
-            "consumed by replay/runner.py); update this test if the pin "
-            "moves further forward"
+        assert "@v0.7.1" in text, (
+            "alpha-engine-lib should pin to v0.7.1 (transparency inventory "
+            "with cost_telemetry row consumed by analysis/cost_report.py); "
+            "update this test if the pin moves further forward"
         )

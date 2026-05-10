@@ -55,11 +55,17 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_BUCKET = "alpha-engine-research"
 _PARQUET_KEY_TEMPLATE = "decision_artifacts/_cost/{date}/cost.parquet"
-_PARQUET_PREFIX = "decision_artifacts/_cost/"
 
 _ANOMALY_RATIO_ENV_VAR = "ALPHA_ENGINE_COST_ANOMALY_RATIO"
 _ANOMALY_RATIO_DEFAULT = 2.0
 _ANOMALY_BASELINE_WEEKS = 4  # rolling window per ROADMAP P5
+
+# Registry row id read from alpha_engine_lib.transparency_inventory.yaml
+# to source the cost-telemetry effective_date (the floor of the
+# rolling baseline window). Keep in sync with the row id in lib's
+# inventory; missing-row → fallback to no-floor (legacy "all gaps
+# treated equal" classification, with a WARN log for visibility).
+_COST_TELEMETRY_REGISTRY_ROW_ID = "cost_telemetry"
 
 # Schema-1.0.0 changelog corpus (ROADMAP P0 sub-item 5 auto-population —
 # cost-anomaly half, 2026-05-07). When detect_anomaly() returns
@@ -246,60 +252,75 @@ def _previous_weekly_dates(run_date: str, *, weeks: int) -> list[str]:
 
 def _telemetry_first_capture_date(
     *,
-    bucket: str,
-    s3_client: Any,
+    inventory: Optional[dict] = None,
 ) -> Optional[str]:
-    """Return ISO date of the earliest ``decision_artifacts/_cost/{date}/cost.parquet``
-    partition in S3, or ``None`` if no parquets exist.
+    """Return the cost-telemetry effective_date from the substrate
+    inventory registry, or ``None`` if the row is missing.
 
-    Used by :func:`detect_anomaly` to distinguish two semantically-different
-    baseline gaps:
+    The substrate inventory (alpha-engine-lib's
+    ``transparency_inventory.yaml``) is the single source of truth for
+    when each measurement-output substrate started capturing data. The
+    cost_telemetry row's ``effective_date`` field is the first Saturday
+    SF run that captured a parquet; consumers (this anomaly detector +
+    the substrate health checker) read it as a structural floor.
 
-    1. **Pre-telemetry** — prior weekly dates that fall *before* the cost
-       telemetry feature shipped (2026-05-01). These dates inherently have
-       no parquets and the renderer should explain that, not blame an
-       operator capture flag.
-    2. **Genuine missing** — prior weekly dates *after* telemetry shipped
-       that still have no parquet. These warrant the
-       "capture flag may have been off" framing.
+    Used by :func:`detect_anomaly` to distinguish:
 
-    Lists the first page of objects under the prefix; for our weekly
-    cadence the partition count stays small. Falls back to ``None`` on
-    any S3 error so the legacy "all gaps treated equal" path still works.
+    1. **Pre-telemetry** — prior weekly dates that fall *before* the
+       row's effective_date. These dates inherently have no parquets
+       and the renderer surfaces that explicitly.
+    2. **Genuine missing** — prior weekly dates *after* the floor that
+       still have no parquet. These warrant the "capture flag may have
+       been off" framing.
+
+    Inventory load failures (yaml missing, lib import fails, row
+    absent) fall back to ``None`` with a WARN log so the legacy
+    "all gaps treated equal" classification still fires — the
+    detector remains functionally degraded but doesn't take down the
+    Saturday SF email.
+
+    ``inventory`` injection lets tests stub the registry without
+    monkey-patching the lib loader.
     """
-    try:
-        response = s3_client.list_objects_v2(
-            Bucket=bucket,
-            Prefix=_PARQUET_PREFIX,
-            MaxKeys=1000,
-        )
-    except ClientError as exc:
+    inv = inventory
+    if inv is None:
+        try:
+            from alpha_engine_lib.transparency import load_inventory
+        except ImportError as exc:
+            logger.warning(
+                "[cost_report] alpha_engine_lib.transparency unavailable "
+                "(%s) — falling back to no-pre-telemetry-floor "
+                "classification. Bump the lib pin to >=0.7.1 to enable.",
+                exc,
+            )
+            return None
+        try:
+            inv = load_inventory()
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[cost_report] load_inventory failed (%s) — falling back "
+                "to no-pre-telemetry-floor classification",
+                exc,
+            )
+            return None
+    rows = inv.get("inventory") or []
+    row = next(
+        (r for r in rows if r.get("id") == _COST_TELEMETRY_REGISTRY_ROW_ID),
+        None,
+    )
+    if row is None:
         logger.warning(
-            "[cost_report] failed to list %s%s: %s — falling back to "
-            "no-pre-telemetry-floor classification",
-            bucket, _PARQUET_PREFIX, exc,
+            "[cost_report] substrate inventory has no %r row — falling "
+            "back to no-pre-telemetry-floor classification. Bump the lib "
+            "pin to a version that ships the row.",
+            _COST_TELEMETRY_REGISTRY_ROW_ID,
         )
         return None
-    contents = response.get("Contents") or []
-    if not contents:
+    effective = row.get("effective_date")
+    if effective is None:
         return None
-    dates: list[str] = []
-    for obj in contents:
-        key = obj.get("Key", "")
-        if not key.endswith("/cost.parquet"):
-            continue
-        # Key shape: decision_artifacts/_cost/{date}/cost.parquet
-        parts = key.split("/")
-        if len(parts) >= 4:
-            candidate = parts[2]
-            try:
-                date_type.fromisoformat(candidate)
-            except ValueError:
-                continue
-            dates.append(candidate)
-    if not dates:
-        return None
-    return min(dates)
+    # YAML may load the date as a datetime.date; coerce to ISO string.
+    return str(effective)
 
 
 def _fetch_total_cost_for_date(
@@ -323,9 +344,15 @@ def detect_anomaly(
     bucket: str = _DEFAULT_BUCKET,
     s3_client: Optional[Any] = None,
     weeks: int = _ANOMALY_BASELINE_WEEKS,
+    inventory: Optional[dict] = None,
 ) -> dict:
     """Compare ``current_total_cost_usd`` against the rolling baseline of
     the previous ``weeks`` Saturday runs.
+
+    The pre-telemetry floor (the date before which baseline gaps are
+    structural rather than operator-flag-off) is sourced from the
+    alpha-engine-lib substrate inventory's ``cost_telemetry`` row.
+    Tests can inject an ``inventory`` dict to bypass the lib loader.
 
     Returns a dict with:
 
@@ -336,8 +363,8 @@ def detect_anomaly(
       capture-flag-off / partial SF / Lambda timeout class).
     - ``baseline_dates_pre_telemetry``: list of ISO dates that pre-date
       telemetry's first captured run. Structurally absent — not a bug.
-    - ``telemetry_first_date``: earliest ``_cost/{date}/`` partition in S3,
-      or ``None`` if no parquets exist yet.
+    - ``telemetry_first_date``: cost_telemetry row's effective_date in
+      the substrate inventory, or ``None`` if the row / lib is absent.
     - ``baseline_mean_usd``: mean spend across found dates (None if zero).
     - ``ratio``: ``current / baseline_mean``, or None if baseline empty.
     - ``threshold_ratio``: configured anomaly threshold.
@@ -365,9 +392,7 @@ def detect_anomaly(
 
     client = s3_client if s3_client is not None else boto3.client("s3")
     prior_dates = _previous_weekly_dates(run_date, weeks=weeks)
-    telemetry_first = _telemetry_first_capture_date(
-        bucket=bucket, s3_client=client,
-    )
+    telemetry_first = _telemetry_first_capture_date(inventory=inventory)
     found: list[tuple[str, float]] = []
     missing: list[str] = []
     pre_telemetry: list[str] = []

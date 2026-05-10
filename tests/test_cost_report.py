@@ -445,105 +445,91 @@ class TestDetectAnomaly:
         assert result["is_anomaly"] is False
 
 
-def _make_multi_date_stub_with_listing(
-    date_to_df: dict[str, pd.DataFrame | None],
-    *,
-    listing_dates: list[str] | None = None,
-) -> MagicMock:
-    """Like ``_make_multi_date_stub`` but also stubs ``list_objects_v2``
-    so ``_telemetry_first_capture_date`` can resolve a min-date floor.
-
-    ``listing_dates`` controls which ISO dates appear in the listing
-    (defaults to ``date_to_df.keys()``). Pass an explicit list to test
-    cases where listing and per-date fetches diverge (e.g. simulating
-    "telemetry shipped 5/2 but the 5/2 parquet itself is gone").
+def _stub_inventory(
+    *, effective_date: str | None = "2026-05-02",
+    include_row: bool = True,
+) -> dict:
+    """Build a minimal substrate-inventory dict with a cost_telemetry
+    row, mirroring alpha-engine-lib's ``transparency_inventory.yaml``
+    shape but trimmed to fields ``_telemetry_first_capture_date``
+    actually reads.
     """
-    base = _make_multi_date_stub(date_to_df)
-    if listing_dates is None:
-        listing_dates = sorted(date_to_df.keys())
-    base.list_objects_v2.return_value = {
-        "Contents": [
-            {"Key": f"decision_artifacts/_cost/{d}/cost.parquet"}
-            for d in listing_dates
-        ],
-    }
-    return base
+    rows: list[dict] = []
+    if include_row:
+        row: dict = {"id": "cost_telemetry"}
+        if effective_date is not None:
+            row["effective_date"] = effective_date
+        rows.append(row)
+    return {"version": 1, "inventory": rows}
 
 
 class TestTelemetryFirstCaptureDate:
-    def test_returns_min_iso_date(self):
+    """Floor derives from the lib substrate inventory, not S3 listing.
+    The detector accepts an injected ``inventory`` dict so tests don't
+    need to monkey-patch the lib loader.
+    """
+
+    def test_returns_effective_date_from_inventory(self):
         from analysis.cost_report import _telemetry_first_capture_date
 
-        stub = _make_multi_date_stub_with_listing(
-            {}, listing_dates=["2026-05-09", "2026-05-02", "2026-05-06"],
-        )
-        assert _telemetry_first_capture_date(
-            bucket="b", s3_client=stub,
-        ) == "2026-05-02"
+        inv = _stub_inventory(effective_date="2026-05-02")
+        assert _telemetry_first_capture_date(inventory=inv) == "2026-05-02"
 
-    def test_returns_none_when_no_partitions(self):
+    def test_returns_none_when_row_missing(self, caplog):
         from analysis.cost_report import _telemetry_first_capture_date
 
-        stub = MagicMock()
-        stub.list_objects_v2.return_value = {"Contents": []}
-        assert _telemetry_first_capture_date(
-            bucket="b", s3_client=stub,
-        ) is None
-
-    def test_returns_none_when_listing_omitted(self):
-        from analysis.cost_report import _telemetry_first_capture_date
-
-        stub = MagicMock()
-        stub.list_objects_v2.return_value = {}  # no Contents key
-        assert _telemetry_first_capture_date(
-            bucket="b", s3_client=stub,
-        ) is None
-
-    def test_skips_non_iso_partition_names(self):
-        from analysis.cost_report import _telemetry_first_capture_date
-
-        stub = MagicMock()
-        stub.list_objects_v2.return_value = {
-            "Contents": [
-                {"Key": "decision_artifacts/_cost/garbage/cost.parquet"},
-                {"Key": "decision_artifacts/_cost/2026-05-04/cost.parquet"},
-                {"Key": "decision_artifacts/_cost/2026-05-02/cost.parquet"},
-            ],
-        }
-        assert _telemetry_first_capture_date(
-            bucket="b", s3_client=stub,
-        ) == "2026-05-02"
-
-    def test_skips_non_cost_parquet_keys(self):
-        from analysis.cost_report import _telemetry_first_capture_date
-
-        stub = MagicMock()
-        stub.list_objects_v2.return_value = {
-            "Contents": [
-                {"Key": "decision_artifacts/_cost/2026-05-02/cost.parquet"},
-                {"Key": "decision_artifacts/_cost/2026-05-02/manifest.json"},
-                {"Key": "decision_artifacts/_cost/2026-04-25/_other.parquet"},
-            ],
-        }
-        # Only cost.parquet keys count toward the floor.
-        assert _telemetry_first_capture_date(
-            bucket="b", s3_client=stub,
-        ) == "2026-05-02"
-
-    def test_returns_none_on_client_error(self, caplog):
-        from analysis.cost_report import _telemetry_first_capture_date
-
-        stub = MagicMock()
-        stub.list_objects_v2.side_effect = ClientError(
-            {"Error": {"Code": "AccessDenied", "Message": "nope"}},
-            "ListObjectsV2",
-        )
+        inv = _stub_inventory(include_row=False)
         with caplog.at_level("WARNING"):
-            assert _telemetry_first_capture_date(
-                bucket="b", s3_client=stub,
-            ) is None
+            assert _telemetry_first_capture_date(inventory=inv) is None
         assert any(
-            "no-pre-telemetry-floor" in r.message for r in caplog.records
+            "no 'cost_telemetry' row" in r.message
+            or "no-pre-telemetry-floor" in r.message
+            for r in caplog.records
+        )
+
+    def test_returns_none_when_effective_date_absent(self):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        inv = _stub_inventory(effective_date=None)
+        assert _telemetry_first_capture_date(inventory=inv) is None
+
+    def test_coerces_yaml_date_to_iso_string(self):
+        """PyYAML loads bare ``YYYY-MM-DD`` literals as ``datetime.date``;
+        the helper coerces to ISO string for downstream comparison.
+        """
+        from analysis.cost_report import _telemetry_first_capture_date
+        from datetime import date as date_type
+
+        inv = {
+            "version": 1,
+            "inventory": [
+                {"id": "cost_telemetry",
+                 "effective_date": date_type(2026, 5, 2)},
+            ],
+        }
+        assert _telemetry_first_capture_date(inventory=inv) == "2026-05-02"
+
+    def test_falls_back_when_lib_import_fails(self, caplog, monkeypatch):
+        """If alpha_engine_lib.transparency isn't on the path (e.g. lib
+        pin is too old), the helper returns None with a WARN log so the
+        legacy "all gaps equal" classification kicks in.
+        """
+        import builtins
+
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        real_import = builtins.__import__
+
+        def _raise_on_transparency(name, *args, **kwargs):
+            if name == "alpha_engine_lib.transparency":
+                raise ImportError("no module named 'alpha_engine_lib.transparency'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _raise_on_transparency)
+        with caplog.at_level("WARNING"):
+            assert _telemetry_first_capture_date() is None
+        assert any(
+            "lib pin to >=0.7.1" in r.message for r in caplog.records
         )
 
 
@@ -551,27 +537,30 @@ class TestPreTelemetryBaselineClassification:
     """Regression coverage for the 2026-05-09 evaluator email bug:
     pre-launch Saturday gaps were rendered as "capture flag may have
     been off" when in fact the telemetry feature didn't exist yet.
+
+    The floor is read from alpha-engine-lib's substrate-inventory
+    ``cost_telemetry`` row's ``effective_date``. Tests inject the
+    inventory dict to bypass the lib loader.
     """
 
     def test_classifies_pre_launch_dates_separately(self):
         from analysis.cost_report import detect_anomaly
 
-        # Telemetry first captured 5/2 (single Saturday post-launch).
+        # Registry says telemetry first captured 5/2.
         # 5/9 run looks back at 5/2 / 4/25 / 4/18 / 4/11 — three are pre-launch.
         baseline_df = pd.DataFrame([
             _make_row(agent_id="a", sector_team_id=None,
                      model_name="claude-haiku-4-5", cost_usd=1.0),
         ])
-        stub = _make_multi_date_stub_with_listing(
-            {"2026-05-02": baseline_df},
-            listing_dates=["2026-05-02"],
-        )
+        stub = _make_multi_date_stub({"2026-05-02": baseline_df})
         result = detect_anomaly(
-            "2026-05-09", current_total_cost_usd=1.10, s3_client=stub,
+            "2026-05-09",
+            current_total_cost_usd=1.10,
+            s3_client=stub,
+            inventory=_stub_inventory(effective_date="2026-05-02"),
         )
         assert result["telemetry_first_date"] == "2026-05-02"
         assert result["baseline_dates_found"] == ["2026-05-02"]
-        # 4/11, 4/18, 4/25 are pre-launch.
         assert sorted(result["baseline_dates_pre_telemetry"]) == [
             "2026-04-11", "2026-04-18", "2026-04-25",
         ]
@@ -580,13 +569,13 @@ class TestPreTelemetryBaselineClassification:
     def test_no_baseline_when_only_pre_launch_priors(self):
         from analysis.cost_report import detect_anomaly
 
-        # Telemetry first captured 5/9 itself (the run we're evaluating).
-        # All 4 priors are pre-launch.
-        stub = _make_multi_date_stub_with_listing(
-            {}, listing_dates=["2026-05-09"],
-        )
+        # Registry says telemetry first captured 5/9 itself; all 4 priors pre-launch.
+        stub = _make_multi_date_stub({})
         result = detect_anomaly(
-            "2026-05-09", current_total_cost_usd=1.0, s3_client=stub,
+            "2026-05-09",
+            current_total_cost_usd=1.0,
+            s3_client=stub,
+            inventory=_stub_inventory(effective_date="2026-05-09"),
         )
         assert result["status"] == "no_baseline"
         assert result["baseline_dates_found"] == []
@@ -594,8 +583,8 @@ class TestPreTelemetryBaselineClassification:
         assert len(result["baseline_dates_pre_telemetry"]) == 4
 
     def test_distinguishes_post_launch_gap_from_pre_launch(self):
-        """If telemetry shipped 4/18, then 4/11 is pre-launch but 4/25
-        with no parquet is a genuine post-launch gap.
+        """Registry effective_date 4/18 → 4/11 is pre-launch; 4/25 with
+        no parquet is a genuine post-launch gap.
         """
         from analysis.cost_report import detect_anomaly
 
@@ -603,14 +592,15 @@ class TestPreTelemetryBaselineClassification:
             _make_row(agent_id="a", sector_team_id=None,
                      model_name="claude-haiku-4-5", cost_usd=1.0),
         ])
-        # Listing reports 4/18 as the earliest partition (telemetry floor).
-        # Per-date stub: 4/18 + 5/2 have parquets; 4/25 is genuinely missing.
-        stub = _make_multi_date_stub_with_listing(
-            {"2026-04-18": baseline_df, "2026-05-02": baseline_df},
-            listing_dates=["2026-04-18", "2026-05-02"],
-        )
+        stub = _make_multi_date_stub({
+            "2026-04-18": baseline_df,
+            "2026-05-02": baseline_df,
+        })
         result = detect_anomaly(
-            "2026-05-09", current_total_cost_usd=1.10, s3_client=stub,
+            "2026-05-09",
+            current_total_cost_usd=1.10,
+            s3_client=stub,
+            inventory=_stub_inventory(effective_date="2026-04-18"),
         )
         assert result["telemetry_first_date"] == "2026-04-18"
         assert sorted(result["baseline_dates_found"]) == [
@@ -619,9 +609,9 @@ class TestPreTelemetryBaselineClassification:
         assert result["baseline_dates_missing"] == ["2026-04-25"]
         assert result["baseline_dates_pre_telemetry"] == ["2026-04-11"]
 
-    def test_legacy_path_when_listing_unavailable(self):
-        """Without a telemetry floor (list_objects_v2 fails), behavior
-        falls back to the original "all-gaps-equal" classification.
+    def test_legacy_path_when_inventory_unavailable(self):
+        """If the inventory has no cost_telemetry row, fall back to the
+        legacy "all-gaps-equal" classification.
         """
         from analysis.cost_report import detect_anomaly
 
@@ -629,17 +619,12 @@ class TestPreTelemetryBaselineClassification:
             _make_row(agent_id="a", sector_team_id=None,
                      model_name="claude-haiku-4-5", cost_usd=1.0),
         ])
-
-        def _list(*args, **kwargs):
-            raise ClientError(
-                {"Error": {"Code": "AccessDenied", "Message": "nope"}},
-                "ListObjectsV2",
-            )
-
         stub = _make_multi_date_stub({"2026-05-02": baseline_df})
-        stub.list_objects_v2.side_effect = _list
         result = detect_anomaly(
-            "2026-05-09", current_total_cost_usd=1.0, s3_client=stub,
+            "2026-05-09",
+            current_total_cost_usd=1.0,
+            s3_client=stub,
+            inventory=_stub_inventory(include_row=False),
         )
         assert result["telemetry_first_date"] is None
         assert result["baseline_dates_pre_telemetry"] == []
