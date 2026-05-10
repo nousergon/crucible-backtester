@@ -21,6 +21,7 @@ import pandas as pd
 
 from pipeline_common import (
     ALPHA_COALESCE_SQL,
+    CURRENT_HORIZON_FILTER_SQL,
     HORIZON_COALESCE_SQL,
     OUTCOMES_RESOLVED_SQL,
 )
@@ -58,7 +59,9 @@ def analyze(research_db_path: str) -> dict:
             f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
             f"{HORIZON_COALESCE_SQL} AS horizon_days "
             "FROM predictor_outcomes "
-            f"WHERE p_up IS NOT NULL AND {OUTCOMES_RESOLVED_SQL} "
+            f"WHERE p_up IS NOT NULL "
+            f"  AND {OUTCOMES_RESOLVED_SQL} "
+            f"  AND {CURRENT_HORIZON_FILTER_SQL} "
             "ORDER BY prediction_date",
             conn,
         )

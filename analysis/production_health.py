@@ -30,6 +30,7 @@ import pandas as pd
 from pipeline_common import (
     ALPHA_COALESCE_SQL,
     CORRECT_COALESCE_SQL,
+    CURRENT_HORIZON_FILTER_SQL,
     HORIZON_COALESCE_SQL,
     OUTCOMES_GRADED_SQL,
 )
@@ -69,7 +70,9 @@ def compute_production_health(
         f"{CORRECT_COALESCE_SQL} AS canonical_correct, "
         f"{HORIZON_COALESCE_SQL} AS horizon_days "
         "FROM predictor_outcomes "
-        f"WHERE {OUTCOMES_GRADED_SQL} AND prediction_date >= ?",
+        f"WHERE {OUTCOMES_GRADED_SQL} "
+        f"  AND {CURRENT_HORIZON_FILTER_SQL} "
+        f"  AND prediction_date >= ?",
         conn,
         params=(cutoff,),
     )
@@ -271,7 +274,9 @@ def compute_calibration_validation(
     df = pd.read_sql_query(
         f"SELECT prediction_confidence, {CORRECT_COALESCE_SQL} AS canonical_correct "
         "FROM predictor_outcomes "
-        f"WHERE {OUTCOMES_GRADED_SQL} AND prediction_date >= ?",
+        f"WHERE {OUTCOMES_GRADED_SQL} "
+        f"  AND {CURRENT_HORIZON_FILTER_SQL} "
+        f"  AND prediction_date >= ?",
         conn,
         params=(cutoff,),
     )

@@ -28,6 +28,7 @@ from scipy.stats import spearmanr
 
 from pipeline_common import (
     ALPHA_COALESCE_SQL,
+    CURRENT_HORIZON_FILTER_SQL,
     HORIZON_COALESCE_SQL,
     OUTCOMES_RESOLVED_SQL,
 )
@@ -65,7 +66,9 @@ def compute_feature_drift(
         f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
         f"{HORIZON_COALESCE_SQL} AS horizon_days "
         "FROM predictor_outcomes "
-        f"WHERE {OUTCOMES_RESOLVED_SQL} AND prediction_date >= ?",
+        f"WHERE {OUTCOMES_RESOLVED_SQL} "
+        f"  AND {CURRENT_HORIZON_FILTER_SQL} "
+        f"  AND prediction_date >= ?",
         conn,
         params=(cutoff,),
     )
