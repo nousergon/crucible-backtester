@@ -16,6 +16,12 @@ import logging
 import sqlite3
 from datetime import date
 
+from alpha_engine_lib.eval_artifacts import (
+    eval_artifact_key,
+    eval_latest_key,
+    new_eval_run_id,
+)
+
 import boto3
 import pandas as pd
 
@@ -261,7 +267,15 @@ def apply(result: dict, bucket: str) -> dict:
     s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
     logger.info("Scanner params updated in S3: %s", result.get("changes"))
 
-    history_key = f"config/scanner_params_history/{date.today().isoformat()}.json"
+    # Canonical eval-style archive layout per lib v0.8.0
+    run_id = new_eval_run_id()
+    history_prefix = "config/scanner_params_history"
+    history_key = eval_artifact_key(history_prefix, run_id)
+    history_latest_key = eval_latest_key(history_prefix)
     s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
+    s3.put_object(
+        Bucket=bucket, Key=history_latest_key, Body=body,
+        ContentType="application/json",
+    )
 
     return {"applied": True, "params": recommended, "changes": result.get("changes")}

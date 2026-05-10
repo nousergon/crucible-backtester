@@ -245,9 +245,11 @@ class TestAssemblerArcEndToEnd:
             )
 
         assert assemble_result.status == "ok"
-        # Assembled audit captures executor_optimizer's full_replace contribution.
+        # Assembled audit captures executor_optimizer's full_replace
+        # contribution. Canonical lib v0.8.0 layout — pull from
+        # latest.json sidecar (the runner mirrors body to that key).
         assembled = s3.read_json(
-            self.BUCKET, f"config/executor_params/assembled/{self.RUN_DATE}.json",
+            self.BUCKET, "config/executor_params/assembled/latest.json",
         )
         assert assembled is not None
         assert assembled["assembled_params"]["atr_multiplier"] == 3.0

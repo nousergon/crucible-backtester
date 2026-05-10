@@ -17,6 +17,11 @@ from datetime import date
 
 import boto3
 import pandas as pd
+from alpha_engine_lib.eval_artifacts import (
+    eval_artifact_key,
+    eval_latest_key,
+    new_eval_run_id,
+)
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
@@ -604,17 +609,24 @@ def apply_weights(result: dict, bucket: str) -> dict:
 
     if shadow_only:
         s3 = boto3.client("s3")
-        shadow_key = f"{S3_SHADOW_WEIGHTS_PREFIX}/{date.today().isoformat()}.json"
+        # Canonical eval-style archive layout per lib v0.8.0 — flat
+        # {prefix}/{run_id}.json + latest.json sidecar (YYMMDDHHMM run_id)
+        run_id = new_eval_run_id()
+        shadow_key = eval_artifact_key(S3_SHADOW_WEIGHTS_PREFIX, run_id)
+        shadow_latest_key = eval_latest_key(S3_SHADOW_WEIGHTS_PREFIX)
+        body_bytes = json.dumps(payload, indent=2)
         try:
             s3.put_object(
-                Bucket=bucket,
-                Key=shadow_key,
-                Body=json.dumps(payload, indent=2),
+                Bucket=bucket, Key=shadow_key, Body=body_bytes,
+                ContentType="application/json",
+            )
+            s3.put_object(
+                Bucket=bucket, Key=shadow_latest_key, Body=body_bytes,
                 ContentType="application/json",
             )
             logger.info(
                 "Skill-composite weights logged to shadow path "
-                "(enforce_skill_composite=False): s3://%s/%s",
+                "(enforce_skill_composite=False): s3://%s/%s (+ latest.json sidecar)",
                 bucket, shadow_key,
             )
         except Exception as e:
@@ -647,15 +659,24 @@ def apply_weights(result: dict, bucket: str) -> dict:
         logger.error("CRITICAL: Failed to write scoring weights to S3: %s", e)
         return {"applied": False, "reason": f"S3 write failed: {e}"}
 
-    history_key = f"config/scoring_weights_history/{date.today().isoformat()}.json"
+    # Canonical eval-style archive layout per lib v0.8.0 — see shadow path above
+    history_run_id = new_eval_run_id()
+    history_prefix = "config/scoring_weights_history"
+    history_key = eval_artifact_key(history_prefix, history_run_id)
+    history_latest_key = eval_latest_key(history_prefix)
     try:
         s3.put_object(
-            Bucket=bucket,
-            Key=history_key,
-            Body=body,
+            Bucket=bucket, Key=history_key, Body=body,
             ContentType="application/json",
         )
-        logger.info("Scoring weights archived to s3://%s/%s", bucket, history_key)
+        s3.put_object(
+            Bucket=bucket, Key=history_latest_key, Body=body,
+            ContentType="application/json",
+        )
+        logger.info(
+            "Scoring weights archived to s3://%s/%s (+ latest.json sidecar)",
+            bucket, history_key,
+        )
     except Exception as e:
         logger.warning("Failed to archive scoring weights history (non-fatal): %s", e)
 

@@ -18,6 +18,12 @@ params to S3.  This module is fully automated — no human approval needed.
 import json
 import logging
 from datetime import date, datetime, timezone
+
+from alpha_engine_lib.eval_artifacts import (
+    eval_artifact_key,
+    eval_latest_key,
+    new_eval_run_id,
+)
 from typing import Any
 
 import boto3
@@ -74,14 +80,24 @@ def save_rolling_metrics(bucket: str, run_date: str, metrics: dict) -> None:
         "saved_at": date.today().isoformat(),
         **metrics,
     }
-    key = f"{S3_METRICS_PREFIX}{run_date}.json"
+    # Canonical eval-style archive layout per lib v0.8.0 — flat
+    # {prefix}/{run_id}.json + latest.json sidecar (YYMMDDHHMM run_id).
+    # S3_METRICS_PREFIX has trailing slash; strip via lib's normalization.
+    run_id = new_eval_run_id()
+    key = eval_artifact_key(S3_METRICS_PREFIX, run_id)
+    latest_key = eval_latest_key(S3_METRICS_PREFIX)
+    body = json.dumps(payload, indent=2)
     s3 = boto3.client("s3")
     s3.put_object(
-        Bucket=bucket, Key=key,
-        Body=json.dumps(payload, indent=2),
-        ContentType="application/json",
+        Bucket=bucket, Key=key, Body=body, ContentType="application/json",
     )
-    logger.info("Rolling metrics saved to s3://%s/%s", bucket, key)
+    s3.put_object(
+        Bucket=bucket, Key=latest_key, Body=body, ContentType="application/json",
+    )
+    logger.info(
+        "Rolling metrics saved to s3://%s/%s (+ latest.json sidecar; run_date=%s)",
+        bucket, key, run_date,
+    )
 
 
 def save_promotion_baseline(bucket: str, metrics: dict, promoted_configs: list[str]) -> None:
