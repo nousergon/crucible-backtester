@@ -32,7 +32,10 @@ class TestRecommendationArtifact:
             promotion_intent="promote",
         )
         assert a.schema_version == 1
-        assert a.run_id  # auto-generated UUID
+        # Canonical lib v0.8.0 — auto-generated YYMMDDHHMM (10 chars, all digits)
+        assert a.run_id
+        assert len(a.run_id) == 10
+        assert a.run_id.isdigit()
         assert a.diagnostic == {}
         assert a.overlay_keys is None
         assert a.notes == ""

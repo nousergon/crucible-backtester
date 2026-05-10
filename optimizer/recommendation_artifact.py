@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
+
+from alpha_engine_lib.eval_artifacts import new_eval_run_id
 from dataclasses import asdict, dataclass, field
 from datetime import date as _date
 from typing import Literal
@@ -90,7 +91,14 @@ class RecommendationArtifact:
     recommended_params: dict
     promotion_intent: PromotionIntent
     schema_version: int = 1
-    run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # run_id is the canonical YYMMDDHHMM identifier per
+    # alpha_engine_lib.eval_artifacts (v0.8.0). Replaces the prior UUIDv4
+    # convention — sortable lex, human-readable, encodes when-it-fired.
+    # Same-minute collisions are by design (only one Sat-SF per
+    # optimizer per cycle in production). Path shape preserved since
+    # the assembler reads back via (run_date, optimizer_name) composite
+    # key lookup; the swap is field-only.
+    run_id: str = field(default_factory=lambda: new_eval_run_id())
     overlay_keys: list[str] | None = None
     diagnostic: dict = field(default_factory=dict)
     notes: str = ""

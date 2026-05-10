@@ -437,13 +437,29 @@ class TestAssembleAuditWrite:
             "test-bucket", "executor_params", "2026-05-09",
             s3_client=s3, write_assembled=True,
         )
-        # Audit write happened.
-        audit_calls = [
+        # Audit write happened — canonical eval-style layout (lib v0.8.0).
+        # Path is `config/executor_params/assembled/{YYMMDDHHMM}.json` plus
+        # a `latest.json` sidecar at the same prefix. We verify by prefix
+        # rather than exact key since the YYMMDDHHMM run_id is wall-clock.
+        prefix = "config/executor_params/assembled/"
+        dated_audit_calls = [
             c for c in s3.put_object.call_args_list
-            if c.kwargs["Key"] == "config/executor_params/assembled/2026-05-09.json"
+            if c.kwargs["Key"].startswith(prefix)
+            and not c.kwargs["Key"].endswith("/latest.json")
         ]
-        assert len(audit_calls) == 1
-        body = json.loads(audit_calls[0].kwargs["Body"])
+        latest_audit_calls = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params/assembled/latest.json"
+        ]
+        assert len(dated_audit_calls) == 1
+        assert len(latest_audit_calls) == 1
+        # Dated key has 10-char YYMMDDHHMM basename
+        dated_basename = dated_audit_calls[0].kwargs["Key"][len(prefix):]
+        assert len(dated_basename) == len("YYMMDDHHMM.json")  # 15
+        assert dated_basename.replace(".json", "").isdigit()
+        # Body content matches between dated + latest (mirror)
+        assert dated_audit_calls[0].kwargs["Body"] == latest_audit_calls[0].kwargs["Body"]
+        body = json.loads(dated_audit_calls[0].kwargs["Body"])
         assert body["status"] == "ok"
         assert body["assembled_params"] == {"atr_multiplier": 3.0}
 
@@ -576,19 +592,37 @@ class TestAssembleCutoverMode:
         assert live_body["updated_at"] == "2026-05-09"
         assert live_body["assembled_by"] == "optimizer.assembler"
 
-        # 3. Dated history written
+        # 3. Dated history written — canonical lib v0.8.0 layout (flat
+        # {prefix}/{YYMMDDHHMM}.json + latest.json sidecar)
+        history_prefix = "config/executor_params_history/"
         history_calls = [
             c for c in s3.put_object.call_args_list
-            if c.kwargs["Key"] == "config/executor_params_history/2026-05-09.json"
+            if c.kwargs["Key"].startswith(history_prefix)
+            and not c.kwargs["Key"].endswith("/latest.json")
+        ]
+        history_latest_calls = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params_history/latest.json"
         ]
         assert len(history_calls) == 1
+        assert len(history_latest_calls) == 1
+        history_basename = history_calls[0].kwargs["Key"][len(history_prefix):]
+        assert len(history_basename) == len("YYMMDDHHMM.json")
+        assert history_basename.replace(".json", "").isdigit()
 
-        # 4. Audit artifact ALSO written (write_assembled=True)
+        # 4. Audit artifact ALSO written (write_assembled=True) — canonical
+        audit_prefix = "config/executor_params/assembled/"
         audit_calls = [
             c for c in s3.put_object.call_args_list
-            if c.kwargs["Key"] == "config/executor_params/assembled/2026-05-09.json"
+            if c.kwargs["Key"].startswith(audit_prefix)
+            and not c.kwargs["Key"].endswith("/latest.json")
+        ]
+        audit_latest_calls = [
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == "config/executor_params/assembled/latest.json"
         ]
         assert len(audit_calls) == 1
+        assert len(audit_latest_calls) == 1
 
         # Notes capture cutover application
         assert "cutover_applied" in result.notes

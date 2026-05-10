@@ -25,4 +25,8 @@ scikit-learn~=1.4
 # call sites in backtest.py / evaluate.py / lambda_health/handler.py.
 # v0.7.1 adds the cost_telemetry row to transparency_inventory.yaml,
 # read by analysis/cost_report.py for the rolling-baseline floor.
-alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.7.1
+# v0.8.0 adds alpha_engine_lib.eval_artifacts (canonical eval-style
+# artifact partition: {prefix}/{run_id}.json + latest.json sidecar with
+# YYMMDDHHMM run_ids). Consumed here by recommendation_artifact +
+# assembler + per-optimizer history writers.
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.8.0

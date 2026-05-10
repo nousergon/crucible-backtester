@@ -39,6 +39,11 @@ from datetime import date
 
 import boto3
 import pandas as pd
+from alpha_engine_lib.eval_artifacts import (
+    eval_artifact_key,
+    eval_latest_key,
+    new_eval_run_id,
+)
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
@@ -769,14 +774,24 @@ def apply(result: dict, bucket: str) -> dict:
     body = json.dumps(payload, indent=2)
 
     if shadow_only:
-        shadow_key = f"{S3_SHADOW_PREFIX}/{date.today().isoformat()}.json"
+        # Canonical eval-style archive layout per alpha_engine_lib.eval_artifacts
+        # (v0.8.0). Flat {prefix}/{run_id}.json + latest.json sidecar with
+        # YYMMDDHHMM run_id. Replaces the prior {prefix}/{date}.json shape so
+        # same-day re-runs preserve forensic capture instead of overwriting.
+        run_id = new_eval_run_id()
+        shadow_key = eval_artifact_key(S3_SHADOW_PREFIX, run_id)
+        shadow_latest_key = eval_latest_key(S3_SHADOW_PREFIX)
         try:
             s3.put_object(
                 Bucket=bucket, Key=shadow_key, Body=body, ContentType="application/json"
             )
+            s3.put_object(
+                Bucket=bucket, Key=shadow_latest_key, Body=body,
+                ContentType="application/json",
+            )
             logger.info(
                 "Executor params written to shadow archive (enforce_skill_composite=False): "
-                "s3://%s/%s",
+                "s3://%s/%s (+ latest.json sidecar)",
                 bucket, shadow_key,
             )
         except Exception as e:
@@ -807,10 +822,21 @@ def apply(result: dict, bucket: str) -> dict:
         logger.error("CRITICAL: Failed to write executor params to S3: %s", e)
         return {"applied": False, "reason": f"S3 write failed: {e}"}
 
-    history_key = f"config/executor_params_history/{date.today().isoformat()}.json"
+    # Canonical eval-style archive layout per lib v0.8.0 — see shadow path above
+    history_run_id = new_eval_run_id()
+    history_prefix = "config/executor_params_history"
+    history_key = eval_artifact_key(history_prefix, history_run_id)
+    history_latest_key = eval_latest_key(history_prefix)
     try:
         s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
-        logger.info("Executor params archived to s3://%s/%s", bucket, history_key)
+        s3.put_object(
+            Bucket=bucket, Key=history_latest_key, Body=body,
+            ContentType="application/json",
+        )
+        logger.info(
+            "Executor params archived to s3://%s/%s (+ latest.json sidecar)",
+            bucket, history_key,
+        )
     except Exception as e:
         logger.warning("Failed to archive executor params history (non-fatal): %s", e)
 

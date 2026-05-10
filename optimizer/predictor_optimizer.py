@@ -33,6 +33,12 @@ import tempfile
 import time
 from datetime import date
 
+from alpha_engine_lib.eval_artifacts import (
+    eval_artifact_key,
+    eval_latest_key,
+    new_eval_run_id,
+)
+
 import boto3
 import numpy as np
 import pandas as pd
@@ -948,9 +954,17 @@ def apply_recommendations(
         )
         log.info("Predictor params updated with Phase 4 recommendations: %s", list(updates.keys()))
 
-        # Archive
-        history_key = f"config/predictor_params_history/{date.today().isoformat()}.json"
+        # Archive — canonical eval-style layout per lib v0.8.0 (flat
+        # {prefix}/{run_id}.json + latest.json sidecar with YYMMDDHHMM run_id)
+        run_id = new_eval_run_id()
+        history_prefix = "config/predictor_params_history"
+        history_key = eval_artifact_key(history_prefix, run_id)
+        history_latest_key = eval_latest_key(history_prefix)
         s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
+        s3.put_object(
+            Bucket=bucket, Key=history_latest_key, Body=body,
+            ContentType="application/json",
+        )
     except Exception as exc:
         log.error("Failed to write predictor params to S3: %s", exc)
         return {"applied": False, "reason": f"S3 write failed: {exc}"}

@@ -56,6 +56,11 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 import boto3
+from alpha_engine_lib.eval_artifacts import (
+    eval_artifact_key,
+    eval_latest_key,
+    new_eval_run_id,
+)
 from botocore.exceptions import ClientError
 
 from optimizer.recommendation_artifact import (
@@ -157,11 +162,30 @@ def read_assembled(
     ``None`` if no audit artifact exists for that date. Used by the
     rollback audit to capture what would-have-been the assembled config
     when a rollback fires.
+
+    Path resolution (canonical lib v0.8.0 layout):
+    1. Try ``config/{config_type}/assembled/latest.json`` first — this is
+       the operator-UX sidecar mirroring the most-recently-written audit.
+       Single-fetch, fast, the right answer for the typical "give me the
+       latest" use case (which is what the rollback path needs).
+    2. Fall back to legacy ``config/{config_type}/assembled/{run_date}.json``
+       for historical audits written before the canonical-layout cutover.
+       Tolerant-reader behavior so the rollback path doesn't break on
+       legacy data during the transition window.
     """
     s3 = s3_client or boto3.client("s3")
-    key = f"config/{config_type}/assembled/{run_date}.json"
+    canonical_key = f"config/{config_type}/assembled/latest.json"
     try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
+        obj = s3.get_object(Bucket=bucket, Key=canonical_key)
+        return json.loads(obj["Body"].read())
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey"):
+            raise
+        # Fall through to legacy-layout fallback
+
+    legacy_key = f"config/{config_type}/assembled/{run_date}.json"
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=legacy_key)
         return json.loads(obj["Body"].read())
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
@@ -420,7 +444,12 @@ def _cutover_apply(
     config_type = result.config_type
     live_key = f"config/{config_type}.json"
     previous_key = f"config/{config_type}_previous.json"
-    history_key = f"config/{config_type}_history/{result.run_date}.json"
+    # Canonical eval-style archive layout per lib v0.8.0 — flat
+    # {prefix}/{run_id}.json + latest.json sidecar (YYMMDDHHMM run_id)
+    history_run_id = new_eval_run_id()
+    history_prefix = f"config/{config_type}_history"
+    history_key = eval_artifact_key(history_prefix, history_run_id)
+    history_latest_key = eval_latest_key(history_prefix)
 
     # 1. Snapshot current live → _previous (rollback safety)
     try:
@@ -464,12 +493,20 @@ def _cutover_apply(
         )
         return f"cutover_failed: live write — {e}"
 
-    # 3. Mirror to dated history (matches legacy convention).
+    # 3. Mirror to dated history — canonical lib v0.8.0 archive layout
+    # (flat + latest.json sidecar; YYMMDDHHMM run_id encodes the time).
     try:
         s3_client.put_object(
             Bucket=bucket, Key=history_key, Body=body, ContentType="application/json",
         )
-        logger.info("Cutover: wrote dated history s3://%s/%s", bucket, history_key)
+        s3_client.put_object(
+            Bucket=bucket, Key=history_latest_key, Body=body,
+            ContentType="application/json",
+        )
+        logger.info(
+            "Cutover: wrote dated history s3://%s/%s (+ latest.json sidecar)",
+            bucket, history_key,
+        )
     except Exception as e:
         logger.warning(
             "Cutover: failed to write dated history s3://%s/%s: %s "
@@ -484,19 +521,32 @@ def _write_assembled_audit(
 ) -> str:
     """Write the assembler result to S3 as an audit artifact.
 
-    Path: ``config/{config_type}/assembled/{run_date}.json``.
-    Failure is non-fatal during the shadow-only PR 3 phase — logs warn,
-    returns empty string.
+    Canonical eval-style archive layout per ``alpha_engine_lib.eval_artifacts``
+    (v0.8.0)::
+
+        config/{config_type}/assembled/{run_id}.json    ← per-run audit
+        config/{config_type}/assembled/latest.json      ← single-fetch sidecar
+
+    Run_id is YYMMDDHHMM (UTC) — same-minute re-runs collide by design;
+    typical Sat-SF cron cadence makes that effectively impossible. Failure
+    is non-fatal during the shadow-only PR 3 phase — logs warn, returns
+    empty string.
     """
-    key = f"config/{result.config_type}/assembled/{result.run_date}.json"
+    run_id = new_eval_run_id()
+    prefix = f"config/{result.config_type}/assembled"
+    key = eval_artifact_key(prefix, run_id)
+    latest_key = eval_latest_key(prefix)
     try:
         body = json.dumps(result.to_dict(), indent=2, sort_keys=True)
         s3_client.put_object(
             Bucket=bucket, Key=key, Body=body, ContentType="application/json",
         )
+        s3_client.put_object(
+            Bucket=bucket, Key=latest_key, Body=body, ContentType="application/json",
+        )
         logger.info(
-            "Wrote assembler audit artifact: s3://%s/%s (status=%s, "
-            "promoting=%d, frozen_keys_restored=%d)",
+            "Wrote assembler audit artifact: s3://%s/%s (+ latest.json sidecar; "
+            "status=%s, promoting=%d, frozen_keys_restored=%d)",
             bucket, key, result.status,
             sum(1 for v in result.artifacts_seen.values() if v["promotion_intent"] == "promote"),
             len(result.frozen_keys_restored),

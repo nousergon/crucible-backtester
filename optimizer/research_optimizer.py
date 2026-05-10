@@ -26,6 +26,12 @@ import json
 import logging
 from datetime import date
 
+from alpha_engine_lib.eval_artifacts import (
+    eval_artifact_key,
+    eval_latest_key,
+    new_eval_run_id,
+)
+
 import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
@@ -334,9 +340,20 @@ def apply(result: dict, bucket: str) -> dict:
     s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
     logger.info("Research params updated in S3: %s", {k: v for k, v in recommended.items() if k in SAFE_PARAMS})
 
-    history_key = f"config/research_params_history/{date.today().isoformat()}.json"
+    # Canonical eval-style archive layout per lib v0.8.0
+    run_id = new_eval_run_id()
+    history_prefix = "config/research_params_history"
+    history_key = eval_artifact_key(history_prefix, run_id)
+    history_latest_key = eval_latest_key(history_prefix)
     s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
-    logger.info("Research params archived to s3://%s/%s", bucket, history_key)
+    s3.put_object(
+        Bucket=bucket, Key=history_latest_key, Body=body,
+        ContentType="application/json",
+    )
+    logger.info(
+        "Research params archived to s3://%s/%s (+ latest.json sidecar)",
+        bucket, history_key,
+    )
 
     return {
         "applied": True,
