@@ -23,5 +23,6 @@ scikit-learn~=1.4
 # alpha-engine-lib pulls in arcticdb + flow-doctor via extras; see
 # preflight.py and the `from alpha_engine_lib.logging import setup_logging`
 # call sites in backtest.py / evaluate.py / lambda_health/handler.py.
-# v0.4.0 adds the agent_schemas submodule used by replay/runner.py.
-alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.4.0
+# v0.7.1 adds the cost_telemetry row to transparency_inventory.yaml,
+# read by analysis/cost_report.py for the rolling-baseline floor.
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.7.1

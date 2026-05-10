@@ -348,12 +348,24 @@ class TestPreviousWeeklyDates:
 
 
 class TestDetectAnomaly:
-    def test_no_baseline_when_all_priors_missing(self):
+    """Legacy classification semantics — preserved by passing
+    ``inventory=_stub_inventory(include_row=False)`` so the
+    pre-telemetry floor is disabled and every prior date competes for
+    the baseline equally. The new pre-telemetry-aware behavior is
+    covered by ``TestPreTelemetryBaselineClassification`` below.
+    """
+
+    @pytest.fixture
+    def no_floor_inventory(self) -> dict:
+        return _stub_inventory(include_row=False)
+
+    def test_no_baseline_when_all_priors_missing(self, no_floor_inventory):
         from analysis.cost_report import detect_anomaly
 
         stub = _make_multi_date_stub({})  # nothing exists
         result = detect_anomaly(
             "2026-05-09", current_total_cost_usd=0.50, s3_client=stub,
+            inventory=no_floor_inventory,
         )
         assert result["status"] == "no_baseline"
         assert result["is_anomaly"] is False
@@ -361,7 +373,7 @@ class TestDetectAnomaly:
         assert result["baseline_dates_found"] == []
         assert len(result["baseline_dates_missing"]) == 4
 
-    def test_ok_when_under_threshold(self):
+    def test_ok_when_under_threshold(self, no_floor_inventory):
         from analysis.cost_report import detect_anomaly
 
         # Baseline averages $0.50; current $0.60 = 1.2x < 2.0× threshold.
@@ -377,6 +389,7 @@ class TestDetectAnomaly:
         })
         result = detect_anomaly(
             "2026-05-09", current_total_cost_usd=0.60, s3_client=stub,
+            inventory=no_floor_inventory,
         )
         assert result["status"] == "ok"
         assert result["is_anomaly"] is False
@@ -384,7 +397,7 @@ class TestDetectAnomaly:
         assert result["ratio"] == pytest.approx(1.2)
         assert len(result["baseline_dates_found"]) == 4
 
-    def test_anomaly_when_over_threshold(self, caplog):
+    def test_anomaly_when_over_threshold(self, caplog, no_floor_inventory):
         from analysis.cost_report import detect_anomaly
 
         # Baseline averages $0.50; current $1.50 = 3.0x > 2.0× threshold.
@@ -401,6 +414,7 @@ class TestDetectAnomaly:
         with caplog.at_level("WARNING"):
             result = detect_anomaly(
                 "2026-05-09", current_total_cost_usd=1.50, s3_client=stub,
+                inventory=no_floor_inventory,
             )
         assert result["status"] == "anomaly"
         assert result["is_anomaly"] is True
@@ -409,7 +423,7 @@ class TestDetectAnomaly:
         assert any("anomaly" in r.message for r in caplog.records)
         assert any("3.00x" in r.message for r in caplog.records)
 
-    def test_partial_baseline_uses_available_dates(self):
+    def test_partial_baseline_uses_available_dates(self, no_floor_inventory):
         """If 2 of 4 priors are missing, baseline is mean of the 2 found."""
         from analysis.cost_report import detect_anomaly
 
@@ -428,6 +442,7 @@ class TestDetectAnomaly:
         })
         result = detect_anomaly(
             "2026-05-09", current_total_cost_usd=0.55, s3_client=stub,
+            inventory=no_floor_inventory,
         )
         assert result["status"] == "ok"
         assert result["baseline_mean_usd"] == pytest.approx(0.50)  # (0.40 + 0.60) / 2
@@ -443,6 +458,195 @@ class TestDetectAnomaly:
         )
         assert result["status"] == "alerting_disabled"
         assert result["is_anomaly"] is False
+
+
+def _stub_inventory(
+    *, effective_date: str | None = "2026-05-02",
+    include_row: bool = True,
+) -> dict:
+    """Build a minimal substrate-inventory dict with a cost_telemetry
+    row, mirroring alpha-engine-lib's ``transparency_inventory.yaml``
+    shape but trimmed to fields ``_telemetry_first_capture_date``
+    actually reads.
+    """
+    rows: list[dict] = []
+    if include_row:
+        row: dict = {"id": "cost_telemetry"}
+        if effective_date is not None:
+            row["effective_date"] = effective_date
+        rows.append(row)
+    return {"version": 1, "inventory": rows}
+
+
+class TestTelemetryFirstCaptureDate:
+    """Floor derives from the lib substrate inventory, not S3 listing.
+    The detector accepts an injected ``inventory`` dict so tests don't
+    need to monkey-patch the lib loader.
+    """
+
+    def test_returns_effective_date_from_inventory(self):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        inv = _stub_inventory(effective_date="2026-05-02")
+        assert _telemetry_first_capture_date(inventory=inv) == "2026-05-02"
+
+    def test_returns_none_when_row_missing(self, caplog):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        inv = _stub_inventory(include_row=False)
+        with caplog.at_level("WARNING"):
+            assert _telemetry_first_capture_date(inventory=inv) is None
+        assert any(
+            "no 'cost_telemetry' row" in r.message
+            or "no-pre-telemetry-floor" in r.message
+            for r in caplog.records
+        )
+
+    def test_returns_none_when_effective_date_absent(self):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        inv = _stub_inventory(effective_date=None)
+        assert _telemetry_first_capture_date(inventory=inv) is None
+
+    def test_coerces_yaml_date_to_iso_string(self):
+        """PyYAML loads bare ``YYYY-MM-DD`` literals as ``datetime.date``;
+        the helper coerces to ISO string for downstream comparison.
+        """
+        from analysis.cost_report import _telemetry_first_capture_date
+        from datetime import date as date_type
+
+        inv = {
+            "version": 1,
+            "inventory": [
+                {"id": "cost_telemetry",
+                 "effective_date": date_type(2026, 5, 2)},
+            ],
+        }
+        assert _telemetry_first_capture_date(inventory=inv) == "2026-05-02"
+
+    def test_falls_back_when_lib_import_fails(self, caplog, monkeypatch):
+        """If alpha_engine_lib.transparency isn't on the path (e.g. lib
+        pin is too old), the helper returns None with a WARN log so the
+        legacy "all gaps equal" classification kicks in.
+        """
+        import builtins
+
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        real_import = builtins.__import__
+
+        def _raise_on_transparency(name, *args, **kwargs):
+            if name == "alpha_engine_lib.transparency":
+                raise ImportError("no module named 'alpha_engine_lib.transparency'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _raise_on_transparency)
+        with caplog.at_level("WARNING"):
+            assert _telemetry_first_capture_date() is None
+        assert any(
+            "lib pin to >=0.7.1" in r.message for r in caplog.records
+        )
+
+
+class TestPreTelemetryBaselineClassification:
+    """Regression coverage for the 2026-05-09 evaluator email bug:
+    pre-launch Saturday gaps were rendered as "capture flag may have
+    been off" when in fact the telemetry feature didn't exist yet.
+
+    The floor is read from alpha-engine-lib's substrate-inventory
+    ``cost_telemetry`` row's ``effective_date``. Tests inject the
+    inventory dict to bypass the lib loader.
+    """
+
+    def test_classifies_pre_launch_dates_separately(self):
+        from analysis.cost_report import detect_anomaly
+
+        # Registry says telemetry first captured 5/2.
+        # 5/9 run looks back at 5/2 / 4/25 / 4/18 / 4/11 — three are pre-launch.
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=1.0),
+        ])
+        stub = _make_multi_date_stub({"2026-05-02": baseline_df})
+        result = detect_anomaly(
+            "2026-05-09",
+            current_total_cost_usd=1.10,
+            s3_client=stub,
+            inventory=_stub_inventory(effective_date="2026-05-02"),
+        )
+        assert result["telemetry_first_date"] == "2026-05-02"
+        assert result["baseline_dates_found"] == ["2026-05-02"]
+        assert sorted(result["baseline_dates_pre_telemetry"]) == [
+            "2026-04-11", "2026-04-18", "2026-04-25",
+        ]
+        assert result["baseline_dates_missing"] == []
+
+    def test_no_baseline_when_only_pre_launch_priors(self):
+        from analysis.cost_report import detect_anomaly
+
+        # Registry says telemetry first captured 5/9 itself; all 4 priors pre-launch.
+        stub = _make_multi_date_stub({})
+        result = detect_anomaly(
+            "2026-05-09",
+            current_total_cost_usd=1.0,
+            s3_client=stub,
+            inventory=_stub_inventory(effective_date="2026-05-09"),
+        )
+        assert result["status"] == "no_baseline"
+        assert result["baseline_dates_found"] == []
+        assert result["baseline_dates_missing"] == []
+        assert len(result["baseline_dates_pre_telemetry"]) == 4
+
+    def test_distinguishes_post_launch_gap_from_pre_launch(self):
+        """Registry effective_date 4/18 → 4/11 is pre-launch; 4/25 with
+        no parquet is a genuine post-launch gap.
+        """
+        from analysis.cost_report import detect_anomaly
+
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=1.0),
+        ])
+        stub = _make_multi_date_stub({
+            "2026-04-18": baseline_df,
+            "2026-05-02": baseline_df,
+        })
+        result = detect_anomaly(
+            "2026-05-09",
+            current_total_cost_usd=1.10,
+            s3_client=stub,
+            inventory=_stub_inventory(effective_date="2026-04-18"),
+        )
+        assert result["telemetry_first_date"] == "2026-04-18"
+        assert sorted(result["baseline_dates_found"]) == [
+            "2026-04-18", "2026-05-02",
+        ]
+        assert result["baseline_dates_missing"] == ["2026-04-25"]
+        assert result["baseline_dates_pre_telemetry"] == ["2026-04-11"]
+
+    def test_legacy_path_when_inventory_unavailable(self):
+        """If the inventory has no cost_telemetry row, fall back to the
+        legacy "all-gaps-equal" classification.
+        """
+        from analysis.cost_report import detect_anomaly
+
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=1.0),
+        ])
+        stub = _make_multi_date_stub({"2026-05-02": baseline_df})
+        result = detect_anomaly(
+            "2026-05-09",
+            current_total_cost_usd=1.0,
+            s3_client=stub,
+            inventory=_stub_inventory(include_row=False),
+        )
+        assert result["telemetry_first_date"] is None
+        assert result["baseline_dates_pre_telemetry"] == []
+        # All 3 missing priors are classified as missing (legacy framing).
+        assert sorted(result["baseline_dates_missing"]) == [
+            "2026-04-11", "2026-04-18", "2026-04-25",
+        ]
 
 
 class TestRenderAnomalySection:
@@ -522,6 +726,100 @@ class TestRenderAnomalySection:
         })
         assert "Baseline gaps" in md
         assert "2 of 4" in md
+
+    def test_pre_telemetry_no_baseline_message(self):
+        """First-week-after-launch case: all priors pre-date telemetry."""
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.0,
+            "baseline_dates_found": [],
+            "baseline_dates_missing": [],
+            "baseline_dates_pre_telemetry": [
+                "2026-04-11", "2026-04-18", "2026-04-25", "2026-05-02",
+            ],
+            "telemetry_first_date": "2026-05-09",
+            "baseline_mean_usd": None,
+            "ratio": None,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "no_baseline",
+        })
+        assert "pre-date the cost-telemetry feature" in md
+        assert "first captured: 2026-05-09" in md
+        # Should NOT blame the operator capture flag for pre-launch gaps.
+        assert "capture-flag-off" not in md
+        assert "capture flag may have been off" not in md
+
+    def test_pre_telemetry_excluded_from_baseline_in_ok_path(self):
+        """Anomaly OK path: pre-telemetry priors get a separate sentence
+        and are excluded from the baseline window.
+        """
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.10,
+            "baseline_dates_found": ["2026-05-02"],
+            "baseline_dates_missing": [],
+            "baseline_dates_pre_telemetry": [
+                "2026-04-11", "2026-04-18", "2026-04-25",
+            ],
+            "telemetry_first_date": "2026-05-02",
+            "baseline_mean_usd": 1.0,
+            "ratio": 1.10,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "ok",
+        })
+        assert "Baseline window" in md
+        assert "3 of 4" in md
+        assert "first captured: 2026-05-02" in md
+        # Pre-telemetry framing — must not say capture-flag-off.
+        assert "capture flag may have been off" not in md
+
+    def test_mixed_pre_telemetry_and_post_launch_gap(self):
+        """Both classifications can co-exist: one pre-launch + one
+        post-launch genuine gap. Both sentences should render.
+        """
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.10,
+            "baseline_dates_found": ["2026-04-18", "2026-05-02"],
+            "baseline_dates_missing": ["2026-04-25"],
+            "baseline_dates_pre_telemetry": ["2026-04-11"],
+            "telemetry_first_date": "2026-04-18",
+            "baseline_mean_usd": 1.0,
+            "ratio": 1.10,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "ok",
+        })
+        assert "Baseline window" in md
+        assert "Baseline gaps" in md
+        # Genuine gap counts only post-launch denominator (2 found + 1 missing = 3).
+        assert "1 of 3" in md
+        assert "post-launch prior weekly runs" in md
+
+    def test_no_baseline_mixed_message(self):
+        """All priors gone — some pre-telemetry, some post-launch
+        missing. Message blends both classifications.
+        """
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.0,
+            "baseline_dates_found": [],
+            "baseline_dates_missing": ["2026-05-02"],
+            "baseline_dates_pre_telemetry": [
+                "2026-04-11", "2026-04-18", "2026-04-25",
+            ],
+            "telemetry_first_date": "2026-04-25",
+            "baseline_mean_usd": None,
+            "ratio": None,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "no_baseline",
+        })
+        assert "pre-date telemetry" in md
+        assert "first captured: 2026-04-25" in md
+        assert "1 post-launch run(s)" in md
 
 
 class TestBuildCostSectionWithAnomaly:
@@ -662,15 +960,17 @@ class TestChangelogAutoEmitOnAnomaly:
         assert body["machine"] == "backtester:analysis/cost_report.py"
         assert body["auto_emitted"] is True
         assert body["run_id"] == "2026-05-09"
-        # Diagnostic block carries the ratio + baseline numbers
+        # Diagnostic block carries the ratio + baseline numbers.
+        # Note: build_cost_section reads the substrate inventory's
+        # cost_telemetry effective_date (2026-05-02 in lib v0.7.1+);
+        # 4/25, 4/18, 4/11 are pre-telemetry → excluded from the
+        # baseline. Only 5/2 contributes; mean stays $1.00.
         ca = body["cost_anomaly"]
         assert ca["ratio"] == 10.0
         assert ca["threshold_ratio"] == 2.0
         assert ca["current_total_usd"] == 10.0
         assert ca["baseline_mean_usd"] == 1.0
-        assert ca["baseline_dates_found"] == [
-            "2026-05-02", "2026-04-25", "2026-04-18", "2026-04-11",
-        ]
+        assert ca["baseline_dates_found"] == ["2026-05-02"]
         # event_id format mirrors the SNS-mirror + cloudwatch-mirror scheme
         parts = body["event_id"].split("_")
         assert len(parts) == 3  # ts_actor_hash

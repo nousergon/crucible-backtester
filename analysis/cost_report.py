@@ -60,6 +60,13 @@ _ANOMALY_RATIO_ENV_VAR = "ALPHA_ENGINE_COST_ANOMALY_RATIO"
 _ANOMALY_RATIO_DEFAULT = 2.0
 _ANOMALY_BASELINE_WEEKS = 4  # rolling window per ROADMAP P5
 
+# Registry row id read from alpha_engine_lib.transparency_inventory.yaml
+# to source the cost-telemetry effective_date (the floor of the
+# rolling baseline window). Keep in sync with the row id in lib's
+# inventory; missing-row → fallback to no-floor (legacy "all gaps
+# treated equal" classification, with a WARN log for visibility).
+_COST_TELEMETRY_REGISTRY_ROW_ID = "cost_telemetry"
+
 # Schema-1.0.0 changelog corpus (ROADMAP P0 sub-item 5 auto-population —
 # cost-anomaly half, 2026-05-07). When detect_anomaly() returns
 # status="anomaly", build_cost_section() writes one structured incident
@@ -243,6 +250,79 @@ def _previous_weekly_dates(run_date: str, *, weeks: int) -> list[str]:
     ]
 
 
+def _telemetry_first_capture_date(
+    *,
+    inventory: Optional[dict] = None,
+) -> Optional[str]:
+    """Return the cost-telemetry effective_date from the substrate
+    inventory registry, or ``None`` if the row is missing.
+
+    The substrate inventory (alpha-engine-lib's
+    ``transparency_inventory.yaml``) is the single source of truth for
+    when each measurement-output substrate started capturing data. The
+    cost_telemetry row's ``effective_date`` field is the first Saturday
+    SF run that captured a parquet; consumers (this anomaly detector +
+    the substrate health checker) read it as a structural floor.
+
+    Used by :func:`detect_anomaly` to distinguish:
+
+    1. **Pre-telemetry** — prior weekly dates that fall *before* the
+       row's effective_date. These dates inherently have no parquets
+       and the renderer surfaces that explicitly.
+    2. **Genuine missing** — prior weekly dates *after* the floor that
+       still have no parquet. These warrant the "capture flag may have
+       been off" framing.
+
+    Inventory load failures (yaml missing, lib import fails, row
+    absent) fall back to ``None`` with a WARN log so the legacy
+    "all gaps treated equal" classification still fires — the
+    detector remains functionally degraded but doesn't take down the
+    Saturday SF email.
+
+    ``inventory`` injection lets tests stub the registry without
+    monkey-patching the lib loader.
+    """
+    inv = inventory
+    if inv is None:
+        try:
+            from alpha_engine_lib.transparency import load_inventory
+        except ImportError as exc:
+            logger.warning(
+                "[cost_report] alpha_engine_lib.transparency unavailable "
+                "(%s) — falling back to no-pre-telemetry-floor "
+                "classification. Bump the lib pin to >=0.7.1 to enable.",
+                exc,
+            )
+            return None
+        try:
+            inv = load_inventory()
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[cost_report] load_inventory failed (%s) — falling back "
+                "to no-pre-telemetry-floor classification",
+                exc,
+            )
+            return None
+    rows = inv.get("inventory") or []
+    row = next(
+        (r for r in rows if r.get("id") == _COST_TELEMETRY_REGISTRY_ROW_ID),
+        None,
+    )
+    if row is None:
+        logger.warning(
+            "[cost_report] substrate inventory has no %r row — falling "
+            "back to no-pre-telemetry-floor classification. Bump the lib "
+            "pin to a version that ships the row.",
+            _COST_TELEMETRY_REGISTRY_ROW_ID,
+        )
+        return None
+    effective = row.get("effective_date")
+    if effective is None:
+        return None
+    # YAML may load the date as a datetime.date; coerce to ISO string.
+    return str(effective)
+
+
 def _fetch_total_cost_for_date(
     run_date: str,
     *,
@@ -264,15 +344,27 @@ def detect_anomaly(
     bucket: str = _DEFAULT_BUCKET,
     s3_client: Optional[Any] = None,
     weeks: int = _ANOMALY_BASELINE_WEEKS,
+    inventory: Optional[dict] = None,
 ) -> dict:
     """Compare ``current_total_cost_usd`` against the rolling baseline of
     the previous ``weeks`` Saturday runs.
+
+    The pre-telemetry floor (the date before which baseline gaps are
+    structural rather than operator-flag-off) is sourced from the
+    alpha-engine-lib substrate inventory's ``cost_telemetry`` row.
+    Tests can inject an ``inventory`` dict to bypass the lib loader.
 
     Returns a dict with:
 
     - ``current_total_usd``: passed-through current spend.
     - ``baseline_dates_found``: list of ISO dates that had parquets.
-    - ``baseline_dates_missing``: list of ISO dates with no parquet.
+    - ``baseline_dates_missing``: list of ISO dates with no parquet that
+      fall *after* telemetry shipped (genuine post-launch gaps —
+      capture-flag-off / partial SF / Lambda timeout class).
+    - ``baseline_dates_pre_telemetry``: list of ISO dates that pre-date
+      telemetry's first captured run. Structurally absent — not a bug.
+    - ``telemetry_first_date``: cost_telemetry row's effective_date in
+      the substrate inventory, or ``None`` if the row / lib is absent.
     - ``baseline_mean_usd``: mean spend across found dates (None if zero).
     - ``ratio``: ``current / baseline_mean``, or None if baseline empty.
     - ``threshold_ratio``: configured anomaly threshold.
@@ -289,6 +381,8 @@ def detect_anomaly(
             "current_total_usd": current_total_cost_usd,
             "baseline_dates_found": [],
             "baseline_dates_missing": [],
+            "baseline_dates_pre_telemetry": [],
+            "telemetry_first_date": None,
             "baseline_mean_usd": None,
             "ratio": None,
             "threshold_ratio": threshold,
@@ -298,9 +392,14 @@ def detect_anomaly(
 
     client = s3_client if s3_client is not None else boto3.client("s3")
     prior_dates = _previous_weekly_dates(run_date, weeks=weeks)
+    telemetry_first = _telemetry_first_capture_date(inventory=inventory)
     found: list[tuple[str, float]] = []
     missing: list[str] = []
+    pre_telemetry: list[str] = []
     for d in prior_dates:
+        if telemetry_first is not None and d < telemetry_first:
+            pre_telemetry.append(d)
+            continue
         total = _fetch_total_cost_for_date(d, bucket=bucket, s3_client=client)
         if total is None:
             missing.append(d)
@@ -311,7 +410,9 @@ def detect_anomaly(
         return {
             "current_total_usd": current_total_cost_usd,
             "baseline_dates_found": [],
-            "baseline_dates_missing": prior_dates,
+            "baseline_dates_missing": missing,
+            "baseline_dates_pre_telemetry": pre_telemetry,
+            "telemetry_first_date": telemetry_first,
             "baseline_mean_usd": None,
             "ratio": None,
             "threshold_ratio": threshold,
@@ -335,6 +436,8 @@ def detect_anomaly(
         "current_total_usd": current_total_cost_usd,
         "baseline_dates_found": [d for d, _ in found],
         "baseline_dates_missing": missing,
+        "baseline_dates_pre_telemetry": pre_telemetry,
+        "telemetry_first_date": telemetry_first,
         "baseline_mean_usd": baseline_mean,
         "ratio": ratio,
         "threshold_ratio": threshold,
@@ -358,11 +461,32 @@ def render_anomaly_section(anomaly: dict) -> str:
         )
     elif status == "no_baseline":
         missing = anomaly.get("baseline_dates_missing") or []
-        lines.append(
-            f"- _No baseline available_ (no parquets found for the "
-            f"previous {len(missing)} weekly runs). Anomaly check "
-            "deferred until baseline accumulates.",
-        )
+        pre_telemetry = anomaly.get("baseline_dates_pre_telemetry") or []
+        telemetry_first = anomaly.get("telemetry_first_date")
+        n_pre = len(pre_telemetry)
+        n_missing = len(missing)
+        n_total = n_pre + n_missing
+        if n_pre and not n_missing and telemetry_first:
+            lines.append(
+                f"- _No baseline available yet_ — all {n_pre} of the "
+                f"previous weekly runs pre-date the cost-telemetry feature "
+                f"(first captured: {telemetry_first}). Baseline fills as "
+                "post-launch Saturdays accumulate.",
+            )
+        elif n_pre and n_missing:
+            lines.append(
+                f"- _No baseline available_ — of the previous {n_total} "
+                f"weekly runs, {n_pre} pre-date telemetry (first captured: "
+                f"{telemetry_first}) and {n_missing} post-launch run(s) "
+                "had no captured parquet (capture-flag-off / partial SF / "
+                "Lambda timeout — check the corresponding evaluator emails).",
+            )
+        else:
+            lines.append(
+                f"- _No baseline available_ (no parquets found for the "
+                f"previous {n_total} weekly runs). Anomaly check "
+                "deferred until baseline accumulates.",
+            )
     else:
         current = anomaly.get("current_total_usd", 0.0)
         baseline = anomaly.get("baseline_mean_usd", 0.0) or 0.0
@@ -370,6 +494,8 @@ def render_anomaly_section(anomaly: dict) -> str:
         threshold = anomaly.get("threshold_ratio", 0.0)
         n_found = len(anomaly.get("baseline_dates_found") or [])
         n_missing = len(anomaly.get("baseline_dates_missing") or [])
+        n_pre = len(anomaly.get("baseline_dates_pre_telemetry") or [])
+        telemetry_first = anomaly.get("telemetry_first_date")
         ratio_str = f"{ratio:.2f}x" if ratio is not None else "N/A"
         lines.append(f"- Current run total: ${current:.4f}")
         lines.append(
@@ -378,11 +504,18 @@ def render_anomaly_section(anomaly: dict) -> str:
         lines.append(
             f"- Ratio: **{ratio_str}** (threshold: {threshold:.2f}x)",
         )
+        if n_pre:
+            lines.append(
+                f"- Baseline window: {n_pre} of {n_found + n_pre + n_missing} "
+                f"prior weekly runs pre-date telemetry (first captured: "
+                f"{telemetry_first}); excluded from baseline.",
+            )
         if n_missing:
             lines.append(
-                f"- Baseline gaps: {n_missing} of {n_found + n_missing} "
-                "prior weekly runs had no captured parquet (capture flag "
-                "may have been off; check the corresponding evaluator emails).",
+                f"- Baseline gaps: {n_missing} of "
+                f"{n_found + n_missing} post-launch prior weekly runs "
+                "had no captured parquet (capture-flag-off / partial SF / "
+                "Lambda timeout — check the corresponding evaluator emails).",
             )
         if anomaly.get("is_anomaly"):
             lines.insert(2, "")
