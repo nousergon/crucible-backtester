@@ -580,6 +580,7 @@ def build_report(
     scanner_opt: dict | None = None,
     team_opt: dict | None = None,
     cio_opt: dict | None = None,
+    tech_weight_ablation: dict | None = None,
     sizing_ab: dict | None = None,
     grading: dict | None = None,
     confusion_matrix: dict | None = None,
@@ -703,6 +704,8 @@ def build_report(
         phase4_sections += _section_team_opt(team_opt)
     if cio_opt and cio_opt.get("status") == "ok":
         phase4_sections += _section_cio_opt(cio_opt)
+    if tech_weight_ablation:
+        phase4_sections += _section_tech_weight_ablation(tech_weight_ablation)
     if sizing_ab and sizing_ab.get("status") == "ok":
         phase4_sections += _section_sizing_ab(sizing_ab)
 
@@ -2205,6 +2208,90 @@ def _section_cio_opt(result: dict) -> list[str]:
         "",
         f"> {result.get('reasoning', '')}",
     ]
+    return lines
+
+
+def _section_tech_weight_ablation(result: dict) -> list[str]:
+    """Build tech weight ablation section.
+
+    Per-sector recommendation by sub-score rank-correlation grid
+    search. Recommendation-only — no auto-apply yet (parallel-
+    observation cutover follows). Surfaces both the per-team status
+    table and any cross-the-gate recommendations for operator review.
+    """
+    lines = ["## Tech weight ablation (per-sector quant scorer)", ""]
+
+    if result.get("status") == "no_data":
+        lines.append(f"> {result.get('reason', 'no team_candidates data')}")
+        lines.append("")
+        return lines
+    if result.get("status") == "insufficient_data":
+        lines.append(
+            f"> Insufficient sub-score data: {result.get('reason', '')}"
+        )
+        lines.append("")
+        return lines
+    if result.get("status") != "ok":
+        lines.append(
+            f"> Tech weight ablation skipped: {result.get('error', 'unknown')}"
+        )
+        lines.append("")
+        return lines
+
+    win_start = result.get("window_start", "?")
+    win_end = result.get("window_end", "?")
+    n_grid = result.get("grid_size", 0)
+    min_imp = result.get("min_improvement", 0.10)
+    n_recs = result.get("n_teams_with_recommendation", 0)
+    n_ok = result.get("n_teams_ok", 0)
+
+    lines.append(
+        f"- Window: **{win_start}** → **{win_end}** "
+        f"({n_grid} configs swept, ≥{result.get('min_rows_per_team', 30)} "
+        f"rows/team required)"
+    )
+    lines.append(
+        f"- Improvement gate: best config must beat current_default by "
+        f"≥{min_imp:.2f} on rank corr (more-negative direction)"
+    )
+    lines.append(
+        f"- **Teams with recommendation:** {n_recs} of {n_ok} eligible"
+    )
+
+    recommendations = result.get("recommendations", {}) or {}
+    if recommendations:
+        lines.append("")
+        lines.append("**Recommendations (recommendation-only, no auto-apply):**")
+        for team_id, cfg_name in sorted(recommendations.items()):
+            lines.append(f"  - `{team_id}` → switch to `{cfg_name}`")
+
+    lines.append("")
+    lines.append("| Team | n_rows | Current corr | Best config | Best corr | Δ |")
+    lines.append("|---|---|---|---|---|---|")
+    for entry in result.get("per_team", []) or []:
+        if entry.get("status") != "ok":
+            lines.append(
+                f"| {entry['team_id']} | {entry.get('n_rows', 0)} | "
+                f"_{entry.get('status', '?')}_ | — | — | — |"
+            )
+            continue
+        cur = entry.get("current_corr")
+        best_cfg = entry.get("best_config", "—")
+        best = entry.get("best_corr")
+        delta = entry.get("improvement_vs_current")
+        rec = entry.get("recommendation", "keep_current")
+        flag = " ⚠️" if rec.startswith("switch_to_") else ""
+        cur_s = f"{cur:+.3f}" if cur is not None else "—"
+        best_s = f"{best:+.3f}" if best is not None else "—"
+        delta_s = f"{delta:+.3f}" if delta is not None else "—"
+        lines.append(
+            f"| {entry['team_id']}{flag} | {entry.get('n_rows', 0)} | "
+            f"{cur_s} | `{best_cfg}` | {best_s} | {delta_s} |"
+        )
+
+    lines.append("")
+    lines.append(f"> {result.get('apply_note', '')}")
+    lines.append("")
     return lines
 
 
