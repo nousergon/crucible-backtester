@@ -445,6 +445,210 @@ class TestDetectAnomaly:
         assert result["is_anomaly"] is False
 
 
+def _make_multi_date_stub_with_listing(
+    date_to_df: dict[str, pd.DataFrame | None],
+    *,
+    listing_dates: list[str] | None = None,
+) -> MagicMock:
+    """Like ``_make_multi_date_stub`` but also stubs ``list_objects_v2``
+    so ``_telemetry_first_capture_date`` can resolve a min-date floor.
+
+    ``listing_dates`` controls which ISO dates appear in the listing
+    (defaults to ``date_to_df.keys()``). Pass an explicit list to test
+    cases where listing and per-date fetches diverge (e.g. simulating
+    "telemetry shipped 5/2 but the 5/2 parquet itself is gone").
+    """
+    base = _make_multi_date_stub(date_to_df)
+    if listing_dates is None:
+        listing_dates = sorted(date_to_df.keys())
+    base.list_objects_v2.return_value = {
+        "Contents": [
+            {"Key": f"decision_artifacts/_cost/{d}/cost.parquet"}
+            for d in listing_dates
+        ],
+    }
+    return base
+
+
+class TestTelemetryFirstCaptureDate:
+    def test_returns_min_iso_date(self):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        stub = _make_multi_date_stub_with_listing(
+            {}, listing_dates=["2026-05-09", "2026-05-02", "2026-05-06"],
+        )
+        assert _telemetry_first_capture_date(
+            bucket="b", s3_client=stub,
+        ) == "2026-05-02"
+
+    def test_returns_none_when_no_partitions(self):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        stub = MagicMock()
+        stub.list_objects_v2.return_value = {"Contents": []}
+        assert _telemetry_first_capture_date(
+            bucket="b", s3_client=stub,
+        ) is None
+
+    def test_returns_none_when_listing_omitted(self):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        stub = MagicMock()
+        stub.list_objects_v2.return_value = {}  # no Contents key
+        assert _telemetry_first_capture_date(
+            bucket="b", s3_client=stub,
+        ) is None
+
+    def test_skips_non_iso_partition_names(self):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        stub = MagicMock()
+        stub.list_objects_v2.return_value = {
+            "Contents": [
+                {"Key": "decision_artifacts/_cost/garbage/cost.parquet"},
+                {"Key": "decision_artifacts/_cost/2026-05-04/cost.parquet"},
+                {"Key": "decision_artifacts/_cost/2026-05-02/cost.parquet"},
+            ],
+        }
+        assert _telemetry_first_capture_date(
+            bucket="b", s3_client=stub,
+        ) == "2026-05-02"
+
+    def test_skips_non_cost_parquet_keys(self):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        stub = MagicMock()
+        stub.list_objects_v2.return_value = {
+            "Contents": [
+                {"Key": "decision_artifacts/_cost/2026-05-02/cost.parquet"},
+                {"Key": "decision_artifacts/_cost/2026-05-02/manifest.json"},
+                {"Key": "decision_artifacts/_cost/2026-04-25/_other.parquet"},
+            ],
+        }
+        # Only cost.parquet keys count toward the floor.
+        assert _telemetry_first_capture_date(
+            bucket="b", s3_client=stub,
+        ) == "2026-05-02"
+
+    def test_returns_none_on_client_error(self, caplog):
+        from analysis.cost_report import _telemetry_first_capture_date
+
+        stub = MagicMock()
+        stub.list_objects_v2.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "nope"}},
+            "ListObjectsV2",
+        )
+        with caplog.at_level("WARNING"):
+            assert _telemetry_first_capture_date(
+                bucket="b", s3_client=stub,
+            ) is None
+        assert any(
+            "no-pre-telemetry-floor" in r.message for r in caplog.records
+        )
+
+
+class TestPreTelemetryBaselineClassification:
+    """Regression coverage for the 2026-05-09 evaluator email bug:
+    pre-launch Saturday gaps were rendered as "capture flag may have
+    been off" when in fact the telemetry feature didn't exist yet.
+    """
+
+    def test_classifies_pre_launch_dates_separately(self):
+        from analysis.cost_report import detect_anomaly
+
+        # Telemetry first captured 5/2 (single Saturday post-launch).
+        # 5/9 run looks back at 5/2 / 4/25 / 4/18 / 4/11 — three are pre-launch.
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=1.0),
+        ])
+        stub = _make_multi_date_stub_with_listing(
+            {"2026-05-02": baseline_df},
+            listing_dates=["2026-05-02"],
+        )
+        result = detect_anomaly(
+            "2026-05-09", current_total_cost_usd=1.10, s3_client=stub,
+        )
+        assert result["telemetry_first_date"] == "2026-05-02"
+        assert result["baseline_dates_found"] == ["2026-05-02"]
+        # 4/11, 4/18, 4/25 are pre-launch.
+        assert sorted(result["baseline_dates_pre_telemetry"]) == [
+            "2026-04-11", "2026-04-18", "2026-04-25",
+        ]
+        assert result["baseline_dates_missing"] == []
+
+    def test_no_baseline_when_only_pre_launch_priors(self):
+        from analysis.cost_report import detect_anomaly
+
+        # Telemetry first captured 5/9 itself (the run we're evaluating).
+        # All 4 priors are pre-launch.
+        stub = _make_multi_date_stub_with_listing(
+            {}, listing_dates=["2026-05-09"],
+        )
+        result = detect_anomaly(
+            "2026-05-09", current_total_cost_usd=1.0, s3_client=stub,
+        )
+        assert result["status"] == "no_baseline"
+        assert result["baseline_dates_found"] == []
+        assert result["baseline_dates_missing"] == []
+        assert len(result["baseline_dates_pre_telemetry"]) == 4
+
+    def test_distinguishes_post_launch_gap_from_pre_launch(self):
+        """If telemetry shipped 4/18, then 4/11 is pre-launch but 4/25
+        with no parquet is a genuine post-launch gap.
+        """
+        from analysis.cost_report import detect_anomaly
+
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=1.0),
+        ])
+        # Listing reports 4/18 as the earliest partition (telemetry floor).
+        # Per-date stub: 4/18 + 5/2 have parquets; 4/25 is genuinely missing.
+        stub = _make_multi_date_stub_with_listing(
+            {"2026-04-18": baseline_df, "2026-05-02": baseline_df},
+            listing_dates=["2026-04-18", "2026-05-02"],
+        )
+        result = detect_anomaly(
+            "2026-05-09", current_total_cost_usd=1.10, s3_client=stub,
+        )
+        assert result["telemetry_first_date"] == "2026-04-18"
+        assert sorted(result["baseline_dates_found"]) == [
+            "2026-04-18", "2026-05-02",
+        ]
+        assert result["baseline_dates_missing"] == ["2026-04-25"]
+        assert result["baseline_dates_pre_telemetry"] == ["2026-04-11"]
+
+    def test_legacy_path_when_listing_unavailable(self):
+        """Without a telemetry floor (list_objects_v2 fails), behavior
+        falls back to the original "all-gaps-equal" classification.
+        """
+        from analysis.cost_report import detect_anomaly
+
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="a", sector_team_id=None,
+                     model_name="claude-haiku-4-5", cost_usd=1.0),
+        ])
+
+        def _list(*args, **kwargs):
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "nope"}},
+                "ListObjectsV2",
+            )
+
+        stub = _make_multi_date_stub({"2026-05-02": baseline_df})
+        stub.list_objects_v2.side_effect = _list
+        result = detect_anomaly(
+            "2026-05-09", current_total_cost_usd=1.0, s3_client=stub,
+        )
+        assert result["telemetry_first_date"] is None
+        assert result["baseline_dates_pre_telemetry"] == []
+        # All 3 missing priors are classified as missing (legacy framing).
+        assert sorted(result["baseline_dates_missing"]) == [
+            "2026-04-11", "2026-04-18", "2026-04-25",
+        ]
+
+
 class TestRenderAnomalySection:
     def test_anomaly_section_includes_warning_marker(self):
         from analysis.cost_report import render_anomaly_section
@@ -522,6 +726,100 @@ class TestRenderAnomalySection:
         })
         assert "Baseline gaps" in md
         assert "2 of 4" in md
+
+    def test_pre_telemetry_no_baseline_message(self):
+        """First-week-after-launch case: all priors pre-date telemetry."""
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.0,
+            "baseline_dates_found": [],
+            "baseline_dates_missing": [],
+            "baseline_dates_pre_telemetry": [
+                "2026-04-11", "2026-04-18", "2026-04-25", "2026-05-02",
+            ],
+            "telemetry_first_date": "2026-05-09",
+            "baseline_mean_usd": None,
+            "ratio": None,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "no_baseline",
+        })
+        assert "pre-date the cost-telemetry feature" in md
+        assert "first captured: 2026-05-09" in md
+        # Should NOT blame the operator capture flag for pre-launch gaps.
+        assert "capture-flag-off" not in md
+        assert "capture flag may have been off" not in md
+
+    def test_pre_telemetry_excluded_from_baseline_in_ok_path(self):
+        """Anomaly OK path: pre-telemetry priors get a separate sentence
+        and are excluded from the baseline window.
+        """
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.10,
+            "baseline_dates_found": ["2026-05-02"],
+            "baseline_dates_missing": [],
+            "baseline_dates_pre_telemetry": [
+                "2026-04-11", "2026-04-18", "2026-04-25",
+            ],
+            "telemetry_first_date": "2026-05-02",
+            "baseline_mean_usd": 1.0,
+            "ratio": 1.10,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "ok",
+        })
+        assert "Baseline window" in md
+        assert "3 of 4" in md
+        assert "first captured: 2026-05-02" in md
+        # Pre-telemetry framing — must not say capture-flag-off.
+        assert "capture flag may have been off" not in md
+
+    def test_mixed_pre_telemetry_and_post_launch_gap(self):
+        """Both classifications can co-exist: one pre-launch + one
+        post-launch genuine gap. Both sentences should render.
+        """
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.10,
+            "baseline_dates_found": ["2026-04-18", "2026-05-02"],
+            "baseline_dates_missing": ["2026-04-25"],
+            "baseline_dates_pre_telemetry": ["2026-04-11"],
+            "telemetry_first_date": "2026-04-18",
+            "baseline_mean_usd": 1.0,
+            "ratio": 1.10,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "ok",
+        })
+        assert "Baseline window" in md
+        assert "Baseline gaps" in md
+        # Genuine gap counts only post-launch denominator (2 found + 1 missing = 3).
+        assert "1 of 3" in md
+        assert "post-launch prior weekly runs" in md
+
+    def test_no_baseline_mixed_message(self):
+        """All priors gone — some pre-telemetry, some post-launch
+        missing. Message blends both classifications.
+        """
+        from analysis.cost_report import render_anomaly_section
+        md = render_anomaly_section({
+            "current_total_usd": 1.0,
+            "baseline_dates_found": [],
+            "baseline_dates_missing": ["2026-05-02"],
+            "baseline_dates_pre_telemetry": [
+                "2026-04-11", "2026-04-18", "2026-04-25",
+            ],
+            "telemetry_first_date": "2026-04-25",
+            "baseline_mean_usd": None,
+            "ratio": None,
+            "threshold_ratio": 2.0,
+            "is_anomaly": False,
+            "status": "no_baseline",
+        })
+        assert "pre-date telemetry" in md
+        assert "first captured: 2026-04-25" in md
+        assert "1 post-launch run(s)" in md
 
 
 class TestBuildCostSectionWithAnomaly:
