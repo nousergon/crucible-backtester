@@ -105,52 +105,68 @@ class TestEnsureSpyColumn:
 
 
 class TestGateThresholds:
-    def test_with_legacy_metrics_computes_thresholds(self):
+    def test_with_legacy_metrics_computes_skilled_risk_thresholds(self):
         legacy = {
-            "sharpe_ratio": 1.2,
-            "total_alpha": 0.04,
+            "sortino_ratio": 1.4,
+            "psr": 0.97,
+            "cvar_95": -0.02,
             "max_drawdown": -0.15,
             "turnover_one_way_ann": 2.0,
         }
         out = _gate_thresholds({}, legacy)
-        assert out["sharpe_min"] == pytest.approx(1.2 * 0.9)
-        assert out["alpha_min"] == pytest.approx(0.04 + 0.005)
+        assert out["sortino_min"] == pytest.approx(1.4 * 0.9), \
+            "Sortino is the primary risk-adjusted gate"
+        assert out["psr_min"] == pytest.approx(0.95), \
+            "PSR confidence floor matches executor_optimizer's _MIN_PSR"
         assert out["max_drawdown_floor"] == pytest.approx(-0.15 * 1.2)
+        assert out["cvar_95_floor"] == pytest.approx(-0.02 * 1.2)
         assert out["turnover_max"] == pytest.approx(2.0 * 2.5)
         assert out["tracking_error_range"] == [0.02, 0.06]
         assert out["active_share_range"] == [0.08, 0.25]
+        assert "sharpe_min" not in out, \
+            "Raw Sharpe is not a gate — observability only per evaluator-revamp"
+        assert "alpha_min" not in out, \
+            "alpha vs SPY is presentation-only, not a gate"
 
-    def test_without_legacy_returns_none_thresholds(self):
-        out = _gate_thresholds({"sharpe_ratio": 1.0}, None)
-        assert out["sharpe_min"] is None
-        assert out["alpha_min"] is None
+    def test_without_legacy_returns_none_thresholds_but_keeps_psr_min(self):
+        out = _gate_thresholds({"sortino_ratio": 1.0}, None)
+        assert out["sortino_min"] is None
+        assert out["psr_min"] == pytest.approx(0.95), \
+            "PSR floor is absolute (95% confidence), not legacy-relative"
         assert out["max_drawdown_floor"] is None
+        assert out["cvar_95_floor"] is None
         assert out["turnover_max"] is None
-        assert out["tracking_error_range"] == [0.02, 0.06]
-        assert out["active_share_range"] == [0.08, 0.25]
 
 
 class TestCompareToLegacy:
-    def test_with_both_sides_emits_deltas_and_thresholds(self):
-        opt = {"sharpe_ratio": 1.1, "total_alpha": 0.05, "max_drawdown": -0.12,
-               "turnover_one_way_ann": 3.0}
-        leg = {"sharpe_ratio": 1.0, "total_alpha": 0.04, "max_drawdown": -0.15,
-               "turnover_one_way_ann": 2.0}
+    def test_with_both_sides_emits_skilled_risk_deltas(self):
+        opt = {"sortino_ratio": 1.5, "psr": 0.96, "cvar_95": -0.018,
+               "max_drawdown": -0.12, "turnover_one_way_ann": 3.0,
+               "total_alpha": 0.05, "sharpe_ratio": 1.1}
+        leg = {"sortino_ratio": 1.4, "psr": 0.92, "cvar_95": -0.020,
+               "max_drawdown": -0.15, "turnover_one_way_ann": 2.0,
+               "total_alpha": 0.04, "sharpe_ratio": 1.0}
         out = compare_to_legacy(opt, leg)
         assert out["optimizer"] == opt
         assert out["legacy"] == leg
-        assert out["deltas"]["sharpe_delta"] == pytest.approx(0.1)
-        assert out["deltas"]["alpha_delta"] == pytest.approx(0.01)
-        assert out["deltas"]["max_drawdown_delta"] == pytest.approx(0.03)
-        assert out["deltas"]["turnover_ratio"] == pytest.approx(1.5)
+        d = out["deltas"]
+        assert d["sortino_delta"] == pytest.approx(0.1)
+        assert d["psr_delta"] == pytest.approx(0.04)
+        assert d["cvar_95_delta"] == pytest.approx(0.002)
+        assert d["max_drawdown_delta"] == pytest.approx(0.03)
+        assert d["turnover_ratio"] == pytest.approx(1.5)
+        assert d["alpha_delta_presentation"] == pytest.approx(0.01), \
+            "alpha delta is preserved but explicitly labeled as presentation-only"
+        assert "sharpe_delta" not in d, "Raw Sharpe delta is not a gate input"
         assert "gate_thresholds" in out
 
     def test_with_none_legacy_emits_null_section(self):
-        opt = {"sharpe_ratio": 1.0}
+        opt = {"sortino_ratio": 1.0, "psr": 0.95}
         out = compare_to_legacy(opt, None)
         assert out["legacy"] is None
         assert out["deltas"] is None
-        assert out["gate_thresholds"]["sharpe_min"] is None
+        assert out["gate_thresholds"]["sortino_min"] is None
+        assert out["gate_thresholds"]["psr_min"] == pytest.approx(0.95)
 
 
 # ── Integration test — exercises the real kernel ────────────────────────────
@@ -195,9 +211,12 @@ class TestEndToEndIntegration:
             assert (row >= -1e-6).all(), "Negative weights present"
 
         m = result.metrics
-        for key in ("total_return", "sharpe_ratio", "max_drawdown",
+        for key in ("sortino_ratio", "psr", "cvar_95",
+                    "max_drawdown", "calmar_ratio",
                     "tracking_error_ann", "mean_active_share",
-                    "mean_spy_weight", "turnover_one_way_ann", "n_rebalances"):
+                    "mean_spy_weight", "turnover_one_way_ann",
+                    "n_rebalances",
+                    "sharpe_ratio", "total_return", "total_alpha"):
             assert key in m, f"Missing metric: {key}"
         assert m["n_rebalances"] == result.n_rebalances
         assert m["n_solver_failures"] >= 0

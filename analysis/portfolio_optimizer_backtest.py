@@ -4,9 +4,17 @@ Portfolio-optimizer backtest — PR 3 of portfolio-optimizer-260511 arc.
 Replays the constrained MVO optimizer (alpha-engine PR #157,
 executor/portfolio_optimizer.py) over historical synthetic predictions from
 synthetic/predictor_backtest.py, then simulates the resulting target-weight
-trajectory through vectorbt. Produces the metric set required by the
-cutover gate validator (PR 4): Sharpe, alpha vs SPY, max DD, turnover,
-tracking error vs SPY, active share, mean SPY weight, mean cash weight.
+trajectory through vectorbt. Produces the skilled-risk metric basket
+required by the cutover gate validator (PR 4): Sortino, PSR (confidence
+Sharpe > 0), CVaR(95), max DD, plus optimizer-construction metrics
+(turnover, tracking error, active share, mean SPY weight).
+
+Anchor — Sortino is the primary risk-adjusted measure, PSR is the
+confidence-significance gate, CVaR + max DD cover tail / peak-to-trough
+risk. Raw Sharpe + alpha vs SPY are emitted for observability/presentation
+only — they are NOT gate inputs. Mirrors the evaluator-revamp framework
+established in optimizer/executor_optimizer.py (Sortino-primary,
+PSR ≥ 0.95 confidence gate) — see evaluator-revamp-260506.md.
 
 Side-by-side comparison with the legacy 1/n bottom-up backtest's metrics is
 the substantive cutover decision input.
@@ -339,7 +347,21 @@ def _simulate_and_measure(
     init_cash: float,
     fees: float,
 ) -> dict:
+    """
+    Simulate target-weight trajectory through vectorbt and emit the
+    skilled-risk metric basket (Sortino / PSR / CVaR / max DD), with raw
+    Sharpe + alpha-vs-SPY available for observability/presentation only.
+
+    Anchor follows the evaluator-revamp framework (workstream D of
+    evaluator-revamp-260506.md): Sortino is the primary risk-adjusted
+    measure, PSR (confidence Sharpe > 0) is the statistical-significance
+    gate, CVaR(95) captures tail risk, max_drawdown captures peak-to-trough.
+    Raw Sharpe is computed for legacy comparison but is NOT a gating metric
+    — see optimizer/executor_optimizer.py:300-325 + tests/test_executor_optimizer.py
+    for the established pattern.
+    """
     import vectorbt as vbt
+    from vectorbt_bridge import portfolio_stats
 
     aligned_prices = price_matrix.reindex(target_weights.index)
     size = target_weights.copy()
@@ -356,28 +378,21 @@ def _simulate_and_measure(
         freq="D",
     )
 
-    total_return = float(pf.total_return())
-    sharpe = float(pf.sharpe_ratio())
-    max_drawdown = float(pf.max_drawdown())
-    calmar = float(pf.calmar_ratio())
-
-    daily_returns = pd.Series(pf.returns(), name="daily_return").astype(np.float64).dropna()
-
     spy_aligned = spy_prices.reindex(target_weights.index).dropna()
-    spy_daily = spy_aligned.pct_change().dropna()
-    spy_aligned_to_pf = spy_daily.reindex(daily_returns.index).dropna()
-    pf_aligned_to_spy = daily_returns.reindex(spy_aligned_to_pf.index)
+    stats = portfolio_stats(pf, spy_prices=spy_aligned)
 
-    if len(spy_aligned) >= 2:
-        spy_return = float((spy_aligned.iloc[-1] / spy_aligned.iloc[0]) - 1.0)
-        total_alpha = total_return - spy_return
-    else:
-        spy_return = None
-        total_alpha = None
+    daily_returns = stats.pop("daily_returns", None)
+    stats.pop("daily_log_returns", None)
 
-    if len(pf_aligned_to_spy) > 1:
-        active_returns = pf_aligned_to_spy.values - spy_aligned_to_pf.values
-        tracking_error_ann = float(np.std(active_returns, ddof=1) * np.sqrt(_TRADING_DAYS_PER_YEAR))
+    if daily_returns is not None and len(daily_returns) > 1:
+        spy_daily = spy_aligned.pct_change().dropna()
+        spy_aligned_to_pf = spy_daily.reindex(daily_returns.index).dropna()
+        pf_aligned_to_spy = daily_returns.reindex(spy_aligned_to_pf.index)
+        if len(pf_aligned_to_spy) > 1:
+            active_returns = pf_aligned_to_spy.values - spy_aligned_to_pf.values
+            tracking_error_ann = float(np.std(active_returns, ddof=1) * np.sqrt(_TRADING_DAYS_PER_YEAR))
+        else:
+            tracking_error_ann = None
     else:
         tracking_error_ann = None
 
@@ -395,17 +410,26 @@ def _simulate_and_measure(
         turnover_one_way_ann = None
 
     return {
-        "total_return": total_return,
-        "spy_return": spy_return,
-        "total_alpha": total_alpha,
-        "sharpe_ratio": sharpe,
-        "max_drawdown": max_drawdown,
-        "calmar_ratio": calmar,
+        "sortino_ratio": stats.get("sortino_ratio"),
+        "psr": stats.get("psr"),
+        "cvar_95": stats.get("cvar_95"),
+        "max_drawdown": stats.get("max_drawdown"),
+        "calmar_ratio": stats.get("calmar_ratio"),
         "tracking_error_ann": tracking_error_ann,
         "mean_active_share": mean_active_share,
         "mean_spy_weight": mean_spy_weight,
         "turnover_one_way_ann": turnover_one_way_ann,
+        "sharpe_ratio": stats.get("sharpe_ratio"),
+        "total_return": stats.get("total_return"),
+        "spy_return": stats.get("spy_return"),
+        "total_alpha": stats.get("total_alpha"),
+        "total_trades": stats.get("total_trades"),
+        "win_rate": stats.get("win_rate"),
     }
+
+
+_DEFAULT_MIN_PSR = 0.95
+_DEFAULT_SORTINO_DEGRADE_RATIO = 0.9
 
 
 def compare_to_legacy(
@@ -414,13 +438,22 @@ def compare_to_legacy(
 ) -> dict:
     """
     Build a side-by-side dict matching the cutover gate validator's input
-    shape (PR 4). When legacy_metrics is None, the deltas are None — useful
-    for first-run reports where the legacy run hasn't been recorded yet.
+    shape (PR 4). Anchored on the skilled-risk basket — Sortino is the
+    primary risk-adjusted measure, PSR is the statistical-significance
+    confidence gate, CVaR(95) + max_drawdown cover tail / peak-to-trough
+    risk. Raw Sharpe and alpha-vs-SPY are emitted as observability /
+    presentation metrics, NOT as gate inputs.
 
-    Gate thresholds (per plan doc):
-        Sharpe_opt   >= Sharpe_leg × 0.9
-        alpha_opt    >= alpha_leg + 0.005   (50 bps annualized)
-        max_dd_opt   >= -|max_dd_leg| × 1.2 (less-negative = better)
+    Mirrors the established executor_optimizer skill-composite pattern
+    (optimizer/executor_optimizer.py:300-325,446-472). When legacy_metrics
+    is None, deltas are None — useful for first-run reports where the
+    legacy baseline hasn't been recorded yet.
+
+    Gate thresholds (per evaluator-revamp-260506.md / [[evaluator_revamp_skilled_risk]]):
+        sortino_opt  >= sortino_leg × 0.9        (primary risk-adjusted)
+        psr_opt      >= 0.95                     (confidence Sharpe > 0)
+        max_dd_opt   >= max_dd_leg × 1.2         (less-negative = better)
+        cvar_95_opt  >= cvar_95_leg × 1.2        (less-negative = better)
         turnover_opt <= turnover_leg × 2.5
         tracking_err in [0.02, 0.06]
         active_share in [0.08, 0.25]
@@ -434,16 +467,20 @@ def compare_to_legacy(
 
     out["legacy"] = dict(legacy_metrics)
     out["deltas"] = {
-        "sharpe_delta": (optimizer_metrics.get("sharpe_ratio") or 0.0)
-                        - (legacy_metrics.get("sharpe_ratio") or 0.0),
-        "alpha_delta": (optimizer_metrics.get("total_alpha") or 0.0)
-                       - (legacy_metrics.get("total_alpha") or 0.0),
+        "sortino_delta": (optimizer_metrics.get("sortino_ratio") or 0.0)
+                         - (legacy_metrics.get("sortino_ratio") or 0.0),
+        "psr_delta": (optimizer_metrics.get("psr") or 0.0)
+                     - (legacy_metrics.get("psr") or 0.0),
+        "cvar_95_delta": (optimizer_metrics.get("cvar_95") or 0.0)
+                         - (legacy_metrics.get("cvar_95") or 0.0),
         "max_drawdown_delta": (optimizer_metrics.get("max_drawdown") or 0.0)
                               - (legacy_metrics.get("max_drawdown") or 0.0),
         "turnover_ratio": _safe_ratio(
             optimizer_metrics.get("turnover_one_way_ann"),
             legacy_metrics.get("turnover_one_way_ann"),
         ),
+        "alpha_delta_presentation": (optimizer_metrics.get("total_alpha") or 0.0)
+                                    - (legacy_metrics.get("total_alpha") or 0.0),
     }
     out["gate_thresholds"] = _gate_thresholds(optimizer_metrics, legacy_metrics)
     return out
@@ -452,23 +489,33 @@ def compare_to_legacy(
 def _gate_thresholds(
     optimizer_metrics: dict, legacy_metrics: dict | None,
 ) -> dict:
+    """
+    Skilled-risk gate thresholds. Sortino is primary; PSR is the
+    confidence floor; CVaR + max_drawdown cap tail risk.
+
+    Raw Sharpe and alpha-vs-SPY are intentionally absent — see
+    [[alpha_vs_spy_is_presentation_not_gating]] and the
+    [[evaluator_revamp_skilled_risk]] basket.
+    """
     if legacy_metrics is None:
         return {
-            "sharpe_min": None,
-            "alpha_min": None,
+            "sortino_min": None,
+            "psr_min": _DEFAULT_MIN_PSR,
             "max_drawdown_floor": None,
+            "cvar_95_floor": None,
             "turnover_max": None,
             "tracking_error_range": [0.02, 0.06],
             "active_share_range": [0.08, 0.25],
         }
-    sharpe_leg = legacy_metrics.get("sharpe_ratio") or 0.0
-    alpha_leg = legacy_metrics.get("total_alpha") or 0.0
+    sortino_leg = legacy_metrics.get("sortino_ratio") or 0.0
     dd_leg = legacy_metrics.get("max_drawdown") or 0.0
+    cvar_leg = legacy_metrics.get("cvar_95") or 0.0
     turnover_leg = legacy_metrics.get("turnover_one_way_ann") or 0.0
     return {
-        "sharpe_min": sharpe_leg * 0.9,
-        "alpha_min": alpha_leg + 0.005,
+        "sortino_min": sortino_leg * _DEFAULT_SORTINO_DEGRADE_RATIO,
+        "psr_min": _DEFAULT_MIN_PSR,
         "max_drawdown_floor": dd_leg * 1.2,
+        "cvar_95_floor": cvar_leg * 1.2,
         "turnover_max": turnover_leg * 2.5,
         "tracking_error_range": [0.02, 0.06],
         "active_share_range": [0.08, 0.25],
