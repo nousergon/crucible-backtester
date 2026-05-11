@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from pipeline_common import (
+    ACTIVE_HORIZON_DAYS,
     ALPHA_COALESCE_SQL,
     CORRECT_COALESCE_SQL,
     CURRENT_HORIZON_FILTER_SQL,
@@ -100,7 +101,12 @@ def compute_production_health(
     regime_ic = _compute_regime_ic(df, bucket)
 
     # ── Training IC comparison ───────────────────────────────────────────────
-    training_ic = _load_training_ic(bucket)
+    # Reference IC must be the model's OOS performance at the active horizon,
+    # NOT in-sample fit. See _load_training_ic for the preference chain — the
+    # 2026-05-11 false-positive retrain alert traced to this reference being
+    # `meta_model_ic = 0.4634` (Ridge in-sample Pearson) instead of the
+    # honest 21d OOS Spearman of 0.166.
+    training_ic, training_ic_source = _load_training_ic(bucket)
     ic_ratio = round(ic_30d / training_ic, 2) if ic_30d is not None and training_ic and training_ic > 0 else None
     degradation_flag = ic_ratio is not None and ic_ratio < _DEGRADATION_RATIO
 
@@ -118,6 +124,7 @@ def compute_production_health(
         "rolling_30d_hit_rate": round(hit_rate, 4),
         "regime_ic": regime_ic,
         "training_ic": training_ic,
+        "training_ic_source": training_ic_source,
         "ic_ratio": ic_ratio,
         "degradation_flag": degradation_flag,
         "prediction_distribution": prediction_distribution,
@@ -204,17 +211,66 @@ def _load_regime_by_date(bucket: str) -> dict[str, str]:
     return regime_map
 
 
-def _load_training_ic(bucket: str) -> float | None:
-    """Load the training walk-forward median IC from training_summary_latest.json."""
+def _load_training_ic(
+    bucket: str,
+    active_horizon_days: int = ACTIVE_HORIZON_DAYS,
+) -> tuple[float | None, str]:
+    """Return (training_ic, source) from predictor/metrics/training_summary_latest.json.
+
+    Preference chain — first available wins:
+
+    1. ``meta_model_oos_ic`` (top-level). Published by alpha-engine-predictor
+       after the rename arc (PR #2 of the 2026-05-11 follow-ups). Honest
+       OOS measurement at the active horizon.
+    2. ``horizon_diagnostic.curve.{H}d.spearman`` where H = active_horizon_days.
+       The walk-forward Spearman IC at the production label horizon — already
+       computed and persisted by the training pipeline today.
+    3. ``walk_forward.median_ic`` (legacy v2 / pre-cutover). Logs a warning
+       because the v3 meta-model writes its IN-SAMPLE Pearson fit here under
+       certain code paths, which overstates OOS skill ~3× and produces
+       false-positive degradation alerts.
+    4. ``test_ic`` (deepest legacy).
+
+    The returned source string is persisted in production_health.json so
+    operators can see WHICH reference drove the degradation flag. If we
+    silently fall back to a legacy/in-sample field, the source label makes
+    that visible without needing to re-derive the chain by reading code.
+    """
     try:
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=bucket, Key="predictor/metrics/training_summary_latest.json")
         summary = json.loads(obj["Body"].read())
-        wf = summary.get("walk_forward", {})
-        return float(wf["median_ic"]) if "median_ic" in wf else float(summary.get("test_ic", 0))
     except Exception as exc:
-        log.debug("Failed to load training IC: %s", exc)
-        return None
+        log.debug("Failed to load training summary: %s", exc)
+        return None, "load_failed"
+
+    if summary.get("meta_model_oos_ic") is not None:
+        return float(summary["meta_model_oos_ic"]), "meta_model_oos_ic"
+
+    horizon_key = f"{active_horizon_days}d"
+    curve_entry = (
+        summary.get("horizon_diagnostic", {})
+        .get("curve", {})
+        .get(horizon_key, {})
+    )
+    spearman = curve_entry.get("spearman")
+    if spearman is not None:
+        return float(spearman), f"horizon_diagnostic.curve.{horizon_key}.spearman"
+
+    wf = summary.get("walk_forward", {})
+    if "median_ic" in wf:
+        log.warning(
+            "production_health: training_ic reference falling back to legacy "
+            "walk_forward.median_ic — under v3 meta-model this is the Ridge's "
+            "in-sample Pearson fit and overstates OOS skill. Expect "
+            "false-positive degradation alerts."
+        )
+        return float(wf["median_ic"]), "walk_forward.median_ic_legacy"
+
+    if "test_ic" in summary:
+        return float(summary["test_ic"]), "test_ic_legacy"
+
+    return None, "absent"
 
 
 _MIN_BIN_N = 10  # skip bins with fewer samples — ECE is noise-dominated below this
