@@ -59,18 +59,63 @@ OUTCOMES_GRADED_SQL = (
     "(correct IS NOT NULL OR correct_5d IS NOT NULL)"
 )
 
-# Active production horizon for rolling analytics. Must match
+# Active production horizon for rolling analytics. Derived from
 # `labeling.forward_days` in alpha-engine-config/predictor/predictor.yaml —
-# bump in lockstep with any future horizon migration. Rolling IC / hit-rate /
-# value-of-veto reads on predictor_outcomes scope to this horizon so the
-# transition window doesn't blend pre-cutover (5d arithmetic) and
-# post-cutover (21d log) rows, whose distributions differ by both scale
-# (variance ~√(21/5)) and label semantics. Backfill / historical-range
-# reads (e.g. weight optimizer cross-era sweeps) should NOT use this filter.
-ACTIVE_HORIZON_DAYS = 21
-CURRENT_HORIZON_FILTER_SQL = (
-    f"COALESCE(horizon_days, 5) = {ACTIVE_HORIZON_DAYS}"
-)
+# the single source of truth that also drives `predictor_outcomes.horizon_days`
+# on the data-collector write side. Rolling IC / hit-rate / value-of-veto
+# reads on predictor_outcomes scope to this horizon so the transition window
+# doesn't blend pre-cutover (5d arithmetic) and post-cutover (21d log) rows,
+# whose distributions differ by both scale (variance ~√(21/5)) and label
+# semantics. Backfill / historical-range reads (e.g. weight optimizer
+# cross-era sweeps) should NOT use this filter.
+
+
+def _load_active_horizon_days(
+    default: int = 21,
+    search_paths: list[Path] | None = None,
+) -> int:
+    """Read `labeling.forward_days` from alpha-engine-config/predictor/predictor.yaml.
+
+    Falls back to ``default`` when no path on ``search_paths`` exists or
+    yields a value. Production runs on the spot instance always have the
+    file (spot_backtest.sh clones alpha-engine-config beside this repo);
+    ``search_paths`` is exposed for tests so they don't need to stub
+    pathlib internals.
+    """
+    if search_paths is None:
+        search_paths = [
+            Path.home() / "alpha-engine-config" / "predictor" / "predictor.yaml",
+            Path(__file__).parent.parent / "alpha-engine-config" / "predictor" / "predictor.yaml",
+        ]
+    for p in search_paths:
+        if not p.exists():
+            continue
+        try:
+            with open(p) as f:
+                cfg = yaml.safe_load(f) or {}
+            fd = cfg.get("labeling", {}).get("forward_days")
+            if fd is None:
+                continue
+            return int(fd)
+        except (OSError, yaml.YAMLError, TypeError, ValueError) as exc:
+            logger.warning(
+                "pipeline_common: could not read forward_days from %s: %s — "
+                "falling back to default=%d", p, exc, default,
+            )
+            continue
+    return default
+
+
+ACTIVE_HORIZON_DAYS = _load_active_horizon_days()
+# Strict equality (NOT `COALESCE(horizon_days, 5) = N`): legacy pre-cutover
+# rows have `horizon_days IS NULL` and must be EXCLUDED, not silently
+# defaulted to 5. The COALESCE-to-5 pattern smuggled 5d-arithmetic
+# outcomes through the filter during the 2026-05-09 21d-log transition
+# window and produced the false-positive ic_degradation retrain alert on
+# 2026-05-11 (rolling=-0.1005 vs training=0.4634). The data collector
+# populates `horizon_days` on the same write that sets `actual_log_alpha`,
+# so any post-cutover resolved row always has a non-NULL value.
+CURRENT_HORIZON_FILTER_SQL = f"horizon_days = {ACTIVE_HORIZON_DAYS}"
 
 
 # ── Phase markers ────────────────────────────────────────────────────────────

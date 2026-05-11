@@ -166,7 +166,7 @@ def test_current_horizon_filter_excludes_legacy_5d_rows():
         db, symbol="NEW", prediction_date="2026-05-10",
         actual_log_alpha=0.03, horizon_days=ACTIVE_HORIZON_DAYS, correct=1,
     )
-    # Legacy 5d row (NULL horizon_days → COALESCE → 5 → filtered out)
+    # Legacy 5d row (NULL horizon_days → strict equality NULL ≠ 21 → filtered out)
     _insert(
         db, symbol="OLD", prediction_date="2026-04-01",
         actual_5d_return=1.5, correct_5d=1,
@@ -186,11 +186,75 @@ def test_current_horizon_filter_excludes_legacy_5d_rows():
     assert found == {"NEW"}
 
 
+def test_strict_horizon_filter_excludes_null_horizon_days_rows():
+    """Regression for the 2026-05-11 false-positive ic_degradation alert.
+
+    The prior filter `COALESCE(horizon_days, 5) = 21` silently coerced
+    NULL → 5 then compared 5 ≠ 21, so legacy rows happened to be
+    excluded — but readers who relied on the COALESCE form for any other
+    horizon would have admitted them. Pin the strict form so the filter
+    is unambiguous: NULL never passes regardless of the active horizon.
+    """
+    db = _create_db()
+    # Two legacy rows distinguishable only by whether horizon_days is set.
+    _insert(
+        db, symbol="LEGACY_NULL", prediction_date="2026-04-01",
+        actual_5d_return=1.5, correct_5d=1,  # horizon_days NULL
+    )
+    _insert(
+        db, symbol="ACTIVE", prediction_date="2026-05-10",
+        actual_log_alpha=0.03, horizon_days=ACTIVE_HORIZON_DAYS, correct=1,
+    )
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            f"SELECT symbol FROM predictor_outcomes "
+            f"WHERE {OUTCOMES_RESOLVED_SQL} AND {CURRENT_HORIZON_FILTER_SQL}"
+        ).fetchall()
+    assert {r[0] for r in rows} == {"ACTIVE"}
+    # Belt-and-braces: the SQL fragment itself must not contain a COALESCE
+    # of horizon_days — the strict form is load-bearing for the false-alarm fix.
+    assert "COALESCE(horizon_days" not in CURRENT_HORIZON_FILTER_SQL
+
+
+def test_active_horizon_days_loads_from_predictor_yaml(tmp_path):
+    """`_load_active_horizon_days` reads `labeling.forward_days` from
+    a predictor.yaml on one of its search paths."""
+    from pipeline_common import _load_active_horizon_days
+    yaml_path = tmp_path / "predictor.yaml"
+    yaml_path.write_text("labeling:\n  forward_days: 42\n")
+    assert _load_active_horizon_days(search_paths=[yaml_path]) == 42
+
+
+def test_active_horizon_days_falls_back_to_default_when_yaml_absent(tmp_path):
+    """When no path on search_paths exists, the loader returns ``default``.
+    Use a non-default value (17) to prove the fallback path actually
+    fired, not that the real production config leaked in via the
+    module-level search paths."""
+    from pipeline_common import _load_active_horizon_days
+    nonexistent = tmp_path / "missing" / "predictor.yaml"
+    assert _load_active_horizon_days(
+        default=17, search_paths=[nonexistent]
+    ) == 17
+
+
+def test_active_horizon_days_falls_back_when_forward_days_key_missing(tmp_path):
+    """A predictor.yaml present but without `labeling.forward_days`
+    falls through to the default (e.g. a partial config during a
+    migration). Loader must not crash or return None."""
+    from pipeline_common import _load_active_horizon_days
+    yaml_path = tmp_path / "predictor.yaml"
+    yaml_path.write_text("model:\n  hidden_1: 64\n")  # no labeling block
+    assert _load_active_horizon_days(
+        default=17, search_paths=[yaml_path]
+    ) == 17
+
+
 def test_active_horizon_days_matches_production_config():
     """Smoke gate: ACTIVE_HORIZON_DAYS must match
     alpha-engine-config/predictor/predictor.yaml `labeling.forward_days`.
-    If this fails, the constant was bumped without updating production
-    config (or vice versa) — fix the mismatch before rolling out."""
+    The loader returns either the config value (production) or the
+    default=21 (CI). When predictor.yaml bumps forward_days, update this
+    literal in lockstep so the gate trips loudly if it drifts again."""
     assert ACTIVE_HORIZON_DAYS == 21, (
         "ACTIVE_HORIZON_DAYS drifted from production forward_days=21. "
         "Bump in lockstep with predictor.yaml when migrating horizons."
