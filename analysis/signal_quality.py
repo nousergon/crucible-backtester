@@ -108,6 +108,21 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
     if "sector" in df.columns and df["sector"].notna().any():
         result["by_sector"] = _accuracy_by_field(populated_5d, populated_10d, populated_30d, "sector")
 
+    # Per-stance attribution (stance taxonomy arc PR 4, 2026-05-11).
+    # Stance was added to predictions.json on 2026-05-11; if upstream
+    # has joined predictions.stance into score_performance via a future
+    # data-layer migration, this lights up automatically. Until then,
+    # the field is absent and we skip — graceful degrade. The 4-stance
+    # cohort split is the load-bearing observability for the executor's
+    # stance-conditional gates: each stance's accuracy + alpha capture
+    # answers "did this stance actually outperform / underperform vs
+    # the others?" — directly informing whether to keep / drop / merge
+    # stances in the taxonomy after the 4-12 week observation window.
+    if "stance" in df.columns and df["stance"].notna().any():
+        result["by_stance"] = _accuracy_by_field(
+            populated_5d, populated_10d, populated_30d, "stance",
+        )
+
     return result
 
 
