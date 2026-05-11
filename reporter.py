@@ -1046,6 +1046,25 @@ def _section_signal_quality(sq: dict) -> list[str]:
                 f"{s.get('n_10d', 0)} |"
             )
 
+    # Per-stance attribution (stance taxonomy arc PR 4, 2026-05-11).
+    # The 4-cohort split (momentum / value / quality / catalyst) is the
+    # observability surface for the executor's stance-conditional
+    # gates. Compare each stance's accuracy + alpha against the
+    # overall row — if a stance is meaningfully underperforming the
+    # rest, the stance prompt / classifier / gates need tuning.
+    stances = sq.get("by_stance", [])
+    if stances:
+        lines += ["", "### By stance", ""]
+        lines += ["| Stance | Acc 5d | Acc 10d | Acc 30d | Avg α 10d | n |"]
+        lines += ["|--------|--------|---------|---------|-----------|---|"]
+        for s in stances:
+            lines.append(
+                f"| {s.get('stance', '?')} | {_pct(s.get('accuracy_5d'))} | "
+                f"{_pct(s.get('accuracy_10d'))} | "
+                f"{_pct(s.get('accuracy_30d'))} | {_alpha_pp(s.get('avg_alpha_10d'))} | "
+                f"{s.get('n_10d', 0)} |"
+            )
+
     return lines
 
 

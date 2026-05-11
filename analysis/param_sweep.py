@@ -83,6 +83,15 @@ EXTENDED_GRID = {
     "momentum_gate_threshold": [-10.0, -5.0, -2.0],
     "correlation_block_threshold": [0.70, 0.75, 0.80, 0.85],
     "momentum_exit_threshold": [-20.0, -15.0, -10.0],
+    # Stance taxonomy arc PR 4 (2026-05-11) — backtester-tunable gates.
+    # Activation gated on ≥4 weeks of stance-tagged history (predictor
+    # started emitting stance on 2026-05-11). Until then, sweep results
+    # for these params will be insufficient_data per ``MIN_SAMPLES``.
+    # Ranges are bracketed around the cold-start defaults (-0.05 and
+    # -15.0) with one tighter and one looser candidate so the optimizer
+    # can move them in either direction once attribution data exists.
+    "value_stance_drawdown_min": [-0.10, -0.05, -0.03],
+    "quality_stance_momentum_threshold": [-20.0, -15.0, -10.0],
 }
 
 # ── Defaults for sweep mode (override via param_sweep_settings in config.yaml) ──

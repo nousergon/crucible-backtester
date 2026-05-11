@@ -89,6 +89,13 @@ SAFE_PARAMS = [
     "correlation_block_threshold",
     "profit_take_pct",
     "momentum_exit_threshold",
+    # Stance taxonomy arc PR 4 (2026-05-11) — executor stance gates
+    # consume these from config/executor_params.json. Search-space
+    # ranges live in analysis/param_sweep.py EXTENDED_GRID. Until 4+
+    # weeks of stance-tagged history exists, the sweep ranges are
+    # ad hoc cold-start values; auto-tuned weekly once data lands.
+    "value_stance_drawdown_min",
+    "quality_stance_momentum_threshold",
 ]
 
 # Factory defaults — the values the executor uses when no S3 config exists.
@@ -111,6 +118,9 @@ FACTORY_DEFAULTS = {
     "correlation_block_threshold": 0.80,
     "profit_take_pct": 0.25,
     "momentum_exit_threshold": -15.0,
+    # Stance gates (default values match executor's _plan_entries defaults)
+    "value_stance_drawdown_min": -0.05,
+    "quality_stance_momentum_threshold": -15.0,
 }
 
 # ── Fallback defaults (override via executor_optimizer section in config.yaml) ──
