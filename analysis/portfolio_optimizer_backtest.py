@@ -16,6 +16,17 @@ only — they are NOT gate inputs. Mirrors the evaluator-revamp framework
 established in optimizer/executor_optimizer.py (Sortino-primary,
 PSR ≥ 0.95 confidence gate) — see evaluator-revamp-260506.md.
 
+Unit conventions (canonical-alpha framework — see triple-barrier-260510.md
++ the 2026-05-09 21d log-domain cutover, alpha-engine-predictor PRs A-E):
+  * alpha_hat: log-domain decimal at 21d horizon (matches predictor's
+    canonical_predicted_alpha)
+  * returns_panel: daily LOG returns (ln(P_t / P_{t-1})), Ledoit-Wolf
+    shrunk in the kernel. Daily log variance compounds linearly to
+    higher horizons (Var_T = T · Var_daily for iid log returns), so the
+    21d alpha_hat and daily Σ live in the same log-units family — the
+    MVO objective wᵀα̂ − λ·wᵀΣw is dimensionally consistent up to the
+    horizon ratio absorbed by λ.
+
 Side-by-side comparison with the legacy 1/n bottom-up backtest's metrics is
 the substantive cutover decision input.
 
@@ -273,10 +284,10 @@ def _build_optimizer_inputs(
             f"Aligned returns have only {len(history_subset)} rows after dropna"
         )
 
-    returns = history_subset.pct_change().dropna().values
+    returns = np.log(history_subset).diff().dropna().values
     if returns.shape[0] < _DEFAULT_MIN_RETURNS:
         raise _InsufficientHistoryError(
-            f"Returns panel has only {returns.shape[0]} rows after pct_change.dropna"
+            f"Returns panel has only {returns.shape[0]} rows after log-diff.dropna"
         )
 
     returns_panel = np.zeros((returns.shape[0], N))
