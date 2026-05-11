@@ -20,6 +20,12 @@ langchain-anthropic~=0.3
 # extracted from the captured DecisionArtifact corpus. >85% match rate
 # ⇒ the LLM is likely just running that tree at $X per call.
 scikit-learn~=1.4
+# cvxpy added 2026-05-11 for analysis/portfolio_optimizer_backtest.py — replays
+# the constrained MVO optimizer (alpha-engine PR #157) over historical synthetic
+# predictions. Same upper bound as alpha-engine (<1.8) to stay compatible with
+# numpy<2 above. Saturday SF spot venv picks this up via `pip install -r
+# requirements.txt`; local dev requires manual install.
+cvxpy>=1.4,<1.8
 # alpha-engine-lib pulls in arcticdb + flow-doctor via extras; see
 # preflight.py and the `from alpha_engine_lib.logging import setup_logging`
 # call sites in backtest.py / evaluate.py / lambda_health/handler.py.
