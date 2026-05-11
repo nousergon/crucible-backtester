@@ -37,7 +37,10 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +111,50 @@ DEFAULT_GRID: tuple[WeightConfig, ...] = (
     WeightConfig("trend_only",      rsi=0.0, macd=0.25, ma50=0.25, ma200=0.25, momentum=0.25),
     WeightConfig("ma_heavy",        rsi=0.20, macd=0.10, ma50=0.30, ma200=0.30, momentum=0.10),
 )
+
+
+# ── Live config reader ──────────────────────────────────────────────────────
+#
+# Per-sector composite_weights overrides live in alpha-engine-config/research/
+# scoring.yaml under technical.composite_weights_per_sector (added 2026-05-11
+# per ROADMAP P1 "Per-sector overrides in composite_weights schema"). The
+# ablation module reads them so its per-team output surfaces what is actually
+# deployed live for each team — not just the hardcoded global default. Gate
+# semantics still compare against the static `current_default` config in
+# DEFAULT_GRID; future ROADMAP P1 "Tech weight ablation auto-apply" (L2202)
+# will flip the gate to use live baselines.
+
+
+def _load_live_composite_weights_per_sector(
+    search_paths: list[Path] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Read technical.composite_weights_per_sector from alpha-engine-config.
+
+    Returns an empty dict if the file or block is missing / malformed.
+    Mirrors the lookup pattern in pipeline_common._load_active_horizon_days
+    so spot runs (config repo cloned beside this repo) and local dev (config
+    repo in $HOME) both resolve.
+    """
+    if search_paths is None:
+        search_paths = [
+            Path.home() / "alpha-engine-config" / "research" / "scoring.yaml",
+            Path(__file__).resolve().parent.parent.parent / "alpha-engine-config" / "research" / "scoring.yaml",
+        ]
+    for p in search_paths:
+        if not p.exists():
+            continue
+        try:
+            with open(p) as f:
+                cfg = yaml.safe_load(f) or {}
+            block = cfg.get("technical", {}).get("composite_weights_per_sector") or {}
+            if isinstance(block, dict):
+                return block
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(
+                "tech_weight_ablation: could not read scoring.yaml from %s: %s", p, exc,
+            )
+            continue
+    return {}
 
 
 # ── Pearson + per-team eval ─────────────────────────────────────────────────
@@ -344,13 +391,20 @@ def compute_tech_weight_ablation(
                 ),
             }
 
-        per_team = [
-            _team_ablation(
+        # Surface what is currently deployed per team so the operator can see
+        # the gap between the recommendation and the live config. Empty dict
+        # is the default (sector-agnostic baseline) — gate semantics still
+        # compare against DEFAULT_GRID's `current_default` until L2202 cutover.
+        live_overrides = _load_live_composite_weights_per_sector()
+
+        per_team = []
+        for t in CANONICAL_SECTORS:
+            result = _team_ablation(
                 conn, team_id=t,
                 start_date=start_iso, end_date=end_iso, grid=grid,
             )
-            for t in CANONICAL_SECTORS
-        ]
+            result["live_baseline_weights"] = live_overrides.get(t)
+            per_team.append(result)
 
         # Sanity: any team have data? If all are insufficient_data, the
         # producer-side wire-up hasn't accumulated enough yet.
