@@ -368,9 +368,11 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.8.0" in text, (
-            "alpha-engine-lib should pin to v0.8.0 (eval_artifacts module "
-            "consumed by recommendation_artifact + assembler + per-optimizer "
-            "history writers for canonical YYMMDDHHMM run_id + flat layout); "
-            "update this test if the pin moves further forward"
+        assert "@v0.10.0" in text, (
+            "alpha-engine-lib should pin to v0.10.0 (DecisionArtifact "
+            "schema_version=2 with optional model_metadata + "
+            "full_prompt_context, enabling deterministic executor decisions "
+            "under L2308; consumed here by replay/runner.py to skip "
+            "deterministic captures instead of crashing); update this test "
+            "if the pin moves further forward"
         )

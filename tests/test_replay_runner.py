@@ -332,6 +332,85 @@ class TestUnknownAgentSkip:
         factory.assert_not_called()
 
 
+class TestDeterministicArtifactSkip:
+    """alpha-engine-lib v0.10.0 introduced ``DecisionArtifact`` schema_version=2
+    with ``model_metadata=None`` for deterministic decisions (e.g.
+    ``executor:entry_triggers`` algorithmic agents). Replay-as-model-
+    substitution is meaningless for deterministic decisions — there's no
+    LLM to swap. The runner must skip with an explicit marker rather
+    than crash on ``None.get("model_name")``.
+    """
+
+    def _deterministic_artifact(self) -> dict:
+        """v2 artifact shape with both LLM fields None — what executor
+        captures will look like once L2308 ships."""
+        return {
+            "schema_version": 2,
+            "run_id": "run-2026-05-15",
+            "timestamp": "2026-05-15T13:25:00Z",
+            "agent_id": "executor:entry_triggers",
+            "model_metadata": None,
+            "full_prompt_context": None,
+            "input_data_snapshot": {
+                "ticker": "AAPL",
+                "current_price": 175.25,
+                "day_high": 178.50,
+                "thresholds": {"pullback_pct": 0.02},
+            },
+            "agent_output": {
+                "fired_trigger": "pullback 1.8% from high $178.50",
+                "trigger_kind": "pullback",
+            },
+        }
+
+    def test_deterministic_v2_artifact_skipped_with_marker(self):
+        """Critical: the prior code path read
+        ``artifact.get("model_metadata", {}).get("model_name")`` which
+        raises ``AttributeError`` on None.get(...). This regression test
+        pins the explicit-skip behavior introduced for the L2308 arc.
+        """
+        from replay.runner import replay_artifact
+
+        artifact = self._deterministic_artifact()
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_chat_anthropic_factory(parsed=None)
+
+        replay = replay_artifact(
+            artifact_key="k.json",
+            target_model="claude-haiku-4-5",
+            s3_client=s3, chat_anthropic_factory=factory,
+            persist=False,
+        )
+
+        assert replay.replay_output_kind == "skipped"
+        assert "deterministic decision" in (replay.replay_error or "")
+        assert replay.original_model == "deterministic"
+        assert replay.original_agent_id == "executor:entry_triggers"
+        assert replay.original_output["trigger_kind"] == "pullback"
+        # Factory not invoked — no LLM call attempted.
+        factory.assert_not_called()
+
+    def test_deterministic_skip_does_not_crash_on_none_model_metadata(self):
+        """Anti-regression: pin that the code path before this fix would
+        have raised AttributeError on None.get(...). If a future refactor
+        reintroduces the old code path, this test catches it.
+        """
+        from replay.runner import replay_artifact
+
+        artifact = self._deterministic_artifact()
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_chat_anthropic_factory(parsed=None)
+
+        # Must not raise.
+        replay = replay_artifact(
+            artifact_key="k.json",
+            target_model="claude-haiku-4-5",
+            s3_client=s3, chat_anthropic_factory=factory,
+            persist=False,
+        )
+        assert replay is not None
+
+
 # ── S3 persistence ───────────────────────────────────────────────────────
 
 

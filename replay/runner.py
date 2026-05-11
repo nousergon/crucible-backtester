@@ -333,13 +333,45 @@ def replay_artifact(
 
     artifact = _load_artifact(s3, bucket=bucket, key=artifact_key)
 
+    # Skip deterministic v2 artifacts (e.g. ``executor:*`` algorithmic
+    # agents). Per alpha-engine-lib v0.10.0, ``DecisionArtifact`` allows
+    # ``model_metadata = None`` + ``full_prompt_context = None`` for
+    # decisions produced without an LLM call. There's nothing to replay
+    # under "rerun under a different model" framing — the decision is
+    # deterministic given its inputs. Return a skip ReplayOutput so the
+    # caller sees an explicit reason instead of a crash.
+    if artifact.get("model_metadata") is None:
+        agent_id = artifact.get("agent_id", "")
+        return ReplayOutput(
+            original_run_id=artifact.get("run_id", ""),
+            original_agent_id=agent_id,
+            original_model="deterministic",
+            original_artifact_key=artifact_key,
+            original_output=artifact.get("agent_output") or {},
+            replay_model=target_model,
+            replay_timestamp=datetime.now(timezone.utc).isoformat(),
+            replay_output={},
+            replay_output_kind="skipped",
+            replay_cost={},
+            replay_latency_ms=0,
+            replay_error=(
+                "deterministic decision (model_metadata=None) — no LLM to "
+                "replay; deterministic captures don't go through "
+                "model-substitution replay"
+            ),
+            comparison={
+                "agreement_score": 0.0,
+                "diff_summary": "skipped — deterministic decision",
+            },
+        )
+
     fpc = artifact.get("full_prompt_context") or {}
     system_prompt = fpc.get("system_prompt") or ""
     user_prompt = fpc.get("user_prompt") or ""
 
     agent_id = artifact.get("agent_id", "")
     original_model = (
-        artifact.get("model_metadata", {}).get("model_name") or "unknown"
+        (artifact.get("model_metadata") or {}).get("model_name") or "unknown"
     )
 
     schema = resolve_schema_for_agent(agent_id)
