@@ -717,6 +717,7 @@ def run(
     config: dict,
     keep_features: bool = False,
     persist_features_callback=None,
+    keep_predictions: bool = False,
 ) -> dict:
     """
     Full predictor-only backtest pipeline.
@@ -736,6 +737,17 @@ def run(
         - price_matrix: DataFrame
         - ohlcv_by_ticker: {ticker: pd.DataFrame}
         - metadata: {n_tickers, n_dates, date_range, ...}
+
+    When ``keep_predictions=True``, the result also includes:
+        - predictions_by_date: {date: {ticker: predicted_alpha}}
+          The raw GBM alpha forecasts before signal envelopes are built.
+          Cheap to keep (a few MB for 10y × 900 tickers); consumed by the
+          portfolio-optimizer backtest harness (PR 3 of
+          alpha-engine-docs/private/portfolio-optimizer-260511.md). Distinct
+          from ``keep_features=True``, which keeps the ~1.1 GB features
+          dict alive — that path was the cause of the 2026-04-26 c5.large
+          OOM. ``keep_predictions`` is the lightweight alternative for
+          downstream consumers that need alpha forecasts but not features.
 
     Parameters
     ----------
@@ -933,5 +945,9 @@ def run(
         result["sector_map"] = sector_map
         result["trading_dates"] = trading_dates
         result["predictions_by_date"] = predictions_by_date
+    elif keep_predictions:
+        result["predictions_by_date"] = predictions_by_date
+        result["sector_map"] = sector_map
+        result["trading_dates"] = trading_dates
 
     return result
