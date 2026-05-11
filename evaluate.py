@@ -59,7 +59,7 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis import veto_analysis
-from analysis import decision_capture_coverage, provenance_grounding, quant_rank_quality
+from analysis import decision_capture_coverage, executor_decision_capture_coverage, provenance_grounding, quant_rank_quality
 from analysis import agent_justification
 from analysis import end_to_end
 from analysis import trigger_scorecard, alpha_distribution, veto_value
@@ -447,6 +447,21 @@ def _run_diagnostics(
     results["decision_capture_coverage"] = tracker.run_module(
         "decision_capture_coverage",
         lambda: decision_capture_coverage.compute_decision_capture_coverage(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            run_date=config.get("_run_date"),
+        ),
+        required_inputs={},
+    )
+
+    # Executor-side decision-capture coverage (L2308 PR 5). Sibling of the
+    # research-side coverage above; reads executor:* artifacts emitted by
+    # L2308 PRs 1-4 producers (entry_triggers / position_sizer /
+    # risk_guard / exit_rules). Insufficient_data until
+    # ALPHA_ENGINE_DECISION_CAPTURE_ENABLED is enabled on the trading EC2
+    # AND ≥1 weekday SF run has captured artifacts.
+    results["executor_decision_capture_coverage"] = tracker.run_module(
+        "executor_decision_capture_coverage",
+        lambda: executor_decision_capture_coverage.compute_executor_decision_capture_coverage(
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=config.get("_run_date"),
         ),
@@ -1102,6 +1117,7 @@ def main() -> None:
             exit_timing=diagnostics.get("exit_timing"),
             macro_eval=diagnostics.get("macro_eval"),
             decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
+            executor_decision_capture_coverage=diagnostics.get("executor_decision_capture_coverage"),
             provenance_grounding=diagnostics.get("provenance_grounding"),
             quant_rank_quality=diagnostics.get("quant_rank_quality"),
             agent_justification=diagnostics.get("agent_justification"),
@@ -1191,6 +1207,7 @@ def main() -> None:
             post_trade=diagnostics.get("post_trade"),
             monte_carlo=diagnostics.get("monte_carlo"),
             decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
+            executor_decision_capture_coverage=diagnostics.get("executor_decision_capture_coverage"),
             provenance_grounding=diagnostics.get("provenance_grounding"),
             quant_rank_quality=diagnostics.get("quant_rank_quality"),
             agent_justification=diagnostics.get("agent_justification"),

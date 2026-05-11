@@ -441,6 +441,68 @@ def _section_decision_capture_coverage(coverage: dict) -> list[str]:
     return lines
 
 
+def _section_executor_decision_capture_coverage(coverage: dict) -> list[str]:
+    """Build Executor Decision Capture Coverage section (L2308 PR 5).
+
+    Sibling of the research-side ``_section_decision_capture_coverage``
+    — surfaces per-component artifact counts for the 4 canonical
+    executor components (entry_triggers / position_sizer / risk_guard /
+    exit_rules) emitted from L2308 PRs 1-4 producers on the most-recent
+    weekday SF. Closes the operator-visibility gap on whether the
+    producer-side wiring is firing in production.
+
+    Insufficient_data when ``ALPHA_ENGINE_DECISION_CAPTURE_ENABLED``
+    hasn't been enabled on the trading EC2 yet (default-off per
+    producer convention).
+    """
+    lines = ["## Executor Decision Capture Coverage", ""]
+
+    if coverage.get("status") == "insufficient_data":
+        reason = coverage.get(
+            "reason", "no executor:* captures found in lookback window",
+        )
+        lines.append(f"> {reason}")
+        lines.append("")
+        return lines
+    if coverage.get("status") != "ok":
+        err = coverage.get("error", "unknown error")
+        lines.append(f"> Coverage computation skipped: {err}")
+        lines.append("")
+        return lines
+
+    wd_date = coverage.get("date", "?")
+    pct = coverage.get("coverage_pct", 0.0)
+    n_present = coverage.get("n_canonical_present", 0)
+    n_expected = coverage.get("n_canonical_expected", 0)
+    total = coverage.get("total_artifacts", 0)
+    flag = "✅" if pct >= 99.0 else ("⚠️" if pct >= 75.0 else "🔴")
+
+    lines.append(
+        f"- Most-recent weekday: **{wd_date}** — {flag} **{pct:.1f}%** "
+        f"({n_present}/{n_expected} canonical components, "
+        f"{total} total artifacts)"
+    )
+
+    per_component = coverage.get("per_component", {})
+    # Per-component count breakdown — surface all 4 since cardinality
+    # varies per component (entry_triggers/exits fire intraday, sizer +
+    # risk_guard fire per morning ENTER candidate). Operator wants to
+    # see counts even on the present-true rows.
+    for component, info in per_component.items():
+        n = info.get("n_artifacts", 0)
+        present_flag = "✅" if info.get("present") else "🔴"
+        lines.append(f"  - {present_flag} `{component}`: {n} artifacts")
+
+    uncategorized = coverage.get("uncategorized_executor_components", []) or []
+    if uncategorized:
+        lines.append(
+            f"- Uncategorized executor components: {', '.join(uncategorized)}"
+        )
+
+    lines.append("")
+    return lines
+
+
 def _section_provenance_grounding(grounding: dict) -> list[str]:
     """Build Provenance Grounding section.
 
@@ -650,6 +712,7 @@ def build_report(
     exit_timing: dict | None = None,
     macro_eval: dict | None = None,
     decision_capture_coverage: dict | None = None,
+    executor_decision_capture_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
     quant_rank_quality: dict | None = None,
     agent_justification: dict | None = None,
@@ -692,6 +755,17 @@ def build_report(
     # are pre-analytics observability surfaces, not analysis findings.
     if decision_capture_coverage:
         lines += _section_decision_capture_coverage(decision_capture_coverage)
+
+    # Executor decision capture coverage (L2308 PR 5) — sibling of the
+    # research-side coverage above; reports per-component artifact
+    # counts for executor:{entry_triggers,position_sizer,risk_guard,
+    # exit_rules}. Renders only when the producer side is firing
+    # (insufficient_data branch elides cleanly to the section header
+    # + a one-line reason).
+    if executor_decision_capture_coverage:
+        lines += _section_executor_decision_capture_coverage(
+            executor_decision_capture_coverage,
+        )
 
     if provenance_grounding:
         lines += _section_provenance_grounding(provenance_grounding)
@@ -881,6 +955,7 @@ def save(
     post_trade: dict | None = None,
     monte_carlo: dict | None = None,
     decision_capture_coverage: dict | None = None,
+    executor_decision_capture_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
     quant_rank_quality: dict | None = None,
     agent_justification: dict | None = None,
@@ -938,6 +1013,7 @@ def save(
         ("veto_analysis.json", veto_result),
         ("confusion_matrix.json", confusion_matrix),
         ("decision_capture_coverage.json", decision_capture_coverage),
+        ("executor_decision_capture_coverage.json", executor_decision_capture_coverage),
         ("provenance_grounding.json", provenance_grounding),
         ("quant_rank_quality.json", quant_rank_quality),
         ("agent_justification.json", agent_justification),
