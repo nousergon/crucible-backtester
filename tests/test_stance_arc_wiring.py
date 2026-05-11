@@ -49,6 +49,71 @@ class TestExecutorOptimizerStanceParams:
         assert FACTORY_DEFAULTS["quality_stance_momentum_threshold"] == pytest.approx(-15.0)
 
 
+class TestExecutorOptimizerStanceSizing:
+    """Stance-conditional sizing multipliers must be wired into the
+    auto-tune path so the backtester can optimize them weekly."""
+
+    @pytest.mark.parametrize("stance", ["momentum", "value", "quality", "catalyst"])
+    def test_each_stance_size_in_safe_params(self, stance):
+        from optimizer.executor_optimizer import SAFE_PARAMS
+        key = f"stance_size_{stance}"
+        assert key in SAFE_PARAMS, (
+            f"{key} must be in SAFE_PARAMS for the auto-tune path"
+        )
+
+    def test_stance_size_factory_defaults_match_executor(self):
+        """Factory defaults must match executor's position_sizer fallbacks
+        (momentum 1.0× / value 0.7× / quality 0.8× / catalyst 0.6×).
+        Drift between the two means the executor and backtester
+        disagree on default behavior."""
+        from optimizer.executor_optimizer import FACTORY_DEFAULTS
+        assert FACTORY_DEFAULTS["stance_size_momentum"] == pytest.approx(1.0)
+        assert FACTORY_DEFAULTS["stance_size_value"] == pytest.approx(0.7)
+        assert FACTORY_DEFAULTS["stance_size_quality"] == pytest.approx(0.8)
+        assert FACTORY_DEFAULTS["stance_size_catalyst"] == pytest.approx(0.6)
+
+    def test_stance_size_factory_defaults_obey_thesis_order(self):
+        """Conviction discount ordering: momentum > quality > value >
+        catalyst. Pinned so a future hand-edit doesn't accidentally
+        flip the ordering — institutional discipline is that
+        higher-uncertainty theses get smaller stakes, not larger."""
+        from optimizer.executor_optimizer import FACTORY_DEFAULTS
+        assert (
+            FACTORY_DEFAULTS["stance_size_momentum"]
+            >= FACTORY_DEFAULTS["stance_size_quality"]
+            >= FACTORY_DEFAULTS["stance_size_value"]
+            >= FACTORY_DEFAULTS["stance_size_catalyst"]
+        )
+
+
+class TestParamSweepStanceSizing:
+    @pytest.mark.parametrize("stance", ["momentum", "value", "quality", "catalyst"])
+    def test_each_stance_size_in_extended_grid(self, stance):
+        from analysis.param_sweep import EXTENDED_GRID
+        key = f"stance_size_{stance}"
+        assert key in EXTENDED_GRID
+        candidates = EXTENDED_GRID[key]
+        # Sweep ranges must include directional candidates so optimizer
+        # can move in either direction
+        assert len(candidates) >= 2
+
+    def test_stance_size_ranges_bracket_defaults(self):
+        """Each sweep range must contain the factory default so the
+        sweep at least re-validates current values, plus directional
+        candidates (tighter + looser)."""
+        from analysis.param_sweep import EXTENDED_GRID
+        from optimizer.executor_optimizer import FACTORY_DEFAULTS
+        for stance, factory_default in [
+            ("momentum", 1.0), ("value", 0.7), ("quality", 0.8), ("catalyst", 0.6),
+        ]:
+            key = f"stance_size_{stance}"
+            candidates = EXTENDED_GRID[key]
+            assert factory_default in candidates, (
+                f"sweep range for {key} should include factory default "
+                f"{factory_default}"
+            )
+
+
 class TestParamSweepStanceRanges:
     """Sweep search space must include stance thresholds so the
     optimizer can move them in either direction once data exists."""
