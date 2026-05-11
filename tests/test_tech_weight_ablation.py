@@ -30,6 +30,7 @@ from optimizer.tech_weight_ablation import (
     _MIN_IMPROVEMENT,
     _MIN_ROWS_PER_TEAM,
     _evaluate_team_under_config,
+    _load_live_composite_weights_per_sector,
     compute_tech_weight_ablation,
 )
 
@@ -326,3 +327,95 @@ class TestComputeTechWeightAblation:
                     if t["team_id"] == "technology")
         # 8 dates × 5 picks = 40 rows in window; ancient must not appear
         assert tech["n_rows"] == 40
+
+
+# ── Live composite_weights_per_sector reader ────────────────────────────────
+
+
+class TestLiveBaselineWeightsReader:
+    """Lock the consumer-side awareness of the L1374 schema addition.
+
+    The ablation module reads alpha-engine-config/research/scoring.yaml's
+    technical.composite_weights_per_sector and surfaces the per-team
+    override (if present) on every team result. Gate semantics are
+    unchanged — that's the L2202 cutover's scope.
+    """
+
+    def test_loader_missing_file_returns_empty(self, tmp_path):
+        missing = tmp_path / "does_not_exist" / "scoring.yaml"
+        assert _load_live_composite_weights_per_sector([missing]) == {}
+
+    def test_loader_reads_override_block(self, tmp_path):
+        yaml_path = tmp_path / "scoring.yaml"
+        yaml_path.write_text(
+            "technical:\n"
+            "  composite_weights:\n"
+            "    rsi: 0.25\n"
+            "    macd: 0.20\n"
+            "    ma50: 0.15\n"
+            "    ma200: 0.15\n"
+            "    momentum: 0.25\n"
+            "  composite_weights_per_sector:\n"
+            "    healthcare:\n"
+            "      rsi: 0.50\n"
+            "      macd: 0.125\n"
+            "      ma50: 0.125\n"
+            "      ma200: 0.125\n"
+            "      momentum: 0.125\n"
+        )
+        result = _load_live_composite_weights_per_sector([yaml_path])
+        assert "healthcare" in result
+        assert result["healthcare"]["rsi"] == 0.50
+
+    def test_loader_missing_block_returns_empty(self, tmp_path):
+        yaml_path = tmp_path / "scoring.yaml"
+        yaml_path.write_text(
+            "technical:\n"
+            "  composite_weights:\n"
+            "    rsi: 0.25\n"
+        )
+        assert _load_live_composite_weights_per_sector([yaml_path]) == {}
+
+    def test_loader_empty_block_returns_empty(self, tmp_path):
+        yaml_path = tmp_path / "scoring.yaml"
+        yaml_path.write_text(
+            "technical:\n"
+            "  composite_weights_per_sector: {}\n"
+        )
+        assert _load_live_composite_weights_per_sector([yaml_path]) == {}
+
+    def test_per_team_output_includes_live_baseline_weights_field(
+        self, conn, monkeypatch,
+    ):
+        """Every per-team result must carry `live_baseline_weights` (None when no override)."""
+        monkeypatch.setattr(
+            "optimizer.tech_weight_ablation._load_live_composite_weights_per_sector",
+            lambda: {
+                "healthcare": {
+                    "rsi": 0.50, "macd": 0.125,
+                    "ma50": 0.125, "ma200": 0.125, "momentum": 0.125,
+                },
+            },
+        )
+        for d in range(8):
+            date = f"2026-04-{d+1:02d}"
+            picks = [
+                (f"H{d}A", 90, 50, 50, 50, 10, 0.05),
+                (f"H{d}B", 80, 50, 50, 50, 30, 0.03),
+                (f"H{d}C", 60, 50, 50, 50, 50, 0.01),
+                (f"H{d}D", 40, 50, 50, 50, 70, -0.02),
+                (f"H{d}E", 20, 50, 50, 50, 90, -0.04),
+            ]
+            _seed(conn, "healthcare", date, picks)
+        result = compute_tech_weight_ablation(
+            db_conn=conn, run_date="2026-04-30",
+        )
+        hc = next(t for t in result["per_team"] if t["team_id"] == "healthcare")
+        assert hc["live_baseline_weights"] == {
+            "rsi": 0.50, "macd": 0.125,
+            "ma50": 0.125, "ma200": 0.125, "momentum": 0.125,
+        }
+        tech = next(t for t in result["per_team"] if t["team_id"] == "technology")
+        # No override for technology → field present but None
+        assert "live_baseline_weights" in tech
+        assert tech["live_baseline_weights"] is None
