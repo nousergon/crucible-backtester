@@ -2223,10 +2223,12 @@ def _run_vectorized_param_sweep(
         "Vectorized sweep stats: %d combos in %.2fs",
         len(df), _time.monotonic() - t_stats,
     )
-    if "total_alpha" in df.columns and df["total_alpha"].notna().any():
-        df.sort_values("total_alpha", ascending=False, inplace=True)
-    elif "sharpe_ratio" in df.columns:
-        df.sort_values("sharpe_ratio", ascending=False, inplace=True)
+    # Sort by sortino_ratio (primary, skilled-risk basket) → total_alpha
+    # (tiebreaker/presentation only). Raw Sharpe is observability only and is
+    # intentionally absent — see [[anchor_gates_on_skilled_risk_not_sharpe]] +
+    # analysis/param_sweep._sort_sweep_df_skilled_risk for the shared helper.
+    from analysis.param_sweep import _sort_sweep_df_skilled_risk
+    _sort_sweep_df_skilled_risk(df)
 
     if not df.empty:
         df.attrs["sweep_mode"] = f"{actual_mode} (vectorized)"

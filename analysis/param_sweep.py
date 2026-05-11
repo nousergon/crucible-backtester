@@ -238,13 +238,28 @@ def _run_combos(
         )
 
     df = pd.DataFrame(rows)
-    # Sort by total_alpha (primary) then sharpe_ratio (tiebreaker)
-    if "total_alpha" in df.columns:
-        df.sort_values("total_alpha", ascending=False, inplace=True)
-    elif "sharpe_ratio" in df.columns:
-        df.sort_values("sharpe_ratio", ascending=False, inplace=True)
-
+    # Sort by sortino_ratio (primary — skilled-risk basket per
+    # [[anchor_gates_on_skilled_risk_not_sharpe]] / evaluator-revamp-260506.md).
+    # total_alpha is presentation/tiebreaker only — never primary, per
+    # [[alpha_vs_spy_is_presentation_not_gating]]. Raw Sharpe is observability
+    # only and is intentionally absent from this sort chain — fall through to
+    # unsorted rather than re-anchor on Sharpe.
+    _sort_sweep_df_skilled_risk(df)
     return df
+
+
+def _sort_sweep_df_skilled_risk(df: "pd.DataFrame") -> None:
+    """In-place sort by Sortino (primary) → total_alpha (tiebreaker).
+
+    Safe when columns are missing or all-NaN — falls through to whichever
+    column has at least one non-NaN value, in order of preference. Returns
+    silently with no sort applied when no usable column exists (preferring
+    the natural enumeration order over a re-anchor on Sharpe).
+    """
+    if "sortino_ratio" in df.columns and df["sortino_ratio"].notna().any():
+        df.sort_values("sortino_ratio", ascending=False, inplace=True)
+    elif "total_alpha" in df.columns and df["total_alpha"].notna().any():
+        df.sort_values("total_alpha", ascending=False, inplace=True)
 
 
 def sweep(
