@@ -92,6 +92,16 @@ EXTENDED_GRID = {
     # can move them in either direction once attribution data exists.
     "value_stance_drawdown_min": [-0.10, -0.05, -0.03],
     "quality_stance_momentum_threshold": [-20.0, -15.0, -10.0],
+    # Stance-conditional sizing multipliers (2026-05-11). Brackets
+    # around the cold-start defaults so the optimizer can move each
+    # in either direction. Momentum kept tight around 1.0 because
+    # that's the baseline; the other three span wider so the value/
+    # quality/catalyst conviction-discount magnitude is the
+    # learn-from-data parameter.
+    "stance_size_momentum": [0.9, 1.0, 1.1],
+    "stance_size_value": [0.5, 0.7, 0.9],
+    "stance_size_quality": [0.6, 0.8, 1.0],
+    "stance_size_catalyst": [0.4, 0.6, 0.8],
 }
 
 # ── Defaults for sweep mode (override via param_sweep_settings in config.yaml) ──

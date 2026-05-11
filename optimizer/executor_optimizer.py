@@ -96,6 +96,16 @@ SAFE_PARAMS = [
     # ad hoc cold-start values; auto-tuned weekly once data lands.
     "value_stance_drawdown_min",
     "quality_stance_momentum_threshold",
+    # Stance-conditional position sizing multipliers (2026-05-11 PR
+    # alpha-engine#NNN). Executor's compute_position_size folds these
+    # into raw_weight as ``stance_adj``. Defaults: momentum 1.0×,
+    # value 0.7×, quality 0.8×, catalyst 0.6×. Auto-tuned weekly via
+    # per-stance Sharpe / alpha attribution once ≥4 weeks of stance-
+    # tagged history accumulates.
+    "stance_size_momentum",
+    "stance_size_value",
+    "stance_size_quality",
+    "stance_size_catalyst",
 ]
 
 # Factory defaults — the values the executor uses when no S3 config exists.
@@ -121,6 +131,12 @@ FACTORY_DEFAULTS = {
     # Stance gates (default values match executor's _plan_entries defaults)
     "value_stance_drawdown_min": -0.05,
     "quality_stance_momentum_threshold": -15.0,
+    # Stance-conditional sizing multipliers (default values match
+    # executor's position_sizer compute_position_size defaults)
+    "stance_size_momentum": 1.0,
+    "stance_size_value": 0.7,
+    "stance_size_quality": 0.8,
+    "stance_size_catalyst": 0.6,
 }
 
 # ── Fallback defaults (override via executor_optimizer section in config.yaml) ──
