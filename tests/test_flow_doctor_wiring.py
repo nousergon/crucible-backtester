@@ -368,10 +368,11 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.12.0" in text, (
-            "alpha-engine-lib should pin to v0.12.0 (alpha_engine_lib.secrets "
-            "module — SSM-backed get_secret() helper with env fallback; "
-            "consumed here by emailer.py + analysis/retrain_alert.py for "
-            "GMAIL_APP_PASSWORD reads after the 2026-05-12 .env-to-SSM "
-            "migration); update this test if the pin moves further forward"
+        assert "@v0.13.0" in text, (
+            "alpha-engine-lib should pin to v0.13.0 (alpha_engine_lib.universe "
+            "module — IO-agnostic filter_to_universe + in_universe primitives; "
+            "consumed transitively via the executor's signal_reader at test "
+            "time for simulate-via-deciders parity. Lockstep with research + "
+            "executor pin bumps shipped 2026-05-12 night for L2853 universe "
+            "consolidation; update this test if the pin moves further forward."
         )

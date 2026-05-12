@@ -130,14 +130,30 @@ def orders_to_portfolio(
     )
 
 
-def portfolio_stats(pf: vbt.Portfolio, spy_prices: pd.Series | None = None) -> dict:
+def portfolio_stats(
+    pf: vbt.Portfolio,
+    spy_prices: pd.Series | None = None,
+    ew_high_vol_basket_returns: pd.Series | None = None,
+) -> dict:
     """
     Extract key metrics from a vectorbt Portfolio into a plain dict.
 
     Suitable for writing to metrics.json or printing as a summary.
 
-    If spy_prices (Close series for SPY, same DatetimeIndex as portfolio)
-    is provided, total_alpha = portfolio return - SPY return is computed.
+    If ``spy_prices`` (Close series for SPY, same DatetimeIndex as portfolio)
+    is provided, ``total_alpha = portfolio return - SPY return`` is computed
+    (presentation framing — cap-weighted SPY is the headline benchmark in
+    morning emails + dashboards).
+
+    If ``ew_high_vol_basket_returns`` (daily simple returns Series from
+    ``analysis.risk_matched_benchmark.construct_ew_high_vol_benchmark``,
+    indexed by trading day) is provided, ``alpha_vs_ew_high_vol`` is
+    computed against the same active date range. This is the institutional
+    skill-isolation framing per evaluator-revamp-260506.md Workstream D:
+    "given how much risk you took, did you outperform the dumb version of
+    taking that risk?" The basket holds the top vol-quartile of the agent's
+    decision universe, equal-weighted + rebalanced weekly. Both columns
+    are emitted alongside; callers decide which to anchor on.
 
     Includes a daily return series + log return series + downside-aware
     metrics (Sortino, CVaR(95)) needed by the evaluator-revamp metric
@@ -206,5 +222,27 @@ def portfolio_stats(pf: vbt.Portfolio, spy_prices: pd.Series | None = None) -> d
     else:
         stats["spy_return"] = None
         stats["total_alpha"] = None
+
+    # Compute alpha vs EW-high-vol basket — institutional skill-isolation
+    # framing per evaluator-revamp-260506.md Workstream D. Basket holds the
+    # top vol-quartile of the agent's decision universe, equal-weighted +
+    # rebalanced weekly; ``construct_ew_high_vol_benchmark`` produces the
+    # daily-returns series this kwarg expects. Compounded over the
+    # portfolio's active date range to a single total-return scalar before
+    # differencing — matches ``total_alpha``'s shape so consumers can swap
+    # which one they rank on without other plumbing changes.
+    if ew_high_vol_basket_returns is not None:
+        pf_dates = pf.wrapper.index
+        basket_aligned = ew_high_vol_basket_returns.reindex(pf_dates).dropna()
+        if len(basket_aligned) >= 2:
+            basket_total_return = float((1.0 + basket_aligned).prod() - 1.0)
+            stats["ew_high_vol_return"] = basket_total_return
+            stats["alpha_vs_ew_high_vol"] = total_return - basket_total_return
+        else:
+            stats["ew_high_vol_return"] = None
+            stats["alpha_vs_ew_high_vol"] = None
+    else:
+        stats["ew_high_vol_return"] = None
+        stats["alpha_vs_ew_high_vol"] = None
 
     return stats
