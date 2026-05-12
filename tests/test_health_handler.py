@@ -60,9 +60,10 @@ def test_build_email_config():
 
 
 def test_build_email_config_empty():
-    with patch.dict(os.environ, {}, clear=True):
-        os.environ.pop("EMAIL_SENDER", None)
-        os.environ.pop("EMAIL_RECIPIENTS", None)
+    # Preserve ALPHA_ENGINE_SECRETS_SOURCE=env (from conftest) so get_secret()
+    # reads from this (cleared) env-dict instead of falling through to SSM —
+    # otherwise the test picks up real production EMAIL_SENDER.
+    with patch.dict(os.environ, {"ALPHA_ENGINE_SECRETS_SOURCE": "env"}, clear=True):
         config = _build_email_config()
         assert config["email_sender"] == ""
         assert config["email_recipients"] == []

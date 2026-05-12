@@ -19,7 +19,7 @@ FROM public.ecr.aws/lambda/python:3.12
 # a local copy via deploy_health.sh staging). No [arcticdb] — health
 # Lambda reads S3 only.
 COPY requirements-health.txt .
-RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.2.2" && \
+RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.12.0" && \
     pip install --no-cache-dir -r requirements-health.txt && \
     rm -rf /root/.cache/pip
 
