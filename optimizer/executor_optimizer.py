@@ -296,33 +296,55 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     # — gated by `use_skill_composite_target` config. Mirrors the
     # weight_optimizer fit-target switch shipped 2026-05-06 (PR #145).
     use_skill_composite = bool(_cfg.get("use_skill_composite_target", False))
+    # L2170 PR 3: within the skill-composite path, optionally swap the
+    # rank column from `sortino_ratio` to `alpha_vs_ew_high_vol` — the
+    # Workstream D institutional risk-matched skill metric. Default off
+    # until ≥2 Saturday SF cycles of shadow runs confirm the basket is
+    # producing sensible numbers (high-vol portfolios show smaller
+    # underperformance vs EW-high-vol than vs SPY by construction). The
+    # flag composes with use_skill_composite_target — when both true,
+    # rank by alpha_vs_ew_high_vol; when only the parent flag is true,
+    # rank by sortino_ratio (the existing path).
+    prefer_risk_matched_alpha = bool(_cfg.get("prefer_risk_matched_alpha", False))
 
     if use_skill_composite:
-        # Skill-composite ranking: sortino_ratio only — skilled downside-aware
-        # return. Sortino aligns with the evaluator-revamp metric stack: it
-        # rewards configs that extract return per unit of *downside* variance —
-        # the exact "intelligent risk-taking" signal. Alpha vs SPY surfaces in
-        # the result dict for operator display but does not drive ranking;
-        # raw alpha is end-user-headline framing, not the optimizer's fit
-        # target. Exact-Sortino ties are effectively measure-zero on a
-        # continuous-param sweep; pandas stable-sort handles them deterministically.
-        if "sortino_ratio" not in valid.columns:
+        rank_col = (
+            "alpha_vs_ew_high_vol"
+            if prefer_risk_matched_alpha
+            else "sortino_ratio"
+        )
+        # Skill-composite ranking. Sortino_ratio is the default — skilled
+        # downside-aware return; rewards configs that extract return per
+        # unit of *downside* variance (the "intelligent risk-taking" signal
+        # from evaluator-revamp-260506.md). When prefer_risk_matched_alpha
+        # is on, swap to alpha_vs_ew_high_vol — Workstream D's risk-matched
+        # skill metric (portfolio return minus the EW-high-vol basket's
+        # return over the same dates). Alpha vs SPY surfaces in the result
+        # dict for operator display but does not drive ranking; raw alpha
+        # is end-user-headline framing, not the optimizer's fit target.
+        # Exact-rank-col ties are effectively measure-zero on a continuous-
+        # param sweep; pandas stable-sort handles them deterministically.
+        if rank_col not in valid.columns:
             return {
                 "status": "insufficient_data",
                 "note": (
-                    "use_skill_composite_target is on but sweep produced no "
-                    "sortino_ratio column — cannot rank by skill-composite."
+                    f"use_skill_composite_target is on (rank_col={rank_col}) "
+                    f"but sweep produced no {rank_col} column — cannot rank "
+                    f"by skill-composite."
                 ),
                 "fit_target": "skill_composite",
             }
-        valid_sortino = valid["sortino_ratio"].notna().sum()
-        if valid_sortino == 0:
+        valid_rank = valid[rank_col].notna().sum()
+        if valid_rank == 0:
             return {
                 "status": "insufficient_data",
-                "note": "All sortino_ratio values are NaN — cannot rank by skill-composite.",
+                "note": (
+                    f"All {rank_col} values are NaN — cannot rank by "
+                    f"skill-composite."
+                ),
                 "fit_target": "skill_composite",
             }
-        valid = valid.sort_values("sortino_ratio", ascending=False)
+        valid = valid.sort_values(rank_col, ascending=False)
         fit_target = "skill_composite"
     else:
         # Legacy multi-metric ranking: Sharpe primary, penalize drawdown.
@@ -350,20 +372,31 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     best_row = valid.iloc[0]
     best_sharpe = best_row["sharpe_ratio"]
 
-    # Alpha + Sortino — informational under legacy, gating under skill-composite.
+    # Alpha + Sortino + risk-matched-alpha — informational under legacy,
+    # gating under skill-composite (which one gates depends on
+    # prefer_risk_matched_alpha within the skill-composite path).
     best_alpha = _safe_float(best_row.get("total_alpha"))
     baseline_alpha = _safe_float(baseline_row.get("total_alpha"))
     best_sortino = _safe_float(best_row.get("sortino_ratio"))
     baseline_sortino = _safe_float(baseline_row.get("sortino_ratio"))
+    best_alpha_vs_ew_high_vol = _safe_float(best_row.get("alpha_vs_ew_high_vol"))
+    baseline_alpha_vs_ew_high_vol = _safe_float(baseline_row.get("alpha_vs_ew_high_vol"))
 
     if use_skill_composite:
-        # Improvement gate is sortino-based when ranking is sortino-first.
-        if baseline_sortino is None or best_sortino is None:
-            improvement_pct = 0.0
-        elif baseline_sortino == 0:
-            improvement_pct = float("inf") if best_sortino > 0 else 0.0
+        # Improvement gate is rank-col-based: sortino_ratio (default) or
+        # alpha_vs_ew_high_vol when prefer_risk_matched_alpha is on.
+        if prefer_risk_matched_alpha:
+            best_rank = best_alpha_vs_ew_high_vol
+            baseline_rank = baseline_alpha_vs_ew_high_vol
         else:
-            improvement_pct = (best_sortino - baseline_sortino) / abs(baseline_sortino)
+            best_rank = best_sortino
+            baseline_rank = baseline_sortino
+        if baseline_rank is None or best_rank is None:
+            improvement_pct = 0.0
+        elif baseline_rank == 0:
+            improvement_pct = float("inf") if best_rank > 0 else 0.0
+        else:
+            improvement_pct = (best_rank - baseline_rank) / abs(baseline_rank)
     else:
         if baseline_sharpe == 0:
             improvement_pct = float("inf") if best_sharpe > 0 else 0.0
@@ -396,6 +429,10 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
 
     common_fields = {
         "fit_target": fit_target,
+        "rank_metric": (
+            "alpha_vs_ew_high_vol" if (use_skill_composite and prefer_risk_matched_alpha)
+            else ("sortino_ratio" if use_skill_composite else "sharpe_drawdown")
+        ),
         "baseline_params": baseline,
         "recommended_params": recommended,
         "factory_defaults": FACTORY_DEFAULTS.copy(),
@@ -405,6 +442,8 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         "baseline_alpha": baseline_alpha,
         "best_sortino": best_sortino,
         "baseline_sortino": baseline_sortino,
+        "best_alpha_vs_ew_high_vol": best_alpha_vs_ew_high_vol,
+        "baseline_alpha_vs_ew_high_vol": baseline_alpha_vs_ew_high_vol,
         "improvement_pct": round(improvement_pct, 4),
         "baseline_combo_rank": baseline_combo_rank,
         "baseline_distance": round(float(baseline_dist), 4),
@@ -413,7 +452,8 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
 
     if use_skill_composite:
         # Guard: never auto-apply params from a negative-Sortino optimization.
-        # Negative Sortino = the strategy's downside-aware return is loss-making.
+        # Negative Sortino = the strategy's downside-aware return is loss-making —
+        # strategy-quality sanity check that fires regardless of the rank column.
         # Mirrors the negative-Sharpe guard but on the skilled-risk-taking axis.
         if best_sortino is None:
             return {
@@ -432,14 +472,55 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
                 ),
             }
 
+        # Additional guard for the risk-matched-alpha rank path: don't
+        # auto-apply when even the best combo can't beat the vol-matched
+        # baseline. The "fishing in volatile waters" framing — if we're not
+        # outperforming the dumb-vol-quartile basket, the strategy isn't
+        # adding skill on the metric we're optimizing for.
+        if prefer_risk_matched_alpha:
+            if best_alpha_vs_ew_high_vol is None:
+                return {
+                    "status": "insufficient_data",
+                    **common_fields,
+                    "note": (
+                        "prefer_risk_matched_alpha is on but best combo has no "
+                        "alpha_vs_ew_high_vol — basket likely empty for this "
+                        "window (insufficient history). Re-run after corpus "
+                        "depth crosses the 60-day vol-lookback threshold."
+                    ),
+                }
+            if best_alpha_vs_ew_high_vol < 0:
+                return {
+                    "status": "negative_alpha_vs_ew_high_vol",
+                    **common_fields,
+                    "note": (
+                        f"Best alpha_vs_ew_high_vol "
+                        f"({best_alpha_vs_ew_high_vol:.4f}) is negative — even "
+                        f"the best combo underperforms the vol-matched baseline. "
+                        f"Refusing to auto-apply: strategy fails the Workstream "
+                        f"D risk-matched skill check."
+                    ),
+                }
+
         min_improvement = _cfg.get("min_sortino_improvement", _MIN_SORTINO_IMPROVEMENT)
         if improvement_pct < min_improvement:
+            # Failure note references whichever metric is the rank column so
+            # the operator sees the right comparison.
+            if prefer_risk_matched_alpha:
+                rank_best = best_alpha_vs_ew_high_vol
+                rank_baseline = baseline_alpha_vs_ew_high_vol
+                rank_label = "alpha_vs_ew_high_vol"
+            else:
+                rank_best = best_sortino
+                rank_baseline = baseline_sortino
+                rank_label = "Sortino"
             return {
                 "status": "no_improvement",
                 **common_fields,
                 "note": (
-                    f"Best Sortino ({best_sortino:.4f}) only {improvement_pct:.1%} better than "
-                    f"baseline ({baseline_sortino:.4f}). Need {min_improvement:.0%}+ to recommend."
+                    f"Best {rank_label} ({rank_best:.4f}) only {improvement_pct:.1%} "
+                    f"better than baseline ({rank_baseline:.4f}). Need "
+                    f"{min_improvement:.0%}+ to recommend."
                 ),
             }
 
@@ -471,15 +552,28 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
                     ),
                 }
 
+        if prefer_risk_matched_alpha:
+            rank_best = best_alpha_vs_ew_high_vol
+            rank_baseline = baseline_alpha_vs_ew_high_vol
+            rank_label = "alpha_vs_ew_high_vol"
+            rank_subtext = (
+                "skill_composite ranking: alpha_vs_ew_high_vol "
+                "(Workstream D risk-matched skill)"
+            )
+        else:
+            rank_best = best_sortino
+            rank_baseline = baseline_sortino
+            rank_label = "Sortino"
+            rank_subtext = "skill_composite ranking: sortino only"
         return {
             "status": "ok",
             **common_fields,
             "n_combos_tested": len(valid),
             "best_psr": _safe_float(best_psr) if best_psr is not None else None,
             "note": (
-                f"Best combo improves Sortino by {improvement_pct:.1%} "
-                f"({baseline_sortino:.4f} → {best_sortino:.4f}) across {len(valid)} combos "
-                f"(skill_composite ranking: sortino only; "
+                f"Best combo improves {rank_label} by {improvement_pct:.1%} "
+                f"({rank_baseline:.4f} → {rank_best:.4f}) across {len(valid)} combos "
+                f"({rank_subtext}; "
                 f"best_alpha={best_alpha} shown for operator display, not gating)."
             ),
         }

@@ -228,6 +228,14 @@ class TestSkillCompositeRanking:
         assert result["recommended_params"]["atr_multiplier"] == 2.0
         assert result["best_alpha"] == -0.10  # presentation only
 
+    def test_skill_composite_emits_rank_metric_sortino_by_default(self):
+        """rank_metric field in result identifies which axis drove the
+        ranking. Default skill-composite path uses sortino_ratio."""
+        _init_default_config({"use_skill_composite_target": True})
+        df = _make_sweep_df(COMBOS)
+        result = recommend(df, base_config={})
+        assert result["rank_metric"] == "sortino_ratio"
+
     def test_skill_blocks_when_psr_below_threshold(self):
         """PSR confidence gate (Workstream D bullet 3): refuse to promote
         when best combo's Probabilistic Sharpe Ratio < min_psr threshold —
@@ -656,3 +664,163 @@ class TestApplyCutoverSkip:
         assert outcome["applied"] is True
         legacy_keys = [c.kwargs["Key"] for c in legacy_s3.put_object.call_args_list]
         assert S3_PARAMS_KEY in legacy_keys
+
+
+# ── prefer_risk_matched_alpha flag (PR 3 — Workstream D rank-metric swap) ────
+
+
+class TestPreferRiskMatchedAlpha:
+    """When `prefer_risk_matched_alpha` is on AND `use_skill_composite_target`
+    is on, ranking swaps from `sortino_ratio` to `alpha_vs_ew_high_vol`
+    (Workstream D risk-matched skill metric — portfolio return minus the
+    EW-high-vol vol-matched basket's return). The negative-sortino sanity
+    guard still fires regardless of rank column; an additional
+    negative-alpha-vs-EW guard catches the "best combo can't even beat the
+    dumb-vol basket" failure mode. Default off — flips on after 2+ Saturday
+    SF shadow cycles confirm the basket is sensibly populated.
+    """
+
+    def _combos_with_ew_alpha(self):
+        # Three combos. Sortino ranking would pick combo B (highest sortino).
+        # alpha_vs_ew_high_vol ranking should pick combo C (highest risk-
+        # matched skill). This makes the rank-column swap observable.
+        return [
+            # combo A: high sharpe, modest sortino, very modest risk-matched skill
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.70, "total_alpha": 0.20, "sortino_ratio": 0.85,
+             "alpha_vs_ew_high_vol": 0.02,
+             "max_drawdown": -0.05, "total_trades": 100},
+            # combo B: highest Sortino — would win under default skill-composite
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.95,
+             "alpha_vs_ew_high_vol": 0.03,
+             "max_drawdown": -0.10, "total_trades": 80},
+            # combo C: highest alpha_vs_ew_high_vol — wins under
+            # prefer_risk_matched_alpha
+            {"atr_multiplier": 2.5, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.60, "total_alpha": 0.25, "sortino_ratio": 0.75,
+             "alpha_vs_ew_high_vol": 0.08,
+             "max_drawdown": -0.08, "total_trades": 90},
+        ]
+
+    def test_flag_off_default_keeps_sortino_rank_path(self):
+        """Default (`prefer_risk_matched_alpha=False`) is unchanged —
+        skill-composite still ranks by sortino. Combo B wins."""
+        _init_default_config({"use_skill_composite_target": True})
+        df = _make_sweep_df(self._combos_with_ew_alpha())
+        result = recommend(df, base_config={})
+        assert result["status"] == "ok"
+        assert result["rank_metric"] == "sortino_ratio"
+        assert result["recommended_params"]["atr_multiplier"] == 2.0  # combo B
+
+    def test_flag_on_swaps_rank_to_alpha_vs_ew_high_vol(self):
+        """With `prefer_risk_matched_alpha=True`, combo C (highest
+        risk-matched alpha) wins instead of combo B (highest sortino).
+        This is the institutional Workstream D rank metric."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "prefer_risk_matched_alpha": True,
+        })
+        df = _make_sweep_df(self._combos_with_ew_alpha())
+        result = recommend(df, base_config={})
+        assert result["status"] == "ok"
+        assert result["rank_metric"] == "alpha_vs_ew_high_vol"
+        assert result["recommended_params"]["atr_multiplier"] == 2.5  # combo C
+        assert result["best_alpha_vs_ew_high_vol"] == 0.08
+
+    def test_flag_on_without_parent_flag_is_noop(self):
+        """`prefer_risk_matched_alpha=True` with `use_skill_composite_target`
+        off → legacy Sharpe-with-drawdown path still runs (the inner flag
+        only takes effect inside the skill-composite branch)."""
+        _init_default_config({"prefer_risk_matched_alpha": True})
+        df = _make_sweep_df(self._combos_with_ew_alpha())
+        result = recommend(df, base_config={})
+        assert result["fit_target"] == "sharpe_legacy"
+        assert result["rank_metric"] == "sharpe_drawdown"
+
+    def test_flag_on_blocks_when_best_risk_matched_alpha_negative(self):
+        """The Workstream D analogue of the negative-Sortino guard: refuse
+        to auto-apply when even the best combo underperforms the
+        vol-matched baseline."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "prefer_risk_matched_alpha": True,
+        })
+        # All three combos UNDER-perform the basket but sortino is positive.
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.6, "alpha_vs_ew_high_vol": -0.05,
+             "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.30,
+             "sortino_ratio": 0.7, "alpha_vs_ew_high_vol": -0.02,
+             "total_trades": 60},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={})
+        assert result["status"] == "negative_alpha_vs_ew_high_vol"
+
+    def test_flag_on_blocks_when_basket_unpopulated(self):
+        """If `alpha_vs_ew_high_vol` is missing from sweep_df (basket couldn't
+        be constructed — insufficient corpus depth, short window), return
+        insufficient_data instead of falling back silently to a different
+        rank column. The operator should know the basket failed."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "prefer_risk_matched_alpha": True,
+        })
+        # NO alpha_vs_ew_high_vol column → the rank_col=alpha_vs_ew_high_vol
+        # branch can't find it.
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.6, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.30,
+             "sortino_ratio": 0.7, "total_trades": 60},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={})
+        assert result["status"] == "insufficient_data"
+        assert "alpha_vs_ew_high_vol" in result["note"]
+
+    def test_flag_on_negative_sortino_still_blocks_strategy_quality(self):
+        """Sortino sanity guard fires regardless of rank column. Even when
+        ranking on alpha_vs_ew_high_vol, a strategy whose downside-aware
+        return is loss-making won't be promoted — separate strategy-quality
+        check from the rank-metric check."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "prefer_risk_matched_alpha": True,
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": -0.5, "alpha_vs_ew_high_vol": 0.05,  # +alpha vs basket but losing money
+             "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.30,
+             "sortino_ratio": -0.3, "alpha_vs_ew_high_vol": 0.02,
+             "total_trades": 60},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={})
+        # Sortino guard fires before the alpha-vs-EW check.
+        assert result["status"] == "negative_sortino"
+
+    def test_flag_on_no_improvement_uses_alpha_threshold(self):
+        """The min-improvement gate is rank-metric-based. Reuses
+        min_sortino_improvement as the threshold (same scale)."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "prefer_risk_matched_alpha": True,
+            "min_sortino_improvement": 0.20,
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.50,
+             "sortino_ratio": 0.50, "alpha_vs_ew_high_vol": 0.05,
+             "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.51,
+             "sortino_ratio": 0.51, "alpha_vs_ew_high_vol": 0.051,
+             "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 2.0})
+        # 0.051 vs 0.05 = 2% lift, below 20% gate.
+        assert result["status"] == "no_improvement"
+        assert "alpha_vs_ew_high_vol" in result["note"]
