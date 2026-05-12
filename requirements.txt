@@ -39,4 +39,4 @@ cvxpy>=1.4,<1.8
 # model_metadata + full_prompt_context (deterministic executor decisions
 # under L2308). Consumed here by replay/runner.py (skips deterministic
 # captures with explicit marker rather than crashing on None.get(...)).
-alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.10.0
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.12.0
