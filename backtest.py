@@ -1644,11 +1644,129 @@ def _build_replay_signals_by_date(
     return out
 
 
+def _replay_for_dates_per_date_bootstrap(
+    *,
+    dates: list[str],
+    config: dict,
+    SimulatedIBKRClient,
+    init_cash: float,
+    price_matrix,
+    ohlcv_by_ticker,
+    bucket: str,
+    merged_config: dict,
+    strategy_config: dict,
+) -> list[dict]:
+    """Per-date-bootstrap implementation of ``replay_for_dates``.
+
+    For each parity date, bootstrap a fresh ``sim_client`` from the eod_pnl
+    snapshot strictly preceding that date, then run ``_simulate_single_date``
+    for that single date. No cumulative state across dates; each parity
+    date validates against live's exact preceding state. Quick-fix
+    alternative to the continuous-bootstrap path; param sweeps continue to
+    use the continuous path (this is parity-only).
+
+    Closes ROADMAP P1 entry "Per-parity-date bootstrap (alternative parity
+    test mode)" — see backtest.py ``replay_for_dates`` docstring's
+    ``per_date_bootstrap`` parameter for the public contract.
+
+    Universe symbols are fetched once at entry (not per-date) — ArcticDB
+    publishes a single universe membership snapshot per Saturday SF;
+    per-date refetch would be cost without changing behavior. Rejected
+    ticker counter is aggregated across dates for the post-loop summary
+    log line, matching the continuous path's behavior.
+    """
+    if not config.get("trades_db_path"):
+        raise RuntimeError(
+            "per_date_bootstrap=True requires trades_db_path in config — "
+            "fresh-bootstrap-per-date depends on eod_pnl history. Set "
+            "config['trades_db_path'] to the path of a live trades.db "
+            "with non-empty eod_pnl rows preceding the parity window."
+        )
+
+    try:
+        from alpha_engine_lib.arcticdb import get_universe_symbols
+        universe_symbols = get_universe_symbols(bucket)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Per-date-bootstrap universe-filter bootstrap failed: could not "
+            f"read ArcticDB universe symbols from bucket {bucket!r}: {exc}"
+        ) from exc
+
+    rejected_ticker_counter: dict[str, int] = {}
+    captured: list[dict] = []
+    n_skipped_no_bootstrap = 0
+    skipped_dates: list[str] = []
+
+    for parity_date in sorted(dates):
+        bootstrap_state = _load_initial_state_from_eod_pnl(
+            config["trades_db_path"], parity_date,
+        )
+        if bootstrap_state is None:
+            n_skipped_no_bootstrap += 1
+            skipped_dates.append(parity_date)
+            logger.warning(
+                "Per-date bootstrap skipped for %s: no meaningful eod_pnl "
+                "row strictly before. Dropping this parity date from output.",
+                parity_date,
+            )
+            continue
+
+        # Fresh sim_client per-date — disjoint from any prior date's state.
+        # NAV is overridden from the bootstrap row immediately below; the
+        # constructor's init_cash arg is just a placeholder shape.
+        sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
+        sim_client._cash = bootstrap_state["cash"]
+        sim_client._positions = bootstrap_state["positions"]
+        sim_client._peak_nav = bootstrap_state["peak_nav"]
+        logger.info(
+            "Per-date bootstrap (%s): as_of=%s, %d positions, "
+            "cash=$%.0f, peak_nav=$%.0f",
+            parity_date, bootstrap_state["as_of"],
+            len(bootstrap_state["positions"]),
+            bootstrap_state["cash"], bootstrap_state["peak_nav"],
+        )
+
+        orders, _skip = _simulate_single_date(
+            sim_client=sim_client,
+            signal_date=parity_date,
+            price_matrix=price_matrix,
+            ohlcv_by_ticker=ohlcv_by_ticker,
+            bucket=bucket,
+            merged_config=merged_config,
+            strategy_config=strategy_config,
+            signals_override=None,  # loaded per-date inside helper
+            universe_symbols=universe_symbols,
+            rejected_ticker_counter=rejected_ticker_counter,
+        )
+        if orders:
+            captured.extend(orders)
+
+    if rejected_ticker_counter:
+        top = sorted(rejected_ticker_counter.items(), key=lambda kv: -kv[1])
+        total_rejects = sum(rejected_ticker_counter.values())
+        logger.warning(
+            "Per-date-bootstrap universe-filter dropped %d signal entries "
+            "across %d tickers. Top offenders: %s",
+            total_rejects, len(rejected_ticker_counter),
+            [f"{t}={n}" for t, n in top[:10]],
+        )
+
+    logger.info(
+        "replay_for_dates (per_date_bootstrap=True): %d orders captured "
+        "across %d requested dates (%d skipped — no eod_pnl row before "
+        "those dates: %s)",
+        len(captured), len(dates), n_skipped_no_bootstrap,
+        skipped_dates[:5] + (["…"] if len(skipped_dates) > 5 else []),
+    )
+    return captured
+
+
 def replay_for_dates(
     dates: list[str],
     config: dict,
     *,
     warmup_from_full_history: bool = True,
+    per_date_bootstrap: bool = False,
 ) -> list[dict]:
     """
     Replay the backtester for a specific list of signal dates; return
@@ -1667,6 +1785,17 @@ def replay_for_dates(
         NAV / positions have time to evolve before the test window. Only
         orders on ``dates`` are returned. If False, only the requested dates
         are simulated starting from ``init_cash`` — fast but NAV-divergent.
+    per_date_bootstrap : when True, bootstrap a FRESH sim_client per parity
+        date from the eod_pnl row strictly preceding each date, run a single
+        date through the executor, capture orders. Loses cumulative state
+        across the parity window but each parity date validates against
+        live's exact preceding state. Quick-fix alternative to the continuous
+        bootstrap path; use case is parity-only validation when continuous
+        sim diverges before reaching the parity window. Requires
+        ``trades_db_path`` in ``config``; raises ``RuntimeError`` otherwise.
+        Param sweeps stay on the continuous path (this flag is parity-only).
+        Mutually exclusive with bootstrap-mode signal_by_date construction —
+        signals are loaded per-date inside ``_simulate_single_date``.
 
     Returns
     -------
@@ -1713,9 +1842,30 @@ def replay_for_dates(
             f"produce parity output against stale prices."
         )
 
-    requested = set(dates)
     bucket = config.get("signals_bucket", "alpha-engine-research")
     merged_config, strategy_config = _build_merged_simulate_config(config)
+
+    # Per-date bootstrap path — diverges from the continuous-bootstrap +
+    # warmup paths because each parity date gets a fresh sim_client
+    # anchored to live's eod_pnl state at the preceding day. See the
+    # docstring's `per_date_bootstrap` parameter and ROADMAP P1 entry
+    # "Per-parity-date bootstrap (alternative parity test mode)" for the
+    # rationale; closes that entry. No requested-date clipping or
+    # carry-forward signal handling — each date is fully self-contained.
+    if per_date_bootstrap:
+        return _replay_for_dates_per_date_bootstrap(
+            dates=dates,
+            config=config,
+            SimulatedIBKRClient=SimulatedIBKRClient,
+            init_cash=init_cash,
+            price_matrix=price_matrix,
+            ohlcv_by_ticker=ohlcv_by_ticker,
+            bucket=bucket,
+            merged_config=merged_config,
+            strategy_config=strategy_config,
+        )
+
+    requested = set(dates)
     sim_client = SimulatedIBKRClient(prices={}, nav=init_cash)
 
     # Bootstrap sim_client state from live's eod_pnl if a trades.db is

@@ -336,3 +336,186 @@ class TestReplayForDatesBootstrapDailyHeartbeat:
         # state but their orders are not part of the parity output.
         assert len(captured) == 1
         assert captured[0]["date"] == "2026-04-15"
+
+
+# ── per_date_bootstrap branch ──────────────────────────────────────────────
+
+class TestReplayForDatesPerDateBootstrap:
+    """Covers the per-parity-date bootstrap mode (ROADMAP P1
+    "Per-parity-date bootstrap (alternative parity test mode)").
+
+    Each parity date gets a fresh ``sim_client`` anchored to live's
+    eod_pnl row strictly before that date — no cumulative state across
+    dates. Mocks the heavy paths but exercises the real per-date
+    iteration + bootstrap-call ordering in ``replay_for_dates``."""
+
+    def _setup_simulation_stub(self, trading_days_iso: list[str]):
+        """Same setup helper as the bootstrap-daily-heartbeat class — fixed
+        price matrix, a SimulatedIBKRClient class that records cash/positions
+        assignments through ordinary attribute writes."""
+        executor_run = MagicMock(return_value=[])
+
+        def _sim_client_factory(*, prices=None, nav=1_000_000.0):
+            return MagicMock(
+                _cash=0.0, _positions={}, _peak_nav=0.0,
+                _prices=prices or {}, _simulation_date=None,
+            )
+        sim_client_class = MagicMock(side_effect=_sim_client_factory)
+        price_matrix = pd.DataFrame(
+            index=pd.DatetimeIndex(pd.to_datetime(trading_days_iso)),
+            data={"AAPL": [100.0] * len(trading_days_iso)},
+        )
+        return (
+            executor_run, sim_client_class, [],
+            price_matrix, 1_000_000.0, {},
+        )
+
+    def test_per_date_bootstrap_calls_load_state_per_date(self):
+        # Three parity dates → three separate bootstrap calls, each anchored
+        # to its own date. No cumulative state carried between them.
+        parity_dates = ["2026-04-13", "2026-04-15", "2026-04-17"]
+        setup = self._setup_simulation_stub(parity_dates)
+
+        bootstrap_args_seen: list[str] = []
+
+        def _bootstrap(trades_db_path, parity_date):
+            bootstrap_args_seen.append(parity_date)
+            return {
+                "positions": {f"TKR_{parity_date}": {"shares": 10,
+                                                      "avg_cost": 50.0,
+                                                      "entry_date": parity_date,
+                                                      "sector": "Tech"}},
+                "cash": 100_000.0,
+                "peak_nav": 1_000_000.0,
+                "as_of": parity_date,
+            }
+
+        sim_clients_seen: list[MagicMock] = []
+
+        def _simulate(**kwargs):
+            sim_clients_seen.append(kwargs["sim_client"])
+            return [{"ticker": "AAPL", "action": "EXIT",
+                     "date": kwargs["signal_date"]}], None
+
+        with (
+            patch.object(bt, "_setup_simulation", return_value=setup),
+            patch.object(bt, "_load_initial_state_from_eod_pnl",
+                         side_effect=_bootstrap),
+            patch.object(bt, "_simulate_single_date", side_effect=_simulate),
+            patch("alpha_engine_lib.arcticdb.get_universe_symbols",
+                  return_value={"AAPL"}),
+        ):
+            captured = bt.replay_for_dates(parity_dates, {
+                "trades_db_path": "/tmp/fake.db",
+                "signals_bucket": "test",
+                "init_cash": 1_000_000.0,
+                "executor_paths": ["/tmp/nonexistent"],
+            }, per_date_bootstrap=True)
+
+        # Bootstrap called once per parity date, in sorted order.
+        assert bootstrap_args_seen == sorted(parity_dates)
+        # Three distinct sim_client instances (no reuse across dates).
+        assert len(sim_clients_seen) == 3
+        assert len({id(c) for c in sim_clients_seen}) == 3
+        # Each sim_client carries its date-specific bootstrap state.
+        for sim_client, parity_date in zip(sim_clients_seen, sorted(parity_dates)):
+            assert sim_client._cash == 100_000.0
+            assert sim_client._peak_nav == 1_000_000.0
+            assert f"TKR_{parity_date}" in sim_client._positions
+        # All three parity dates' orders captured.
+        assert sorted(o["date"] for o in captured) == sorted(parity_dates)
+
+    def test_per_date_bootstrap_requires_trades_db_path(self):
+        setup = self._setup_simulation_stub(["2026-04-15"])
+        with (
+            patch.object(bt, "_setup_simulation", return_value=setup),
+        ):
+            with pytest.raises(RuntimeError, match="trades_db_path"):
+                bt.replay_for_dates(["2026-04-15"], {
+                    "signals_bucket": "test",
+                    "init_cash": 1_000_000.0,
+                    "executor_paths": ["/tmp/nonexistent"],
+                }, per_date_bootstrap=True)
+
+    def test_per_date_bootstrap_skips_dates_with_no_eod_pnl_row(self):
+        # The 2026-03-09 date predates any eod_pnl row in this hypothetical
+        # trades.db; the helper returns None and the date is silently dropped
+        # from the output with a WARNING log.
+        parity_dates = ["2026-03-09", "2026-04-15"]
+        setup = self._setup_simulation_stub(parity_dates)
+
+        def _bootstrap(trades_db_path, parity_date):
+            if parity_date == "2026-03-09":
+                return None
+            return {
+                "positions": {}, "cash": 100_000.0,
+                "peak_nav": 1_000_000.0, "as_of": "2026-04-14",
+            }
+
+        def _simulate(**kwargs):
+            return [{"ticker": "AAPL", "action": "EXIT",
+                     "date": kwargs["signal_date"]}], None
+
+        with (
+            patch.object(bt, "_setup_simulation", return_value=setup),
+            patch.object(bt, "_load_initial_state_from_eod_pnl",
+                         side_effect=_bootstrap),
+            patch.object(bt, "_simulate_single_date", side_effect=_simulate),
+            patch("alpha_engine_lib.arcticdb.get_universe_symbols",
+                  return_value=set()),
+        ):
+            captured = bt.replay_for_dates(parity_dates, {
+                "trades_db_path": "/tmp/fake.db",
+                "signals_bucket": "test",
+                "init_cash": 1_000_000.0,
+                "executor_paths": ["/tmp/nonexistent"],
+            }, per_date_bootstrap=True)
+
+        # 03-09 dropped; only 04-15 in output.
+        assert len(captured) == 1
+        assert captured[0]["date"] == "2026-04-15"
+
+    def test_per_date_bootstrap_does_not_carry_orders_across_dates(self):
+        # Even if _simulate_single_date returns orders on every date, the
+        # captured list aggregates them as separate per-date entries — no
+        # carry-forward of state from prior dates implied by the API.
+        parity_dates = ["2026-04-13", "2026-04-14"]
+        setup = self._setup_simulation_stub(parity_dates)
+
+        def _bootstrap(trades_db_path, parity_date):
+            return {
+                "positions": {}, "cash": 100_000.0,
+                "peak_nav": 1_000_000.0, "as_of": parity_date,
+            }
+
+        n_calls = 0
+
+        def _simulate(**kwargs):
+            nonlocal n_calls
+            n_calls += 1
+            # Every call sees a fresh sim_client (None _simulation_date
+            # confirms the constructor was invoked anew per-date).
+            assert kwargs["sim_client"]._simulation_date in (None,
+                                                              kwargs["signal_date"])
+            return [{"ticker": "X", "action": "EXIT",
+                     "date": kwargs["signal_date"], "n_call": n_calls}], None
+
+        with (
+            patch.object(bt, "_setup_simulation", return_value=setup),
+            patch.object(bt, "_load_initial_state_from_eod_pnl",
+                         side_effect=_bootstrap),
+            patch.object(bt, "_simulate_single_date", side_effect=_simulate),
+            patch("alpha_engine_lib.arcticdb.get_universe_symbols",
+                  return_value=set()),
+        ):
+            captured = bt.replay_for_dates(parity_dates, {
+                "trades_db_path": "/tmp/fake.db",
+                "signals_bucket": "test",
+                "init_cash": 1_000_000.0,
+                "executor_paths": ["/tmp/nonexistent"],
+            }, per_date_bootstrap=True)
+
+        # Each call's order is captured; no cumulative aggregation.
+        assert len(captured) == 2
+        assert {o["date"] for o in captured} == set(parity_dates)
+        assert {o["n_call"] for o in captured} == {1, 2}

@@ -453,6 +453,11 @@ def _run_backtester_for_dates(dates: list[str], bucket: str,
     window. Replaces the cold-start warmup (Option A long-term parity
     strategy — see ``_load_initial_state_from_eod_pnl`` docstring in
     backtest.py).
+
+    Set ``PARITY_PER_DATE_BOOTSTRAP=1`` in the environment to opt into the
+    per-parity-date bootstrap mode (fresh sim_client per parity date,
+    anchored to eod_pnl's preceding-day snapshot). Param-sweep paths
+    continue using the continuous-state default.
     """
     from pipeline_common import load_config
     import backtest as _bt
@@ -464,7 +469,8 @@ def _run_backtester_for_dates(dates: list[str], bucket: str,
     if trades_db_path:
         config["trades_db_path"] = trades_db_path
 
-    return _bt.replay_for_dates(sorted(dates), config)
+    per_date = os.environ.get("PARITY_PER_DATE_BOOTSTRAP", "").strip() == "1"
+    return _bt.replay_for_dates(sorted(dates), config, per_date_bootstrap=per_date)
 
 
 # ── trades.db access ────────────────────────────────────────────────────────
