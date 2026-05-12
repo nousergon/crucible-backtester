@@ -206,9 +206,18 @@ def _categorize_trigger(trigger_type: str | None) -> str:
     if not trigger_type:
         return "unknown"
     t = trigger_type.lower()
-    for keyword in ("pullback", "vwap", "support", "time_expiry", "expiry"):
+    # Both "time_expiry*" and bare "expiry*" trigger names canonicalize to
+    # "time_expiry"; without an explicit map the old `.replace("expiry",
+    # "time_expiry")` produced "time_time_expiry" for the first form.
+    for keyword, canonical in (
+        ("pullback", "pullback"),
+        ("vwap", "vwap"),
+        ("support", "support"),
+        ("time_expiry", "time_expiry"),
+        ("expiry", "time_expiry"),
+    ):
         if keyword in t:
-            return keyword.replace("expiry", "time_expiry")
+            return canonical
     return "other"
 
 

@@ -145,9 +145,11 @@ def compute_attribution(df: pd.DataFrame) -> dict:
             p = all_pvals[i]
             fdr_non_significant.append(f"{label}.{target} (p={p:.3f})")
 
-    # Tag each correlation with FDR significance
+    # Snapshot keys before tagging — the loop body mutates the same dict,
+    # which raises RuntimeError on Python 3.13+ and is undefined on older
+    # versions.
     for label in correlations:
-        for target in correlations[label]:
+        for target in list(correlations[label].keys()):
             key = (label, target)
             correlations[label][f"{target}_fdr_significant"] = fdr_map.get(key, False)
 
