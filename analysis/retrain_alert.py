@@ -27,13 +27,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import smtplib
 from datetime import date, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import boto3
+
+from alpha_engine_lib.secrets import get_secret
 
 log = logging.getLogger(__name__)
 
@@ -219,7 +220,7 @@ def send_retrain_alert(
     plain_body = _build_plain_body(alert)
 
     region = config.get("aws_region", "us-east-1")
-    gmail_pw = os.environ.get("GMAIL_APP_PASSWORD", "")
+    gmail_pw = get_secret("GMAIL_APP_PASSWORD", required=False, default="")
 
     try:
         if gmail_pw:

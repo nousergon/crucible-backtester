@@ -11,13 +11,14 @@ SES fallback: used automatically when GMAIL_APP_PASSWORD is absent.
 from __future__ import annotations
 
 import logging
-import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import boto3
 from botocore.exceptions import ClientError
+
+from alpha_engine_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ def send_report_email(
     subject = _build_subject(run_date, status, product_name)
     html_body, plain_body = _build_body(run_date, report_md, s3_bucket, s3_prefix, product_name)
 
-    gmail_pw = os.environ.get("GMAIL_APP_PASSWORD", "")
+    gmail_pw = get_secret("GMAIL_APP_PASSWORD", required=False, default="")
     if gmail_pw:
         _send_via_smtp(subject, plain_body, html_body, sender, recipients, gmail_pw)
     else:
