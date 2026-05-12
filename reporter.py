@@ -1584,8 +1584,10 @@ def _section_predictor_backtest(stats: dict) -> list[str]:
         "| Metric | Value |",
         "|--------|-------|",
         f"| **Total alpha** | **{_pct(stats.get('total_alpha'))}** |",
+        f"| Alpha vs EW-high-vol | {_pct(stats.get('alpha_vs_ew_high_vol'))} |",
         f"| Total return | {_pct(stats.get('total_return'))} |",
         f"| SPY return | {_pct(stats.get('spy_return'))} |",
+        f"| EW-high-vol return | {_pct(stats.get('ew_high_vol_return'))} |",
         f"| Sharpe ratio | {_fmt(stats.get('sharpe_ratio'))} |",
         f"| Max drawdown | {_pct(stats.get('max_drawdown'))} |",
         f"| Calmar ratio | {_fmt(stats.get('calmar_ratio'))} |",
@@ -1608,7 +1610,8 @@ def _section_param_sweep_predictor(df) -> list[str]:
     # leak into param_cols and confuse the operator about which columns
     # are tunable params vs derived metrics.
     NON_PARAM_COLS = {
-        "total_return", "total_alpha", "spy_return", "sharpe_ratio",
+        "total_return", "total_alpha", "alpha_vs_ew_high_vol",
+        "ew_high_vol_return", "spy_return", "sharpe_ratio",
         "sortino_ratio", "cvar_95", "calmar_ratio",
         "max_drawdown", "total_trades", "win_rate",
         "status", "dates_simulated", "total_orders", "note", "error",
@@ -1616,11 +1619,12 @@ def _section_param_sweep_predictor(df) -> list[str]:
     param_cols = [c for c in df.columns if c not in NON_PARAM_COLS]
 
     # Render the most-informative stat columns alongside params, in a fixed
-    # order. ``total_alpha`` first (presentation), Sortino + CVaR second
-    # (skilled-risk-taking metric stack from the 2026-05-06 evaluator
-    # revamp), then Sharpe + return + drawdown + win rate.
+    # order. ``total_alpha`` first (presentation), Sortino + CVaR + the
+    # risk-matched alpha (Workstream D — alpha vs EW-high-vol basket)
+    # second (skilled-risk-taking metric stack from the 2026-05-06
+    # evaluator revamp), then Sharpe + return + drawdown + win rate.
     PREFERRED_STAT_ORDER = [
-        "total_alpha", "sortino_ratio", "cvar_95",
+        "total_alpha", "alpha_vs_ew_high_vol", "sortino_ratio", "cvar_95",
         "sharpe_ratio", "total_return", "spy_return", "max_drawdown", "win_rate",
     ]
     stat_cols = [c for c in PREFERRED_STAT_ORDER if c in df.columns]
@@ -1674,7 +1678,8 @@ def _section_param_sweep(df) -> list[str]:
     # (a dict of ticker→gap_days) was str()-ified into every row.
     _NON_PARAM_COLS = {
         # stat cols (rendered separately as stat_cols)
-        "total_return", "total_alpha", "spy_return", "sharpe_ratio",
+        "total_return", "total_alpha", "alpha_vs_ew_high_vol",
+        "ew_high_vol_return", "spy_return", "sharpe_ratio",
         "max_drawdown", "calmar_ratio", "total_trades", "win_rate",
         # metadata leaked from sweep infra — not real params
         "status", "dates_simulated", "dates_expected", "coverage",
@@ -1694,7 +1699,7 @@ def _section_param_sweep(df) -> list[str]:
         c for c in df.columns
         if c not in _NON_PARAM_COLS and _is_scalar_col(c)
     ]
-    stat_cols = [c for c in ["total_alpha", "sharpe_ratio", "total_return", "spy_return", "max_drawdown", "win_rate"] if c in df.columns]
+    stat_cols = [c for c in ["total_alpha", "alpha_vs_ew_high_vol", "sharpe_ratio", "total_return", "spy_return", "max_drawdown", "win_rate"] if c in df.columns]
     show_cols = param_cols + stat_cols
     header = "| " + " | ".join(show_cols) + " |"
     sep    = "| " + " | ".join("---" for _ in show_cols) + " |"
@@ -1703,7 +1708,8 @@ def _section_param_sweep(df) -> list[str]:
         cells = []
         for c in show_cols:
             v = row.get(c)
-            if c in ("total_return", "total_alpha", "spy_return", "max_drawdown", "win_rate"):
+            if c in ("total_return", "total_alpha", "alpha_vs_ew_high_vol",
+                     "spy_return", "max_drawdown", "win_rate"):
                 cells.append(_pct(v))
             elif c in ("sharpe_ratio",):
                 cells.append(_fmt(v))
