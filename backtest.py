@@ -1157,6 +1157,37 @@ def _simulate_single_date(
     return orders, None
 
 
+def _try_construct_ew_high_vol_basket(price_matrix) -> pd.Series | None:
+    """Build the EW-high-vol basket from ``price_matrix``; return ``None``
+    on failure or insufficient history.
+
+    L2170 Workstream D: per-config risk-matched skill measurement. The
+    basket holds the top vol-quartile of the agent's decision universe
+    (here: all columns of the universe-wide price matrix the simulator
+    already loads), equal-weighted, rebalanced weekly. Pure-compute, no
+    new data dependency — `construct_ew_high_vol_benchmark` operates on
+    the same price matrix the sweep already has in memory.
+
+    Returns ``None`` for short windows (< 60-day vol-lookback), degenerate
+    price matrices, or any construction failure — caller's `portfolio_stats`
+    falls back to the SPY-only alpha computation. Best-effort by design;
+    the EW-high-vol stat is additive observability, not load-bearing.
+    """
+    try:
+        from analysis.risk_matched_benchmark import construct_ew_high_vol_benchmark
+        basket = construct_ew_high_vol_benchmark(price_matrix)
+        if basket is None or basket.empty:
+            return None
+        return basket
+    except Exception:
+        logger.warning(
+            "Could not construct EW-high-vol basket from price matrix — "
+            "falling back to SPY-only alpha computation.",
+            exc_info=True,
+        )
+        return None
+
+
 def _run_simulation_loop(
     executor_run,
     SimulatedIBKRClient,
@@ -1166,6 +1197,7 @@ def _run_simulation_loop(
     ohlcv_by_ticker: dict[str, pd.DataFrame] | None = None,
     signals_by_date: dict | None = None,
     spy_prices: pd.Series | None = None,
+    ew_high_vol_basket_returns: pd.Series | None = None,
     atr_by_ticker: dict[str, float] | None = None,
     vwap_series_by_ticker: dict[str, pd.Series] | None = None,
     coverage_by_ticker: dict[str, float] | None = None,
@@ -1391,7 +1423,11 @@ def _run_simulation_loop(
         all_orders, price_matrix, init_cash=init_cash, fees=fees,
         slippage_bps=slippage_bps, assume_next_day_fill=assume_next_day_fill,
     )
-    stats = compute_portfolio_stats(pf, spy_prices=spy_prices)
+    stats = compute_portfolio_stats(
+        pf,
+        spy_prices=spy_prices,
+        ew_high_vol_basket_returns=ew_high_vol_basket_returns,
+    )
     # Record simulation assumptions for reporting
     if slippage_bps > 0 or assume_next_day_fill:
         fill_type = "next-day close" if assume_next_day_fill else "same-day close"
@@ -2107,9 +2143,17 @@ def run_simulate(config: dict) -> dict:
             "min_required": min_dates,
         }
 
+    # Build the EW-high-vol basket once per simulate call so portfolio_stats
+    # can emit `alpha_vs_ew_high_vol` alongside `total_alpha`. Pure-compute,
+    # no new data dependency — uses the same `price_matrix` the simulator
+    # already loaded. Returns None on insufficient history; basket is best-
+    # effort observability, never load-bearing.
+    ew_basket = _try_construct_ew_high_vol_basket(price_matrix)
+
     return _run_simulation_loop(
         executor_run, SimulatedIBKRClient, dates, price_matrix, config,
         ohlcv_by_ticker=ohlcv,
+        ew_high_vol_basket_returns=ew_basket,
     )
 
 
@@ -2143,10 +2187,18 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
         bucket, tickers_allowlist=_allowlist,
     )
 
+    # Build the EW-high-vol basket once for the full sweep — depends only
+    # on prices, not on the executor config combo being swept. Shared
+    # across every _run_simulation_loop call so each per-combo
+    # portfolio_stats() can emit alpha_vs_ew_high_vol without recomputing
+    # the basket per combo.
+    ew_basket = _try_construct_ew_high_vol_basket(price_matrix)
+
     def sim_fn(combo_config: dict) -> dict:
         return _run_simulation_loop(
             executor_run, SimulatedIBKRClient, dates, price_matrix, combo_config,
             ohlcv_by_ticker=ohlcv,
+            ew_high_vol_basket_returns=ew_basket,
             atr_by_ticker=atr_by_ticker,
             vwap_series_by_ticker=vwap_series_by_ticker,
             coverage_by_ticker=coverage_by_ticker,
@@ -2529,6 +2581,12 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     sector_map = result.get("sector_map", {})
     trading_dates = result.get("trading_dates", [])
 
+    # Build the EW-high-vol basket once for the predictor sweep — shared
+    # by the default-config single_run AND every per-combo sim. Basket
+    # depends only on prices so it's combo-invariant. None on insufficient
+    # history; portfolio_stats falls back to SPY-only alpha computation.
+    ew_basket = _try_construct_ew_high_vol_basket(price_matrix)
+
     # One-time-share logic for ATR + VWAP precomputed maps. The
     # predictor-param-sweep is the bottleneck the Saturday SF dry-run
     # timed out on: 60 combos × 2000+ dates × per-ticker ArcticDB reads.
@@ -2592,6 +2650,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 ohlcv_by_ticker=ohlcv_by_ticker,
                 signals_by_date=signals_by_date,
                 spy_prices=spy_prices,
+                ew_high_vol_basket_returns=ew_basket,
                 atr_by_ticker=atr_by_ticker,
                 vwap_series_by_ticker=vwap_series_by_ticker,
                 coverage_by_ticker=coverage_by_ticker,
@@ -2845,6 +2904,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 ohlcv_by_ticker=ohlcv_by_ticker,
                 signals_by_date=signals_by_date,
                 spy_prices=spy_prices,
+                ew_high_vol_basket_returns=ew_basket,
                 atr_by_ticker=atr_by_ticker,
                 vwap_series_by_ticker=vwap_series_by_ticker,
                 coverage_by_ticker=coverage_by_ticker,
