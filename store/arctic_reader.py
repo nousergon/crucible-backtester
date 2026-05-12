@@ -239,9 +239,15 @@ def load_universe_from_arctic(
         # Defensive dedup per 2026-04-15 duplicate-row workaround window
         df = df[~df.index.duplicated(keep="last")].sort_index()
 
-        # price_data gets OHLCV columns only
-        ohlcv_cols = [c for c in OHLCV_COLS if c in df.columns]
-        price_data[ticker] = df[ohlcv_cols]
+        # price_data gets OHLCV columns plus the row-provenance ``source``
+        # column when present (alpha-engine-data wires it as of 2026-05-09).
+        # Carrying it through lets price_loader's gap-warning metric
+        # discriminate "neither yfinance nor polygon had data" cells from
+        # pre-IPO matrix-pivot artifacts.
+        price_cols = [c for c in OHLCV_COLS if c in df.columns]
+        if "source" in df.columns:
+            price_cols.append("source")
+        price_data[ticker] = df[price_cols]
 
         # features_by_ticker gets the full DataFrame (OHLCV + features),
         # only for stock tickers (not macro/ETFs)

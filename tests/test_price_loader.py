@@ -28,21 +28,33 @@ import loaders.price_loader  # noqa: E402, F401
 import store.arctic_reader  # noqa: E402, F401
 
 
-def _make_arctic_mock(ticker_series_map: dict[str, pd.Series], field: str = "Close") -> tuple:
+def _make_arctic_mock(
+    ticker_series_map: dict[str, pd.Series],
+    field: str = "Close",
+    include_source: bool = False,
+) -> tuple:
     """Build a (price_data, features_by_ticker) tuple matching ArcticDB's shape.
 
-    Each series becomes a DataFrame with Open/High/Low/Close/Volume columns.
+    Each series becomes a DataFrame with Open/High/Low/Close/Volume columns,
+    plus the row-provenance ``source`` column when ``include_source=True``
+    (mirrors the 2026-05-09 daily_append rollout). All non-NaN rows are
+    stamped ``"polygon"``; tests that want a NaN-source row should patch
+    the returned dict in place.
     """
     price_data: dict[str, pd.DataFrame] = {}
     for ticker, series in ticker_series_map.items():
-        df = pd.DataFrame({
+        cols = {
             "Open": series,
             "High": series,
             "Low": series,
             field: series,
             "Volume": pd.Series(1_000_000, index=series.index, dtype="int64"),
-        })
-        price_data[ticker] = df
+        }
+        if include_source:
+            cols["source"] = pd.Series(
+                ["polygon"] * len(series), index=series.index, dtype=object,
+            ).where(series.notna(), other=None)
+        price_data[ticker] = pd.DataFrame(cols)
     return price_data, {}
 
 
@@ -112,6 +124,154 @@ class TestBuildMatrixArcticDB:
         assert df.empty
         assert df.attrs["no_data_dates"] == ["2026-03-10"]
         mock_arctic.assert_not_called()
+
+
+class TestGapWarningSourceAware:
+    """price_gap_warnings — source-aware + pre-IPO-aware semantics.
+
+    Pins the L1066 ROADMAP entry's expected behavior: the gap-warning
+    metric only fires on cells where neither yfinance nor polygon
+    persisted a row (i.e. ``source`` column is NaN) within the
+    [first_listed_date, simulation_end] window per ticker, excluding
+    calendar-mismatch macros (VIX/TNX/IRX).
+    """
+
+    @patch("loaders.price_loader._tickers_from_signals")
+    @patch("loaders.price_loader.load_universe_from_arctic")
+    def test_pre_ipo_dates_excluded_from_gap_count(self, mock_arctic, mock_signals):
+        """A late-IPO ticker shouldn't warn for its pre-IPO date range.
+
+        IPO-2026-03-07 ticker over a 10-day window: 7 cells of pre-IPO
+        history (no source row, by definition) + 3 post-IPO cells
+        (source="polygon"). The pre-IPO 7 must NOT contribute to the gap
+        count — only post-IPO source-NaN cells count.
+        """
+        from loaders.price_loader import build_matrix
+
+        dates = [f"2026-03-{d:02d}" for d in range(2, 12)]  # 2026-03-02 .. 2026-03-11
+        mock_signals.return_value = ["IPOCO", "MSFT"]
+
+        post_ipo_idx = pd.to_datetime([f"2026-03-{d:02d}" for d in (7, 8, 9, 10, 11)])
+        full_idx = pd.to_datetime(dates)
+
+        price_data, _ = _make_arctic_mock(
+            {
+                "IPOCO": pd.Series(np.arange(100, 105, dtype=float), index=post_ipo_idx),
+                "MSFT": pd.Series(np.arange(200, 210, dtype=float), index=full_idx),
+            },
+            include_source=True,
+        )
+        mock_arctic.return_value = (price_data, {})
+
+        df = build_matrix(dates, bucket="test")
+        assert "IPOCO" not in df.attrs["price_gap_warnings"], (
+            "Pre-IPO dates must not count as gaps — IPOCO's history starts "
+            "2026-03-07, prior dates aren't ingestion failures."
+        )
+        assert "MSFT" not in df.attrs["price_gap_warnings"]
+
+    @patch("loaders.price_loader._tickers_from_signals")
+    @patch("loaders.price_loader.load_universe_from_arctic")
+    def test_calendar_mismatch_macros_excluded(self, mock_arctic, mock_signals):
+        """VIX/TNX/IRX trade on different calendars — exclude from gap warning.
+
+        The simulation universe includes equities with full NYSE coverage
+        and a macro with a missing-row pattern that would trip the
+        threshold. The macro must be skipped.
+        """
+        from loaders.price_loader import build_matrix
+
+        dates = [f"2026-03-{d:02d}" for d in range(2, 16)]  # 14 days
+        mock_signals.return_value = ["MSFT", "VIX"]
+
+        full_idx = pd.to_datetime(dates)
+        sparse_idx = pd.to_datetime(["2026-03-02", "2026-03-15"])  # 2-of-14
+        price_data, _ = _make_arctic_mock(
+            {
+                "MSFT": pd.Series(np.arange(200, 200 + len(full_idx), dtype=float), index=full_idx),
+                "VIX": pd.Series([20.0, 22.0], index=sparse_idx),
+            },
+            include_source=True,
+        )
+        mock_arctic.return_value = (price_data, {})
+
+        df = build_matrix(dates, bucket="test")
+        assert "VIX" not in df.attrs["price_gap_warnings"], (
+            "VIX trades on the CBOE volatility calendar; missing NYSE-equity "
+            "dates are calendar mismatches, not data gaps."
+        )
+
+    @patch("loaders.price_loader._tickers_from_signals")
+    @patch("loaders.price_loader.load_universe_from_arctic")
+    def test_source_nan_within_window_does_warn(self, mock_arctic, mock_signals):
+        """A long-history ticker with a mid-window source-NaN streak warns.
+
+        Genuine ingestion gap class — the only population the metric is
+        meant to surface. Mirrors the ~11 IPO/spinoff structural cases
+        in the L1066 diagnostic.
+        """
+        from loaders.price_loader import build_matrix
+
+        dates = [f"2026-03-{d:02d}" for d in range(2, 16)]  # 14 days
+        mock_signals.return_value = ["GAPPY", "MSFT"]
+
+        full_idx = pd.to_datetime(dates)
+        gappy_series = pd.Series(np.arange(100, 100 + len(full_idx), dtype=float), index=full_idx)
+        msft_series = pd.Series(np.arange(200, 200 + len(full_idx), dtype=float), index=full_idx)
+
+        price_data, _ = _make_arctic_mock(
+            {"GAPPY": gappy_series, "MSFT": msft_series},
+            include_source=True,
+        )
+        # Drop source rows across 9 calendar days (~7 business days) in
+        # the middle of the window — keep Close populated so this
+        # exercises the source-aware path, not Close-NaN fallback.
+        # Mirrors "polygon outage but yfinance backfill still produced a
+        # Close at zero authority" hypothetical that the new metric
+        # should still flag.
+        gap_dates = pd.to_datetime([f"2026-03-{d:02d}" for d in range(5, 14)])
+        price_data["GAPPY"].loc[gap_dates, "source"] = None
+        mock_arctic.return_value = (price_data, {})
+
+        df = build_matrix(dates, bucket="test")
+        assert "GAPPY" in df.attrs["price_gap_warnings"], (
+            "7-day source-NaN streak inside [first_listed, sim_end] window "
+            "must trip the gap-warning threshold."
+        )
+        assert df.attrs["price_gap_warnings"]["GAPPY"] >= 6
+        assert "MSFT" not in df.attrs["price_gap_warnings"]
+
+    @patch("loaders.price_loader._tickers_from_signals")
+    @patch("loaders.price_loader.load_universe_from_arctic")
+    def test_legacy_series_without_source_falls_back_to_close(self, mock_arctic, mock_signals):
+        """Pre-2026-05-09 ArcticDB rows lack the ``source`` column.
+
+        For those tickers the metric falls back to a Close-NaN check on
+        the same windowed range so legacy series still produce sane
+        warnings during the migration tail.
+        """
+        from loaders.price_loader import build_matrix
+
+        dates = [f"2026-03-{d:02d}" for d in range(2, 16)]  # 14 days
+        mock_signals.return_value = ["LEGACY", "MSFT"]
+
+        full_idx = pd.to_datetime(dates)
+        sparse_idx = pd.to_datetime(["2026-03-02"])  # 1-of-14
+
+        price_data, _ = _make_arctic_mock(
+            {
+                "LEGACY": pd.Series([100.0], index=sparse_idx),
+                "MSFT": pd.Series(np.arange(200, 200 + len(full_idx), dtype=float), index=full_idx),
+            },
+            include_source=False,  # legacy: no source column
+        )
+        mock_arctic.return_value = (price_data, {})
+
+        df = build_matrix(dates, bucket="test")
+        # LEGACY's first_seen is 2026-03-02 (only date with data), so the
+        # window covers all 14 days; 13 Close-NaN cells > threshold.
+        assert "LEGACY" in df.attrs["price_gap_warnings"]
+        assert "MSFT" not in df.attrs["price_gap_warnings"]
 
 
 class TestArcticFreshnessGate:

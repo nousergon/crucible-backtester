@@ -28,6 +28,19 @@ logger = logging.getLogger(__name__)
 # survive the rip because they apply to the resulting matrix, not to the source.
 _MAX_FFILL_DAYS = 5        # max forward-fill window (1 trading week)
 _MAX_STALENESS_BDAYS = 5   # circuit breaker: halt simulation if data this stale
+_GAP_WARNING_THRESHOLD = 5  # tickers with > this many genuine gap days get flagged
+
+# Tickers that trade on a different calendar than the NYSE equity calendar
+# (bond futures + options/volatility indexes) — excluded from gap warnings
+# because their "missing" NYSE dates are calendar mismatches, not data
+# quality issues. Pinned to the symbols actually persisted as ArcticDB
+# universe entries: ``IRX`` (13-week T-bill), ``TNX`` (10-yr Treasury),
+# ``VIX`` + ``VIX3M`` (CBOE volatility), plus the ``^`` Yahoo-prefixed
+# aliases retained for legacy code paths.
+_CALENDAR_MISMATCH_TICKERS = {
+    "VIX", "VIX3M", "TNX", "IRX",
+    "^VIX", "^TNX", "^IRX",
+}
 
 
 def build_matrix(
@@ -73,7 +86,11 @@ def build_matrix(
     are dropped (VectorBT treats NaN as zero-return which distorts results).
 
     Attached to `df.attrs`:
-      * `price_gap_warnings` — per-ticker gap counts (>5 days)
+      * `price_gap_warnings` — per-ticker count of business days where neither
+          yfinance nor polygon had a row inside the per-ticker
+          [first_listed_date, simulation_end] window. Excludes pre-IPO dates
+          (derived from the ticker's own first non-NaN Close) and
+          calendar-mismatch macros (VIX/VIX3M/TNX/IRX).
       * `unfilled_gaps` — per-ticker count of NaN rows that remained after ffill
       * `staleness_warning` — human-readable string or None
       * `stale_circuit_break` — True if last price date < today - 5 BDays
@@ -191,11 +208,52 @@ def build_matrix(
             frame = frame[~frame.index.duplicated(keep="last")].sort_index()
             _ohlcv_out[ticker] = frame
 
-    # ── Gap detection, ffill, circuit-breaker (unchanged semantics) ────────
-    was_nan = df.isna()
-    gap_lengths = was_nan.sum(axis=0)
-    long_gaps = gap_lengths[gap_lengths > 5]
-    price_gap_warnings = {str(k): int(v) for k, v in long_gaps.items()} if not long_gaps.empty else {}
+    # ── Gap detection (source-aware, pre-IPO-aware) ────────────────────────
+    #
+    # A "gap" is a date inside the requested simulation window where the
+    # ticker's per-row ``source`` provenance is NaN — i.e. neither yfinance
+    # nor polygon landed a row for that (ticker, date) under the upstream
+    # windowed-data-reconciliation arc (alpha-engine-data PRs #199-#201,
+    # 2026-05-10). This replaces the prior matrix-wide NaN count, which
+    # conflated three distinct phenomena:
+    #   1. Front-of-history mismatches (e.g. ASGN/HOLX have 10 days of
+    #      pre-2016-05-09 history that other tickers don't) — pivoting
+    #      produced NaN cells on every other ticker for those 10 dates,
+    #      surfacing as ~110 false-positive "gap" warnings.
+    #   2. Calendar mismatches for VIX/TNX/IRX (bond/options calendars).
+    #   3. Genuine ingestion gaps (~11 IPO/spinoff edge cases) — the
+    #      population the metric is meant to surface.
+    # Per-ticker first-listed-date is derived from the ticker's own
+    # ``Close`` history (first non-NaN row) — no separate IPO metadata
+    # registry exists, and the price panel is self-consistent for this
+    # purpose. Calendar-mismatch macros are excluded via name set.
+    universe_dates = pd.to_datetime(sorted(dates))
+    sim_end = universe_dates.max() if len(universe_dates) else None
+    price_gap_warnings: dict[str, int] = {}
+    for ticker, df_ticker in price_data.items():
+        if ticker in _CALENDAR_MISMATCH_TICKERS:
+            continue
+        if df_ticker is None or df_ticker.empty or "Close" not in df_ticker.columns:
+            continue
+        first_seen = df_ticker["Close"].first_valid_index()
+        if first_seen is None or sim_end is None:
+            continue
+        window_lo = max(pd.Timestamp(first_seen), universe_dates.min())
+        if window_lo > sim_end:
+            continue
+        window = pd.bdate_range(start=window_lo, end=sim_end)
+        if len(window) == 0:
+            continue
+        # Source-aware path when provenance is present; legacy series
+        # (pre-2026-05-09 daily_append rollout) fall back to a Close-NaN
+        # check on the same windowed range.
+        if "source" in df_ticker.columns:
+            present = df_ticker["source"].reindex(window).notna().sum()
+        else:
+            present = df_ticker["Close"].reindex(window).notna().sum()
+        gap_count = int(len(window) - present)
+        if gap_count > _GAP_WARNING_THRESHOLD:
+            price_gap_warnings[str(ticker)] = gap_count
     if price_gap_warnings:
         logger.warning("Price gaps detected (will be ffill'd up to %d days): %s",
                        _MAX_FFILL_DAYS, price_gap_warnings)
