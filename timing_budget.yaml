@@ -141,3 +141,12 @@ full_run_hard_caps_seconds:
   # Main simulation pipeline (signals → orders → vectorbt). Typical
   # 5–15 min for a single-run. Cap at 45 min.
   simulation_pipeline: 2700.0
+
+  # Portfolio-optimizer cutover gate (ROADMAP L2222 PR 4.5). Runs the
+  # constrained MVO optimizer over synthetic predictor history + evaluates
+  # cutover criteria. Predictor backtest dominates (~4 min from
+  # predictor_pipeline). Optimizer rebalances at 5d cadence over ~2y
+  # = ~100 rebalances × ~0.1s/solve ≈ 10s. Cap generously at 30 min to
+  # absorb cold spot variance + cvxpy ECOS solver outliers; if a run trips
+  # this, investigate before widening — the optimizer should be fast.
+  portfolio_optimizer_gate: 1800.0

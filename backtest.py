@@ -14,14 +14,21 @@ Usage:
     # Predictor-only backtest (10y synthetic signals, no LLM calls)
     python backtest.py --mode predictor-backtest
 
-    # Full simulation pipeline (param-sweep + predictor-backtest)
+    # Portfolio-optimizer cutover-gate runner — replays the constrained MVO
+    # optimizer over synthetic predictor history and persists a gate report
+    # to s3://{bucket}/predictor/optimizer_gate/{date}.json. Used by the
+    # Saturday SF to surface PR 5 cutover readiness; see ROADMAP L2222.
+    python backtest.py --mode portfolio-optimizer-backtest
+
+    # Full simulation pipeline (param-sweep + predictor-backtest + optimizer-gate)
     python backtest.py --mode all
 
     # Upload results to S3
     python backtest.py --mode all --upload
 
 Options:
-    --mode          simulate | param-sweep | all | predictor-backtest
+    --mode          simulate | param-sweep | all | predictor-backtest |
+                    portfolio-optimizer-backtest
     --config        path to config.yaml (default: ./config.yaml)
     --db            path to local research.db (skips S3 pull; useful locally)
     --upload        upload results to S3
@@ -2002,6 +2009,72 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
     return param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
 
 
+def run_portfolio_optimizer_gate(
+    config: dict,
+    run_date: str,
+    legacy_metrics: dict | None = None,
+    s3_client=None,
+) -> dict:
+    """
+    Run the portfolio-optimizer cutover gate against the synthetic predictor
+    backtest and persist the report to S3.
+
+    ROADMAP L2222 PR 4.5. Orchestrates ``analysis.portfolio_optimizer_gate``'s
+    ``run_gate_against_predictor_backtest`` (predictor history → optimizer
+    backtest → compare → evaluate_gate) and writes the result to
+    ``s3://{bucket}/predictor/optimizer_gate/{run_date}.json``. The Saturday
+    SF reads the persisted JSON as the readiness signal for PR 5 cutover
+    (flip ``use_portfolio_optimizer: true``).
+
+    legacy_metrics: optional dict from a same-run simulate stage's
+    ``portfolio_stats`` to give the gate side-by-side comparisons against
+    the in-production legacy planner. None is valid — the gate will skip
+    legacy-relative criteria and still check the absolute criteria
+    (psr_min, tracking_error_range, active_share_range).
+    """
+    import boto3
+    from analysis.portfolio_optimizer_gate import (
+        gate_passed,
+        run_gate_against_predictor_backtest,
+    )
+
+    logger.info(
+        "portfolio_optimizer_gate: starting (legacy_metrics=%s)",
+        "provided" if legacy_metrics else "skipped",
+    )
+    gate_result = run_gate_against_predictor_backtest(
+        config=config,
+        legacy_metrics=legacy_metrics,
+    )
+
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    key = f"predictor/optimizer_gate/{run_date}.json"
+    latest_key = "predictor/optimizer_gate/latest.json"
+    payload = {
+        "run_date": run_date,
+        "passed": gate_passed(gate_result.get("gate_report") or {}),
+        **gate_result,
+    }
+    body = json.dumps(payload, default=str, indent=2).encode("utf-8")
+
+    s3 = s3_client or boto3.client("s3")
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+        s3.put_object(Bucket=bucket, Key=latest_key, Body=body, ContentType="application/json")
+        logger.info("portfolio_optimizer_gate: persisted s3://%s/%s", bucket, key)
+    except Exception as exc:
+        logger.warning(
+            "portfolio_optimizer_gate: S3 persist failed (non-fatal): %s", exc,
+        )
+
+    verdict = (gate_result.get("gate_report") or {}).get("verdict")
+    logger.info(
+        "portfolio_optimizer_gate: verdict=%s passed=%s",
+        verdict, payload["passed"],
+    )
+    return payload
+
+
 def run_predictor_backtest(config: dict) -> dict:
     """
     Run predictor-only historical backtest: generate synthetic signals from
@@ -3242,7 +3315,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=[
-            "simulate", "param-sweep", "all", "predictor-backtest", "smoke",
+            "simulate", "param-sweep", "all", "predictor-backtest",
+            "portfolio-optimizer-backtest",
+            "smoke",
             "smoke-simulate", "smoke-param-sweep",
             "smoke-predictor-backtest", "smoke-phase4",
             "smoke-predictor-param-sweep",
@@ -3875,6 +3950,33 @@ def main() -> None:
             predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
                 args, config, executor_rec, current_executor_params, fd,
             )
+
+    # ── Portfolio-optimizer cutover gate ──────────────────────────────────
+    # ROADMAP L2222 PR 4.5. Runs the constrained MVO optimizer over synthetic
+    # predictor history + persists a per-run gate report. Saturday SF reads
+    # the JSON for PR 5 cutover-readiness signal. Non-fatal — gate failures
+    # are observability, not a backtester-pipeline blocker.
+    if args.mode in ("portfolio-optimizer-backtest", "all"):
+        try:
+            with registry.phase("portfolio_optimizer_gate", mode=args.mode):
+                # Pass simulate-phase portfolio_stats as legacy_metrics when
+                # available so the gate can evaluate legacy-relative criteria
+                # (sortino_min, max_drawdown_floor, cvar_95_floor, turnover_max).
+                # On mode=portfolio-optimizer-backtest (standalone), portfolio_stats
+                # is None and the gate reports skipped verdicts for those.
+                run_portfolio_optimizer_gate(
+                    config=config,
+                    run_date=args.date,
+                    legacy_metrics=portfolio_stats,
+                )
+        except Exception as exc:
+            logger.warning(
+                "portfolio_optimizer_gate phase failed (non-fatal): %s",
+                exc, exc_info=True,
+            )
+            if fd:
+                fd.report(exc, severity="warning", context={
+                    "site": "portfolio_optimizer_gate", "mode": args.mode})
 
     # ── Export simulation artifacts for evaluator ────────────────────────
     if args.mode in ("simulate", "param-sweep", "all", "predictor-backtest"):
