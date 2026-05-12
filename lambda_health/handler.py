@@ -59,6 +59,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # SSM-backed secrets (e.g. ANTHROPIC_API_KEY) that flow_doctor.init()
 # does not consult.
 from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.secrets import get_secret
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -301,10 +302,10 @@ def _load_last_feature_drift(bucket: str) -> dict | None:
 
 def _build_email_config() -> dict:
     """Build email config from environment variables."""
-    recipients_str = os.environ.get("EMAIL_RECIPIENTS", "")
+    recipients_str = get_secret("EMAIL_RECIPIENTS", required=False, default="") or ""
     recipients = [r.strip() for r in recipients_str.split(",") if r.strip()]
     return {
-        "email_sender": os.environ.get("EMAIL_SENDER", ""),
+        "email_sender": get_secret("EMAIL_SENDER", required=False, default="") or "",
         "email_recipients": recipients,
         "aws_region": os.environ.get("AWS_REGION", "us-east-1"),
     }

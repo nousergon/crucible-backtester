@@ -33,6 +33,8 @@ _PINNED_SECRETS = frozenset(
         "EDGAR_IDENTITY",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_CHAT_ID",
+        "EMAIL_SENDER",
+        "EMAIL_RECIPIENTS",
     ]
 )
 
