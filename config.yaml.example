@@ -1,3 +1,17 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DESCRIPTIVE / DOCUMENTATION ONLY
+#
+# Production reads the live config from alpha-engine-config/backtester/config.yaml
+# at runtime (spot_backtest.sh syncs it onto the spot instance at boot).
+# Edits to this file affect ONLY:
+#   1. New-environment bootstrap (copies this template to config.yaml), and
+#   2. Public-repo schema documentation for the backtester's config surface.
+#
+# Edits here have ZERO effect on the live system. To change a runtime value
+# or add a flag that needs to take effect, the change MUST land in
+# alpha-engine-config (separate private repo).
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Alpha Engine Backtester Configuration
 # Copy to config.yaml and customise all values below.
 # config.yaml is gitignored and should never be committed.
