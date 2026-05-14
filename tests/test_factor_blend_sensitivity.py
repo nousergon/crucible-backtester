@@ -16,7 +16,7 @@ from analysis.factor_blend_sensitivity import (
     MIN_TRUSTWORTHY_SAMPLES,
     _hit_rate,
     _sortino,
-    build_report,
+    build_sensitivity_report,
     compute_stance_outcomes,
     detect_mismatches,
 )
@@ -291,12 +291,12 @@ class TestDetectMismatches:
         assert "caution" not in mismatches["market_regime"].tolist()
 
 
-# ── build_report ────────────────────────────────────────────────────────────
+# ── build_sensitivity_report ────────────────────────────────────────────────
 
 
 class TestBuildReport:
     def test_empty_data_has_data_false(self, regime_weights):
-        result = build_report(pd.DataFrame(), regime_weights)
+        result = build_sensitivity_report(pd.DataFrame(), regime_weights)
         assert result["has_data"] is False
         assert result["n_total"] == 0
         assert result["outcomes"].empty
@@ -304,7 +304,7 @@ class TestBuildReport:
 
     def test_horizon_threaded_through(self, regime_weights):
         rows = _seed_rows("bull", "momentum", 5, [0.05, 0.03, -0.01, 0.04, 0.02])
-        result = build_report(pd.DataFrame(rows), regime_weights, horizon="30d")
+        result = build_sensitivity_report(pd.DataFrame(rows), regime_weights, horizon="30d")
         assert result["horizon"] == "30d"
         assert result["has_data"] is True
         assert result["n_total"] == 5

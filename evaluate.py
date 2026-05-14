@@ -58,6 +58,7 @@ import pandas as pd
 import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
+from analysis import factor_blend_sensitivity
 from analysis import veto_analysis
 from analysis import decision_capture_coverage, executor_decision_capture_coverage, provenance_grounding, quant_rank_quality
 from analysis import agent_justification
@@ -414,6 +415,31 @@ def _run_diagnostics(
         lambda: _run_post_trade(trades_db),
         required_inputs={"trades_db": avail["trades_db"]},
         skip_if_missing=["trades_db"],
+    )
+
+    # Factor blend sensitivity — config-vs-realized stance ordering check.
+    # PR 6 of scanner-placement arc + follow-up wire-in. Reads existing
+    # score_performance df_base; backtester config may override regime
+    # weights via factor_blend.regime_weights, else falls back to the
+    # canonical defaults mirroring alpha-engine-config/research/scoring.yaml.
+    fb_cfg = (config or {}).get("factor_blend") or {}
+    fb_regime_weights = fb_cfg.get(
+        "regime_weights",
+        factor_blend_sensitivity.DEFAULT_REGIME_WEIGHTS,
+    )
+    fb_horizon = fb_cfg.get("horizon", "10d")
+    results["factor_blend_sensitivity"] = tracker.run_module(
+        "factor_blend_sensitivity",
+        lambda: factor_blend_sensitivity.build_sensitivity_report(
+            df_base if df_base is not None else __import__("pandas").DataFrame(),
+            fb_regime_weights,
+            horizon=fb_horizon,
+        ),
+        required_inputs={
+            "research_db": avail["research_db"],
+            "df_base": df_base is not None,
+        },
+        skip_if_missing=["df_base"],
     )
 
     # Macro multiplier evaluation
@@ -1148,6 +1174,7 @@ def main() -> None:
             confusion_matrix=diagnostics.get("confusion_matrix"),
             post_trade=diagnostics.get("post_trade"),
             monte_carlo=diagnostics.get("monte_carlo"),
+            factor_blend_sensitivity=diagnostics.get("factor_blend_sensitivity"),
         )
 
         # Prepend completeness summary to report
