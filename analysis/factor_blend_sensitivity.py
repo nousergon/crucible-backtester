@@ -44,6 +44,36 @@ KNOWN_STANCES: tuple[str, ...] = (
     "momentum", "quality", "value", "low_vol",
 )
 
+
+# Default regime weights mirror the canonical values in
+# alpha-engine-config/research/scoring.yaml aggregator.factor_blend.
+# Used by the weekly wire-in (evaluate.py) when the backtester config
+# doesn't carry an override. Updating scoring.yaml weights should be
+# accompanied by a mirror update here — drift would silently break the
+# mismatch detector since the analyzer would compare realized outcomes
+# against stale config weights. Pinned by test against the values in
+# alpha-engine-config (see test_factor_blend_sensitivity_defaults_align).
+DEFAULT_REGIME_WEIGHTS: dict[str, dict[str, float]] = {
+    "bull": {
+        "momentum_score": 0.40,
+        "quality_score": 0.30,
+        "value_score": 0.20,
+        "low_vol_score": -0.10,
+    },
+    "bear": {
+        "low_vol_score": 0.40,
+        "quality_score": 0.30,
+        "momentum_score": -0.20,
+        "value_score": 0.10,
+    },
+    "neutral": {
+        "momentum_score": 0.25,
+        "quality_score": 0.25,
+        "value_score": 0.25,
+        "low_vol_score": 0.25,
+    },
+}
+
 # Minimum samples per (regime, stance) cell before we trust the realized
 # stats. Below this the cell is reported but ``trustworthy=False`` — the
 # downstream consumer should not act on the mismatch flag for tiny cells.
@@ -218,7 +248,7 @@ def detect_mismatches(
     return pd.DataFrame(rows)
 
 
-def build_report(
+def build_sensitivity_report(
     score_performance: pd.DataFrame,
     regime_weights: dict[str, dict[str, float]],
     horizon: str = "10d",

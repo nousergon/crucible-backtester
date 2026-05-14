@@ -727,6 +727,7 @@ def build_report(
     confusion_matrix: dict | None = None,
     post_trade: dict | None = None,
     monte_carlo: dict | None = None,
+    factor_blend_sensitivity: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -824,6 +825,13 @@ def build_report(
 
         # Attribution
         lines += _section_attribution(attribution)
+        lines += [""]
+
+    # Factor blend sensitivity (PR 6 of scanner-placement arc + follow-up).
+    # Renders only when the diagnostic ran. Empty-data path renders a
+    # one-line "deferred" banner inside the section.
+    if factor_blend_sensitivity:
+        lines += _section_factor_blend_sensitivity(factor_blend_sensitivity)
         lines += [""]
 
     # Alpha magnitude distribution
@@ -1214,6 +1222,86 @@ def _section_attribution(attr: dict) -> list[str]:
         lines += ["", f"> FDR non-significant: {', '.join(fdr_ns)}"]
 
     lines += ["", f"> {attr.get('note', '')}"]
+    return lines
+
+
+def _section_factor_blend_sensitivity(report: dict) -> list[str]:
+    """Render factor_blend_sensitivity report — does configured regime weight
+    ordering match realized stance Sortino ordering?
+
+    Observability layer (PR 6 of scanner-placement arc). Surfaces
+    mismatches between alpha-engine-config/research/scoring.yaml
+    aggregator.factor_blend's per-regime stance weights and the
+    realized risk-adjusted return per (regime, stance) cell.
+    """
+    lines = ["## Factor blend sensitivity"]
+    if not report or not report.get("has_data"):
+        lines += [
+            "",
+            "> Deferred until factor_blend Phase 3 has accumulated history "
+            "in score_performance (stance + market_regime + returns).",
+        ]
+        return lines
+
+    horizon = report.get("horizon", "10d")
+    n_total = report.get("n_total", 0)
+    outcomes = report.get("outcomes")
+    mismatches = report.get("mismatches")
+
+    lines += [
+        "",
+        f"Analyzed {n_total} signals across (regime, stance) cells "
+        f"(horizon: {horizon}). Cross-checks config-ordered stance "
+        "rankings vs realized-Sortino-ordered rankings.",
+        "",
+    ]
+
+    # Mismatch table — the headline finding
+    if mismatches is not None and not getattr(mismatches, "empty", True):
+        lines += [
+            "### Config vs realized stance ordering",
+            "",
+            "| Regime | Config #1 | Realized #1 | Trustworthy cells | Mismatch |",
+            "|--------|-----------|-------------|-------------------|----------|",
+        ]
+        for _, row in mismatches.iterrows():
+            mismatch_val = row.get("mismatch")
+            if mismatch_val is None or (
+                hasattr(mismatch_val, "__bool__") is False
+                and str(mismatch_val) == "nan"
+            ):
+                m = "—"
+            else:
+                m = "**YES**" if bool(mismatch_val) else "no"
+            lines.append(
+                f"| {row.get('market_regime', '?')} | "
+                f"{row.get('config_top_stance') or '—'} | "
+                f"{row.get('realized_top_stance') or '—'} | "
+                f"{row.get('n_trustworthy_cells', 0)} | {m} |"
+            )
+
+    # Per-(regime, stance) outcomes
+    if outcomes is not None and not getattr(outcomes, "empty", True):
+        lines += [
+            "",
+            "### Realized per-stance outcomes",
+            "",
+            "| Regime | Stance | n | Mean α | Sortino | Hit rate | Trustworthy |",
+            "|--------|--------|---|--------|---------|----------|-------------|",
+        ]
+        for _, row in outcomes.iterrows():
+            trust = "yes" if bool(row.get("trustworthy")) else "no"
+            sortino = row.get("sortino")
+            sortino_str = f"{sortino:.2f}" if sortino is not None else "—"
+            hit = row.get("hit_rate_beat_spy")
+            hit_str = f"{100*hit:.0f}%" if hit is not None else "—"
+            lines.append(
+                f"| {row.get('market_regime', '?')} | "
+                f"{row.get('stance', '?')} | {int(row.get('n_picks', 0))} | "
+                f"{_alpha_pp(row.get('mean_alpha'))} | {sortino_str} | "
+                f"{hit_str} | {trust} |"
+            )
+
     return lines
 
 
