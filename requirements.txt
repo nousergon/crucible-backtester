@@ -39,4 +39,10 @@ cvxpy>=1.4,<1.8
 # model_metadata + full_prompt_context (deterministic executor decisions
 # under L2308). Consumed here by replay/runner.py (skips deterministic
 # captures with explicit marker rather than crashing on None.get(...)).
-alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.13.0
+# v0.16.0 adds load_latest_eval_artifact + list_eval_artifacts for the
+# canonical sidecar-resolution reader. Required by sibling alpha-engine
+# executor's signal_reader.py (imported via test_simulate_via_deciders
+# integration tests); cross-repo lockstep — bumping in sync with
+# alpha-engine's lib pin to avoid the silent-downgrade pattern flagged
+# in feedback_lib_pin_lockstep_cross_repo_composition.
+alpha-engine-lib[arcticdb,flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.16.0
