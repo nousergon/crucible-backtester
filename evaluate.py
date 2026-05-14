@@ -65,6 +65,7 @@ from analysis import end_to_end
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
 from analysis import exit_timing, macro_eval
+from analysis import regime_stratified_sortino_runner
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
 from optimizer import trigger_optimizer, predictor_sizing_optimizer
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
@@ -419,6 +420,22 @@ def _run_diagnostics(
     results["macro_eval"] = tracker.run_module(
         "macro_eval",
         lambda: macro_eval.compute_macro_evaluation(db_path),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Regime-stratified Sortino (Stage C.2 T2). Reads score_performance,
+    # groups picks by market_regime, computes Sortino/Sharpe/log-alpha
+    # per (regime, horizon) and the bull-bear Sortino spread (headline
+    # T2 metric). Writes canonical eval-artifact to
+    # s3://{bucket}/regime/stratified_sortino/{run_id}.json + latest.json
+    # sidecar — consumed by the dashboard's Regime page.
+    results["regime_stratified_sortino"] = tracker.run_module(
+        "regime_stratified_sortino",
+        lambda: regime_stratified_sortino_runner.run_regime_stratified_sortino(
+            db_path=db_path,
+            s3_bucket=config.get("s3_bucket") or config.get("signals_bucket"),
+        ),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
     )

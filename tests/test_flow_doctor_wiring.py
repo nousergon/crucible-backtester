@@ -368,11 +368,12 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.13.0" in text, (
-            "alpha-engine-lib should pin to v0.13.0 (alpha_engine_lib.universe "
-            "module — IO-agnostic filter_to_universe + in_universe primitives; "
-            "consumed transitively via the executor's signal_reader at test "
-            "time for simulate-via-deciders parity. Lockstep with research + "
-            "executor pin bumps shipped 2026-05-12 night for L2853 universe "
-            "consolidation; update this test if the pin moves further forward."
+        assert "@v0.16.0" in text, (
+            "alpha-engine-lib should pin to v0.16.0 (load_latest_eval_artifact "
+            "+ list_eval_artifacts canonical readers — required transitively "
+            "by the executor's signal_reader at test time for simulate-via-"
+            "deciders parity. Lockstep with the alpha-engine executor pin "
+            "bumped 2026-05-14 for the Stage D' Wire 2 sizing wire + the "
+            "T2 stratified-Sortino runner; update this test if the pin "
+            "moves further forward."
         )
