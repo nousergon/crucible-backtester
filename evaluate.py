@@ -31,10 +31,6 @@ import time as _time
 from datetime import date
 from pathlib import Path
 
-from ssm_secrets import load_secrets
-
-load_secrets()
-
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
 # pattern across all 5 entrypoints; see executor/main.py for reference).
 # Module-top so import-time errors in pandas / boto3 / analysis modules

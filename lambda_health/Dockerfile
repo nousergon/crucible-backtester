@@ -24,7 +24,6 @@ RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://gith
     rm -rf /root/.cache/pip
 
 # Copy application code
-COPY ssm_secrets.py .
 COPY health_status.py .
 COPY preflight.py .
 COPY analysis/__init__.py analysis/

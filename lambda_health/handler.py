@@ -52,12 +52,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 #
 # exclude_patterns starts empty by deliberate convention.
 #
-# Why module-top is safe even though load_secrets is deferred below:
-# flow-doctor.yaml only references EMAIL_SENDER / EMAIL_RECIPIENTS /
-# GMAIL_APP_PASSWORD, all populated by Lambda's `--environment` block
-# BEFORE the Python interpreter starts. load_secrets() pulls separate
-# SSM-backed secrets (e.g. ANTHROPIC_API_KEY) that flow_doctor.init()
-# does not consult.
+# Secrets load via alpha_engine_lib.secrets.get_secret() at use-site
+# (per-process cached); flow-doctor.yaml only references EMAIL_SENDER /
+# EMAIL_RECIPIENTS / GMAIL_APP_PASSWORD, all populated by Lambda's
+# `--environment` block BEFORE the Python interpreter starts.
 from alpha_engine_lib.logging import setup_logging
 from alpha_engine_lib.secrets import get_secret
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
@@ -78,21 +76,21 @@ log = logging.getLogger(__name__)
 
 # Expensive init is deferred to the first handler invocation to keep
 # Lambda's cold-start init phase under the 10-second hard timeout.
-# Pre-emptively applies research's / predictor's _ensure_init pattern
-# even though lambda_health is "lightweight" — load_secrets() is an
-# SSM round-trip (~1-2s) and the same v72-class regression that hit
-# alpha-engine-predictor is the failure mode we want to keep closed.
 # Idempotent via the `_init_done` flag.
+#
+# Post-L2998-PR-9c (2026-05-14): secrets now load via
+# alpha_engine_lib.secrets.get_secret() at use-site (lazy, per-process
+# cached). No bulk SSM round-trip on cold-start. Stub retained to
+# preserve the handler() call shape + idempotency flag in case future
+# deferred init is needed.
 _init_done = False
 
 
 def _ensure_init() -> None:
-    """Run expensive init once, on the first handler invocation."""
+    """Run deferred init once, on the first handler invocation."""
     global _init_done
     if _init_done:
         return
-    from ssm_secrets import load_secrets
-    load_secrets()
     _init_done = True
 
 

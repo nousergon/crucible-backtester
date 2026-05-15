@@ -39,9 +39,14 @@ set -euo pipefail
 # ── Ensure HOME is set (SSM RunCommand does not set it) ──────────────────────
 export HOME="${HOME:-/home/ec2-user}"
 
-# ── Load .env ────────────────────────────────────────────────────────────────
-# Master .env lives in alpha-engine-data; fall back to ~/.alpha-engine.env
-# (Step Functions SSM), then local .env
+# ── Path setup ───────────────────────────────────────────────────────────────
+# Launcher-side .env sourcing was retired in L2998 PR 9c (2026-05-14):
+# secrets load from SSM via alpha_engine_lib.secrets.get_secret() at
+# Python startup; the EC2 instance role grants ssm:GetParameter on
+# /alpha-engine/*. ENV_FILE is still resolved for the spot-side SCP at
+# the upload step below, which carries non-secret runtime config
+# (EMAIL_*, S3_BUCKET, etc.) until that path is also retired under a
+# follow-on PR.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -51,15 +56,6 @@ if [ ! -f "$ENV_FILE" ]; then
 fi
 if [ ! -f "$ENV_FILE" ]; then
     ENV_FILE="$REPO_ROOT/.env"
-fi
-if [ -f "$ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    set +a
-    echo "Loaded .env from $ENV_FILE"
-else
-    echo "WARNING: No .env file found"
 fi
 
 # ── Configuration ──────────────────────────────────────────────────────────────

@@ -59,7 +59,7 @@ echo "════════════════════════�
 echo "  STEP 2: Evaluator (ae-data via SSM)"
 echo "═══════════════════════════════════════════════════════════════"
 
-EVAL_CMD="set -eo pipefail; export HOME=/home/ec2-user; sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main; cd /home/ec2-user/alpha-engine-backtester; set -a && source /home/ec2-user/.alpha-engine.env && set +a; source .venv/bin/activate; python evaluate.py --mode ${EVAL_MODE} --upload 2>&1"
+EVAL_CMD="set -eo pipefail; export HOME=/home/ec2-user; sudo -u ec2-user git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main; cd /home/ec2-user/alpha-engine-backtester; source .venv/bin/activate; python evaluate.py --mode ${EVAL_MODE} --upload 2>&1"
 
 SSM_CMD_ID=$(aws ssm send-command \
     --instance-ids "$AE_DATA_INSTANCE_ID" \
