@@ -34,7 +34,6 @@ RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://gith
 # Lambda Lambda task layout flattens lambda_concordance/handler.py to
 # /var/task/handler.py (handler resolves LAMBDA_TASK_ROOT). replay/
 # imports stay nested.
-COPY ssm_secrets.py .
 COPY preflight.py .
 COPY replay/ replay/
 
