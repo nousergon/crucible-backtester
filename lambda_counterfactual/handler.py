@@ -71,23 +71,15 @@ _init_done = False
 
 
 def _ensure_init() -> None:
-    """Defer SSM secrets fetch to first invocation. No LLM creds needed
-    by counterfactual but flow-doctor's email channel does need EMAIL_*
-    vars (already populated by Lambda's --environment block, not SSM)
-    so this is a near-no-op. Kept for parity with the rest of the
-    Lambda fleet."""
+    """Run deferred init once, on the first handler invocation.
+
+    Post-L2998-PR-9c (2026-05-14): secrets load via
+    alpha_engine_lib.secrets.get_secret() at use-site. No bulk SSM
+    fetch here. Retained for parity with the Lambda fleet + the
+    XDG_CACHE_HOME default needed for Lambda's read-only /var/task."""
     global _init_done
     if _init_done:
         return
-    try:
-        from ssm_secrets import load_secrets
-        load_secrets()
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[lambda_counterfactual] ssm_secrets.load_secrets() failed; "
-            "relying on existing env vars",
-            exc_info=True,
-        )
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
     _init_done = True
 

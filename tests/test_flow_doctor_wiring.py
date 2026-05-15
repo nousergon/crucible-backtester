@@ -308,14 +308,13 @@ class TestFlowDoctorRetrievalIsLiveOnlyWhereUsed:
 
 
 class TestColdStartDeferral:
-    """lambda_health/handler.py must defer load_secrets() to first
-    invocation via _ensure_init(), keeping cold-start under Lambda's
-    10s init wall.
+    """lambda_health/handler.py must NOT call load_secrets() anywhere.
 
-    Pre-emptive lock based on the alpha-engine-predictor canary v72
-    failure (statusCode=0, FunctionError= empty) on 2026-05-01 —
-    same class. Mirrors alpha-engine-research and alpha-engine-predictor
-    handler patterns.
+    Post-L2998-PR-9c (2026-05-14): the per-repo ssm_secrets shim is
+    deleted. Secrets load via alpha_engine_lib.secrets.get_secret() at
+    use-site (per-process cached). The _ensure_init() function is
+    retained as a deferred-init hook in case future cold-start work
+    needs it, but the load_secrets() body has been stripped.
 
     Source-text checks; runtime behavior covered by docker smoke
     (not in CI).
@@ -328,16 +327,22 @@ class TestColdStartDeferral:
         stripped = re.sub(r"^\s*#.*$", "", stripped, flags=re.MULTILINE)
         return stripped
 
-    def test_lambda_health_handler_does_not_call_load_secrets_at_module_top(self):
+    def test_lambda_health_handler_does_not_call_load_secrets(self):
         text = (REPO_ROOT / "lambda_health" / "handler.py").read_text()
         body = self._strip_comments_and_docstrings(text)
-        ensure_def_idx = body.find("def _ensure_init(")
-        assert ensure_def_idx != -1, "_ensure_init() must be defined at module-top"
-        prefix = body[:ensure_def_idx]
-        assert "load_secrets()" not in prefix, (
-            "lambda_health/handler.py calls load_secrets() at module-top; "
-            "defer it inside _ensure_init() to keep cold-start under "
-            "Lambda's 10s init timeout"
+        assert "load_secrets()" not in body, (
+            "lambda_health/handler.py must not call load_secrets(); "
+            "the per-repo ssm_secrets shim is deleted post-PR-9c and "
+            "secrets now load via alpha_engine_lib.secrets.get_secret() "
+            "at use-site"
+        )
+        assert "from ssm_secrets" not in body, (
+            "lambda_health/handler.py must not import from ssm_secrets; "
+            "the shim is deleted post-PR-9c"
+        )
+        assert "import ssm_secrets" not in body, (
+            "lambda_health/handler.py must not import ssm_secrets; "
+            "the shim is deleted post-PR-9c"
         )
 
     def test_lambda_health_handler_calls_ensure_init_first_in_handler(self):
@@ -346,11 +351,12 @@ class TestColdStartDeferral:
         assert handler_idx != -1
         body = text[handler_idx:]
         ensure_call_idx = body.find("_ensure_init()")
-        # BacktesterPreflight uses ANTHROPIC_API_KEY (or similar) that
-        # load_secrets populates — ensure init runs before preflight.
+        # _ensure_init() is retained as a deferred-init hook (currently
+        # a no-op stub post-PR-9c). Preserve the call-shape so future
+        # cold-start work has a wired entry point.
         preflight_idx = body.find("BacktesterPreflight(")
         assert ensure_call_idx != -1, (
-            "handler() must call _ensure_init() to fire deferred SSM load"
+            "handler() must call _ensure_init() (deferred-init hook)"
         )
         if preflight_idx != -1:
             assert ensure_call_idx < preflight_idx, (
