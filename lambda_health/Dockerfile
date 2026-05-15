@@ -36,6 +36,13 @@ COPY preflight.py .
 COPY analysis/__init__.py analysis/
 COPY analysis/production_health.py analysis/
 COPY analysis/retrain_alert.py analysis/
+# production_health.py imports the canonical COALESCE / horizon-filter SQL
+# constants + ACTIVE_HORIZON_DAYS from pipeline_common (introduced by the
+# #178/#180 canonical-alpha analytics arc). The Dockerfile was never
+# updated to ship it, so the first post-#178 build raised
+# ModuleNotFoundError: pipeline_common at runtime. Slim-safe: its
+# module-level imports are stdlib + boto3/pandas/yaml only.
+COPY pipeline_common.py .
 COPY lambda_health/handler.py handler.py
 
 # flow-doctor.yaml ships alongside the handler; handler.py resolves
