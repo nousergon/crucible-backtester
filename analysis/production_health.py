@@ -30,10 +30,12 @@ import pandas as pd
 from pipeline_common import (
     ACTIVE_HORIZON_DAYS,
     ALPHA_COALESCE_SQL,
+    CANONICAL_CUTOVER_DATE,
     CORRECT_COALESCE_SQL,
     CURRENT_HORIZON_FILTER_SQL,
     HORIZON_COALESCE_SQL,
     OUTCOMES_GRADED_SQL,
+    POST_CUTOVER_FILTER_SQL,
 )
 
 log = logging.getLogger(__name__)
@@ -42,6 +44,65 @@ _MIN_SAMPLES = 10
 _IC_STD_EPSILON = 1e-8
 _MODE_COLLAPSE_THRESHOLD = 0.75  # if any direction > 75% of predictions → flag
 _DEGRADATION_RATIO = 0.50  # flag if production IC < 50% of training IC
+
+
+def _classify_skipped_window(conn, cutoff: str, n_current: int) -> dict:
+    """Build the skip payload when the current-model window is under-sized.
+
+    Distinguishes the expected post-cutover maturation blackout from a
+    genuine data gap. `horizon_days = N` does NOT isolate the post-cutover
+    model — the grader stamps `horizon_days` at grade time, so pre-cutover
+    predictions whose 21d window closed post-migration also carry it. So
+    production analytics additionally scope to `prediction_date >= the
+    canonical cutover`. During the ~21-trading-day window after the cutover
+    there are graded outcomes in the lookback but none from the post-cutover
+    model. Re-count graded rows ignoring both the horizon and cutover
+    filters: if such rows exist, this is the blackout (self-clears); only
+    a truly empty graded window is a real `insufficient_samples` gap.
+
+    Shared by compute_production_health + compute_calibration_validation so
+    the IC and ECE paths classify the blackout identically.
+    """
+    n_any = int(
+        pd.read_sql_query(
+            "SELECT COUNT(*) AS n FROM predictor_outcomes "
+            f"WHERE {OUTCOMES_GRADED_SQL} AND prediction_date >= ?",
+            conn,
+            params=(cutoff,),
+        )["n"].iloc[0]
+    )
+    if n_any >= _MIN_SAMPLES:
+        msg = (
+            f"Post-cutover blackout: {n_any} resolved outcomes in window but "
+            f"{n_current} from the post-cutover model (prediction_date >= "
+            f"{CANONICAL_CUTOVER_DATE}) at the active {ACTIVE_HORIZON_DAYS}d "
+            f"horizon (< {_MIN_SAMPLES}). Pre-cutover-model rows are excluded "
+            f"by design — their confidence/score semantics differ from the "
+            f"current model. Current-model outcomes mature ~"
+            f"{ACTIVE_HORIZON_DAYS} trading days after the "
+            f"{CANONICAL_CUTOVER_DATE} cutover. Self-clears — not a "
+            f"degradation and not a broken pipeline."
+        )
+        log.info("Production health: %s", msg)
+        return {
+            "status": "skipped",
+            "reason": "post_cutover_ic_blackout",
+            "n": n_current,
+            "n_any_horizon": n_any,
+            "active_horizon_days": ACTIVE_HORIZON_DAYS,
+            "message": msg,
+        }
+
+    log.info(
+        "Production health: %d post-cutover current-horizon outcomes (< %d) — skipping",
+        n_current, _MIN_SAMPLES,
+    )
+    return {
+        "status": "skipped",
+        "reason": "insufficient_samples",
+        "n": n_current,
+        "n_any_horizon": n_any,
+    }
 
 
 def compute_production_health(
@@ -73,55 +134,15 @@ def compute_production_health(
         "FROM predictor_outcomes "
         f"WHERE {OUTCOMES_GRADED_SQL} "
         f"  AND {CURRENT_HORIZON_FILTER_SQL} "
+        f"  AND {POST_CUTOVER_FILTER_SQL} "
         f"  AND prediction_date >= ?",
         conn,
         params=(cutoff,),
     )
     if len(df) < _MIN_SAMPLES:
-        # Distinguish a genuine data gap from the expected post-cutover
-        # blackout. After the 2026-05-09 21d canonical-alpha cutover, the
-        # strict `horizon_days = ACTIVE_HORIZON_DAYS` filter excludes
-        # pre-cutover NULL-horizon / legacy-5d rows by design. For ~21
-        # trading days after the first post-cutover prediction there are
-        # simply no graded current-horizon outcomes yet — that is NOT a
-        # broken pipeline. Re-count graded rows in the window WITHOUT the
-        # horizon filter: if resolved outcomes exist but none at the active
-        # horizon, this is the maturation blackout, which self-clears.
-        n_any_horizon = pd.read_sql_query(
-            "SELECT COUNT(*) AS n FROM predictor_outcomes "
-            f"WHERE {OUTCOMES_GRADED_SQL} AND prediction_date >= ?",
-            conn,
-            params=(cutoff,),
-        )["n"].iloc[0]
+        result = _classify_skipped_window(conn, cutoff, len(df))
         conn.close()
-
-        if n_any_horizon >= _MIN_SAMPLES:
-            msg = (
-                f"Post-cutover IC blackout: {n_any_horizon} resolved outcomes "
-                f"in window but {len(df)} at the active {ACTIVE_HORIZON_DAYS}d "
-                f"horizon (< {_MIN_SAMPLES}). Pre-cutover/legacy rows are "
-                f"excluded by design; current-horizon outcomes mature ~"
-                f"{ACTIVE_HORIZON_DAYS} trading days after the 21d canonical "
-                f"cutover. Self-clears — not a degradation and not a broken "
-                f"pipeline."
-            )
-            log.info("Production health: %s", msg)
-            return {
-                "status": "skipped",
-                "reason": "post_cutover_ic_blackout",
-                "n": len(df),
-                "n_any_horizon": int(n_any_horizon),
-                "active_horizon_days": ACTIVE_HORIZON_DAYS,
-                "message": msg,
-            }
-
-        log.info("Production health: %d resolved outcomes (< %d minimum) — skipping", len(df), _MIN_SAMPLES)
-        return {
-            "status": "skipped",
-            "reason": "insufficient_samples",
-            "n": len(df),
-            "n_any_horizon": int(n_any_horizon),
-        }
+        return result
 
     conn.close()
 
@@ -374,14 +395,23 @@ def compute_calibration_validation(
         "FROM predictor_outcomes "
         f"WHERE {OUTCOMES_GRADED_SQL} "
         f"  AND {CURRENT_HORIZON_FILTER_SQL} "
+        f"  AND {POST_CUTOVER_FILTER_SQL} "
         f"  AND prediction_date >= ?",
         conn,
         params=(cutoff,),
     )
-    conn.close()
 
     if len(df) < _MIN_SAMPLES:
-        return {"status": "skipped", "reason": "insufficient_samples", "n": len(df)}
+        # Same blackout classification as the IC path: pre-cutover-model
+        # rows graded at 21d would otherwise pool a stale, semantically
+        # mismatched population into the ECE (the 2026-05-15 spurious
+        # calibration_breakdown). During the post-cutover maturation
+        # window this self-clears.
+        result = _classify_skipped_window(conn, cutoff, len(df))
+        conn.close()
+        return result
+
+    conn.close()
 
     df["confidence"] = pd.to_numeric(df["prediction_confidence"], errors="coerce")
     df["correct"] = pd.to_numeric(df["canonical_correct"], errors="coerce")
