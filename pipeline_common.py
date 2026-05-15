@@ -117,6 +117,21 @@ ACTIVE_HORIZON_DAYS = _load_active_horizon_days()
 # so any post-cutover resolved row always has a non-NULL value.
 CURRENT_HORIZON_FILTER_SQL = f"horizon_days = {ACTIVE_HORIZON_DAYS}"
 
+# Canonical-alpha cutover date (2026-05-09; alpha-engine-predictor PRs A-E).
+# `horizon_days = 21` alone does NOT isolate the post-cutover model: the
+# grading job stamps `horizon_days` at GRADE time, so a PRE-cutover-model
+# prediction whose 21d window closed post-migration also gets
+# `horizon_days = 21` with a populated `actual_log_alpha`. Those rows carry
+# the OLD model's confidence/score semantics and must not drive retrain
+# alerts about the CURRENT model. Production-quality analytics (rolling IC,
+# regime IC, calibration ECE) therefore scope to predictions MADE on/after
+# the cutover. Surfaced 2026-05-15: post-#180 the IC path was safe only by
+# luck (its 30d window held zero such rows) while the 60d calibration
+# window pooled 415 pre-cutover-model rows → spurious calibration_breakdown.
+# Historical / cross-era reads (weight optimizer sweeps) must NOT apply this.
+CANONICAL_CUTOVER_DATE = "2026-05-09"
+POST_CUTOVER_FILTER_SQL = f"prediction_date >= '{CANONICAL_CUTOVER_DATE}'"
+
 
 # ── Phase markers ────────────────────────────────────────────────────────────
 #
