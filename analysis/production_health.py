@@ -77,11 +77,53 @@ def compute_production_health(
         conn,
         params=(cutoff,),
     )
-    conn.close()
-
     if len(df) < _MIN_SAMPLES:
+        # Distinguish a genuine data gap from the expected post-cutover
+        # blackout. After the 2026-05-09 21d canonical-alpha cutover, the
+        # strict `horizon_days = ACTIVE_HORIZON_DAYS` filter excludes
+        # pre-cutover NULL-horizon / legacy-5d rows by design. For ~21
+        # trading days after the first post-cutover prediction there are
+        # simply no graded current-horizon outcomes yet — that is NOT a
+        # broken pipeline. Re-count graded rows in the window WITHOUT the
+        # horizon filter: if resolved outcomes exist but none at the active
+        # horizon, this is the maturation blackout, which self-clears.
+        n_any_horizon = pd.read_sql_query(
+            "SELECT COUNT(*) AS n FROM predictor_outcomes "
+            f"WHERE {OUTCOMES_GRADED_SQL} AND prediction_date >= ?",
+            conn,
+            params=(cutoff,),
+        )["n"].iloc[0]
+        conn.close()
+
+        if n_any_horizon >= _MIN_SAMPLES:
+            msg = (
+                f"Post-cutover IC blackout: {n_any_horizon} resolved outcomes "
+                f"in window but {len(df)} at the active {ACTIVE_HORIZON_DAYS}d "
+                f"horizon (< {_MIN_SAMPLES}). Pre-cutover/legacy rows are "
+                f"excluded by design; current-horizon outcomes mature ~"
+                f"{ACTIVE_HORIZON_DAYS} trading days after the 21d canonical "
+                f"cutover. Self-clears — not a degradation and not a broken "
+                f"pipeline."
+            )
+            log.info("Production health: %s", msg)
+            return {
+                "status": "skipped",
+                "reason": "post_cutover_ic_blackout",
+                "n": len(df),
+                "n_any_horizon": int(n_any_horizon),
+                "active_horizon_days": ACTIVE_HORIZON_DAYS,
+                "message": msg,
+            }
+
         log.info("Production health: %d resolved outcomes (< %d minimum) — skipping", len(df), _MIN_SAMPLES)
-        return {"status": "skipped", "reason": "insufficient_samples", "n": len(df)}
+        return {
+            "status": "skipped",
+            "reason": "insufficient_samples",
+            "n": len(df),
+            "n_any_horizon": int(n_any_horizon),
+        }
+
+    conn.close()
 
     # ── Rolling IC & hit rate ────────────────────────────────────────────────
     df["net_signal"] = pd.to_numeric(df["p_up"], errors="coerce").fillna(0) - pd.to_numeric(df["p_down"], errors="coerce").fillna(0)
