@@ -19,6 +19,13 @@ FROM public.ecr.aws/lambda/python:3.12
 # a local copy via deploy_health.sh staging). No [arcticdb] — health
 # Lambda reads S3 only.
 COPY requirements-health.txt .
+# `git` is required for the git+https install below and is NOT present in
+# the AL2023-based Lambda python base image. Omitting it silently broke
+# every `deploy_health.sh` build after the 2026-05-03 lib-public flip
+# switched this line from a vendored local copy to git+https — which is
+# why the health Lambda image stayed frozen at its 2026-04-08 build and
+# re-raised the already-fixed 2026-05-11 false-positive retrain alert.
+RUN microdnf install -y git && microdnf clean all
 RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.16.0" && \
     pip install --no-cache-dir -r requirements-health.txt && \
     rm -rf /root/.cache/pip
