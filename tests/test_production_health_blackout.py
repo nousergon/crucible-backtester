@@ -16,6 +16,7 @@ Fix: production analytics scope to `prediction_date >= CANONICAL_CUTOVER_DATE`
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -126,6 +127,30 @@ def test_calibration_pre_cutover_rows_report_blackout(tmp_path):
     assert result["status"] == "skipped"
     assert result["reason"] == "post_cutover_ic_blackout"
     assert "overall_ece" not in result
+
+
+def test_blackout_result_is_persisted_to_s3(tmp_path, monkeypatch):
+    """Regression for the 2026-05-15 forensic landmine: the skip path
+    returned before the S3 write, freezing production_health.json at a
+    stale degradation_flag. The blackout result must be persisted."""
+    from analysis import production_health as ph
+
+    puts: dict[str, dict] = {}
+
+    class _S3:
+        def put_object(self, Bucket, Key, Body, ContentType):
+            puts[Key] = json.loads(Body)
+
+    monkeypatch.setattr(ph.boto3, "client", lambda svc, *a, **k: _S3())
+
+    db = _make_db(tmp_path, [_row(i, _PRE, 21) for i in range(15)])
+    ph.compute_production_health(db, bucket="b", run_date="2026-05-15")
+
+    key = "predictor/metrics/production_health.json"
+    assert key in puts, "blackout skip must still persist production_health.json"
+    assert puts[key]["reason"] == "post_cutover_ic_blackout"
+    assert puts[key]["date"] == "2026-05-15"
+    assert "degradation_flag" not in puts[key]
 
 
 def test_blackout_skip_does_not_trigger_retrain_alert(tmp_path):

@@ -45,8 +45,33 @@ _IC_STD_EPSILON = 1e-8
 _MODE_COLLAPSE_THRESHOLD = 0.75  # if any direction > 75% of predictions → flag
 _DEGRADATION_RATIO = 0.50  # flag if production IC < 50% of training IC
 
+_PROD_HEALTH_KEY = "predictor/metrics/production_health.json"
+_CALIBRATION_KEY = "predictor/metrics/calibration_validation.json"
 
-def _classify_skipped_window(conn, cutoff: str, n_current: int) -> dict:
+
+def _persist_metric(bucket: str, key: str, result: dict) -> None:
+    """Best-effort write of a metrics artifact to S3.
+
+    Called on EVERY non-error return path (skip/blackout AND full compute)
+    so the standalone artifact always reflects the latest run. Before this,
+    skip/blackout paths returned before the write, freezing
+    production_health.json at the last full-compute run's
+    `degradation_flag` — the 2026-05-15 forensic landmine that opened this
+    investigation (`training_ic_source: None` was read off that stale file).
+    """
+    try:
+        boto3.client("s3").put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(result, indent=2, default=str).encode(),
+            ContentType="application/json",
+        )
+        log.info("Wrote %s (%s)", key, result.get("reason") or result.get("status") or "ok")
+    except Exception as exc:
+        log.warning("Failed to write %s to S3: %s", key, exc)
+
+
+def _classify_skipped_window(conn, cutoff: str, n_current: int, run_date: str) -> dict:
     """Build the skip payload when the current-model window is under-sized.
 
     Distinguishes the expected post-cutover maturation blackout from a
@@ -85,6 +110,7 @@ def _classify_skipped_window(conn, cutoff: str, n_current: int) -> dict:
         )
         log.info("Production health: %s", msg)
         return {
+            "date": run_date,
             "status": "skipped",
             "reason": "post_cutover_ic_blackout",
             "n": n_current,
@@ -98,6 +124,7 @@ def _classify_skipped_window(conn, cutoff: str, n_current: int) -> dict:
         n_current, _MIN_SAMPLES,
     )
     return {
+        "date": run_date,
         "status": "skipped",
         "reason": "insufficient_samples",
         "n": n_current,
@@ -140,8 +167,9 @@ def compute_production_health(
         params=(cutoff,),
     )
     if len(df) < _MIN_SAMPLES:
-        result = _classify_skipped_window(conn, cutoff, len(df))
+        result = _classify_skipped_window(conn, cutoff, len(df), run_date)
         conn.close()
+        _persist_metric(bucket, _PROD_HEALTH_KEY, result)
         return result
 
     conn.close()
@@ -194,22 +222,11 @@ def compute_production_health(
         "mode_collapse_flag": mode_collapse_flag,
     }
 
-    # ── Write to S3 ──────────────────────────────────────────────────────────
-    try:
-        s3 = boto3.client("s3")
-        s3.put_object(
-            Bucket=bucket,
-            Key="predictor/metrics/production_health.json",
-            Body=json.dumps(result, indent=2, default=str).encode(),
-            ContentType="application/json",
-        )
-        log.info(
-            "Production health: IC=%.4f  hit_rate=%.3f  degradation=%s  mode_collapse=%s  n=%d",
-            ic_30d or 0, hit_rate, degradation_flag, mode_collapse_flag, len(df),
-        )
-    except Exception as exc:
-        log.warning("Failed to write production_health.json to S3: %s", exc)
-
+    log.info(
+        "Production health: IC=%.4f  hit_rate=%.3f  degradation=%s  mode_collapse=%s  n=%d",
+        ic_30d or 0, hit_rate, degradation_flag, mode_collapse_flag, len(df),
+    )
+    _persist_metric(bucket, _PROD_HEALTH_KEY, result)
     return result
 
 
@@ -407,8 +424,9 @@ def compute_calibration_validation(
         # mismatched population into the ECE (the 2026-05-15 spurious
         # calibration_breakdown). During the post-cutover maturation
         # window this self-clears.
-        result = _classify_skipped_window(conn, cutoff, len(df))
+        result = _classify_skipped_window(conn, cutoff, len(df), run_date)
         conn.close()
+        _persist_metric(bucket, _CALIBRATION_KEY, result)
         return result
 
     conn.close()
@@ -482,17 +500,6 @@ def compute_calibration_validation(
     if calibrator_deployed_at is not None:
         result["calibrator_deployed_at"] = calibrator_deployed_at
 
-    # ── Write to S3 ──────────────────────────────────────────────────────────
-    try:
-        s3 = boto3.client("s3")
-        s3.put_object(
-            Bucket=bucket,
-            Key="predictor/metrics/calibration_validation.json",
-            Body=json.dumps(result, indent=2, default=str).encode(),
-            ContentType="application/json",
-        )
-        log.info("Calibration validation: ECE=%.4f (%s)  bins=%d  n=%d", overall_ece or 0, quality, len(bins), total_n)
-    except Exception as exc:
-        log.warning("Failed to write calibration_validation.json to S3: %s", exc)
-
+    log.info("Calibration validation: ECE=%.4f (%s)  bins=%d  n=%d", overall_ece or 0, quality, len(bins), total_n)
+    _persist_metric(bucket, _CALIBRATION_KEY, result)
     return result
