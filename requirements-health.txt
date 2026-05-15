@@ -2,6 +2,10 @@ numpy>=1.24.0,<2
 pandas>=2.0
 scipy>=1.10
 boto3>=1.26.0
+# pipeline_common.py does `import yaml` at module import time (reads
+# labeling.forward_days to derive ACTIVE_HORIZON_DAYS). Pin explicitly
+# rather than rely on alpha-engine-lib pulling PyYAML transitively.
+pyyaml>=6.0
 # alpha-engine-lib provides setup_logging + get_flow_doctor used by
 # lambda_health/handler.py. Installed inside lambda_health/Dockerfile
 # from public git+https. [flow_doctor] pulls the flow-doctor extra;
