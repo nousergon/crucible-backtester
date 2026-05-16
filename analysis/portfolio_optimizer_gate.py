@@ -63,6 +63,7 @@ def evaluate_gate(comparison: dict) -> dict:
         Gate report dict:
             {
               "verdict": "pass" | "fail",
+              "signal_source": "synthetic" | "production" | "unknown",
               "n_pass": int,
               "n_fail": int,
               "n_skipped": int,
@@ -79,12 +80,13 @@ def evaluate_gate(comparison: dict) -> dict:
     optimizer = comparison["optimizer"] or {}
     thresholds = comparison["gate_thresholds"] or {}
     has_legacy = comparison.get("legacy") is not None
+    signal_source = comparison.get("signal_source", "unknown")
 
     criteria = [
         _check_sortino(optimizer, thresholds, has_legacy),
         _check_psr(optimizer, thresholds),
-        _check_max_drawdown(optimizer, thresholds, has_legacy),
-        _check_cvar(optimizer, thresholds, has_legacy),
+        _check_max_drawdown(optimizer, thresholds),
+        _check_cvar(optimizer, thresholds),
         _check_turnover(optimizer, thresholds, has_legacy),
         _check_tracking_error(optimizer, thresholds),
         _check_active_share(optimizer, thresholds),
@@ -95,10 +97,12 @@ def evaluate_gate(comparison: dict) -> dict:
     n_skipped = sum(1 for c in criteria if c.status == _SKIPPED)
 
     verdict = _PASS if n_fail == 0 and n_pass > 0 else _FAIL
-    summary = _build_summary(verdict, n_pass, n_fail, n_skipped, criteria)
+    summary = _build_summary(verdict, n_pass, n_fail, n_skipped, criteria,
+                             signal_source)
 
     return {
         "verdict": verdict,
+        "signal_source": signal_source,
         "n_pass": n_pass,
         "n_fail": n_fail,
         "n_skipped": n_skipped,
@@ -137,13 +141,15 @@ def _check_psr(optimizer: dict, thresholds: dict) -> GateResult:
                       f"psr_opt={value:.4f} {'≥' if status == _PASS else '<'} {threshold:.4f}")
 
 
-def _check_max_drawdown(optimizer: dict, thresholds: dict, has_legacy: bool) -> GateResult:
+def _check_max_drawdown(optimizer: dict, thresholds: dict) -> GateResult:
     name = "max_drawdown_floor"
     threshold = thresholds.get("max_drawdown_floor")
     value = optimizer.get("max_drawdown")
-    if threshold is None or not has_legacy:
+    # ROADMAP L124: absolute risk floor — applies with or without a legacy
+    # baseline. Only skip if no floor is configured at all.
+    if threshold is None:
         return GateResult(name, _SKIPPED, value, threshold,
-                          "No legacy baseline available")
+                          "No absolute max-drawdown floor configured")
     if value is None:
         return GateResult(name, _FAIL, None, threshold,
                           "Optimizer max_drawdown missing")
@@ -152,13 +158,15 @@ def _check_max_drawdown(optimizer: dict, thresholds: dict, has_legacy: bool) -> 
                       f"max_dd_opt={value:.4f} {'≥' if status == _PASS else '<'} {threshold:.4f} (less-negative=better)")
 
 
-def _check_cvar(optimizer: dict, thresholds: dict, has_legacy: bool) -> GateResult:
+def _check_cvar(optimizer: dict, thresholds: dict) -> GateResult:
     name = "cvar_95_floor"
     threshold = thresholds.get("cvar_95_floor")
     value = optimizer.get("cvar_95")
-    if threshold is None or not has_legacy:
+    # ROADMAP L124: absolute tail-risk floor — applies with or without a
+    # legacy baseline. Only skip if no floor is configured at all.
+    if threshold is None:
         return GateResult(name, _SKIPPED, value, threshold,
-                          "No legacy baseline available")
+                          "No absolute CVaR(95) floor configured")
     if value is None:
         return GateResult(name, _FAIL, None, threshold,
                           "Optimizer cvar_95 missing")
@@ -215,10 +223,13 @@ def _check_active_share(optimizer: dict, thresholds: dict) -> GateResult:
 
 
 def _build_summary(
-    verdict: str, n_pass: int, n_fail: int, n_skipped: int, criteria: list[GateResult],
+    verdict: str, n_pass: int, n_fail: int, n_skipped: int,
+    criteria: list[GateResult], signal_source: str = "unknown",
 ) -> str:
     lines = [
         f"GATE VERDICT: {verdict.upper()}  ({n_pass} pass / {n_fail} fail / {n_skipped} skipped)",
+        f"SIGNAL SOURCE: {signal_source}  "
+        f"(thresholds interpretable only against the matching input distribution)",
         "",
     ]
     for c in criteria:
@@ -246,11 +257,12 @@ def run_gate_against_predictor_backtest(
         config: full backtester config dict (signals_bucket, executor_paths,
             predictor_paths, predictor_backtest section, etc.).
         legacy_metrics: optional dict of legacy backtest metrics for
-            side-by-side comparison. When None, the gate reports skipped
-            verdicts for all legacy-relative criteria (sortino_min,
-            max_drawdown_floor, cvar_95_floor, turnover_max) while still
-            checking the absolute criteria (psr_min, tracking_error_range,
-            active_share_range).
+            side-by-side comparison. When None, the gate skips only the
+            legacy-relative criteria (sortino_min, turnover_max) while
+            still checking ALL absolute criteria (psr_min,
+            max_drawdown_floor, cvar_95_floor, tracking_error_range,
+            active_share_range) — ROADMAP L124: risk floors are absolute,
+            not gated on a legacy baseline.
         rebalance_freq_days: passthrough to run_optimizer_backtest.
         universe_cap: passthrough to run_optimizer_backtest.
 
@@ -316,7 +328,12 @@ def run_gate_against_predictor_backtest(
         universe_cap=universe_cap,
     )
 
-    comparison = compare_to_legacy(opt_result.metrics, legacy_metrics)
+    # This runner drives the synthetic predictor-GBM replay. The
+    # production-signal runner (consuming signals/{date}/signals.json) is
+    # the sequenced L124 PR 2 — it passes signal_source="production".
+    comparison = compare_to_legacy(
+        opt_result.metrics, legacy_metrics, signal_source="synthetic"
+    )
     report = evaluate_gate(comparison)
 
     logger.info(
