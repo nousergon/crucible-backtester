@@ -12,6 +12,11 @@ from __future__ import annotations
 
 import pytest
 
+from analysis.portfolio_optimizer_backtest import (
+    _ABS_CVAR_95_FLOOR,
+    _ABS_MAX_DRAWDOWN_FLOOR,
+    compare_to_legacy,
+)
 from analysis.portfolio_optimizer_gate import (
     evaluate_gate,
     gate_passed,
@@ -19,7 +24,11 @@ from analysis.portfolio_optimizer_gate import (
 
 
 def _all_pass_comparison() -> dict:
-    """Construct a comparison dict where every criterion should PASS."""
+    """Construct a comparison dict where every criterion should PASS.
+
+    Risk floors are the ABSOLUTE constants (ROADMAP L124) — no longer
+    legacy-scaled — and ``signal_source`` is threaded through.
+    """
     return {
         "optimizer": {
             "sortino_ratio": 1.5,
@@ -37,11 +46,12 @@ def _all_pass_comparison() -> dict:
             "cvar_95": -0.020,
             "turnover_one_way_ann": 1.0,
         },
+        "signal_source": "synthetic",
         "gate_thresholds": {
             "sortino_min": 1.4 * 0.9,
             "psr_min": 0.95,
-            "max_drawdown_floor": -0.15 * 1.2,
-            "cvar_95_floor": -0.020 * 1.2,
+            "max_drawdown_floor": _ABS_MAX_DRAWDOWN_FLOOR,
+            "cvar_95_floor": _ABS_CVAR_95_FLOOR,
             "turnover_max": 1.0 * 2.5,
             "tracking_error_range": [0.02, 0.06],
             "active_share_range": [0.08, 0.25],
@@ -111,14 +121,14 @@ class TestPsrCriterion:
 class TestDrawdownAndCvar:
     def test_max_dd_more_negative_than_floor_fails(self):
         comp = _all_pass_comparison()
-        comp["optimizer"]["max_drawdown"] = -0.25
+        comp["optimizer"]["max_drawdown"] = -0.40  # worse than absolute -0.35
         report = evaluate_gate(comp)
         dd = next(c for c in report["criteria"] if c["name"] == "max_drawdown_floor")
         assert dd["status"] == "fail"
 
     def test_cvar_more_negative_than_floor_fails(self):
         comp = _all_pass_comparison()
-        comp["optimizer"]["cvar_95"] = -0.05
+        comp["optimizer"]["cvar_95"] = -0.06  # worse than absolute -0.05
         report = evaluate_gate(comp)
         cvar = next(c for c in report["criteria"] if c["name"] == "cvar_95_floor")
         assert cvar["status"] == "fail"
@@ -157,38 +167,74 @@ class TestRangeGates:
 
 
 class TestNoLegacyBaseline:
-    def test_first_run_path_skips_legacy_gates_keeps_absolute_gates(self):
-        """When legacy is None, the gate should still check absolute criteria
-        (PSR, tracking-error range, active-share range) but skip legacy-
-        relative ones. Verdict can still be 'pass' if all checkable gates pass."""
-        comp = {
-            "optimizer": {
-                "sortino_ratio": 1.5,
-                "psr": 0.97,
-                "max_drawdown": -0.10,
-                "cvar_95": -0.015,
-                "turnover_one_way_ann": 1.5,
-                "tracking_error_ann": 0.04,
-                "mean_active_share": 0.15,
-            },
-            "legacy": None,
-            "gate_thresholds": {
-                "sortino_min": None,
-                "psr_min": 0.95,
-                "max_drawdown_floor": None,
-                "cvar_95_floor": None,
-                "turnover_max": None,
-                "tracking_error_range": [0.02, 0.06],
-                "active_share_range": [0.08, 0.25],
-            },
+    def test_first_run_applies_absolute_risk_floors_via_real_compare(self):
+        """ROADMAP L124: with NO legacy baseline, max_drawdown_floor and
+        cvar_95_floor are ABSOLUTE and still gate (previously they were
+        legacy-scaled → None → skipped, which made the gate circular —
+        "can't be riskier than a portfolio that barely trades"). Only the
+        genuinely legacy-relative criteria (sortino_min, turnover_max) skip.
+
+        Built via the REAL compare_to_legacy(..., None) so this asserts the
+        actual producer contract, not a hand-mocked threshold dict."""
+        optimizer = {
+            "sortino_ratio": 1.5,
+            "psr": 0.97,
+            "max_drawdown": -0.10,
+            "cvar_95": -0.015,
+            "turnover_one_way_ann": 1.5,
+            "tracking_error_ann": 0.04,
+            "mean_active_share": 0.15,
         }
+        comp = compare_to_legacy(optimizer, None, signal_source="production")
         report = evaluate_gate(comp)
-        assert report["n_skipped"] == 4, \
-            f"sortino/max_dd/cvar/turnover should be skipped; got {report['n_skipped']}"
-        assert report["n_pass"] == 3, \
-            f"psr/TE/AS should pass; got {report['n_pass']}"
-        assert report["verdict"] == "pass", \
-            "All checkable gates pass → overall verdict pass"
+
+        skipped = {c["name"] for c in report["criteria"]
+                   if c["status"] == "skipped_no_legacy"}
+        assert skipped == {"sortino_min", "turnover_max"}, \
+            f"only sortino/turnover skip without legacy; got {skipped}"
+
+        dd = next(c for c in report["criteria"] if c["name"] == "max_drawdown_floor")
+        cvar = next(c for c in report["criteria"] if c["name"] == "cvar_95_floor")
+        assert dd["status"] == "pass" and dd["threshold"] == _ABS_MAX_DRAWDOWN_FLOOR
+        assert cvar["status"] == "pass" and cvar["threshold"] == _ABS_CVAR_95_FLOOR
+
+        assert report["n_skipped"] == 2
+        assert report["n_pass"] == 5  # psr, max_dd, cvar, TE, AS
+        assert report["verdict"] == "pass"
+
+    def test_absolute_risk_floor_fails_without_legacy(self):
+        """The whole point of L124: a too-risky optimizer portfolio now
+        FAILS the gate even with no legacy baseline (previously: skipped)."""
+        optimizer = {
+            "sortino_ratio": 1.5, "psr": 0.97,
+            "max_drawdown": -0.50,  # worse than absolute -0.35
+            "cvar_95": -0.015,
+            "turnover_one_way_ann": 1.5,
+            "tracking_error_ann": 0.04, "mean_active_share": 0.15,
+        }
+        report = evaluate_gate(compare_to_legacy(optimizer, None))
+        dd = next(c for c in report["criteria"] if c["name"] == "max_drawdown_floor")
+        assert dd["status"] == "fail"
+        assert report["verdict"] == "fail"
+
+
+class TestSignalSourceDiscriminator:
+    def test_signal_source_propagates_to_report_and_summary(self):
+        comp = _all_pass_comparison()
+        comp["signal_source"] = "production"
+        report = evaluate_gate(comp)
+        assert report["signal_source"] == "production"
+        assert "SIGNAL SOURCE: production" in report["summary"]
+
+    def test_signal_source_defaults_unknown_when_absent(self):
+        comp = _all_pass_comparison()
+        del comp["signal_source"]
+        report = evaluate_gate(comp)
+        assert report["signal_source"] == "unknown"
+
+    def test_compare_to_legacy_defaults_synthetic(self):
+        comp = compare_to_legacy({"sortino_ratio": 1.0}, None)
+        assert comp["signal_source"] == "synthetic"
 
 
 class TestInputValidation:

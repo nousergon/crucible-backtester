@@ -19,6 +19,8 @@ import pandas as pd
 import pytest
 
 from analysis.portfolio_optimizer_backtest import (
+    _ABS_CVAR_95_FLOOR,
+    _ABS_MAX_DRAWDOWN_FLOOR,
     OptimizerBacktestResult,
     _ensure_spy_column,
     _gate_thresholds,
@@ -115,12 +117,14 @@ class TestGateThresholds:
         }
         out = _gate_thresholds({}, legacy)
         assert out["sortino_min"] == pytest.approx(1.4 * 0.9), \
-            "Sortino is the primary risk-adjusted gate"
+            "Sortino stays legacy-relative (primary risk-adjusted gate)"
         assert out["psr_min"] == pytest.approx(0.95), \
             "PSR confidence floor matches executor_optimizer's _MIN_PSR"
-        assert out["max_drawdown_floor"] == pytest.approx(-0.15 * 1.2)
-        assert out["cvar_95_floor"] == pytest.approx(-0.02 * 1.2)
-        assert out["turnover_max"] == pytest.approx(2.0 * 2.5)
+        # ROADMAP L124: risk floors are now ABSOLUTE, not legacy × 1.2.
+        assert out["max_drawdown_floor"] == pytest.approx(_ABS_MAX_DRAWDOWN_FLOOR)
+        assert out["cvar_95_floor"] == pytest.approx(_ABS_CVAR_95_FLOOR)
+        assert out["turnover_max"] == pytest.approx(2.0 * 2.5), \
+            "Turnover stays legacy-relative (behavior comparison, not a risk floor)"
         assert out["tracking_error_range"] == [0.02, 0.06]
         assert out["active_share_range"] == [0.08, 0.25]
         assert "sharpe_min" not in out, \
@@ -128,14 +132,19 @@ class TestGateThresholds:
         assert "alpha_min" not in out, \
             "alpha vs SPY is presentation-only, not a gate"
 
-    def test_without_legacy_returns_none_thresholds_but_keeps_psr_min(self):
+    def test_without_legacy_keeps_absolute_risk_floors_and_psr(self):
+        """ROADMAP L124: without a legacy baseline the absolute risk floors
+        still apply (previously None → skipped → circular gate). Only the
+        genuinely legacy-relative thresholds are None."""
         out = _gate_thresholds({"sortino_ratio": 1.0}, None)
-        assert out["sortino_min"] is None
+        assert out["sortino_min"] is None, "legacy-relative → None without baseline"
+        assert out["turnover_max"] is None, "legacy-relative → None without baseline"
         assert out["psr_min"] == pytest.approx(0.95), \
             "PSR floor is absolute (95% confidence), not legacy-relative"
-        assert out["max_drawdown_floor"] is None
-        assert out["cvar_95_floor"] is None
-        assert out["turnover_max"] is None
+        assert out["max_drawdown_floor"] == pytest.approx(_ABS_MAX_DRAWDOWN_FLOOR), \
+            "max-drawdown floor is now absolute — applies with no legacy"
+        assert out["cvar_95_floor"] == pytest.approx(_ABS_CVAR_95_FLOOR), \
+            "CVaR(95) floor is now absolute — applies with no legacy"
 
 
 class TestCompareToLegacy:

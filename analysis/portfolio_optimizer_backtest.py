@@ -442,10 +442,31 @@ def _simulate_and_measure(
 _DEFAULT_MIN_PSR = 0.95
 _DEFAULT_SORTINO_DEGRADE_RATIO = 0.9
 
+# Absolute risk-tolerance floors (ROADMAP L124, enhanced-index design
+# intent decided 2026-05-16). Previously max_drawdown_floor / cvar_95_floor
+# were legacy-scaled (dd_leg × 1.2), which made the gate circular: on the
+# synthetic replay legacy barely trades (50 trades / 10y, -1.1% max DD), so
+# "must not be riskier than a portfolio that barely trades" is unfalsifiable
+# noise — exactly why the 2026-05-13 cutover gate FAILed 5/7 and was
+# manually overridden. These are now absolute, anchored to an enhanced-index
+# (SPY core + tilt) risk appetite: an enhanced-index book tracks SPY closely
+# so its worst-case peak-to-trough should be ~SPY-like, not unbounded.
+#   - max_drawdown_floor -0.35 ≈ SPY's deepest 10y drawdown (COVID 2020 ~-34%)
+#   - cvar_95_floor      -0.05 ≈ a generous outer bound on the worst-5%-day
+#                                 expected loss (SPY daily CVaR95 ≈ -2.8%)
+# These MAGNITUDES are operator-tunable risk-appetite parameters, not settled
+# doctrine — the structural fix is "absolute, always-applied" vs "circular,
+# skipped-without-legacy"; the specific numbers are a defensible starting
+# point Brian can tighten/loosen.
+_ABS_MAX_DRAWDOWN_FLOOR = -0.35
+_ABS_CVAR_95_FLOOR = -0.05
+
 
 def compare_to_legacy(
     optimizer_metrics: dict,
     legacy_metrics: dict | None,
+    *,
+    signal_source: str = "synthetic",
 ) -> dict:
     """
     Build a side-by-side dict matching the cutover gate validator's input
@@ -468,8 +489,14 @@ def compare_to_legacy(
         turnover_opt <= turnover_leg × 2.5
         tracking_err in [0.02, 0.06]
         active_share in [0.08, 0.25]
+
+    ``signal_source`` ("synthetic" | "production") is threaded into the
+    output so the operator can interpret the verdict against the right
+    input distribution (ROADMAP L124). The synthetic predictor-GBM replay
+    runs at ~96.6% active-share vs ~15.5% on production research signals —
+    a FAIL on synthetic is not the same statement as a FAIL on production.
     """
-    out: dict = {"optimizer": dict(optimizer_metrics)}
+    out: dict = {"optimizer": dict(optimizer_metrics), "signal_source": signal_source}
     if legacy_metrics is None:
         out["legacy"] = None
         out["deltas"] = None
@@ -504,6 +531,15 @@ def _gate_thresholds(
     Skilled-risk gate thresholds. Sortino is primary; PSR is the
     confidence floor; CVaR + max_drawdown cap tail risk.
 
+    ``max_drawdown_floor`` and ``cvar_95_floor`` are ABSOLUTE
+    risk-tolerance values (``_ABS_*`` constants) applied regardless of
+    whether a legacy baseline exists — ROADMAP L124. They were previously
+    ``legacy × 1.2``, which made them circular (and ``None``/skipped with
+    no legacy): the gate could only fail risk relative to a barely-trading
+    synthetic-replay legacy. ``sortino_min`` / ``turnover_max`` remain
+    legacy-relative (relative-performance / behavior comparisons, not
+    absolute risk floors) and still skip cleanly without a baseline.
+
     Raw Sharpe and alpha-vs-SPY are intentionally absent — see
     [[alpha_vs_spy_is_presentation_not_gating]] and the
     [[evaluator_revamp_skilled_risk]] basket.
@@ -512,21 +548,19 @@ def _gate_thresholds(
         return {
             "sortino_min": None,
             "psr_min": _DEFAULT_MIN_PSR,
-            "max_drawdown_floor": None,
-            "cvar_95_floor": None,
+            "max_drawdown_floor": _ABS_MAX_DRAWDOWN_FLOOR,
+            "cvar_95_floor": _ABS_CVAR_95_FLOOR,
             "turnover_max": None,
             "tracking_error_range": [0.02, 0.06],
             "active_share_range": [0.08, 0.25],
         }
     sortino_leg = legacy_metrics.get("sortino_ratio") or 0.0
-    dd_leg = legacy_metrics.get("max_drawdown") or 0.0
-    cvar_leg = legacy_metrics.get("cvar_95") or 0.0
     turnover_leg = legacy_metrics.get("turnover_one_way_ann") or 0.0
     return {
         "sortino_min": sortino_leg * _DEFAULT_SORTINO_DEGRADE_RATIO,
         "psr_min": _DEFAULT_MIN_PSR,
-        "max_drawdown_floor": dd_leg * 1.2,
-        "cvar_95_floor": cvar_leg * 1.2,
+        "max_drawdown_floor": _ABS_MAX_DRAWDOWN_FLOOR,
+        "cvar_95_floor": _ABS_CVAR_95_FLOOR,
         "turnover_max": turnover_leg * 2.5,
         "tracking_error_range": [0.02, 0.06],
         "active_share_range": [0.08, 0.25],
