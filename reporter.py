@@ -339,14 +339,16 @@ def _section_pipeline_health(health: dict) -> list[str]:
         lines.append(f"> {health['staleness_warning']}")
         lines.append("")
 
-    # Research DB status
-    db_status = health.get("db_pull_status", "unknown")
+    # Research DB status. Only an explicit "ok" pull renders "Loaded";
+    # every other state (failed pull, unset/None _db_pull_status from a
+    # path that never attempted the pull, or any unexpected value) is a
+    # not-loaded state and must hit the clear MISSING message — never a
+    # bare `None`/value passthrough that reads as a rendering bug.
+    db_status = health.get("db_pull_status")
     if db_status == "ok":
         lines.append("- Research DB: Loaded")
-    elif db_status == "failed":
-        lines.append("- Research DB: **MISSING** — signal quality analysis skipped")
     else:
-        lines.append(f"- Research DB: {db_status}")
+        lines.append("- Research DB: **MISSING** — signal quality analysis skipped")
 
     # Simulation coverage. Render `(degraded)` when the count fields
     # aren't populated (e.g. evaluator-only runs that didn't re-execute
@@ -1323,6 +1325,12 @@ def _section_portfolio(stats: dict) -> list[str]:
         "| Metric | Value |",
         "|--------|-------|",
         f"| Total return | {_pct(stats.get('total_return'))} |",
+        # Sortino is the primary/headline risk-adjusted metric per the
+        # Sharpe→Sortino skilled-risk evaluator revamp (see
+        # optimizer/executor_optimizer.py skill_composite,
+        # analysis/param_sweep.py::_sort_sweep_df_skilled_risk). Sharpe is
+        # kept as a secondary line for continuity, not deleted.
+        f"| **Sortino ratio** | **{_fmt(stats.get('sortino_ratio'))}** |",
         f"| Sharpe ratio | {_fmt(stats.get('sharpe_ratio'))} |",
         f"| Max drawdown | {_pct(stats.get('max_drawdown'))} |",
         f"| Calmar ratio | {_fmt(stats.get('calmar_ratio'))} |",
@@ -1676,6 +1684,12 @@ def _section_predictor_backtest(stats: dict) -> list[str]:
         f"| Total return | {_pct(stats.get('total_return'))} |",
         f"| SPY return | {_pct(stats.get('spy_return'))} |",
         f"| EW-high-vol return | {_pct(stats.get('ew_high_vol_return'))} |",
+        # Sortino is the primary/headline risk-adjusted metric per the
+        # Sharpe→Sortino skilled-risk evaluator revamp; Sharpe kept as a
+        # secondary line for continuity. Both come from the shared
+        # vectorbt_bridge stats dict (sortino_ratio computed alongside
+        # sharpe_ratio) — no new metric computed here.
+        f"| **Sortino ratio** | **{_fmt(stats.get('sortino_ratio'))}** |",
         f"| Sharpe ratio | {_fmt(stats.get('sharpe_ratio'))} |",
         f"| Max drawdown | {_pct(stats.get('max_drawdown'))} |",
         f"| Calmar ratio | {_fmt(stats.get('calmar_ratio'))} |",
@@ -1717,12 +1731,19 @@ def _section_param_sweep_predictor(df) -> list[str]:
     ]
     stat_cols = [c for c in PREFERRED_STAT_ORDER if c in df.columns]
 
-    # Header is honest about the rendered ranking. Sweep is sorted by
-    # total_alpha (primary) per ``param_sweep.py::_run_combos``; surface
-    # that explicitly so "by total alpha" doesn't read as misleading
-    # when the alpha column is suppressed for narrowness.
-    sort_label = "total_alpha" if "total_alpha" in df.columns else "sharpe_ratio"
-    lines = [f"## Predictor param sweep — top combinations (sorted by {sort_label})", ""]
+    # Header is honest about the rendered ranking. Per the skilled-risk
+    # evaluator revamp the sweep is sorted by Sortino (primary) →
+    # total_alpha (tiebreaker) — see
+    # ``param_sweep.py::_sort_sweep_df_skilled_risk`` (sortino_ratio
+    # descending, falling through to total_alpha when sortino is
+    # missing/all-NaN). State both so the caption matches the real sort
+    # and doesn't read as misleading when a column is suppressed for
+    # narrowness.
+    lines = [
+        "## Predictor param sweep — top combinations "
+        "(sorted by Sortino, total_alpha tiebreaker)",
+        "",
+    ]
 
     show_cols = param_cols + stat_cols
     header = "| " + " | ".join(show_cols) + " |"

@@ -79,11 +79,35 @@ class TestSectionPipelineHealth:
         assert "too_short" in text
 
     def test_empty_health_dict(self):
-        """Empty health dict should still produce a valid section."""
+        """Empty health dict (db_pull_status unset / never attempted) must
+        render the explicit MISSING message — never a bare value/None
+        passthrough that reads as a rendering bug. Updated for the
+        2026-05-16 not-loaded-always-MISSING contract."""
         lines = _section_pipeline_health({})
         text = "\n".join(lines)
         assert "## Pipeline Health" in text
-        assert "unknown" in text  # db_pull_status defaults to "unknown"
+        assert "Research DB: **MISSING** — signal quality analysis skipped" in text
+        # Regression guard: the old behavior leaked the literal default
+        # ("unknown") or a bare "None" into the rendered line.
+        assert "Research DB: unknown" not in text
+        assert "Research DB: None" not in text
+
+    def test_unset_db_pull_status_renders_missing_not_none(self):
+        """A not-loaded state from a path that never attempted the pull
+        (db_pull_status is None — the exact 2026-05-16 SF-spot symptom)
+        must hit the clear MISSING message, not `- Research DB: None`."""
+        lines = _section_pipeline_health({"db_pull_status": None})
+        text = "\n".join(lines)
+        assert "Research DB: **MISSING** — signal quality analysis skipped" in text
+        assert "Research DB: None" not in text
+
+    def test_unexpected_db_pull_status_renders_missing(self):
+        """Any unexpected db_pull_status value is a not-loaded state and
+        must render MISSING, never pass the raw value through."""
+        lines = _section_pipeline_health({"db_pull_status": "weird-value"})
+        text = "\n".join(lines)
+        assert "Research DB: **MISSING** — signal quality analysis skipped" in text
+        assert "weird-value" not in text
 
 
 # ── build_report() ───────────────────────────────────────────────────────────
@@ -381,8 +405,11 @@ class TestReporterCleanupBundle:
             },
         ])
         md = "\n".join(_section_param_sweep_predictor(df))
-        # Header names the sort axis explicitly (not just "by total alpha").
-        assert "sorted by total_alpha" in md
+        # Header names the real sort axis: Sortino primary, total_alpha
+        # tiebreaker (param_sweep.py::_sort_sweep_df_skilled_risk). Updated
+        # for the 2026-05-16 caption-vs-sort reconciliation.
+        assert "sorted by Sortino, total_alpha tiebreaker" in md
+        assert "sorted by total_alpha)" not in md  # old misleading caption gone
         # Header column row contains stat columns in the preferred order.
         # sortino_ratio + cvar_95 must NOT be in param_cols position.
         header_row = next(
@@ -569,3 +596,54 @@ class TestSectionSkillVsBeta:
     def test_returns_empty_grading_with_no_research(self):
         from reporter import _section_skill_vs_beta
         assert _section_skill_vs_beta({}) == []
+
+
+class TestSortinoHeadlineMetric:
+    """Per the Sharpe→Sortino skilled-risk evaluator revamp, Sortino is
+    the primary/headline risk-adjusted metric in the Mode 2 and Layer-1A
+    tables. Sharpe is kept as a secondary line (not deleted)."""
+
+    def _stats(self, **over):
+        s = {
+            "status": "ok",
+            "total_return": 0.42,
+            "total_alpha": 0.11,
+            "sortino_ratio": 1.930,
+            "sharpe_ratio": 1.210,
+            "max_drawdown": -0.18,
+            "calmar_ratio": 0.9,
+            "total_trades": 120,
+            "win_rate": 0.55,
+        }
+        s.update(over)
+        return s
+
+    def test_mode2_table_headlines_sortino_keeps_sharpe_secondary(self):
+        from reporter import _section_portfolio
+        md = "\n".join(_section_portfolio(self._stats()))
+        # Sortino is bolded as the headline risk-adjusted metric.
+        assert "| **Sortino ratio** | **1.930** |" in md
+        # Sharpe is retained as a secondary (non-bold) line — NOT deleted.
+        assert "| Sharpe ratio | 1.210 |" in md
+        # Sortino row appears before the Sharpe row.
+        assert md.index("Sortino ratio") < md.index("Sharpe ratio")
+
+    def test_layer1a_table_headlines_sortino_keeps_sharpe_secondary(self):
+        from reporter import _section_predictor_backtest
+        stats = self._stats(
+            alpha_vs_ew_high_vol=0.03,
+            spy_return=0.31,
+            ew_high_vol_return=0.34,
+            dates_simulated=2400,
+            total_orders=900,
+            predictor_metadata={
+                "n_tickers": 60, "n_dates": 2400,
+                "date_range_start": "2016-01-04",
+                "date_range_end": "2026-05-15",
+                "top_n_per_day": 5, "min_score": 70,
+            },
+        )
+        md = "\n".join(_section_predictor_backtest(stats))
+        assert "| **Sortino ratio** | **1.930** |" in md
+        assert "| Sharpe ratio | 1.210 |" in md
+        assert md.index("Sortino ratio") < md.index("Sharpe ratio")
