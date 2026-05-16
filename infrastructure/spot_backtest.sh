@@ -483,7 +483,15 @@ CACHE
 # adhoc-skipto-backtester-20260513-2333). Capture artifacts exist for
 # production observability — they have no semantic meaning in the sweep.
 # Paired with alpha-engine #177.
-ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true;'
+# AWS_REGION/AWS_DEFAULT_REGION: the .env-deprecation arc deleted the
+# sourced .env, so the region env vars boto3 + lib preflight require are
+# no longer set in the spot shell. Same #247 regression as alpha-engine-data's
+# spot scripts; spot_backtest.sh was in a sibling repo the original arc
+# didn't touch. System is single-region us-east-1 (matches this file's own
+# ${AWS_REGION:-us-east-1} defaults). Origin: 2026-05-16 Saturday SF
+# PredictorTraining failure (spot_train.sh sibling) — audited forward to
+# prevent the identical Backtester/Parity/Evaluator failure.
+ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1;'
 
 # Determine python binary on remote
 REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
