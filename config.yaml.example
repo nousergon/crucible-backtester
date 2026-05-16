@@ -141,6 +141,20 @@ executor_optimizer:
   min_sharpe_improvement: 0.10   # best must exceed baseline by 10%+
   drawdown_penalty_weight: 0.50  # penalize max_drawdown in combined ranking score
 
+# ── Regression monitor / auto-rollback ──────────────────────────────────────
+# Post-run gate that auto-rolls-back optimizer config promotions if metrics
+# regress vs the saved promotion baseline. Primary risk-adjusted trigger is
+# Sortino (skilled-risk evaluator revamp); Sharpe is observability only. Guards
+# prevent a degraded/low-power week or a stale/pre-cutover baseline from
+# spuriously reverting configs (see the 2026-05-16 spurious-rollback forensic).
+regression_monitor:
+  accuracy_drop_threshold_pp: 5.0     # rollback if accuracy_10d drops > 5pp
+  sortino_drop_threshold_pct: 0.20    # rollback if Sortino drops > 20% (PRIMARY)
+  sharpe_drop_threshold_pct: 0.20     # observability only — NOT a trigger
+  min_trades_for_rollback: 30         # skip rollback if portfolio total_trades < 30
+  min_signals_for_rollback: 30        # skip rollback if resolved signal n < 30
+  baseline_max_age_days: 21           # baseline older than this → skip + refresh
+
 # ── Veto threshold analysis ─────────────────────────────────────────────────
 veto_analysis:
   confidence_thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]

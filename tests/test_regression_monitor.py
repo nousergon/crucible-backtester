@@ -86,47 +86,60 @@ class TestCheckRegression:
     @patch("optimizer.regression_monitor.write_rollback_audit", return_value="")
     @patch("optimizer.regression_monitor.rollback_all", return_value=[])
     @patch("optimizer.regression_monitor._load_baseline")
-    def test_positive_sharpe_detects_large_drop(
+    def test_sharpe_drop_no_longer_triggers_regression(
         self, mock_load, mock_rollback, mock_audit,
     ):
-        """Sharpe dropping >20% from positive baseline should trigger regression."""
+        """CONTRACT CHANGE (2026-05-16): Sharpe is observability only — a
+        large Sharpe drop alone, with Sortino healthy, must NOT fire rollback.
+        (Was: test_positive_sharpe_detects_large_drop.)"""
         mock_load.return_value = {
             "sharpe_ratio": 2.0,
+            "sortino_ratio": 2.0,
             "accuracy_10d": 0.60,
+            "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"sharpe_ratio": 1.0, "accuracy_10d": 0.58},
+            {"sharpe_ratio": 1.0, "sortino_ratio": 1.95, "accuracy_10d": 0.58},
+            run_date="2026-05-16",
         )
         assert result["checked"] is True
-        assert result["regression_detected"] is True
+        # Sharpe drop persisted for observability...
         assert result["details"]["sharpe_drop_pct"] == pytest.approx(0.5, abs=0.01)
+        # ...but it is NOT a regression trigger any more.
+        assert result["regression_detected"] is False
+        mock_rollback.assert_not_called()
 
     @patch("optimizer.regression_monitor._load_baseline")
-    def test_positive_sharpe_no_regression_when_stable(self, mock_load):
-        """Sharpe within 20% of baseline should NOT trigger regression."""
-        mock_load.return_value = {"sharpe_ratio": 2.0}
+    def test_positive_sortino_no_regression_when_stable(self, mock_load):
+        """Sortino within 20% of baseline should NOT trigger regression."""
+        mock_load.return_value = {
+            "sortino_ratio": 2.0, "saved_at": "2026-05-10",
+        }
         result = check_regression(
             "test-bucket",
-            {"sharpe_ratio": 1.8},
+            {"sortino_ratio": 1.8},
+            run_date="2026-05-16",
         )
         assert result["checked"] is True
         assert result["regression_detected"] is False
 
     @patch("optimizer.regression_monitor._load_baseline")
-    def test_negative_sharpe_baseline_skips_sharpe_check(self, mock_load):
-        """Negative baseline Sharpe should skip the Sharpe regression check."""
+    def test_negative_sortino_baseline_skips_sortino_check(self, mock_load):
+        """Negative baseline Sortino should skip the Sortino regression check."""
         mock_load.return_value = {
-            "sharpe_ratio": -0.5,
+            "sortino_ratio": -0.5,
             "accuracy_10d": 0.60,
+            "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"sharpe_ratio": -1.0, "accuracy_10d": 0.58},
+            {"sortino_ratio": -1.0, "accuracy_10d": 0.58},
+            run_date="2026-05-16",
         )
         assert result["checked"] is True
-        # Sharpe check skipped (base_sharpe <= 0), so no sharpe_drop_pct
-        assert "sharpe_drop_pct" not in result["details"]
+        # Sortino check skipped (base_sortino <= 0), so no sortino_drop_pct
+        assert "sortino_drop_pct" not in result["details"]
         # Accuracy drop is only 2pp (< 5pp threshold), so no regression
         assert result["regression_detected"] is False
 
@@ -136,40 +149,53 @@ class TestCheckRegression:
     def test_accuracy_drop_triggers_regression(
         self, mock_load, mock_rollback, mock_audit,
     ):
-        """Accuracy dropping >5pp should trigger regression."""
+        """Accuracy dropping >5pp should trigger regression (with adequate
+        samples + fresh baseline)."""
         mock_load.return_value = {
             "accuracy_10d": 0.65,
+            "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"accuracy_10d": 0.55},
+            {"accuracy_10d": 0.55, "total_trades": 80, "n_signals": 80},
+            run_date="2026-05-16",
         )
         assert result["checked"] is True
         assert result["regression_detected"] is True
+        assert result["rollback_triggered"] is True
         assert result["details"]["accuracy_drop"] == pytest.approx(10.0, abs=0.1)
 
     @patch("optimizer.regression_monitor._load_baseline")
     def test_same_metrics_no_regression(self, mock_load):
         """Identical metrics should not trigger regression."""
-        baseline = {"sharpe_ratio": 1.5, "accuracy_10d": 0.60}
+        baseline = {
+            "sharpe_ratio": 1.5, "sortino_ratio": 1.8, "accuracy_10d": 0.60,
+            "saved_at": "2026-05-10",
+        }
         mock_load.return_value = baseline
-        result = check_regression("test-bucket", baseline.copy())
+        result = check_regression(
+            "test-bucket", baseline.copy(), run_date="2026-05-16",
+        )
         assert result["checked"] is True
         assert result["regression_detected"] is False
 
     @patch("optimizer.regression_monitor.write_rollback_audit", return_value="")
     @patch("optimizer.regression_monitor.rollback_all", return_value=[])
     @patch("optimizer.regression_monitor._load_baseline")
-    def test_custom_thresholds(self, mock_load, mock_rollback, mock_audit):
-        """Custom config thresholds should be respected."""
-        mock_load.return_value = {"sharpe_ratio": 2.0}
-        # 15% drop with a strict 10% threshold → should trigger
+    def test_custom_sortino_threshold(self, mock_load, mock_rollback, mock_audit):
+        """Custom Sortino config threshold should be respected."""
+        mock_load.return_value = {
+            "sortino_ratio": 2.0, "saved_at": "2026-05-10",
+        }
+        # 15% Sortino drop with a strict 10% threshold → should trigger
         result = check_regression(
             "test-bucket",
-            {"sharpe_ratio": 1.7},
-            config={"regression_monitor": {"sharpe_drop_threshold_pct": 0.10}},
+            {"sortino_ratio": 1.7, "total_trades": 80, "n_signals": 80},
+            config={"regression_monitor": {"sortino_drop_threshold_pct": 0.10}},
+            run_date="2026-05-16",
         )
         assert result["regression_detected"] is True
+        assert result["rollback_triggered"] is True
 
 
 # ── Rollback audit (PR 6 of optimizer-artifact-assembler arc) ───────────────
@@ -332,9 +358,13 @@ class TestCheckRegressionInvokesAudit:
                           "key": "config/executor_params.json"}])
     @patch("optimizer.regression_monitor._load_baseline")
     def test_audit_fired_on_regression(self, mock_load, mock_rb, mock_audit):
-        mock_load.return_value = {"sharpe_ratio": 2.0}
+        mock_load.return_value = {
+            "sortino_ratio": 2.0, "saved_at": "2026-05-05",
+        }
         result = check_regression(
-            "test-bucket", {"sharpe_ratio": 1.0}, run_date="2026-05-09",
+            "test-bucket",
+            {"sortino_ratio": 1.0, "total_trades": 80, "n_signals": 80},
+            run_date="2026-05-09",
         )
         assert result["regression_detected"] is True
         assert result["rollback_triggered"] is True
@@ -349,10 +379,228 @@ class TestCheckRegressionInvokesAudit:
     @patch("optimizer.regression_monitor.write_rollback_audit")
     @patch("optimizer.regression_monitor._load_baseline")
     def test_audit_not_fired_when_no_regression(self, mock_load, mock_audit):
-        mock_load.return_value = {"sharpe_ratio": 2.0}
+        mock_load.return_value = {
+            "sortino_ratio": 2.0, "saved_at": "2026-05-05",
+        }
         result = check_regression(
-            "test-bucket", {"sharpe_ratio": 1.9}, run_date="2026-05-09",
+            "test-bucket",
+            {"sortino_ratio": 1.9, "total_trades": 80, "n_signals": 80},
+            run_date="2026-05-09",
         )
         assert result["regression_detected"] is False
         # No regression → no rollback → no audit.
         mock_audit.assert_not_called()
+
+
+# ── extract_metrics: Sortino + sample-size threading ────────────────────────
+
+
+class TestExtractMetricsSkilledRisk:
+    """Sortino + total_trades + signal-n must be extracted so check_regression
+    can use them (threaded from where Sharpe already comes from)."""
+
+    def test_extracts_sortino_and_total_trades(self):
+        stats = {
+            "sharpe_ratio": 1.5,
+            "sortino_ratio": 2.1,
+            "total_trades": 55,
+            "total_alpha": 0.08,
+        }
+        metrics = extract_metrics(stats, None)
+        assert metrics["sortino_ratio"] == 2.1
+        assert metrics["total_trades"] == 55
+        # Sharpe still persisted for continuity/observability.
+        assert metrics["sharpe_ratio"] == 1.5
+
+    def test_extracts_n_signals_from_overall_n_10d(self):
+        sq = {"overall": {"accuracy_10d": 0.60, "n_10d": 42}}
+        metrics = extract_metrics(None, sq)
+        assert metrics["n_signals"] == 42
+        assert metrics["accuracy_10d"] == 0.60
+
+
+# ── 2026-05-16 spurious-rollback regression guards ──────────────────────────
+
+
+class TestRegressionGuards:
+    """The three changes from the 2026-05-16 spurious-rollback forensic:
+    (1) Sortino-aware gate, (2) min-sample/degraded guard, (3) stale-baseline
+    skip+refresh. Net invariant: a degraded/low-n week OR a stale/pre-cutover
+    baseline must NOT auto-revert configs."""
+
+    @patch("optimizer.regression_monitor.write_rollback_audit", return_value="")
+    @patch("optimizer.regression_monitor.rollback_all", return_value=[])
+    @patch("optimizer.regression_monitor._load_baseline")
+    def test_a_sortino_drop_with_samples_and_fresh_baseline_fires(
+        self, mock_load, mock_rb, mock_audit,
+    ):
+        """(a) Sortino-drop > threshold + adequate samples + fresh baseline
+        → rollback fires."""
+        mock_load.return_value = {
+            "sortino_ratio": 2.0, "accuracy_10d": 0.60, "saved_at": "2026-05-10",
+        }
+        result = check_regression(
+            "test-bucket",
+            {"sortino_ratio": 1.0, "accuracy_10d": 0.60,
+             "total_trades": 80, "n_signals": 80},
+            run_date="2026-05-16",
+        )
+        assert result["regression_detected"] is True
+        assert result["rollback_triggered"] is True
+        assert result["details"]["sortino_drop_pct"] == pytest.approx(0.5, abs=0.01)
+        mock_rb.assert_called_once()
+
+    @patch("optimizer.regression_monitor.rollback_all")
+    @patch("optimizer.regression_monitor._load_baseline")
+    def test_b_sharpe_drops_but_sortino_fine_no_rollback(
+        self, mock_load, mock_rb,
+    ):
+        """(b) Sharpe drops but Sortino fine → NO rollback (proves the gate
+        moved off Sharpe)."""
+        mock_load.return_value = {
+            "sharpe_ratio": 2.0, "sortino_ratio": 2.0,
+            "accuracy_10d": 0.60, "saved_at": "2026-05-10",
+        }
+        result = check_regression(
+            "test-bucket",
+            {"sharpe_ratio": 0.8, "sortino_ratio": 1.95, "accuracy_10d": 0.60,
+             "total_trades": 80, "n_signals": 80},
+            run_date="2026-05-16",
+        )
+        # Sharpe drop ~60% persisted for observability...
+        assert result["details"]["sharpe_drop_pct"] == pytest.approx(0.6, abs=0.01)
+        # ...Sortino drop only ~2.5% → no regression, no rollback.
+        assert result["regression_detected"] is False
+        assert result["rollback_triggered"] is False
+        mock_rb.assert_not_called()
+
+    @patch("optimizer.regression_monitor.rollback_all")
+    @patch("optimizer.regression_monitor._load_baseline")
+    def test_c_low_n_detects_but_does_not_rollback(self, mock_load, mock_rb):
+        """(c) The exact 2026-05-16 degraded-week shape: baseline 0.4179 /
+        current 0.3154 (−24.5% > 20% → regression detected) but the run is a
+        low-power recovery week (n=42 signals / 55 trades) below the default
+        floor → regression flagged but rollback_triggered=False, configs
+        untouched. (n=42/55 are below this test's stricter configured floor
+        — proving the exact spurious-rollback shape is now suppressed.)"""
+        mock_load.return_value = {
+            "sortino_ratio": 0.4179, "accuracy_10d": 0.60,
+            "saved_at": "2026-05-10",
+        }
+        result = check_regression(
+            "test-bucket",
+            {"sortino_ratio": 0.3154, "accuracy_10d": 0.60,
+             "total_trades": 55, "n_signals": 42},
+            config={"regression_monitor": {
+                "min_trades_for_rollback": 60,
+                "min_signals_for_rollback": 60,
+            }},
+            run_date="2026-05-16",
+        )
+        # Sortino drop is ~24.5% (> 20%) → regression IS detected...
+        assert result["regression_detected"] is True
+        assert result["details"]["sortino_drop_pct"] == pytest.approx(0.245, abs=0.005)
+        # ...but the low-power guard suppresses the rollback.
+        assert result["rollback_triggered"] is False
+        assert result["details"]["guard"] == "min_sample"
+        assert any("total_trades=55" in r for r in result["details"]["low_power"])
+        assert any("n_signals=42" in r for r in result["details"]["low_power"])
+        mock_rb.assert_not_called()
+
+    @patch("optimizer.regression_monitor.rollback_all")
+    @patch("optimizer.regression_monitor._load_baseline")
+    def test_c2_default_floor_suppresses_rollback(self, mock_load, mock_rb):
+        """(c) Below the DEFAULT min-sample floor (30): regression detected
+        but rollback_triggered=False, configs untouched."""
+        mock_load.return_value = {
+            "sortino_ratio": 0.4179, "accuracy_10d": 0.60,
+            "saved_at": "2026-05-10",
+        }
+        result = check_regression(
+            "test-bucket",
+            {"sortino_ratio": 0.3154, "accuracy_10d": 0.60,
+             "total_trades": 25, "n_signals": 18},
+            run_date="2026-05-16",
+        )
+        assert result["regression_detected"] is True
+        assert result["rollback_triggered"] is False
+        assert result["details"]["guard"] == "min_sample"
+        assert any("total_trades=25" in r for r in result["details"]["low_power"])
+        assert any("n_signals=18" in r for r in result["details"]["low_power"])
+        mock_rb.assert_not_called()
+
+    @patch("optimizer.regression_monitor.rollback_all")
+    @patch("optimizer.regression_monitor._refresh_baseline_from_current")
+    @patch("optimizer.regression_monitor._load_baseline")
+    def test_d_stale_baseline_skipped_and_refreshed(
+        self, mock_load, mock_refresh, mock_rb,
+    ):
+        """(d) The 2026-05-02 → 2026-05-16 case (14 days, > 21? no — use the
+        exact spurious case: baseline older than max-age) → skipped +
+        baseline refreshed, rollback_triggered=False."""
+        mock_load.return_value = {
+            "sortino_ratio": 0.4179, "accuracy_10d": 0.60,
+            "saved_at": "2026-04-20",  # 26 days before run → > 21-day max
+        }
+        result = check_regression(
+            "test-bucket",
+            {"sortino_ratio": 0.3154, "accuracy_10d": 0.50,
+             "total_trades": 80, "n_signals": 80},
+            run_date="2026-05-16",
+        )
+        assert result["checked"] is False
+        assert result["reason"] == "baseline_stale_refreshed"
+        assert result["regression_detected"] is False
+        assert result["rollback_triggered"] is False
+        assert result["details"]["guard"] == "baseline_stale_refreshed"
+        assert result["details"]["baseline_age_days"] == 26
+        mock_refresh.assert_called_once()
+        mock_rb.assert_not_called()
+
+    @patch("optimizer.regression_monitor.rollback_all")
+    @patch("optimizer.regression_monitor._refresh_baseline_from_current")
+    @patch("optimizer.regression_monitor._load_baseline")
+    def test_d2_custom_max_age_respected(
+        self, mock_load, mock_refresh, mock_rb,
+    ):
+        """The literal 2026-05-02 → 2026-05-16 forensic case (14 days) is
+        stale under a stricter configured 10-day max."""
+        mock_load.return_value = {
+            "sortino_ratio": 0.4179, "saved_at": "2026-05-02",
+        }
+        result = check_regression(
+            "test-bucket",
+            {"sortino_ratio": 0.3154, "total_trades": 80, "n_signals": 80},
+            config={"regression_monitor": {"baseline_max_age_days": 10}},
+            run_date="2026-05-16",
+        )
+        assert result["reason"] == "baseline_stale_refreshed"
+        assert result["details"]["baseline_age_days"] == 14
+        mock_refresh.assert_called_once()
+        mock_rb.assert_not_called()
+
+    @patch("optimizer.regression_monitor.rollback_all")
+    @patch("optimizer.regression_monitor._load_baseline")
+    def test_e_baseline_missing_sortino_not_comparable_no_fire(
+        self, mock_load, mock_rb,
+    ):
+        """(e) Baseline missing sortino_ratio (older baseline) → primary gate
+        not comparable; do NOT fall back to firing on Sharpe."""
+        mock_load.return_value = {
+            "sharpe_ratio": 2.0,          # only Sharpe, no Sortino
+            "accuracy_10d": 0.60,
+            "saved_at": "2026-05-10",
+        }
+        result = check_regression(
+            "test-bucket",
+            {"sharpe_ratio": 0.5, "sortino_ratio": 0.4, "accuracy_10d": 0.60,
+             "total_trades": 80, "n_signals": 80},
+            run_date="2026-05-16",
+        )
+        assert result["checked"] is True
+        assert result["details"].get("sortino_not_comparable") is True
+        # Sharpe collapsed 75% but it is observability only + Sortino baseline
+        # absent → no regression, no rollback.
+        assert result["regression_detected"] is False
+        assert result["rollback_triggered"] is False
+        mock_rb.assert_not_called()

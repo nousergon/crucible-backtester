@@ -160,18 +160,26 @@ class TestAssemblerArcEndToEnd:
 
     def _saved_baseline(self) -> dict:
         """Promotion baseline reflecting prior weeks' performance — high
-        enough that today's portfolio_stats trip the 20% Sharpe-drop gate."""
+        enough that today's portfolio_stats trip the 20% Sortino-drop gate.
+        Fresh (saved_at within the 21-day max age vs RUN_DATE 2026-05-09) so
+        the stale-baseline guard does not pre-empt the regression check."""
         return {
-            "sharpe_ratio": 1.0,        # baseline
+            "sortino_ratio": 1.0,       # baseline (primary risk-adjusted gate)
+            "sharpe_ratio": 1.0,
             "accuracy_10d": 0.62,
+            "saved_at": "2026-05-05",
         }
 
     def _todays_metrics(self) -> dict:
-        """Today's actual portfolio metrics — Sharpe collapsed enough to
-        trip the 20% drop threshold, triggering rollback."""
+        """Today's actual portfolio metrics — Sortino collapsed enough to
+        trip the 20% drop threshold, with adequate sample sizes so the
+        min-sample guard does not suppress the rollback."""
         return {
-            "sharpe_ratio": 0.241,       # 75% drop from baseline
+            "sortino_ratio": 0.241,      # 75% drop from baseline
+            "sharpe_ratio": 0.241,
             "accuracy_10d": 0.60,
+            "total_trades": 80,
+            "n_signals": 80,
         }
 
     def test_full_chain_emits_audit_with_rejected_recommendations(self, s3):
@@ -265,7 +273,7 @@ class TestAssemblerArcEndToEnd:
 
         # ── Step 3: regression_monitor detects regression → rollback ─────
         # Saved baseline is from prior weeks; today's portfolio_stats trip
-        # the 20% Sharpe drop gate → rollback_all reverts live to _previous.
+        # the 20% Sortino drop gate → rollback_all reverts live to _previous.
         baseline = self._saved_baseline()
         with patch("optimizer.regression_monitor.boto3") as reg_boto3, \
              patch("optimizer.rollback.boto3") as rb_boto3, \
@@ -286,7 +294,7 @@ class TestAssemblerArcEndToEnd:
         # ── Step 4: Verify rollback fired + reverted live to 5/7 data ────
         assert regression_result["regression_detected"] is True
         assert regression_result["rollback_triggered"] is True
-        assert regression_result["details"]["sharpe_drop_pct"] > 0.20
+        assert regression_result["details"]["sortino_drop_pct"] > 0.20
 
         live_post_rollback = s3.read_json(
             self.BUCKET, "config/executor_params.json",
@@ -303,7 +311,7 @@ class TestAssemblerArcEndToEnd:
 
         # Audit captures the trigger.
         assert audit["trigger"]["regression_detected"] is True
-        assert audit["trigger"]["details"]["sharpe_drop_pct"] > 0.20
+        assert audit["trigger"]["details"]["sortino_drop_pct"] > 0.20
 
         # Audit captures the rolled-back configs.
         rolled_back_executor = next(

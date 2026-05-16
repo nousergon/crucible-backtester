@@ -13,6 +13,16 @@ After each weekly backtester run:
 
 The promotion baseline is saved automatically before any optimizer writes new
 params to S3.  This module is fully automated — no human approval needed.
+
+Rollback trigger (post 2026-05-16 spurious-rollback forensic):
+  - PRIMARY risk-adjusted gate is **Sortino-%** (skilled-risk evaluator
+    revamp), OR accuracy-pp. Sharpe-% is persisted for observability only
+    and is NO LONGER a rollback trigger.
+  - Rollback is SUPPRESSED (regression may still be reported) on a
+    degraded / low-statistical-power week (below min-trades / min-signals
+    floors), or when the saved baseline is stale / pre-cutover (in which
+    case the baseline is skipped AND refreshed from current metrics so
+    subsequent runs compare post-cutover).
 """
 
 import json
@@ -48,7 +58,28 @@ ARTIFACT_CONFIG_TYPES = ("executor_params",)
 
 # Default thresholds (can be overridden via config.yaml regression_monitor section)
 DEFAULT_ACCURACY_DROP_PP = 5.0     # rollback if accuracy drops > 5 percentage points
-DEFAULT_SHARPE_DROP_PCT = 0.20     # rollback if Sharpe drops > 20%
+DEFAULT_SHARPE_DROP_PCT = 0.20     # rollback if Sharpe drops > 20% (OBSERVABILITY ONLY,
+#                                    no longer a rollback trigger — see 2026-05-16 arc)
+DEFAULT_SORTINO_DROP_PCT = 0.20    # rollback if Sortino drops > 20% (PRIMARY
+#                                    risk-adjusted gate post skilled-risk evaluator revamp)
+
+# Min-sample / degraded-week guard. A low-statistical-power week must not be
+# allowed to auto-rollback live configs (mirrors executor_optimizer.min_valid_combos
+# / veto_analysis.min_predictions conventions). The 2026-05-16 spurious rollback
+# fired on a Mode-2 n=55-trade / signal n=42 recovery week — both below sane floors.
+DEFAULT_MIN_TRADES_FOR_ROLLBACK = 30
+DEFAULT_MIN_SIGNALS_FOR_ROLLBACK = 30
+
+# Stale-baseline guard. A baseline must not be compared across a framework /
+# regime cutover or persist stale forever. The 2026-05-16 rollback compared a
+# 2026-05-02 baseline (predating the 2026-05-09 canonical-alpha cutover AND the
+# 2026-05-13 portfolio-optimizer cutover) against a 2026-05-16 run — apples to
+# oranges. Age-based staleness is used (no clean canonical cutover constant
+# exists in-repo / lib; age is simpler and self-healing across any future
+# cutover). When the baseline is older than this many days it is treated as
+# not-comparable: regression/rollback is skipped this run AND the baseline is
+# refreshed from current metrics so subsequent runs compare post-cutover.
+DEFAULT_BASELINE_MAX_AGE_DAYS = 21
 
 
 def extract_metrics(portfolio_stats: dict | None, signal_quality: dict | None) -> dict:
@@ -56,7 +87,13 @@ def extract_metrics(portfolio_stats: dict | None, signal_quality: dict | None) -
     metrics = {}
 
     if portfolio_stats and isinstance(portfolio_stats, dict):
-        for key in ("sharpe_ratio", "total_alpha", "max_drawdown", "win_rate"):
+        # sortino_ratio is the PRIMARY risk-adjusted regression gate post the
+        # skilled-risk evaluator revamp; total_trades drives the min-sample
+        # guard. sharpe_ratio kept for continuity/observability only.
+        for key in (
+            "sharpe_ratio", "sortino_ratio", "total_alpha", "max_drawdown",
+            "win_rate", "total_trades",
+        ):
             if key in portfolio_stats:
                 metrics[key] = portfolio_stats[key]
 
@@ -65,6 +102,11 @@ def extract_metrics(portfolio_stats: dict | None, signal_quality: dict | None) -
         for key in ("accuracy_10d", "accuracy_30d"):
             if key in overall:
                 metrics[key] = overall[key]
+        # n_10d is the resolved-signal sample size backing accuracy_10d —
+        # used by the min-sample guard. Persisted as n_signals for a stable
+        # cross-version key independent of the accuracy horizon.
+        if "n_10d" in overall:
+            metrics["n_signals"] = overall["n_10d"]
 
     return metrics
 
@@ -130,6 +172,55 @@ def _load_baseline(bucket: str) -> dict | None:
         if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
             return None
         raise
+
+
+def _baseline_age_days(baseline: dict, run_date: str | None) -> int | None:
+    """Age in days between the baseline's ``saved_at`` and the current run.
+
+    Returns None if either date is unparseable (treated as "age unknown" —
+    the caller decides the conservative action).
+    """
+    saved_at = baseline.get("saved_at")
+    if not saved_at:
+        return None
+    try:
+        base_dt = date.fromisoformat(str(saved_at)[:10])
+    except (ValueError, TypeError):
+        return None
+    try:
+        ref_dt = (
+            date.fromisoformat(str(run_date)[:10]) if run_date else date.today()
+        )
+    except (ValueError, TypeError):
+        ref_dt = date.today()
+    return (ref_dt - base_dt).days
+
+
+def _refresh_baseline_from_current(
+    bucket: str, current_metrics: dict, run_date: str | None,
+) -> None:
+    """Overwrite the promotion baseline with the current run's metrics.
+
+    Called when the existing baseline is not comparable (stale / pre-cutover)
+    so subsequent runs compare against a post-cutover baseline rather than
+    silently continuing to compare against the stale one forever.
+    """
+    payload = {
+        "saved_at": (str(run_date)[:10] if run_date else date.today().isoformat()),
+        "promoted_configs": [],
+        "refreshed_reason": "baseline_stale_refreshed",
+        **current_metrics,
+    }
+    s3 = boto3.client("s3")
+    s3.put_object(
+        Bucket=bucket, Key=S3_BASELINE_KEY,
+        Body=json.dumps(payload, indent=2),
+        ContentType="application/json",
+    )
+    logger.warning(
+        "Promotion baseline refreshed from current metrics (stale baseline "
+        "skipped) → s3://%s/%s", bucket, S3_BASELINE_KEY,
+    )
 
 
 def _capture_rejected_recommendations(
@@ -207,7 +298,11 @@ def write_rollback_audit(
             "details": regression_check_result.get("details", {}),
             "thresholds": {
                 "accuracy_drop_threshold_pp": DEFAULT_ACCURACY_DROP_PP,
+                "sortino_drop_threshold_pct": DEFAULT_SORTINO_DROP_PCT,
                 "sharpe_drop_threshold_pct": DEFAULT_SHARPE_DROP_PCT,
+                "min_trades_for_rollback": DEFAULT_MIN_TRADES_FOR_ROLLBACK,
+                "min_signals_for_rollback": DEFAULT_MIN_SIGNALS_FOR_ROLLBACK,
+                "baseline_max_age_days": DEFAULT_BASELINE_MAX_AGE_DAYS,
             },
         },
         "baseline": regression_check_result.get("baseline"),
@@ -270,10 +365,23 @@ def check_regression(
             "regression_detected": bool,
             "rollback_triggered": bool,
             "rollback_audit_key": str | None,
-            "details": {"accuracy_drop": float|None, "sharpe_drop_pct": float|None},
+            "details": {
+                "accuracy_drop": float|None,
+                "sortino_drop_pct": float|None,
+                "sharpe_drop_pct": float|None,    # observability only
+                "guard": str|None,                # why rollback was suppressed
+            },
             "baseline": dict|None,
             "current": dict,
         }
+
+    Rollback trigger is **accuracy-pp OR sortino-%** (Sharpe is observability
+    only post the skilled-risk evaluator revamp). Rollback is suppressed —
+    even when a regression is *detected* — when (a) the run is below the
+    min-trades / min-signals floor (degraded/low-power week), or (b) the
+    baseline is stale / pre-cutover (in which case it is refreshed), or
+    (c) the baseline lacks ``sortino_ratio`` (older baseline → not
+    comparable on the primary gate).
     """
     baseline = _load_baseline(bucket)
     if baseline is None:
@@ -282,12 +390,59 @@ def check_regression(
 
     reg_config = (config or {}).get("regression_monitor", {})
     acc_threshold = reg_config.get("accuracy_drop_threshold_pp", DEFAULT_ACCURACY_DROP_PP)
+    sortino_threshold = reg_config.get(
+        "sortino_drop_threshold_pct", DEFAULT_SORTINO_DROP_PCT,
+    )
     sharpe_threshold = reg_config.get("sharpe_drop_threshold_pct", DEFAULT_SHARPE_DROP_PCT)
+    min_trades = reg_config.get(
+        "min_trades_for_rollback", DEFAULT_MIN_TRADES_FOR_ROLLBACK,
+    )
+    min_signals = reg_config.get(
+        "min_signals_for_rollback", DEFAULT_MIN_SIGNALS_FOR_ROLLBACK,
+    )
+    baseline_max_age_days = reg_config.get(
+        "baseline_max_age_days", DEFAULT_BASELINE_MAX_AGE_DAYS,
+    )
 
-    details = {}
+    # ── Guard 3: stale / pre-cutover baseline ────────────────────────────────
+    # Checked FIRST: a stale baseline must never be compared (the 2026-05-16
+    # spurious rollback compared a 2026-05-02 pre-cutover baseline). Skip the
+    # check this run AND refresh the baseline so subsequent runs compare
+    # against a post-cutover baseline. Never silently keep comparing.
+    age_days = _baseline_age_days(baseline, run_date)
+    if age_days is not None and age_days > baseline_max_age_days:
+        logger.warning(
+            "Baseline is %d days old (> %d-day max) — treating as not "
+            "comparable (likely predates a framework/regime cutover). "
+            "Skipping regression check and refreshing baseline from current "
+            "metrics.",
+            age_days, baseline_max_age_days,
+        )
+        try:
+            _refresh_baseline_from_current(bucket, current_metrics, run_date)
+        except Exception as e:  # refresh failure must not break the run
+            logger.warning(
+                "Baseline refresh failed (%s) — next run will re-detect "
+                "staleness and retry.", e,
+            )
+        return {
+            "checked": False,
+            "reason": "baseline_stale_refreshed",
+            "regression_detected": False,
+            "rollback_triggered": False,
+            "details": {
+                "baseline_age_days": age_days,
+                "baseline_max_age_days": baseline_max_age_days,
+                "guard": "baseline_stale_refreshed",
+            },
+            "baseline": baseline,
+            "current": current_metrics,
+        }
+
+    details: dict = {}
     regression_detected = False
 
-    # Accuracy check (10d)
+    # Accuracy check (10d) — secondary gate (retained)
     base_acc = baseline.get("accuracy_10d")
     curr_acc = current_metrics.get("accuracy_10d")
     if base_acc is not None and curr_acc is not None:
@@ -301,18 +456,63 @@ def check_regression(
                 drop_pp, base_acc * 100, curr_acc * 100, acc_threshold,
             )
 
-    # Sharpe check
+    # Sortino check — PRIMARY risk-adjusted gate (skilled-risk evaluator revamp).
+    base_sortino = baseline.get("sortino_ratio")
+    curr_sortino = current_metrics.get("sortino_ratio")
+    sortino_comparable = (
+        base_sortino is not None and curr_sortino is not None and base_sortino > 0
+    )
+    if sortino_comparable:
+        drop_pct = (base_sortino - curr_sortino) / abs(base_sortino)
+        details["sortino_drop_pct"] = drop_pct
+        if drop_pct > sortino_threshold:
+            regression_detected = True
+            logger.warning(
+                "Regression: sortino dropped %.1f%% (%.4f -> %.4f), threshold=%.1f%%",
+                drop_pct * 100, base_sortino, curr_sortino, sortino_threshold * 100,
+            )
+    elif base_sortino is None:
+        # Older baseline with no Sortino → not comparable on the primary
+        # risk-adjusted gate. Do NOT fall back to firing on Sharpe.
+        details["sortino_not_comparable"] = True
+        logger.info(
+            "Baseline has no sortino_ratio — primary risk-adjusted gate not "
+            "comparable; relying on accuracy gate only this run.",
+        )
+
+    # Sharpe check — OBSERVABILITY ONLY (no longer a rollback trigger). Persist
+    # the drop for continuity / dashboards; never sets regression_detected.
     base_sharpe = baseline.get("sharpe_ratio")
     curr_sharpe = current_metrics.get("sharpe_ratio")
     if base_sharpe is not None and curr_sharpe is not None and base_sharpe > 0:
-        drop_pct = (base_sharpe - curr_sharpe) / abs(base_sharpe)
-        details["sharpe_drop_pct"] = drop_pct
-        if drop_pct > sharpe_threshold:
-            regression_detected = True
-            logger.warning(
-                "Regression: sharpe dropped %.1f%% (%.4f -> %.4f), threshold=%.1f%%",
-                drop_pct * 100, base_sharpe, curr_sharpe, sharpe_threshold * 100,
+        sharpe_drop_pct = (base_sharpe - curr_sharpe) / abs(base_sharpe)
+        details["sharpe_drop_pct"] = sharpe_drop_pct
+        if sharpe_drop_pct > sharpe_threshold:
+            logger.info(
+                "Sharpe dropped %.1f%% (%.4f -> %.4f) — observability only, "
+                "NOT a rollback trigger (primary gate is Sortino).",
+                sharpe_drop_pct * 100, base_sharpe, curr_sharpe,
             )
+
+    # ── Guard 2: min-sample / degraded-week ──────────────────────────────────
+    # A low-statistical-power week may *detect* a regression but must NOT
+    # auto-rollback live configs. (2026-05-16: Mode-2 n=55 trades / signal
+    # n=42 recovery week.)
+    n_trades = current_metrics.get("total_trades")
+    n_signals = current_metrics.get("n_signals")
+    low_power_reasons = []
+    if n_trades is not None and n_trades < min_trades:
+        low_power_reasons.append(
+            f"total_trades={n_trades} < min_trades_for_rollback={min_trades}"
+        )
+    if n_signals is not None and n_signals < min_signals:
+        low_power_reasons.append(
+            f"n_signals={n_signals} < min_signals_for_rollback={min_signals}"
+        )
+    rollback_suppressed_low_power = bool(low_power_reasons)
+    if rollback_suppressed_low_power:
+        details["low_power"] = low_power_reasons
+        details["guard"] = "min_sample"
 
     result = {
         "checked": True,
@@ -323,7 +523,14 @@ def check_regression(
         "current": current_metrics,
     }
 
-    if regression_detected:
+    if regression_detected and rollback_suppressed_low_power:
+        logger.warning(
+            "Regression DETECTED but rollback SUPPRESSED — low statistical "
+            "power week (%s). Configs left in place.",
+            "; ".join(low_power_reasons),
+        )
+
+    if regression_detected and not rollback_suppressed_low_power:
         logger.warning("Regression detected — triggering auto-rollback")
         rollback_results = rollback_all(bucket)
         result["rollback_triggered"] = True
