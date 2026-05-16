@@ -78,10 +78,10 @@ from reporter import build_report, save, upload_to_s3
 from pipeline_common import (
     PhaseRegistry,
     PhaseTimeoutError,
+    init_research_db,
     load_config,
     load_phase_hard_caps,
     phase,
-    pull_research_db,
 )
 
 logger = logging.getLogger(__name__)
@@ -3620,6 +3620,29 @@ def _init_pipeline(args: argparse.Namespace, config: dict) -> None:
     """
     executor_optimizer.init_config(config)
 
+    # Pull research.db from S3 (or use --db override) so the backtest
+    # stage's reporter can report an honest Pipeline-Health status.
+    #
+    # Why this lives here and not only in evaluate.py: the Saturday SF
+    # split (evaluator-split-260507 / PR #250-era) runs the `backtest`
+    # stage as a standalone SF state with `--skip-stages=evaluator`, so
+    # the dedicated Evaluator state (the only other init_research_db
+    # caller, evaluate.py:123) does NOT run inside the Backtester state.
+    # Before this call, backtest.py only set research_db when `--db` was
+    # passed, leaving `_db_pull_status` unset on the SF path — the
+    # reporter then rendered a bare `- Research DB: None`.
+    #
+    # The original evaluate.py split (commit c852393, 2026-04-09) removed
+    # the research.db pull from backtest.py and relocated it to evaluate.py;
+    # the SF evaluator-stage split later exposed that latent gap on the
+    # standalone backtest stage. init_research_db degrades gracefully
+    # (sets research_db=None + _db_pull_status="failed" on a pull failure)
+    # so the predictor-only / synthetic modes — which do not consume
+    # research.db — are unaffected; the failure surfaces loudly via the
+    # WARNING/ERROR log + the reporter's explicit **MISSING** line per the
+    # existing convention rather than crashing those paths.
+    init_research_db(args.db, config)
+
     # Set the assembler-cutover flag from config — when true, executor
     # optimizer's apply() skips its legacy live-key writes (the assembler
     # in evaluate.py becomes the sole writer of config/executor_params.json).
@@ -3628,10 +3651,6 @@ def _init_pipeline(args: argparse.Namespace, config: dict) -> None:
     _set_cutover_enabled(
         config.get("assembler", {}).get("cutover_enabled", False),
     )
-
-    if args.db:
-        config["research_db"] = args.db
-        logger.info("Using local research.db: %s", args.db)
 
 
 def _run_simulation_pipeline(
