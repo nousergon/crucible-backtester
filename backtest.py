@@ -2213,17 +2213,26 @@ def run_portfolio_optimizer_gate(
     run_date: str,
     legacy_metrics: dict | None = None,
     s3_client=None,
+    signal_source: str = "synthetic",
 ) -> dict:
     """
-    Run the portfolio-optimizer cutover gate against the synthetic predictor
-    backtest and persist the report to S3.
+    Run the portfolio-optimizer cutover gate and persist the report to S3.
 
-    ROADMAP L2222 PR 4.5. Orchestrates ``analysis.portfolio_optimizer_gate``'s
-    ``run_gate_against_predictor_backtest`` (predictor history → optimizer
-    backtest → compare → evaluate_gate) and writes the result to
-    ``s3://{bucket}/predictor/optimizer_gate/{run_date}.json``. The Saturday
-    SF reads the persisted JSON as the readiness signal for PR 5 cutover
-    (flip ``use_portfolio_optimizer: true``).
+    ROADMAP L2222 PR 4.5 / L124 PR 2. Orchestrates
+    ``analysis.portfolio_optimizer_gate``'s
+    ``run_gate_against_predictor_backtest`` ({synthetic | production} history
+    → optimizer backtest → compare → evaluate_gate).
+
+    ``signal_source="synthetic"`` (default) writes to the existing
+    ``s3://{bucket}/predictor/optimizer_gate/{run_date}.json`` +
+    ``.../latest.json`` keys the Saturday SF reads as the PR 5 readiness
+    signal — unchanged, so the consumer contract is untouched.
+    ``signal_source="production"`` (L124 PR 2 — the gate run against the
+    deployed research cohort, the verdict the operator can trust as the
+    SOLE promotion lever) writes to an *additive* sibling namespace
+    ``.../optimizer_gate/production/{run_date}.json`` +
+    ``.../production/latest.json``, so the two sources never overwrite
+    each other and existing readers are unaffected.
 
     legacy_metrics: optional dict from a same-run simulate stage's
     ``portfolio_stats`` to give the gate side-by-side comparisons against
@@ -2238,19 +2247,26 @@ def run_portfolio_optimizer_gate(
     )
 
     logger.info(
-        "portfolio_optimizer_gate: starting (legacy_metrics=%s)",
-        "provided" if legacy_metrics else "skipped",
+        "portfolio_optimizer_gate: starting (signal_source=%s, legacy_metrics=%s)",
+        signal_source, "provided" if legacy_metrics else "skipped",
     )
     gate_result = run_gate_against_predictor_backtest(
         config=config,
         legacy_metrics=legacy_metrics,
+        signal_source=signal_source,
     )
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
-    key = f"predictor/optimizer_gate/{run_date}.json"
-    latest_key = "predictor/optimizer_gate/latest.json"
+    prefix = (
+        "predictor/optimizer_gate/production"
+        if signal_source == "production"
+        else "predictor/optimizer_gate"
+    )
+    key = f"{prefix}/{run_date}.json"
+    latest_key = f"{prefix}/latest.json"
     payload = {
         "run_date": run_date,
+        "signal_source": signal_source,
         "passed": gate_passed(gate_result.get("gate_report") or {}),
         **gate_result,
     }
@@ -3543,6 +3559,22 @@ def _parse_args() -> argparse.Namespace:
             "smoke time instead of during a 2h Saturday SF run."
         ),
     )
+    parser.add_argument(
+        "--signal-source",
+        dest="signal_source",
+        choices=["synthetic", "production"],
+        default="synthetic",
+        help=(
+            "Input stream for the portfolio-optimizer cutover gate. "
+            "'synthetic' (default) replays the 10y predictor-GBM over the "
+            "full universe (a stress test). 'production' (ROADMAP L124 PR 2) "
+            "runs the gate against the deployed research cohort "
+            "(signals/{date}/signals.json + predictor/predictions/{date}.json) "
+            "— the verdict the operator trusts as the SOLE promotion lever. "
+            "Production runs persist to the additive "
+            "predictor/optimizer_gate/production/ S3 namespace."
+        ),
+    )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--db", help="Override research_db path from config")
     parser.add_argument("--upload", action="store_true", help="Upload results to S3")
@@ -4257,6 +4289,7 @@ def main() -> None:
                     config=config,
                     run_date=args.date,
                     legacy_metrics=portfolio_stats,
+                    signal_source=getattr(args, "signal_source", "synthetic"),
                 )
         except Exception as exc:
             logger.warning(

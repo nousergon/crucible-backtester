@@ -248,10 +248,12 @@ def run_gate_against_predictor_backtest(
     legacy_metrics: dict | None = None,
     rebalance_freq_days: int = 5,
     universe_cap: int = 30,
+    signal_source: str = "synthetic",
 ) -> dict:
     """
-    End-to-end gate runner — orchestrates predictor_backtest → optimizer
-    backtest → compare_to_legacy → evaluate_gate.
+    End-to-end gate runner — orchestrates {predictor_backtest |
+    production_signal_backtest} → optimizer backtest → compare_to_legacy →
+    evaluate_gate.
 
     Args:
         config: full backtester config dict (signals_bucket, executor_paths,
@@ -265,6 +267,14 @@ def run_gate_against_predictor_backtest(
             not gated on a legacy baseline.
         rebalance_freq_days: passthrough to run_optimizer_backtest.
         universe_cap: passthrough to run_optimizer_backtest.
+        signal_source: "synthetic" (default — 10y predictor-GBM replay over
+            the full universe) or "production" (ROADMAP L124 PR 2 — the
+            deployed research cohort from signals/{date}/signals.json +
+            predictor/predictions/{date}.json). The optimizer kernel is
+            identical for both; only the input distribution differs. The
+            enhanced-index TE/active-share bands are calibrated for the
+            production distribution — a synthetic-source verdict's
+            band criteria should be read as a stress test, not a gate.
 
     Returns:
         {
@@ -280,11 +290,15 @@ def run_gate_against_predictor_backtest(
     gate verdict.
     """
     import os
-    from synthetic.predictor_backtest import run as run_predictor_pipeline
     from analysis.portfolio_optimizer_backtest import (
         compare_to_legacy,
         run_optimizer_backtest,
     )
+
+    if signal_source not in ("synthetic", "production"):
+        raise ValueError(
+            f"signal_source must be 'synthetic' or 'production', got {signal_source!r}"
+        )
 
     executor_paths = config.get("executor_paths", [])
     if isinstance(executor_paths, str):
@@ -296,14 +310,35 @@ def run_gate_against_predictor_backtest(
             "Add the alpha-engine repo root to executor_paths in config.yaml."
         )
 
-    logger.info("Gate runner: invoking synthetic predictor backtest with keep_predictions=True")
-    pred_result = run_predictor_pipeline(config, keep_predictions=True)
+    if signal_source == "production":
+        from synthetic.production_signal_backtest import (
+            build_production_signal_inputs,
+        )
+
+        logger.info(
+            "Gate runner: building inputs from the PRODUCTION archive "
+            "(signals/ ∪ predictor/predictions/) — measures deployed behavior"
+        )
+        pred_result = build_production_signal_inputs(config)
+    else:
+        from synthetic.predictor_backtest import run as run_predictor_pipeline
+
+        logger.info(
+            "Gate runner: invoking synthetic predictor backtest "
+            "with keep_predictions=True"
+        )
+        pred_result = run_predictor_pipeline(config, keep_predictions=True)
+
     if pred_result.get("status") != "ok":
         return {
             "comparison": None,
             "gate_report": {
                 "verdict": _FAIL,
-                "summary": f"Predictor backtest failed: status={pred_result.get('status')}",
+                "summary": (
+                    f"{signal_source} input producer failed: "
+                    f"status={pred_result.get('status')} "
+                    f"({pred_result.get('error', 'no detail')})"
+                ),
                 "criteria": [],
                 "n_pass": 0,
                 "n_fail": 1,
@@ -312,6 +347,7 @@ def run_gate_against_predictor_backtest(
             "optimizer_diagnostics": [],
             "n_rebalances": 0,
             "n_solver_failures": 0,
+            "signal_source": signal_source,
         }
 
     logger.info(
@@ -328,11 +364,12 @@ def run_gate_against_predictor_backtest(
         universe_cap=universe_cap,
     )
 
-    # This runner drives the synthetic predictor-GBM replay. The
-    # production-signal runner (consuming signals/{date}/signals.json) is
-    # the sequenced L124 PR 2 — it passes signal_source="production".
+    # The optimizer kernel (executor.portfolio_optimizer.solve_target_weights)
+    # is identical for both sources; only the input distribution differs.
+    # signal_source is threaded into the verdict so band criteria are
+    # interpretable (L124 PR 1 added the discriminator; PR 2 makes it real).
     comparison = compare_to_legacy(
-        opt_result.metrics, legacy_metrics, signal_source="synthetic"
+        opt_result.metrics, legacy_metrics, signal_source=signal_source
     )
     report = evaluate_gate(comparison)
 
@@ -347,4 +384,6 @@ def run_gate_against_predictor_backtest(
         "optimizer_diagnostics": opt_result.diagnostics_per_rebalance,
         "n_rebalances": opt_result.n_rebalances,
         "n_solver_failures": opt_result.n_solver_failures,
+        "signal_source": signal_source,
+        "production_window": pred_result.get("production_window"),
     }
