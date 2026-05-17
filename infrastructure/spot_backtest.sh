@@ -95,6 +95,14 @@ DRY_RUN="${DRY_RUN:-false}"               # true → --dry-run
 # iteration against a single stage (e.g. parity-only when debugging a cred
 # divergence).
 SKIP_STAGES="${SKIP_STAGES:-}"
+# pit_parity observational stage (ROADMAP L2371 / plan §D4). DEFAULT ON
+# 2026-05-17 (Brian): every Saturday SF spot run now emits
+# backtest/{date}/pit_parity.json (the skilled-risk-basket contamination
+# report). NON-BLOCKING + writes no configs + does NOT flip --walk-forward
+# (the L2371 close is the separate, manual, post-review step). Opt out per
+# run with --no-pit-parity or PIT_PARITY_ENABLED=0 (ad-hoc/dry iterations
+# where the extra predictor-sim pass isn't wanted).
+PIT_PARITY_ENABLED="${PIT_PARITY_ENABLED:-1}"
 # Freeze the evaluator (passes --freeze to evaluate.py → suppresses per-
 # optimizer S3 config writes; report artifacts + email still upload). Use
 # for off-cycle test runs so mid-week sweeps don't auto-promote weights/
@@ -128,6 +136,9 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN="true"; shift ;;
         --skip-stages) SKIP_STAGES="$2"; shift 2 ;;
         --skip-stages=*) SKIP_STAGES="${1#*=}"; shift ;;
+        --no-pit-parity) PIT_PARITY_ENABLED="0"; shift ;;
+        --pit-parity-enabled) PIT_PARITY_ENABLED="$2"; shift 2 ;;
+        --pit-parity-enabled=*) PIT_PARITY_ENABLED="${1#*=}"; shift ;;
         --freeze-evaluator) FREEZE_EVALUATOR="true"; shift ;;
         --use-vectorized-sweep) USE_VECTORIZED_SWEEP="true"; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
@@ -676,6 +687,11 @@ BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
 # SKIP_STAGES baked in from the dispatcher's --skip-stages flag. Stages in
 # this CSV are skipped with a loud ⊘ echo; everything else runs.
 SKIP_STAGES="${SKIP_STAGES}"
+# PIT_PARITY_ENABLED baked in from the dispatcher (default 1 / ON since
+# 2026-05-17). Same mechanism as SKIP_STAGES — the dispatcher-side value is
+# interpolated at heredoc-generation time so the runtime gate below resolves
+# it on the spot instance.
+PIT_PARITY_ENABLED="${PIT_PARITY_ENABLED}"
 # Shared RUN_DATE used by parity + evaluator uploads so they land under the
 # same backtest/{date}/ prefix.
 RUN_DATE=\$(date -u +%Y-%m-%d)
@@ -708,17 +724,21 @@ else
     echo "▶ stage=backtest END at \$(date -u +%H:%M:%S)"
 fi
 
-# ── Stage: pit_parity (observational, opt-in, NON-BLOCKING) ─────────────────
+# ── Stage: pit_parity (observational, DEFAULT ON, NON-BLOCKING) ─────────────
 # Proof-of-impact for point-in-time discipline (ROADMAP L2371 / plan §D4):
 # runs the predictor backtest both ways (legacy single-pass vs
 # --walk-forward) and emits the skilled-risk-basket contamination report to
 # s3://{bucket}/backtest/{RUN_DATE}/pit_parity.json. This is the input to
 # the manual, Brian-gated --walk-forward default flip (plan §5).
 #
-# DEFAULT OFF: set PIT_PARITY_ENABLED=1 in the SF env to opt in. It runs a
-# second predictor backtest so it ~doubles the predictor-sim slice; kept
-# opt-in until Brian wants the artifact. NEVER fails the spot run (|| true)
-# — observational only, writes no configs, gates nothing.
+# DEFAULT ON 2026-05-17 (Brian: "switch pit to on"). Runs an extra
+# predictor-sim pass (~+1 predictor backtest; bounded, the predictor
+# pipeline is ~4 min / ~8% of the 1800s cap). NEVER fails the spot run
+# (|| true) — observational only, writes no configs, and does NOT change
+# --walk-forward (the optimizer-feeding default stays OFF; flipping it is
+# the separate post-review L2371 step). Opt out per run: --no-pit-parity
+# or PIT_PARITY_ENABLED=0. Runtime fallback stays :-0 (belt-and-suspenders
+# if the dispatcher bake is ever bypassed).
 if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ] && ! _stage_skipped backtest; then
     echo "▶ stage=pit_parity START at \$(date -u +%H:%M:%S) (observational, non-blocking)"
     $REMOTE_PYTHON -u backtest.py --mode predictor-backtest --pit-parity \\
