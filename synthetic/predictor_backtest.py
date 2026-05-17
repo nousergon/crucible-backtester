@@ -29,6 +29,7 @@ Performance notes (10y on c5.large spot):
 
 from __future__ import annotations
 
+import datetime as _dt
 import gc
 import json
 import logging
@@ -228,10 +229,28 @@ def download_gbm_model(bucket: str = "alpha-engine-research", region: str = "us-
     Returns the local path to the downloaded model.
     """
     s3 = boto3.client("s3", region_name=region)
+    return _download_gbm_to_temp(
+        s3,
+        bucket,
+        "predictor/weights/meta/momentum_model.txt",
+        "predictor/weights/meta/momentum_model.txt.meta.json",
+    )
 
-    model_key = "predictor/weights/meta/momentum_model.txt"
-    meta_key = "predictor/weights/meta/momentum_model.txt.meta.json"
 
+def _download_gbm_to_temp(s3, bucket: str, model_key: str, meta_key: str) -> str:
+    """Download a momentum-GBM booster + its meta.json to a temp file.
+
+    Key-parameterized core shared by the live-weights path
+    (:func:`download_gbm_model`) and the point-in-time walk-forward path
+    (:func:`run_walk_forward_inference`, which passes an archived
+    ``predictor/weights/meta/archive/{date}/momentum_model.txt`` key
+    resolved by :mod:`synthetic.pit_weights`). Same hard-fail discipline
+    on both legs regardless of which key was requested: a missing booster
+    is a PredictorTraining-pipeline problem, and a missing meta.json would
+    crash the downstream ``feature_names`` alignment in a less useful place
+    — so both raise :class:`RuntimeError` rather than silently degrading.
+    Returns the local booster path (``<path>.meta.json`` sits beside it).
+    """
     model_tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
     model_tmp.close()
     try:
@@ -240,8 +259,8 @@ def download_gbm_model(bucket: str = "alpha-engine-research", region: str = "us-
     except Exception as exc:
         raise RuntimeError(
             f"Layer-1A momentum GBM not found at s3://{bucket}/{model_key}. "
-            "Saturday PredictorTraining step must populate predictor/weights/"
-            "meta/momentum_model.txt on each run — investigate the training "
+            "Saturday PredictorTraining step must populate "
+            f"{model_key} on each run — investigate the training "
             f"pipeline if this key is missing. Underlying error: {exc}"
         ) from exc
 
@@ -713,6 +732,224 @@ def _resolve_trading_dates(
     return trading_dates
 
 
+# Plan defaults for the purged + embargoed walk-forward fold scheme
+# (alpha-engine-docs/private/pit-discipline-260515.md §D1). Every value is
+# config-overridable via predictor_backtest.walk_forward_params so a later
+# experiment can sweep the fold scheme without a code change.
+#   test_window — ~21 trading days (~1mo), the weekly-Saturday weight-promotion
+#                 cadence the simulation must respect (plan D1).
+#   min_train   — 504 (~2y), mirrors the predictor's WF_MIN_TRAIN_DAYS for
+#                 system-wide consistency (plan §3 scope discipline). The train
+#                 block is not refit here — archived weights are resolved — so
+#                 this only governs how much un-archived warmup history is
+#                 skipped before the first scorable fold.
+#   purge       — 21 = canonical label horizon (plan invariant 2; the
+#                 predictor's own WF_PURGE_DAYS=5 is for its 5d-era labels,
+#                 superseded by the 21d canonical-alpha cutover).
+#   embargo     — 2 trading days, LdP Ch.7 lower bound (plan D1 / §7). This is
+#                 the plan's addition over the predictor (purge but no embargo).
+#   train_mode  — "expanding" genuinely matches the predictor
+#                 (meta_trainer.py train_mask = d <= train_end, no lower bound;
+#                 the plan doc's "rolling matches predictor" wording is a known
+#                 doc error corrected in pit_folds.py).
+_WF_DEFAULTS = {
+    "test_window": 21,
+    "min_train": 504,
+    "purge": 21,
+    "embargo": 2,
+    "train_mode": "expanding",
+}
+
+
+def run_walk_forward_inference(
+    features_by_ticker: dict[str, pd.DataFrame],
+    trading_dates: list[str],
+    predictor_path: str,
+    *,
+    bucket: str,
+    region: str = "us-east-1",
+    wf_params: dict | None = None,
+    s3_client=None,
+) -> tuple[dict[str, dict[str, float]], dict]:
+    """Point-in-time-honest replacement for the single-pass ``run_inference``.
+
+    Slice C of PR 1, ROADMAP L2371 / Backtester Phase 2 (plan
+    ``alpha-engine-docs/private/pit-discipline-260515.md``). The single-pass
+    path replays *all* history against the **current live** momentum GBM —
+    look-ahead contamination, since the optimizer's param sweep then selects
+    parameters on future-trained weights. This path instead, for each
+    purged + embargoed walk-forward fold, resolves the latest archived
+    momentum weights whose *knowledge time ≤ the fold's test-window start*
+    (:func:`synthetic.pit_weights.resolve_momentum_weights`) and scores only
+    that fold's test window with them.
+
+    No-future-fallback (plan invariant 3 / the central trap): a fold with no
+    archived weights on-or-before its decision date raises
+    :class:`~synthetic.pit_weights.ColdStartExclusion`; the fold is **skipped
+    and counted**, never resolved to the nearest / earliest-future snapshot.
+    The cold-start-excluded count is a first-class run-quality output (a high
+    count is itself a finding about archive coverage).
+
+    Performance: the inference tensor is built once per *distinct scorer
+    feature signature* (one in practice — the momentum feature set is stable
+    across weekly retrains) and reused across every fold, so the cost stays
+    ≈ the single-pass path rather than O(n_folds × full-tensor). Distinct
+    archived boosters are downloaded once and cached by archive date.
+
+    Returns ``(predictions_by_date, wf_stats)`` where ``predictions_by_date``
+    is the same ``{date: {ticker: alpha}}`` contract the single-pass path
+    returns (sparse: only scored test-window dates are present — warmup /
+    cold-start dates are "not investable yet" and correctly absent), and
+    ``wf_stats`` is the metadata block surfaced under
+    ``metadata["walk_forward"]``.
+    """
+    from synthetic.pit_weights import (
+        ColdStartExclusion,
+        resolve_momentum_weights,
+    )
+    from synthetic.pit_folds import build_walk_forward_folds
+
+    if predictor_path not in sys.path:
+        sys.path.insert(0, predictor_path)
+    from model.gbm_scorer import GBMScorer
+
+    p = {**_WF_DEFAULTS, **(wf_params or {})}
+    s3 = s3_client if s3_client is not None else boto3.client("s3", region_name=region)
+
+    # trading_dates is the sorted-unique axis from _resolve_trading_dates;
+    # fold indices index straight back into it so date<->index stays aligned.
+    date_objs = [_dt.date.fromisoformat(d) for d in trading_dates]
+    folds = build_walk_forward_folds(
+        date_objs,
+        test_window=p["test_window"],
+        min_train=p["min_train"],
+        purge=p["purge"],
+        embargo=p["embargo"],
+        train_mode=p["train_mode"],
+    )
+    logger.info(
+        "[walk_forward] %d fold(s) over %d trading dates (%s..%s); "
+        "test_window=%d min_train=%d purge=%d embargo=%d mode=%s",
+        len(folds), len(trading_dates),
+        trading_dates[0] if trading_dates else "-",
+        trading_dates[-1] if trading_dates else "-",
+        p["test_window"], p["min_train"], p["purge"], p["embargo"],
+        p["train_mode"],
+    )
+
+    # Caches keyed so the expensive bits happen once: boosters by archive
+    # date, tensors by the scorer's feature signature (tuple of names).
+    scorer_by_archive: dict[_dt.date, object] = {}
+    model_path_by_archive: dict[_dt.date, str] = {}
+    tensor_by_sig: dict[tuple, tuple] = {}
+
+    predictions_by_date: dict[str, dict[str, float]] = {}
+    n_cold_start = 0
+    cold_start_test_starts: list[str] = []
+    archive_dates_used: set[_dt.date] = set()
+    n_test_dates_scored = 0
+
+    try:
+        for fold in folds:
+            decision_date = fold.test_start_date
+            try:
+                resolved = resolve_momentum_weights(s3, bucket, decision_date)
+            except ColdStartExclusion as exc:
+                n_cold_start += 1
+                cold_start_test_starts.append(decision_date.isoformat())
+                logger.info(
+                    "[walk_forward] fold test_start=%s EXCLUDED (cold-start): %s",
+                    decision_date.isoformat(), exc,
+                )
+                continue
+
+            adate = resolved.archive_date
+            archive_dates_used.add(adate)
+
+            scorer = scorer_by_archive.get(adate)
+            if scorer is None:
+                mpath = _download_gbm_to_temp(
+                    s3, bucket, resolved.model_key, resolved.meta_key,
+                )
+                model_path_by_archive[adate] = mpath
+                scorer = GBMScorer.load(mpath)
+                if not scorer.feature_names:
+                    raise RuntimeError(
+                        f"Archived momentum model {resolved.model_key} has no "
+                        "feature_names metadata — cannot align input features. "
+                        "The archived meta.json predates feature_names "
+                        "persistence; exclude that archive date or refresh it."
+                    )
+                scorer_by_archive[adate] = scorer
+
+            sig = tuple(scorer.feature_names)
+            cached = tensor_by_sig.get(sig)
+            if cached is None:
+                logger.info(
+                    "[walk_forward] building inference tensor for %d-feature "
+                    "signature (archive %s)", len(sig), adate.isoformat(),
+                )
+                cached = build_inference_tensor(features_by_ticker, list(sig))
+                tensor_by_sig[sig] = cached
+            tensor, tickers, date_to_idx = cached
+
+            fold_test_dates = trading_dates[
+                fold.test_start_idx : fold.test_end_idx + 1
+            ]
+            fold_preds = _predict_from_tensor(
+                tensor, tickers, date_to_idx, fold_test_dates,
+                scorer=scorer, heartbeat_every=50,
+                log_label=f"WF[{decision_date.isoformat()}<-{adate.isoformat()}]",
+            )
+            for d, row in fold_preds.items():
+                if d in predictions_by_date:
+                    # Non-overlapping test windows is a fold-splitter
+                    # invariant; a collision means the splitter regressed.
+                    raise RuntimeError(
+                        f"[walk_forward] date {d} scored by >1 fold — "
+                        "fold splitter produced overlapping test windows"
+                    )
+                predictions_by_date[d] = row
+            n_test_dates_scored += len(fold_preds)
+    finally:
+        for mpath in model_path_by_archive.values():
+            for path in (mpath, mpath + ".meta.json"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    n_folds_scored = len(folds) - n_cold_start
+    wf_stats = {
+        "enabled": True,
+        "n_folds": len(folds),
+        "n_folds_scored": n_folds_scored,
+        "n_cold_start_excluded": n_cold_start,
+        "cold_start_test_starts": cold_start_test_starts,
+        "archive_dates_used": sorted(d.isoformat() for d in archive_dates_used),
+        "n_distinct_archives": len(archive_dates_used),
+        "n_test_dates_scored": n_test_dates_scored,
+        "params": p,
+    }
+    logger.info(
+        "[walk_forward] complete: %d/%d folds scored, %d cold-start-excluded, "
+        "%d distinct archive(s), %d test dates with predictions",
+        n_folds_scored, len(folds), n_cold_start,
+        len(archive_dates_used), n_test_dates_scored,
+    )
+    if n_cold_start and n_folds_scored == 0:
+        # Every fold cold-start-excluded → the run produced zero PIT signals.
+        # Loud, not silent (feedback_no_silent_fails): a parity run on this
+        # would compare against nothing.
+        logger.error(
+            "[walk_forward] ALL %d folds cold-start-excluded — no archived "
+            "weights on-or-before any fold decision date. Archive coverage "
+            "(predictor/weights/meta/archive/) is the constraint, not a code "
+            "bug; the PIT run has no signals to simulate.", len(folds),
+        )
+    return predictions_by_date, wf_stats
+
+
 def run(
     config: dict,
     keep_features: bool = False,
@@ -864,15 +1101,36 @@ def run(
     _log_rss("post_ohlcv_build_and_drain")
     logger.info("Freed raw price data (memory optimization)")
 
-    # 5. Download GBM model
-    model_path = download_gbm_model(bucket=bucket)
-    _log_rss("post_gbm_download")
-
-    # 6. Run inference
+    # 5 + 6. Inference. Two mutually-exclusive paths:
+    #   - walk_forward OFF (default): single pass over all dates against the
+    #     CURRENT LIVE momentum GBM. Look-ahead-contaminated but the
+    #     historical behavior — preserved byte-for-byte until PR 3's parity
+    #     report is reviewed and the default is flipped (plan §5 / S3-contract
+    #     caution: a new code path never silently changes optimizer inputs).
+    #   - walk_forward ON: per-fold point-in-time weight resolution
+    #     (run_walk_forward_inference). The model temp files are managed
+    #     inside that function; model_path stays None so the cleanup block
+    #     below no-ops on this path.
     n_feature_tickers = len(features_by_ticker)
-    predictions_by_date = run_inference(
-        features_by_ticker, model_path, predictor_path, trading_dates,
-    )
+    wf_enabled = bool(config.get("walk_forward", False))
+    wf_params = pb_config.get("walk_forward_params", {})
+    if wf_enabled:
+        logger.info(
+            "[walk_forward] PIT-honest inference ON — archived weights "
+            "resolved per fold (knowledge-time ≤ decision-date)"
+        )
+        model_path = None
+        predictions_by_date, wf_stats = run_walk_forward_inference(
+            features_by_ticker, trading_dates, predictor_path,
+            bucket=bucket, wf_params=wf_params,
+        )
+    else:
+        model_path = download_gbm_model(bucket=bucket)
+        _log_rss("post_gbm_download")
+        predictions_by_date = run_inference(
+            features_by_ticker, model_path, predictor_path, trading_dates,
+        )
+        wf_stats = None
     _log_rss("post_inference")
 
     # 6b. Persist features via caller-provided callback BEFORE dropping.
@@ -897,14 +1155,17 @@ def run(
         logger.info("Freed feature data (memory optimization)")
         _log_rss("post_feature_free")
 
-    # Clean up temp model file
-    try:
-        os.unlink(model_path)
-        meta_path = model_path + ".meta.json"
-        if os.path.exists(meta_path):
-            os.unlink(meta_path)
-    except OSError:
-        pass
+    # Clean up temp model file. None on the walk_forward path —
+    # run_walk_forward_inference already unlinked every archived booster
+    # it downloaded (its own finally block).
+    if model_path is not None:
+        try:
+            os.unlink(model_path)
+            meta_path = model_path + ".meta.json"
+            if os.path.exists(meta_path):
+                os.unlink(meta_path)
+        except OSError:
+            pass
 
     # 7. Generate signals (using technical scoring from OHLCV, enriched by GBM alpha)
     signals_by_date = build_signals_by_date(
@@ -928,6 +1189,10 @@ def run(
         "n_enter_signals_total": n_enter_total,
         "top_n_per_day": top_n,
         "min_score": min_score,
+        # None on the legacy single-pass path; the PIT run-quality block
+        # (fold count, cold-start exclusions, archives used) when walk_forward
+        # is on. Consumed by PR 3's --pit-parity contamination report.
+        "walk_forward": wf_stats,
     }
     logger.info("Predictor backtest data ready: %s", metadata)
 
