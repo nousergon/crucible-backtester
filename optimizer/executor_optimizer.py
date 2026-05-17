@@ -212,6 +212,27 @@ def read_current_params(bucket: str) -> dict:
     return FACTORY_DEFAULTS.copy()
 
 
+def read_params_as_of(bucket: str, as_of_date) -> dict:
+    """Point-in-time sibling of :func:`read_current_params` (PIT walk-forward,
+    ROADMAP L2371 / Backtester Phase 3).
+
+    Resolves the executor-params snapshot whose knowledge time ≤
+    ``as_of_date`` (``optimizer.config_archive.resolve_as_of``). No eligible
+    snapshot → genesis ``FACTORY_DEFAULTS`` (the documented shipped
+    defaults), **never** a later snapshot — the no-future-fallback invariant
+    (plan §3 / D3). Return shape mirrors :func:`read_current_params` exactly
+    (``SAFE_PARAMS`` subset, or full defaults when empty) so call sites are
+    contract-identical whichever path they take.
+    """
+    from optimizer.config_archive import resolve_as_of
+
+    data = resolve_as_of(bucket, "executor_params", as_of_date)
+    if not data:
+        return FACTORY_DEFAULTS.copy()
+    params = {k: data[k] for k in SAFE_PARAMS if k in data}
+    return params if params else FACTORY_DEFAULTS.copy()
+
+
 def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | None = None) -> dict:
     """
     Extract best executor params from param sweep results.
@@ -959,6 +980,18 @@ def apply(result: dict, bucket: str) -> dict:
         )
     except Exception as e:
         logger.warning("Failed to archive executor params history (non-fatal): %s", e)
+
+    # Index this apply in the bitemporal knowledge-time changelog so the
+    # PIT walk-forward backtest can resolve it (best-effort, never fatal —
+    # live + history are already durable). plan §D3.
+    from optimizer.config_archive import record_apply
+    record_apply(
+        bucket, "executor_params",
+        history_key=history_key,
+        knowledge_date=payload["updated_at"],
+        run_id=history_run_id,
+        s3_client=s3,
+    )
 
     return {
         "applied": True,

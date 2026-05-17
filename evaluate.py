@@ -66,6 +66,7 @@ from analysis import regime_stratified_sortino_runner
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
 from optimizer import trigger_optimizer, predictor_sizing_optimizer
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
+from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 from completeness import CompletenessTracker
@@ -772,7 +773,7 @@ def _run_veto_opt(config: dict, df_base, freeze: bool) -> dict:
 
 def _run_research_opt(config: dict, df_base, freeze: bool) -> dict:
     bucket = config.get("signals_bucket", "alpha-engine-research")
-    current_rp = research_optimizer.read_current_params(bucket)
+    current_rp = read_params_pit_or_current(research_optimizer, bucket, config)
     corr_result = research_optimizer.compute_boost_correlations(df_base, bucket)
     if corr_result.get("status") != "ok":
         return corr_result
@@ -809,7 +810,7 @@ def _run_scanner_opt(config: dict, db_path: str, freeze: bool, bucket: str) -> d
     analysis = scanner_optimizer.analyze(db_path)
     if analysis.get("status") != "ok":
         return analysis
-    current = scanner_optimizer.read_current_params(bucket)
+    current = read_params_pit_or_current(scanner_optimizer, bucket, config)
     result = scanner_optimizer.recommend(analysis, current)
     if result.get("status") == "ok":
         if freeze:
@@ -852,7 +853,7 @@ def _run_executor_opt(config: dict, sweep_df, freeze: bool) -> dict:
         }
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
-    current_params = executor_optimizer.read_current_params(bucket)
+    current_params = read_params_pit_or_current(executor_optimizer, bucket, config)
     result = executor_optimizer.recommend(sweep_df, config, current_params=current_params)
     if result.get("status") == "ok":
         if freeze:

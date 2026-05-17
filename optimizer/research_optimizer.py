@@ -123,6 +123,26 @@ def read_current_params(bucket: str) -> dict:
     return FACTORY_DEFAULTS.copy()
 
 
+def read_params_as_of(bucket: str, as_of_date) -> dict:
+    """Point-in-time sibling of :func:`read_current_params` (PIT walk-forward,
+    ROADMAP L2371 / Backtester Phase 3).
+
+    Resolves the research-params snapshot whose knowledge time ≤
+    ``as_of_date``. No eligible snapshot → genesis ``FACTORY_DEFAULTS``,
+    **never** a later snapshot (no-future-fallback, plan §3 / D3). Return
+    shape mirrors :func:`read_current_params` exactly
+    (``{**FACTORY_DEFAULTS, **params}``) so call sites are contract-identical
+    whichever path they take.
+    """
+    from optimizer.config_archive import resolve_as_of
+
+    data = resolve_as_of(bucket, "research_params", as_of_date)
+    if not data:
+        return FACTORY_DEFAULTS.copy()
+    params = {k: data[k] for k in FACTORY_DEFAULTS if k in data}
+    return {**FACTORY_DEFAULTS, **params}
+
+
 def compute_boost_correlations(
     df: pd.DataFrame,
     bucket: str,
@@ -353,6 +373,17 @@ def apply(result: dict, bucket: str) -> dict:
     logger.info(
         "Research params archived to s3://%s/%s (+ latest.json sidecar)",
         bucket, history_key,
+    )
+
+    # Bitemporal knowledge-time index for PIT walk-forward resolution
+    # (best-effort, never fatal — live + history already durable). plan §D3.
+    from optimizer.config_archive import record_apply
+    record_apply(
+        bucket, "research_params",
+        history_key=history_key,
+        knowledge_date=payload["updated_at"],
+        run_id=run_id,
+        s3_client=s3,
     )
 
     return {

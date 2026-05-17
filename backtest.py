@@ -73,6 +73,7 @@ import yaml
 
 from analysis import param_sweep
 from optimizer import executor_optimizer
+from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 from pipeline_common import (
@@ -2826,7 +2827,10 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
     grid = config.get("param_sweep")
     if grid:
         bucket = config.get("signals_bucket", "alpha-engine-research")
-        grid = _seed_grid_with_current(grid, executor_optimizer.read_current_params(bucket))
+        grid = _seed_grid_with_current(
+            grid,
+            read_params_pit_or_current(executor_optimizer, bucket, config),
+        )
 
         # Tier 3 Part A (2026-04-27): precompute SignalLookup ONCE here,
         # before the sim_fn closure is constructed. All 60 combos in
@@ -4044,6 +4048,12 @@ def main() -> None:
         config["walk_forward"] = True
     else:
         config.setdefault("walk_forward", False)
+    # Run-date label = the PIT as-of for optimizer-baseline reads under
+    # walk-forward (config_archive.as_of_date_from_config). evaluate.py:934
+    # sets the same key; mirror it here so backtest-mode call sites
+    # (param-sweep grid seed + executor baseline) resolve to a backdated
+    # config when --date is backdated, and to "current" for a live run.
+    config.setdefault("_run_date", args.date)
 
     # Smoke-phase mode: apply the fixture BEFORE phase-selection parsing
     # so the fixture's only_phases/skip_phases/force flow through the
@@ -4180,7 +4190,9 @@ def main() -> None:
     current_executor_params = None
     if args.mode in ("param-sweep", "all", "predictor-backtest"):
         bucket = config.get("signals_bucket", "alpha-engine-research")
-        current_executor_params = executor_optimizer.read_current_params(bucket)
+        current_executor_params = read_params_pit_or_current(
+            executor_optimizer, bucket, config,
+        )
 
     # ── Simulate + param sweep + executor optimizer ───────────────────────
     if args.mode in ("simulate", "param-sweep", "all"):
