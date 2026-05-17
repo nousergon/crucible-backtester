@@ -95,6 +95,23 @@ predictor_backtest:
   top_n_signals_per_day: 20
   min_score: 70
   use_full_cache: true              # load 10y S3 cache instead of 2y slim cache
+  # Purged + embargoed walk-forward fold scheme for the --walk-forward
+  # (point-in-time) path. Defaults below = plan pit-discipline-260515.md §D1;
+  # omit the block entirely to use them. Only consulted when walk_forward
+  # is on (CLI --walk-forward or top-level `walk_forward: true`).
+  walk_forward_params:
+    test_window: 21                 # ~1mo; weekly weight-promotion cadence
+    min_train: 504                  # ~2y; mirrors predictor WF_MIN_TRAIN_DAYS
+    purge: 21                       # canonical label horizon (LdP Ch.7 purge)
+    embargo: 2                      # LdP Ch.7 lower bound (predictor has none)
+    train_mode: expanding           # matches predictor (d <= train_end)
+
+# Point-in-time-honest predictor backtest (ROADMAP L2371 / Backtester
+# Phase 2). DEFAULT false — the single-pass path replays history against
+# the current live momentum GBM (look-ahead) and stays the default until
+# PR 3's --pit-parity contamination report is reviewed and the flip is
+# made manually. Set true here or pass --walk-forward.
+walk_forward: false
 
 # ── Param sweep settings ───────────────────────────────────────────────────
 # mode: "random" samples from the grid; "grid" runs exhaustive search.

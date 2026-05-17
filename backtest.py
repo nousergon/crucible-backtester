@@ -3610,6 +3610,16 @@ def _parse_args() -> argparse.Namespace:
                                    "Reserved for emergency rollback if the "
                                    "vectorized stats diverge from scalar in a "
                                    "spot run; default-on flip happened 2026-04-28.")
+    parser.add_argument(
+        "--walk-forward", action="store_true",
+        help="Point-in-time-honest predictor backtest: resolve archived "
+             "momentum weights whose knowledge-time ≤ each fold's decision "
+             "date instead of replaying history against the current live "
+             "model (ROADMAP L2371 / Backtester Phase 2; plan "
+             "pit-discipline-260515.md). DEFAULT OFF — the single-pass "
+             "look-ahead path stays the default until PR 3's --pit-parity "
+             "report is reviewed and the flip is made manually (plan §5).",
+    )
     return parser.parse_args()
 
 
@@ -4024,6 +4034,16 @@ def main() -> None:
         config["use_vectorized_sweep"] = True
     else:
         config.setdefault("use_vectorized_sweep", True)
+
+    # Point-in-time walk-forward (ROADMAP L2371 / Backtester Phase 2).
+    # Stamped top-level (not under predictor_backtest) so it survives the
+    # mode/smoke-fixture dict replacements that rewrite config["predictor_
+    # backtest"]; predictor_backtest.run reads config.get("walk_forward").
+    # config.yaml may also set `walk_forward: true` to drive it from a file.
+    if args.walk_forward:
+        config["walk_forward"] = True
+    else:
+        config.setdefault("walk_forward", False)
 
     # Smoke-phase mode: apply the fixture BEFORE phase-selection parsing
     # so the fixture's only_phases/skip_phases/force flow through the
