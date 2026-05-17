@@ -3615,6 +3615,16 @@ def _parse_args() -> argparse.Namespace:
                                    "vectorized stats diverge from scalar in a "
                                    "spot run; default-on flip happened 2026-04-28.")
     parser.add_argument(
+        "--pit-parity", action="store_true",
+        help="Observational proof-of-impact: run the predictor backtest both "
+             "ways (legacy single-pass vs --walk-forward) over the same date "
+             "grid and emit the skilled-risk-basket contamination report to "
+             "backtest/{date}/pit_parity.json (ROADMAP L2371 / plan §D4). "
+             "Dedicated run — does NOT run the optimizer pipeline and never "
+             "writes configs. The --walk-forward default flip is gated on a "
+             "human reading this report (plan §5).",
+    )
+    parser.add_argument(
         "--walk-forward", action="store_true",
         help="Point-in-time-honest predictor backtest: resolve archived "
              "momentum weights whose knowledge-time ≤ each fold's decision "
@@ -4154,6 +4164,28 @@ def main() -> None:
                 print(f"  Rolled back: {r['config_type']} → {r['key']}")
             else:
                 print(f"  Skipped: {r.get('reason', 'unknown')}")
+        return
+
+    # --pit-parity: dedicated observational run (plan §D4). Runs BEFORE
+    # _init_pipeline / the optimizer so it can never write a config; emits
+    # the contamination report and returns. Never raises into the SF — the
+    # spot stage that invokes it is best-effort and non-blocking.
+    if args.pit_parity:
+        from analysis.pit_parity import run_pit_parity
+        try:
+            report = run_pit_parity(config)
+            print(json.dumps(
+                {k: report[k] for k in (
+                    "schema", "run_date", "delta_pit_minus_current",
+                    "headline_log_alpha_delta", "materiality", "_s3_key",
+                ) if k in report},
+                indent=2, default=str,
+            ))
+        except Exception as e:
+            logger.error(
+                "[pit_parity] run failed (observational, non-fatal): %s",
+                e, exc_info=True,
+            )
         return
 
     _init_pipeline(args, config)

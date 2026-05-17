@@ -708,6 +708,27 @@ else
     echo "▶ stage=backtest END at \$(date -u +%H:%M:%S)"
 fi
 
+# ── Stage: pit_parity (observational, opt-in, NON-BLOCKING) ─────────────────
+# Proof-of-impact for point-in-time discipline (ROADMAP L2371 / plan §D4):
+# runs the predictor backtest both ways (legacy single-pass vs
+# --walk-forward) and emits the skilled-risk-basket contamination report to
+# s3://{bucket}/backtest/{RUN_DATE}/pit_parity.json. This is the input to
+# the manual, Brian-gated --walk-forward default flip (plan §5).
+#
+# DEFAULT OFF: set PIT_PARITY_ENABLED=1 in the SF env to opt in. It runs a
+# second predictor backtest so it ~doubles the predictor-sim slice; kept
+# opt-in until Brian wants the artifact. NEVER fails the spot run (|| true)
+# — observational only, writes no configs, gates nothing.
+if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ] && ! _stage_skipped backtest; then
+    echo "▶ stage=pit_parity START at \$(date -u +%H:%M:%S) (observational, non-blocking)"
+    $REMOTE_PYTHON -u backtest.py --mode predictor-backtest --pit-parity \\
+        --date "\${RUN_DATE}" --log-level INFO 2>&1 \\
+        || echo "WARNING: pit_parity stage failed (observational — spot run continues)"
+    echo "▶ stage=pit_parity END at \$(date -u +%H:%M:%S)"
+else
+    echo "⊘ stage=pit_parity SKIPPED (PIT_PARITY_ENABLED!=1 — opt-in observational)"
+fi
+
 # ── Stage: parity ───────────────────────────────────────────────────────────
 # Parity is OBSERVABILITY, not a gate. Each Saturday SF run produces:
 #   * parity_report.json — per-run drill-down (count + ticker-set + field
