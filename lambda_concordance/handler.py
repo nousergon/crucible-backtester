@@ -114,12 +114,27 @@ def handler(event: dict, context) -> dict:
 
     # Imports deferred until after _ensure_init so SSM-loaded secrets
     # are available for any module-level init that consults them.
+    from replay import is_shell_run_dry, shell_run_dry_response
     from replay.batch import (
         DEFAULT_MAX_ARTIFACTS,
         compute_and_emit_concordance,
     )
 
     t0 = time.time()
+
+    # Shell-run dry path (Saturday-SF keystone). Boot + module imports
+    # above have already run for real (the keystone's whole point —
+    # exercise bootstrap/import/lib-pin/transport). Return a benign
+    # success BEFORE the replay.batch scan (decision_artifacts S3
+    # discovery), BEFORE any langchain_anthropic / target-model call,
+    # and BEFORE any CloudWatch metric emit or S3 summary persist.
+    if is_shell_run_dry(event):
+        logger.info(
+            "[lambda_concordance] shell-run dry path: boot+imports OK, "
+            "skipping replay scan + Anthropic + S3/CW writes"
+        )
+        return shell_run_dry_response("lambda_concordance", t0)
+
     bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
 
     target_models = event.get("target_models") or ["claude-haiku-4-5"]

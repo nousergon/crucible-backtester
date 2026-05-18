@@ -94,9 +94,29 @@ def handler(event: dict, context) -> dict:
     """
     _ensure_init()
 
+    from replay import is_shell_run_dry, shell_run_dry_response
     from replay.counterfactual import compute_and_emit
 
     t0 = time.time()
+
+    # Shell-run dry path (Saturday-SF keystone). Boot + module imports
+    # above have already run for real. Return a benign success BEFORE
+    # the replay.counterfactual scan (decision_artifacts S3 discovery +
+    # sklearn fit), and BEFORE any CloudWatch metric emit or S3
+    # per-agent analysis persist. No LLM calls exist on this path.
+    #
+    # Side benefit (NOT the contract): because the corpus scan is
+    # skipped, this also sidesteps the known separate production
+    # Counterfactual 600s-timeout-on-corpus-growth bug under shell_run
+    # — that real-Saturday timeout remains a distinct out-of-scope
+    # issue tracked separately; the scan logic is untouched here.
+    if is_shell_run_dry(event):
+        logger.info(
+            "[lambda_counterfactual] shell-run dry path: boot+imports "
+            "OK, skipping replay scan + sklearn fit + S3/CW writes"
+        )
+        return shell_run_dry_response("lambda_counterfactual", t0)
+
     bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
 
     end_time_iso = event.get("end_time_iso")
