@@ -103,6 +103,19 @@ SKIP_STAGES="${SKIP_STAGES:-}"
 # run with --no-pit-parity or PIT_PARITY_ENABLED=0 (ad-hoc/dry iterations
 # where the extra predictor-sim pass isn't wanted).
 PIT_PARITY_ENABLED="${PIT_PARITY_ENABLED:-1}"
+# RUN_DATE: the single artifact-date label for backtest/{date}/ (param
+# sweep + portfolio_stats + parity + pit_parity + evaluator inputs). The
+# Saturday SF stamps this ONCE at InitializeInput from
+# $$.Execution.StartTime and threads it (export RUN_DATE=…) into the
+# Backtester / Parity / Evaluator SSM commands — each a SEPARATE spot
+# instance with its own spot_backtest.sh invocation. Resolving it here
+# from the injected env (not per-stage wall-clock) is what keeps all
+# three stages keyed to the SAME prefix when a multi-hour run straddles
+# UTC midnight (the 2026-05-17 Evaluator failure: Backtester wrote
+# backtest/2026-05-17/, Evaluator looked in backtest/2026-05-18/). Same
+# dispatcher→heredoc bake-in mechanism as SKIP_STAGES / PIT_PARITY_ENABLED.
+# Falls back to wall-clock UTC for ad-hoc manual runs that don't inject it.
+RUN_DATE="${RUN_DATE:-$(date -u +%Y-%m-%d)}"
 # Freeze the evaluator (passes --freeze to evaluate.py → suppresses per-
 # optimizer S3 config writes; report artifacts + email still upload). Use
 # for off-cycle test runs so mid-week sweeps don't auto-promote weights/
@@ -139,6 +152,8 @@ while [[ $# -gt 0 ]]; do
         --no-pit-parity) PIT_PARITY_ENABLED="0"; shift ;;
         --pit-parity-enabled) PIT_PARITY_ENABLED="$2"; shift 2 ;;
         --pit-parity-enabled=*) PIT_PARITY_ENABLED="${1#*=}"; shift ;;
+        --run-date) RUN_DATE="$2"; shift 2 ;;
+        --run-date=*) RUN_DATE="${1#*=}"; shift ;;
         --freeze-evaluator) FREEZE_EVALUATOR="true"; shift ;;
         --use-vectorized-sweep) USE_VECTORIZED_SWEEP="true"; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
@@ -692,9 +707,14 @@ SKIP_STAGES="${SKIP_STAGES}"
 # interpolated at heredoc-generation time so the runtime gate below resolves
 # it on the spot instance.
 PIT_PARITY_ENABLED="${PIT_PARITY_ENABLED}"
-# Shared RUN_DATE used by parity + evaluator uploads so they land under the
-# same backtest/{date}/ prefix.
-RUN_DATE=\$(date -u +%Y-%m-%d)
+# RUN_DATE baked in from the dispatcher (resolved once from the injected
+# env / --run-date / wall-clock fallback above) so backtest + param-sweep
+# + parity + pit_parity + evaluator uploads all land under the SAME
+# backtest/{date}/ prefix — even across the 3 separate spot stages of one
+# Saturday SF run that may straddle UTC midnight. Same gen-time
+# interpolation as SKIP_STAGES / PIT_PARITY_ENABLED above; the prior
+# per-spot \$(date -u) recompute was the 2026-05-17 Evaluator date-split.
+RUN_DATE="${RUN_DATE}"
 
 _stage_skipped() {
     case ",\${SKIP_STAGES}," in
@@ -715,7 +735,14 @@ if _stage_skipped backtest; then
     echo "⊘ stage=backtest SKIPPED (--skip-stages=\${SKIP_STAGES})"
 else
     echo "▶ stage=backtest START at \$(date -u +%H:%M:%S)"
-    if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1; then
+    # --date "\${RUN_DATE}" pins backtest.py's artifact prefix to the
+    # SF-stamped run date. Without it backtest.py defaults --date to its
+    # own date.today() on this spot instance, so the backtest stage wrote
+    # backtest/2026-05-17/ while the later Evaluator spot looked under
+    # backtest/2026-05-18/ — the 2026-05-17 date-split. Parity / pit_parity
+    # / evaluator already thread \${RUN_DATE}; this closes the last gap so
+    # ALL stages key off the single SF-declared date.
+    if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --date "\${RUN_DATE}" --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1; then
         echo "ERROR: backtest.py failed. Spot run marked FAILED — check" >&2
         echo "       flow-doctor alerts. Parity + evaluator stages skipped" >&2
         echo "       to prevent auto-promotion of unvalidated configs." >&2
