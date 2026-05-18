@@ -8,6 +8,24 @@
 # Usage:
 #   ./infrastructure/spot_backtest.sh                   # full run (--mode all)
 #   ./infrastructure/spot_backtest.sh --smoke-only      # quick validation, then terminate
+#   ./infrastructure/spot_backtest.sh --preflight-only  # boot + deps + the
+#                                                       #   bootstrap-class smoke
+#                                                       #   harness only
+#                                                       #   (backtest.py --mode=smoke:
+#                                                       #   BacktesterPreflight +
+#                                                       #   _runtime_smoke — lib-pin /
+#                                                       #   imports / predictor-weights /
+#                                                       #   universe-freshness, ~30-60s,
+#                                                       #   from PRs #43-#48), then
+#                                                       #   exit 0 — NO param sweep,
+#                                                       #   NO portfolio sim, NO parity,
+#                                                       #   NO evaluator, NO config/*.json
+#                                                       #   auto-apply, ZERO external API
+#                                                       #   calls, ZERO S3/config writes.
+#                                                       #   Friday shell_run dry path
+#                                                       #   (ROADMAP "Friday shell-run —
+#                                                       #   per-module dry-path
+#                                                       #   activation" owed-item #3).
 #   ./infrastructure/spot_backtest.sh --mode simulate   # override backtest mode
 #   ./infrastructure/spot_backtest.sh --instance-type c5.xlarge  # override instance type
 #   ./infrastructure/spot_backtest.sh --dry-run         # full-universe exercise without
@@ -81,6 +99,26 @@ BACKTEST_MODE="all"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 RUN_MODE="full"  # full | smoke-only
+# PREFLIGHT_ONLY is a MODIFIER, orthogonal to RUN_MODE — matching the
+# data (spot_data_weekly.sh #259) and predictor (spot_train.sh #175)
+# siblings' verbatim --preflight-only flag for cross-script consistency
+# (the Friday shell_run SF keystone follow-on dispatches the same flag
+# name to every module). When set, the script boots + installs deps for
+# real, runs ONLY the bootstrap-class smoke harness (backtest.py
+# --mode=smoke = BacktesterPreflight + _runtime_smoke; ~30-60s,
+# read-only), then `exit 0` BEFORE the per-phase smoke modes, the
+# evaluate.py S3-probe diagnostics, AND the entire full-backtest heredoc
+# (param sweep / portfolio sim / parity / pit_parity / evaluator /
+# config/*.json optimizer auto-apply / CloudWatch heartbeats). Catches
+# bootstrap-class breakage (lib-pin drift, sys.path collision, stale
+# ArcticDB universe, missing predictor weights, SSM timeout, image gap)
+# ~12h before the real Saturday Backtester. backtest.py --mode=smoke
+# itself `return`s before _init_pipeline / the optimizer, so it writes
+# no S3 config; gating in front of the full heredoc + the
+# evaluate.py/per-phase smoke block makes every sweep/sim/parity/
+# evaluator and every config/{executor,scoring,predictor,research,
+# scanner}_params*.json writer statically unreachable under this flag.
+PREFLIGHT_ONLY=0
 # All PhaseRegistry-adjacent flags are also routable from the
 # Saturday SF input via env vars. When set they pass through as
 # CLI args to backtest.py.
@@ -132,6 +170,7 @@ USE_VECTORIZED_SWEEP="${USE_VECTORIZED_SWEEP:-false}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
+        --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --instance-type=*) INSTANCE_TYPE="${1#*=}"; shift ;;
         --mode) BACKTEST_MODE="$2"; shift 2 ;;
@@ -231,6 +270,7 @@ echo "  Region        : $AWS_REGION"
 echo "  Branch        : $BRANCH"
 echo "  Backtest mode : $BACKTEST_MODE"
 echo "  Run mode      : $RUN_MODE"
+echo "  Preflight-only: $PREFLIGHT_ONLY  (1 = boot + deps + smoke harness + exit 0, NO sweep/sim/parity/evaluator/auto-apply, ZERO writes)"
 echo "  Skip phase 4  : $SKIP_PHASE4"
 echo "  Skip phases   : ${SKIP_PHASES:-(none)}"
 echo "  Only phases   : ${ONLY_PHASES:-(none)}"
@@ -521,6 +561,67 @@ ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source
 
 # Determine python binary on remote
 REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
+
+# ── Preflight-only (Friday shell_run dry path) ──────────────────────────────
+# ROADMAP "Friday shell-run — per-module dry-path activation" owed-item #3.
+# Placed AFTER the real boot/clone/deps/config-upload (so the bootstrap
+# path — lib-pin resolution, sys.path, predictor cache sync, image deps —
+# is genuinely exercised) and STRICTLY BEFORE both the --smoke-only block
+# (per-phase smoke modes + the evaluate.py S3-probe diagnostics) and the
+# full-backtest heredoc.
+#
+# Runs ONLY `backtest.py --mode=smoke` — the EXISTING bootstrap-class
+# smoke harness from PRs #43-#48 (BacktesterPreflight: lib-version /
+# imports / predictor-weights presence / executor-config validation, then
+# _runtime_smoke: universe-symbols + per-ticker ArcticDB read + recent
+# signals.json load + Layer-1A GBM load/predict — all S3 *reads*, ~30-60s).
+# We REUSE backtest.py's existing --mode=smoke (no new harness): per
+# backtest.py:4180-4184 it runs preflight + _runtime_smoke then `return`s
+# BEFORE _init_pipeline / the simulation / the optimizer, so it itself
+# performs zero config writes and makes no external API (yfinance/
+# Anthropic) data fetch.
+#
+# Hard invariant proof (what is statically unreachable under this flag):
+#   * The per-phase smoke loop (smoke-simulate / smoke-param-sweep /
+#     smoke-predictor-backtest / smoke-phase4 / smoke-predictor-param-sweep)
+#     and the `evaluate.py --mode diagnostics` S3-probe block live INSIDE
+#     the `if [ "$RUN_MODE" = "smoke-only" ]` body below — the `exit 0`
+#     here never reaches it.
+#   * The full-backtest heredoc (backtest stage / pit_parity / parity /
+#     evaluator) and its config/{executor,scoring,predictor,research,
+#     scanner}_params*.json optimizer auto-apply (evaluate.py --upload,
+#     non-frozen) live further below — also unreachable.
+#   * No CloudWatch heartbeat, no parity_report.json / parity_metrics.csv
+#     upload, no reporter S3 upload — all of those are past this exit.
+# Net: smoke harness (read-only) runs, then exit 0. Zero external API
+# calls, zero S3/config writes. The `trap cleanup EXIT` still fires and
+# terminates the spot instance.
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  PREFLIGHT-ONLY (Friday shell_run dry path)"
+    echo "  boot + deps done; running bootstrap-class smoke harness only,"
+    echo "  then exit 0 — NO sweep / sim / parity / evaluator / auto-apply,"
+    echo "  ZERO external API calls, ZERO S3/config writes."
+    echo "═══════════════════════════════════════════════════════════════"
+    run_remote bash -s <<PREFLIGHT
+set -euo pipefail
+cd /home/ec2-user/alpha-engine-backtester
+${ENV_SOURCE}
+
+# backtest.py --mode=smoke = BacktesterPreflight + _runtime_smoke, then
+# returns 0 BEFORE _init_pipeline / simulation / optimizer (see
+# backtest.py:4180). No --upload, no full mode, no config write.
+echo "==> Preflight: backtest.py --mode=smoke"
+$REMOTE_PYTHON -u backtest.py --mode=smoke --log-level INFO 2>&1
+PREFLIGHT
+
+    echo ""
+    echo "==> Preflight-only PASSED — bootstrap-class smoke clean."
+    echo "==> Instance will be terminated (no sweep/sim/parity/evaluator,"
+    echo "    no config/*.json auto-apply, no S3/config writes performed)."
+    exit 0
+fi
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
 if [ "$RUN_MODE" = "smoke-only" ]; then
