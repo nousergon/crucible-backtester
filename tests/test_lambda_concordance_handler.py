@@ -261,3 +261,64 @@ class TestEventPayloadThreading:
                 context=None,
             )
         assert captured["agent_filter"] == ["sector_quant", "ic_cio"]
+
+
+# ── Shell-run dry path (Saturday-SF keystone) ────────────────────────────
+
+
+class TestShellRunDryPath:
+    """`dry_run_llm: true` (the canonical keystone shell-run key) must
+    short-circuit BEFORE the replay scan: no compute_and_emit_concordance
+    call (so no decision_artifacts S3 discovery, no langchain_anthropic /
+    target-model call, no CloudWatch metric emit, no S3 summary
+    persist), boot + module imports still run, and a benign success
+    envelope is returned."""
+
+    def test_dry_run_llm_short_circuits_before_scan(self, handler_mod):
+        with patch.object(handler_mod, "_ensure_init") as m_init, \
+             patch("replay.batch.compute_and_emit_concordance") as m_compute:
+            result = handler_mod.handler({"dry_run_llm": True}, context=None)
+
+        # Boot/init still ran for real (the keystone's whole point).
+        m_init.assert_called_once()
+        # The replay scan / Anthropic / S3+CW path was never entered.
+        m_compute.assert_not_called()
+        # SF (Catch-wrapped, non-blocking) treats this as success.
+        assert result["status"] == "DRY_RUN"
+        assert result["dry_run"] is True
+        assert result["handler"] == "lambda_concordance"
+        assert "duration_seconds" in result
+
+    def test_dry_run_llm_string_true_coerced(self, handler_mod):
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance") as m_compute:
+            result = handler_mod.handler({"dry_run_llm": "true"}, context=None)
+        m_compute.assert_not_called()
+        assert result["status"] == "DRY_RUN"
+
+    def test_dry_run_llm_false_takes_real_path(self, handler_mod):
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance",
+                   return_value=_ok_summary()) as m_compute:
+            result = handler_mod.handler({"dry_run_llm": False}, context=None)
+        m_compute.assert_called_once()
+        assert result["status"] == "OK"
+
+    def test_absent_dry_run_llm_takes_real_path(self, handler_mod):
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance",
+                   return_value=_ok_summary()) as m_compute:
+            result = handler_mod.handler({}, context=None)
+        m_compute.assert_called_once()
+        assert result["status"] == "OK"
+
+    def test_legacy_dry_run_key_still_takes_real_path(self, handler_mod):
+        """The pre-existing `dry_run` (compute-but-don't-emit-metrics)
+        semantic is preserved — it must NOT short-circuit the scan."""
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.batch.compute_and_emit_concordance",
+                   return_value=_ok_summary()) as m_compute:
+            result = handler_mod.handler({"dry_run": True}, context=None)
+        m_compute.assert_called_once()
+        assert m_compute.call_args.kwargs["emit_metrics"] is False
+        assert result["status"] == "OK"
