@@ -73,7 +73,27 @@ DEFAULT_BUCKET = "alpha-engine-research"
 DEFAULT_CAPTURE_PREFIX = "decision_artifacts"
 DEFAULT_ANALYSIS_PREFIX = "decision_artifacts/_counterfactual"
 
-DEFAULT_WINDOW_DAYS = 56  # 8 weeks — same convention as clustering
+DEFAULT_WINDOW_DAYS = 28
+"""Trailing scan window. Originally 56 days (8 weeks — same convention as
+clustering); reduced 2026-05-19 to fit under the 600s Lambda ceiling once
+captured-artifact count crossed ~32k+ in the 56-day window (ROADMAP L293).
+28 days is still > the 30-day statistical-significance heuristic for the
+LdP triple-barrier fits the counterfactual gate consumes, and at the
+current ~585 artifacts/day rate keeps total per-run I/O bounded around
+16k get_objects (vs 32k+ on the 56d default that timed out 5/16 + 5/17).
+
+The per-agent cap below is the second-order bound — even if the window
+default is reverted operationally, no single agent's artifact backlog
+can stall the run."""
+
+DEFAULT_MAX_ARTIFACTS_PER_AGENT = 500
+"""Hard cap on per-agent_id_base artifact loads. Most agents stay well
+below this (sector teams emit 1-2 artifacts/day, ic_cio 1/day, etc.);
+the cap exists to bound the heavy population-wide agents (thesis_update
+hit ~25 picks/day × 28 days = ~700 artifacts on its own at the
+2026-05-13 substrate ramp-up rate). Most-recent-first ordering preserves
+the recency-weighted tree fit. None or 0 disables the cap."""
+
 DEFAULT_TREE_MAX_DEPTH = 3
 
 MIN_SAMPLES_FOR_FIT = 10
@@ -355,12 +375,27 @@ def _list_artifact_keys_in_window(
     end_date: datetime,
     window_days: int,
     agent_filter: list[str] | None = None,
+    max_artifacts_per_agent: int | None = DEFAULT_MAX_ARTIFACTS_PER_AGENT,
 ) -> list[str]:
     """List captured-artifact keys under the trailing window. Same
     meta-prefix exclusion + per-day pagination as the rationale-
-    clustering + concordance pipelines."""
+    clustering + concordance pipelines.
+
+    Iterates day-by-day from end_date BACKWARD so the keys list is
+    already ordered most-recent-first. This lets the per-agent cap
+    drop the oldest artifacts when an agent_id_base has more than
+    ``max_artifacts_per_agent`` keys in the window.
+
+    The cap is applied here (pre ``_load_artifact``) so the bounded
+    list is what hits the expensive S3 get_object loop downstream —
+    the bound translates directly into a wall-clock budget under the
+    600s Lambda ceiling (ROADMAP L293).
+    """
     paginator = s3.get_paginator("list_objects_v2")
-    keys: list[str] = []
+    # day_offset iterates 0..N-1 from end_date (today) backward, so
+    # appending in iteration order produces a most-recent-first list.
+    keys_by_agent: dict[str, list[str]] = defaultdict(list)
+    all_keys: list[str] = []
 
     for day_offset in range(window_days):
         day = end_date - timedelta(days=day_offset)
@@ -383,12 +418,19 @@ def _list_artifact_keys_in_window(
                     )
                 ):
                     continue
-                if agent_filter:
-                    base_id = _agent_id_base_from_key(key)
-                    if base_id is None or base_id not in agent_filter:
-                        continue
-                keys.append(key)
-    return keys
+                base_id = _agent_id_base_from_key(key) or "unknown"
+                if agent_filter and base_id not in agent_filter:
+                    continue
+                if (
+                    max_artifacts_per_agent is not None
+                    and max_artifacts_per_agent > 0
+                    and len(keys_by_agent[base_id]) >= max_artifacts_per_agent
+                ):
+                    # Cap hit — drop older artifacts for this agent.
+                    continue
+                keys_by_agent[base_id].append(key)
+                all_keys.append(key)
+    return all_keys
 
 
 def _agent_id_base_from_key(key: str) -> Optional[str]:
@@ -477,6 +519,7 @@ def compute_and_emit(
     metric_name: str = DEFAULT_METRIC_NAME,
     max_depth: int = DEFAULT_TREE_MAX_DEPTH,
     agent_filter: Optional[list[str]] = None,
+    max_artifacts_per_agent: int | None = DEFAULT_MAX_ARTIFACTS_PER_AGENT,
     s3_client: Optional[Any] = None,
     cloudwatch_client: Optional[Any] = None,
     emit_metrics: bool = True,
@@ -500,11 +543,14 @@ def compute_and_emit(
         end_date=end,
         window_days=window_days,
         agent_filter=agent_filter,
+        max_artifacts_per_agent=max_artifacts_per_agent,
     )
 
     logger.info(
-        "[counterfactual] discovered %d artifacts window=[%s, %s]",
+        "[counterfactual] discovered %d artifacts window=[%s, %s] "
+        "(max_artifacts_per_agent=%s)",
         len(keys), window_start.isoformat(), end.isoformat(),
+        max_artifacts_per_agent if max_artifacts_per_agent else "unbounded",
     )
 
     # Group rows by agent_id_base. Unsupported agents counted separately

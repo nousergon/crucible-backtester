@@ -20,8 +20,13 @@ Event shape (all fields optional):
 
     {
       "end_time_iso":  "2026-05-09T00:00:00Z",   # default: now UTC
-      "window_days":   56,                        # default: 8 weeks
+      "window_days":   28,                        # default: 4 weeks (was 56,
+                                                  #   reduced 2026-05-19 to fit
+                                                  #   under 600s Lambda ceiling
+                                                  #   once corpus crossed ~32k+
+                                                  #   in 56d — ROADMAP L293)
       "max_depth":     3,                         # default: 3 ("3-deep rule")
+      "max_artifacts_per_agent": 500,            # default: 500 (None=unbounded)
       "agents":        ["ic_cio","macro_economist"],  # default: all supported (v1)
       "dry_run":       false                      # default: false
     }
@@ -124,8 +129,25 @@ def handler(event: dict, context) -> dict:
         datetime.fromisoformat(end_time_iso.replace("Z", "+00:00"))
         if end_time_iso else None
     )
-    window_days = int(event.get("window_days", 56))
+    # ROADMAP L293 (2026-05-19): default window 56 → 28 days to fit
+    # under the 600s Lambda ceiling. Original 56d still selectable via
+    # the event override for ad-hoc deeper-corpus runs.
+    from replay.counterfactual import (
+        DEFAULT_MAX_ARTIFACTS_PER_AGENT,
+        DEFAULT_WINDOW_DAYS,
+    )
+
+    window_days = int(event.get("window_days", DEFAULT_WINDOW_DAYS))
     max_depth = int(event.get("max_depth", 3))
+    # max_artifacts_per_agent: explicit None disables the cap; absent
+    # field gets the module default.
+    if "max_artifacts_per_agent" in event:
+        _raw = event["max_artifacts_per_agent"]
+        max_artifacts_per_agent: int | None = (
+            None if _raw is None else int(_raw)
+        )
+    else:
+        max_artifacts_per_agent = DEFAULT_MAX_ARTIFACTS_PER_AGENT
     agent_filter = event.get("agents") or None
     if isinstance(agent_filter, str):
         agent_filter = [a.strip() for a in agent_filter.split(",") if a.strip()]
@@ -133,8 +155,8 @@ def handler(event: dict, context) -> dict:
 
     logger.info(
         "[lambda_counterfactual] start window_days=%d max_depth=%d "
-        "agents=%s dry_run=%s end_time=%s",
-        window_days, max_depth, agent_filter, dry_run,
+        "max_artifacts_per_agent=%s agents=%s dry_run=%s end_time=%s",
+        window_days, max_depth, max_artifacts_per_agent, agent_filter, dry_run,
         end_time_iso or "(now UTC)",
     )
 
@@ -143,6 +165,7 @@ def handler(event: dict, context) -> dict:
             end_time=end_time,
             window_days=window_days,
             max_depth=max_depth,
+            max_artifacts_per_agent=max_artifacts_per_agent,
             agent_filter=agent_filter,
             bucket=bucket,
             emit_metrics=not dry_run,
