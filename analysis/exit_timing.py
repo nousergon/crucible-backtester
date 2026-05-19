@@ -7,8 +7,11 @@ For each completed trade (with entry and exit), computes:
   - Capture ratio: realized return / MFE (are we capturing gains?)
   - Stop efficiency: |realized loss| / MAE (are stops placed well?)
 
-Requires daily OHLCV price data during the hold period. Reads from
-predictor/price_cache_slim parquets in S3 (no external API calls).
+Requires daily OHLCV price data during the hold period. Reads from the
+ArcticDB universe library (primary, via alpha_engine_lib), falling back to
+the predictor/price_cache_slim then predictor/price_cache parquets in S3
+(no external API calls). Wave-4 migration: the slim leg is parity-observed
+and removed in PR4.
 
 Data source: trades table in trades.db (roundtrip trades with entry_trade_id).
 """
@@ -20,6 +23,9 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+
+from alpha_engine_lib.arcticdb import load_universe_ohlcv
+from alpha_engine_lib.reconcile import reconcile_frame_dicts
 
 logger = logging.getLogger(__name__)
 
@@ -193,24 +199,73 @@ def _load_price_cache(tickers: list[str], bucket: str = "alpha-engine-research")
     Silently skips tickers that don't have cache files.
     """
     import io
+    import json
     import boto3
 
+    # Wave-4 (predictor/price_cache_slim deletion): the ArcticDB universe
+    # lib is primary for traded tickers (all equities + SPY, which are
+    # universe members — exit_timing never needs macro/index symbols, so
+    # no macro-lib read here). The slim -> price_cache(10y) parquet chain
+    # is the fallback. While slim still exists we dual-read it for the
+    # parity ParityReport (grep ``WAVE4_PARITY_METRIC exit_timing``) so
+    # PR4's deletion is data-driven. The slim leg is removed in PR4;
+    # predictor/price_cache (10y) stays — that is Wave-3's scope.
+    tickers = list(tickers)
     s3 = boto3.client("s3")
-    cache = {}
+
+    arctic: dict[str, pd.DataFrame] = {}
+    try:
+        arctic = load_universe_ohlcv(bucket, symbols=tickers)
+    except Exception as exc:  # noqa: BLE001 - fall back to parquet chain
+        logger.warning(
+            "ArcticDB universe read for exit_timing failed: %s", exc
+        )
+
+    def _read_parquet(prefix: str, ticker: str):
+        key = f"{prefix}/{ticker}.parquet"
+        try:
+            resp = s3.get_object(Bucket=bucket, Key=key)
+            df = pd.read_parquet(io.BytesIO(resp["Body"].read()))
+            if df.empty:
+                return None
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if "Date" in df.columns:
+                    df = df.set_index("Date")
+                df.index = pd.to_datetime(df.index)
+            return df
+        except Exception:
+            return None
+
+    # Parity observation: compare slim vs ArcticDB over the tickers
+    # ArcticDB returned (set asymmetry expected — some traded tickers may
+    # only exist in the parquet cache; logged, not fatal).
+    if arctic:
+        slim_for_parity = {}
+        for ticker in arctic:
+            d = _read_parquet("predictor/price_cache_slim", ticker)
+            if d is not None:
+                slim_for_parity[ticker] = d
+        if slim_for_parity:
+            report = reconcile_frame_dicts(
+                slim_for_parity,
+                {k: arctic[k] for k in slim_for_parity},
+                value_cols=("Close",),
+                require_ticker_match=False,
+            )
+            logger.info("exit_timing slim<->arctic %s", report.summary())
+            logger.info(
+                "WAVE4_PARITY_METRIC exit_timing %s",
+                json.dumps(report.as_metrics()),
+            )
+
+    cache = dict(arctic)
+    # Fallback parquet chain for any ticker ArcticDB did not return.
     for ticker in tickers:
-        # Try slim cache first (smaller, 2y), then full cache (10y)
+        if ticker in cache:
+            continue
         for prefix in ("predictor/price_cache_slim", "predictor/price_cache"):
-            key = f"{prefix}/{ticker}.parquet"
-            try:
-                resp = s3.get_object(Bucket=bucket, Key=key)
-                df = pd.read_parquet(io.BytesIO(resp["Body"].read()))
-                if not df.empty:
-                    if not isinstance(df.index, pd.DatetimeIndex):
-                        if "Date" in df.columns:
-                            df = df.set_index("Date")
-                        df.index = pd.to_datetime(df.index)
-                    cache[ticker] = df
-                    break
-            except Exception:
-                continue
+            df = _read_parquet(prefix, ticker)
+            if df is not None:
+                cache[ticker] = df
+                break
     return cache
