@@ -115,6 +115,9 @@ class TestStatusEnvelope:
 
 class TestEventPayloadThreading:
     def test_default_window_days(self, handler_mod):
+        """ROADMAP L293 (2026-05-19): default window dropped 56 → 28 days
+        to keep the Saturday-SF Counterfactual Lambda under its 600s ceiling
+        after the captured-artifact corpus crossed ~32k+ in the 56d window."""
         captured = {}
 
         def fake_compute(**kwargs):
@@ -126,8 +129,47 @@ class TestEventPayloadThreading:
                    side_effect=fake_compute):
             handler_mod.handler({}, context=None)
 
-        assert captured["window_days"] == 56
+        assert captured["window_days"] == 28
         assert captured["max_depth"] == 3
+        # ROADMAP L293 (2026-05-19): second-order bound — per-agent cap
+        # defaults to 500 so a future heavy-population-agent backlog
+        # can't blow the runtime past the ceiling even at the 28d default.
+        assert captured["max_artifacts_per_agent"] == 500
+
+    def test_max_artifacts_per_agent_event_override(self, handler_mod):
+        """Explicit override threads through to compute_and_emit."""
+        captured = {}
+
+        def fake_compute(**kwargs):
+            captured.update(kwargs)
+            return _ok_summary()
+
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.counterfactual.compute_and_emit",
+                   side_effect=fake_compute):
+            handler_mod.handler(
+                {"max_artifacts_per_agent": 200}, context=None,
+            )
+
+        assert captured["max_artifacts_per_agent"] == 200
+
+    def test_max_artifacts_per_agent_none_disables_cap(self, handler_mod):
+        """Explicit None in the event payload disables the cap for
+        ad-hoc deeper-corpus runs."""
+        captured = {}
+
+        def fake_compute(**kwargs):
+            captured.update(kwargs)
+            return _ok_summary()
+
+        with patch.object(handler_mod, "_ensure_init"), \
+             patch("replay.counterfactual.compute_and_emit",
+                   side_effect=fake_compute):
+            handler_mod.handler(
+                {"max_artifacts_per_agent": None}, context=None,
+            )
+
+        assert captured["max_artifacts_per_agent"] is None
 
     def test_window_days_event_override(self, handler_mod):
         captured = {}

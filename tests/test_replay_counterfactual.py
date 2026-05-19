@@ -10,7 +10,7 @@ unsupported-agent bucket, multi-agent grouping, persistence shape).
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -351,3 +351,119 @@ class TestComputeAndEmit:
         assert summary["agents_skipped_thin_sample"][0]["agent_id_base"] == "ic_cio"
         # No metric emission for thin-sample skip.
         cw.put_metric_data.assert_not_called()
+
+
+# ── ROADMAP L293 (2026-05-19) — per-agent artifact cap regression suite ──
+
+
+class TestPerAgentArtifactCap:
+    """Bounds the artifact-scan ceiling so the Saturday-SF Counterfactual
+    Lambda stays under its 600s timeout regardless of how heavy any single
+    agent's decision-artifact backlog grows. The cap applies at the
+    list-keys stage (pre ``_load_artifact``) so it directly reduces the
+    expensive S3 get_object loop."""
+
+    def test_cap_drops_oldest_when_one_agent_dominates(self):
+        """Single agent with more artifacts than the cap → most-recent-first
+        truncation keeps only ``max_artifacts_per_agent`` keys for that
+        agent. The list iterates day-by-day backward from end_date so the
+        first ``cap`` keys are the freshest."""
+        from replay.counterfactual import _list_artifact_keys_in_window
+
+        end = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        # Build artifacts spread across 5 days for a single agent, 3/day
+        artifacts: dict[str, dict] = {}
+        for day_offset in range(5):
+            day = end - timedelta(days=day_offset)
+            day_key = day.strftime("%Y/%m/%d")
+            for i in range(3):
+                k = f"decision_artifacts/{day_key}/ic_cio/r{day_offset}_{i}.json"
+                artifacts[k] = {"agent_id": "ic_cio"}
+        s3 = _build_s3_stub(artifacts)
+
+        # Cap at 7 — should keep day 0 (3 keys) + day 1 (3 keys) + 1 from day 2.
+        keys = _list_artifact_keys_in_window(
+            s3,
+            bucket="b",
+            capture_prefix="decision_artifacts",
+            end_date=end,
+            window_days=5,
+            max_artifacts_per_agent=7,
+        )
+        assert len(keys) == 7
+        # All retained keys are from the 3 most-recent days (5/9, 5/8, 5/7).
+        retained_days = {k.split("/")[3] for k in keys}
+        assert retained_days <= {"09", "08", "07"}
+
+    def test_cap_none_returns_all_keys(self):
+        """``max_artifacts_per_agent=None`` disables the cap — full corpus."""
+        from replay.counterfactual import _list_artifact_keys_in_window
+
+        end = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        artifacts = {
+            f"decision_artifacts/2026/05/09/ic_cio/r{i}.json": {"agent_id": "ic_cio"}
+            for i in range(15)
+        }
+        s3 = _build_s3_stub(artifacts)
+
+        keys = _list_artifact_keys_in_window(
+            s3,
+            bucket="b",
+            capture_prefix="decision_artifacts",
+            end_date=end,
+            window_days=1,
+            max_artifacts_per_agent=None,
+        )
+        assert len(keys) == 15
+
+    def test_cap_zero_returns_all_keys(self):
+        """``max_artifacts_per_agent=0`` is treated as unbounded (defensive
+        — operator may set 0 expecting "no cap" or "no work"; the
+        less-surprising behavior is to disable the cap rather than emit
+        zero data)."""
+        from replay.counterfactual import _list_artifact_keys_in_window
+
+        end = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        artifacts = {
+            f"decision_artifacts/2026/05/09/ic_cio/r{i}.json": {"agent_id": "ic_cio"}
+            for i in range(10)
+        }
+        s3 = _build_s3_stub(artifacts)
+
+        keys = _list_artifact_keys_in_window(
+            s3,
+            bucket="b",
+            capture_prefix="decision_artifacts",
+            end_date=end,
+            window_days=1,
+            max_artifacts_per_agent=0,
+        )
+        assert len(keys) == 10
+
+    def test_cap_applied_per_agent_id_base(self):
+        """Two agents each exceeding the cap → each independently truncated
+        to ``max_artifacts_per_agent``. Cap is a per-agent ceiling, not a
+        global one."""
+        from replay.counterfactual import _list_artifact_keys_in_window
+
+        end = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        artifacts: dict[str, dict] = {}
+        for i in range(10):
+            artifacts[f"decision_artifacts/2026/05/09/ic_cio/r{i}.json"] = {}
+            artifacts[f"decision_artifacts/2026/05/09/macro_economist/r{i}.json"] = {}
+        s3 = _build_s3_stub(artifacts)
+
+        keys = _list_artifact_keys_in_window(
+            s3,
+            bucket="b",
+            capture_prefix="decision_artifacts",
+            end_date=end,
+            window_days=1,
+            max_artifacts_per_agent=3,
+        )
+        # 3 per agent × 2 agents = 6 total.
+        assert len(keys) == 6
+        ic_cio_keys = [k for k in keys if "/ic_cio/" in k]
+        macro_keys = [k for k in keys if "/macro_economist/" in k]
+        assert len(ic_cio_keys) == 3
+        assert len(macro_keys) == 3
