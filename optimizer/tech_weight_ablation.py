@@ -15,11 +15,22 @@ healthcare/industrials/tech — top quant ranks systematically pick
 losers. This module sweeps a grid of alternate weight configs and
 recommends per-sector overrides.
 
-**Recommendation-only** — does NOT auto-apply. Mirrors the executor
-optimizer's PSR-confidence + parallel-observation pattern: ship the
-recommendation, observe for N weeks, only flip live config under a
-deliberate cutover. Auto-apply is a follow-up after the rank-quality
-diagnostic confirms the recommendations are stable.
+Two-stage activation (ROADMAP L2553 auto-apply cutover):
+
+  1. ``use_tech_ablation_target=True`` (default false) — every weekly
+     run that produces an ``ok`` recommendation writes a shadow payload
+     to ``config/scoring_weights_per_sector_shadow_history/{run_id}.json``
+     (+ ``latest.json`` sidecar). Live config is unchanged. Pure
+     observability — the operator can compare shadow trajectories
+     against the live ``scoring.yaml`` baselines week-over-week.
+
+  2. ``enforce_tech_ablation=True`` (default false) — in addition to
+     the shadow archive, the apply path writes the live
+     ``config/scoring_weights_per_sector.json`` key **only if** the
+     reproduction gate passes: the same per-sector recommendation
+     dict must reproduce across the last ``_MIN_CONSECUTIVE_WEEKS``
+     shadow archives. This prevents a single noisy week from flipping
+     sector weights live.
 
 Reads ``team_candidates`` joined to ``universe_returns`` for rows where
 the 5 sub-score columns are non-NULL (populated only after PR-B's v15
@@ -33,16 +44,44 @@ wiring.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+# ── S3 contract (auto-apply, ROADMAP L2553) ─────────────────────────────────
+
+S3_LIVE_KEY = "config/scoring_weights_per_sector.json"
+S3_SHADOW_PREFIX = "config/scoring_weights_per_sector_shadow_history"
+
+# Reproduction gate: live write only fires when the same per-sector
+# recommendation dict reproduces across this many consecutive shadow
+# archives. Mirrors the ROADMAP L2553 "4+ consecutive Saturdays"
+# acceptance.
+_MIN_CONSECUTIVE_WEEKS = 4
+
+# Module-level config ref — set by init_config() from evaluate.py
+_cfg: dict = {}
+
+
+def init_config(config: dict) -> None:
+    """Load tech_weight_ablation section from backtester config.
+
+    Recognized keys (all default false):
+      - ``use_tech_ablation_target``: enable shadow-archive writes
+      - ``enforce_tech_ablation``: enable live writes (also requires
+        reproduction gate to pass)
+    """
+    global _cfg
+    _cfg = config.get("tech_weight_ablation", {}) or {}
 
 
 # ── Canonical sectors (mirrors quant_rank_quality + decision_capture) ───────
@@ -445,15 +484,287 @@ def compute_tech_weight_ablation(
             "recommendations": recommendations,
             "n_teams_ok": n_ok,
             "n_teams_with_recommendation": len(recommendations),
-            # Recommendation-only — no apply path. Mirrors the parallel-
-            # observation pattern: ship recommendation, observe N weeks,
-            # cut over deliberately.
+            # The compute step is recommendation-only; apply() is the
+            # cutover gate (two-flag activation + reproduction guard).
             "applied": False,
             "apply_note": (
-                "recommendation-only — auto-apply gated on parallel "
-                "observation cutover (follow-up PR)"
+                "see apply() — gated on use_tech_ablation_target + "
+                "enforce_tech_ablation flags"
             ),
         }
     finally:
         if own_conn:
             conn.close()
+
+
+# ── Auto-apply path (ROADMAP L2553) ─────────────────────────────────────────
+
+
+def _config_name_to_weights(config_name: str) -> dict[str, float] | None:
+    """Map a WeightConfig name (e.g. ``"rsi_only"``) → its weight dict.
+
+    Returns None when the name is not in DEFAULT_GRID — guards against
+    a future schema drift where the grid is reshuffled.
+    """
+    for cfg in DEFAULT_GRID:
+        if cfg.name == config_name:
+            return {
+                "rsi": cfg.rsi, "macd": cfg.macd,
+                "ma50": cfg.ma50, "ma200": cfg.ma200,
+                "momentum": cfg.momentum,
+            }
+    return None
+
+
+def _build_per_sector_payload(result: dict) -> dict[str, dict[str, float]]:
+    """Translate ``recommendations: {team_id -> config_name}`` into a
+    per-sector weights payload the research-side consumer can read as
+    an override layer on top of ``scoring.yaml``.
+
+    Returns ``{team_id: {weight_name: weight_value, ...}, ...}``.
+    Teams with no recommendation (kept_current or non-`switch_to_*`)
+    are omitted — absent key means \"no override, use scoring.yaml
+    default\".
+    """
+    out: dict[str, dict[str, float]] = {}
+    for team_id, config_name in (result.get("recommendations") or {}).items():
+        weights = _config_name_to_weights(config_name)
+        if weights is not None:
+            out[team_id] = weights
+    return out
+
+
+def _read_recent_shadow_archives(
+    s3, bucket: str, n: int,
+) -> list[dict]:
+    """Read up to ``n`` most-recent shadow archives, newest first.
+
+    Returns parsed JSON dicts. Missing/corrupt artifacts are skipped
+    with a warning — the reproduction gate then treats them as
+    \"reproduction not yet reached\".
+    """
+    from botocore.exceptions import ClientError
+
+    # List `{prefix}/...json` artifacts. The eval_artifact layout uses
+    # YYMMDDHHMM-encoded keys + a `latest.json` sidecar; sort
+    # lexicographically and the YYMMDDHHMM ordering doubles as time
+    # ordering. Skip the sidecar so we only score real archives.
+    try:
+        resp = s3.list_objects_v2(
+            Bucket=bucket, Prefix=f"{S3_SHADOW_PREFIX}/",
+        )
+    except ClientError as e:
+        logger.warning(
+            "[tech_weight_ablation] shadow archive list failed (%s) — "
+            "treating as no history available",
+            type(e).__name__,
+        )
+        return []
+    keys = sorted(
+        (obj["Key"] for obj in (resp.get("Contents") or [])
+         if obj["Key"].endswith(".json")
+         and not obj["Key"].endswith("/latest.json")),
+        reverse=True,
+    )[:n]
+
+    out: list[dict] = []
+    for key in keys:
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            out.append(json.loads(obj["Body"].read()))
+        except Exception as e:
+            logger.warning(
+                "[tech_weight_ablation] shadow archive %s unreadable (%s) — "
+                "skipping",
+                key, type(e).__name__,
+            )
+    return out
+
+
+def _check_reproduction_gate(
+    s3, bucket: str, current_payload: dict[str, dict[str, float]],
+    *, min_consecutive: int = _MIN_CONSECUTIVE_WEEKS,
+) -> dict:
+    """Pass = the same per-sector recommendation reproduces across the
+    last ``min_consecutive`` shadow archives.
+
+    Returns ``{"passed": bool, "reason": str, "n_consecutive": int}``.
+
+    A shadow archive matches when its ``per_sector`` dict equals
+    ``current_payload`` byte-for-byte (key set + weight values). One
+    week that disagrees breaks the streak — the gate explicitly does
+    NOT tolerate intermittent shadow drift, matching the L2553
+    \"4+ consecutive Saturdays\" framing.
+    """
+    archives = _read_recent_shadow_archives(s3, bucket, min_consecutive)
+    if len(archives) < min_consecutive:
+        return {
+            "passed": False,
+            "reason": (
+                f"reproduction gate: only {len(archives)} prior shadow "
+                f"archive(s) available; need {min_consecutive}"
+            ),
+            "n_consecutive": len(archives),
+        }
+    for i, archive in enumerate(archives):
+        prior = archive.get("per_sector") or {}
+        if prior != current_payload:
+            return {
+                "passed": False,
+                "reason": (
+                    f"reproduction gate broken at archive[-{i + 1}]: "
+                    f"per_sector payload differs from this week"
+                ),
+                "n_consecutive": i,
+            }
+    return {
+        "passed": True,
+        "reason": (
+            f"per_sector payload reproduced across last "
+            f"{min_consecutive} shadow archives"
+        ),
+        "n_consecutive": min_consecutive,
+    }
+
+
+def apply(result: dict, bucket: str) -> dict:
+    """Write the per-sector tech-weight recommendation to S3 under the
+    two-stage activation contract documented at module top.
+
+    Two write paths:
+
+    - **Shadow** (``use_tech_ablation_target=True``,
+      ``enforce_tech_ablation`` ignored): canonical eval-style archive
+      at ``config/scoring_weights_per_sector_shadow_history/{run_id}.json``
+      + ``latest.json`` sidecar. Live config untouched. The shadow
+      archives are also what the reproduction gate reads to decide
+      whether to fire the live write.
+
+    - **Live** (``use_tech_ablation_target=True`` AND
+      ``enforce_tech_ablation=True`` AND reproduction gate passes):
+      writes ``config/scoring_weights_per_sector.json`` after the
+      reproduction gate confirms the same recommendation reproduced
+      across the last ``_MIN_CONSECUTIVE_WEEKS`` shadow archives.
+      Always also writes the shadow archive — every fire goes into
+      history.
+
+    Returns the standard apply-result dict shape with ``applied`` +
+    ``reason`` + per-path bookkeeping. Mirrors
+    ``executor_optimizer.apply()`` so the evaluator wiring is uniform.
+    """
+    import boto3
+    from alpha_engine_lib.eval_artifacts import (
+        eval_artifact_key, eval_latest_key, new_eval_run_id,
+    )
+
+    use_shadow = bool(_cfg.get("use_tech_ablation_target", False))
+    enforce = bool(_cfg.get("enforce_tech_ablation", False))
+
+    if not use_shadow:
+        # Flag off — nothing to do. Recommendation stays advisory.
+        return {
+            "applied": False,
+            "reason": "use_tech_ablation_target=False",
+        }
+    if result.get("status") != "ok":
+        return {
+            "applied": False,
+            "reason": f"compute status={result.get('status')}",
+        }
+
+    per_sector = _build_per_sector_payload(result)
+    if not per_sector:
+        return {
+            "applied": False,
+            "reason": "no per-sector recommendation to apply",
+        }
+
+    payload = {
+        "per_sector": per_sector,
+        "updated_at": str(date.today()),
+        "n_teams_with_recommendation": len(per_sector),
+        "source": "tech_weight_ablation",
+        "run_date": result.get("run_date"),
+        "min_improvement": result.get("min_improvement"),
+    }
+    body = json.dumps(payload, indent=2)
+
+    s3 = boto3.client("s3")
+
+    # Always write shadow when the flag is on — that's the whole
+    # observability point. Reproduction gate reads these.
+    run_id = new_eval_run_id()
+    shadow_key = eval_artifact_key(S3_SHADOW_PREFIX, run_id)
+    shadow_latest_key = eval_latest_key(S3_SHADOW_PREFIX)
+    try:
+        s3.put_object(
+            Bucket=bucket, Key=shadow_key, Body=body,
+            ContentType="application/json",
+        )
+        s3.put_object(
+            Bucket=bucket, Key=shadow_latest_key, Body=body,
+            ContentType="application/json",
+        )
+        logger.info(
+            "[tech_weight_ablation] shadow archive written: s3://%s/%s",
+            bucket, shadow_key,
+        )
+    except Exception as e:
+        logger.error(
+            "[tech_weight_ablation] shadow archive write failed: %s", e,
+        )
+        return {
+            "applied": False,
+            "reason": f"shadow S3 write failed: {e}",
+        }
+
+    if not enforce:
+        return {
+            "applied": False,
+            "reason": "shadow mode (enforce_tech_ablation=False)",
+            "shadow_key": shadow_key,
+            "per_sector": per_sector,
+        }
+
+    # Live-write gate: reproduction across last N shadow archives.
+    # NB the current week's archive has just been written, so the
+    # gate reads N archives starting with this one.
+    gate = _check_reproduction_gate(s3, bucket, per_sector)
+    if not gate["passed"]:
+        return {
+            "applied": False,
+            "reason": gate["reason"],
+            "shadow_key": shadow_key,
+            "per_sector": per_sector,
+            "reproduction_gate": gate,
+        }
+
+    try:
+        s3.put_object(
+            Bucket=bucket, Key=S3_LIVE_KEY, Body=body,
+            ContentType="application/json",
+        )
+        logger.info(
+            "[tech_weight_ablation] live config updated: s3://%s/%s — "
+            "per_sector=%s",
+            bucket, S3_LIVE_KEY, per_sector,
+        )
+    except Exception as e:
+        logger.error(
+            "[tech_weight_ablation] CRITICAL: live S3 write failed: %s", e,
+        )
+        return {
+            "applied": False,
+            "reason": f"live S3 write failed: {e}",
+            "shadow_key": shadow_key,
+            "per_sector": per_sector,
+        }
+
+    return {
+        "applied": True,
+        "reason": "live config written + shadow archive recorded",
+        "live_key": S3_LIVE_KEY,
+        "shadow_key": shadow_key,
+        "per_sector": per_sector,
+        "reproduction_gate": gate,
+    }
