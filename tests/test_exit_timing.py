@@ -325,3 +325,114 @@ def test_compute_exit_timing_db_query_error_caught(tmp_path, monkeypatch):
     result = compute_exit_timing(str(db))
     assert result["status"] == "error"
     assert "simulated query failure" in result["error"]
+
+
+# ── Wave-4: _load_price_cache ArcticDB primary / parquet fallback / parity ────
+
+import io as _io  # noqa: E402
+
+from analysis.exit_timing import _load_price_cache  # noqa: E402
+
+
+def _pf(n=8, start=100.0):
+    idx = pd.date_range("2026-03-01", periods=n, freq="D")
+    return pd.DataFrame(
+        {"Open": [start] * n, "High": [start] * n, "Low": [start] * n,
+         "Close": [float(start + i) for i in range(n)], "Volume": [1] * n},
+        index=idx,
+    )
+
+
+class _FakeS3:
+    """get_object serving parquet bytes from a {key: DataFrame} map."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def get_object(self, Bucket, Key):
+        if Key not in self._store:
+            raise RuntimeError(f"NoSuchKey {Key}")
+        buf = _io.BytesIO()
+        self._store[Key].to_parquet(buf)
+        buf.seek(0)
+        return {"Body": buf}
+
+
+def test_load_price_cache_arcticdb_primary_no_parquet_needed(monkeypatch):
+    monkeypatch.setattr(
+        "analysis.exit_timing.load_universe_ohlcv",
+        lambda bucket, symbols: {"AAPL": _pf(), "SPY": _pf(start=500)},
+    )
+    # S3 store empty except slim parity copies (identical -> parity PASS)
+    store = {
+        "predictor/price_cache_slim/AAPL.parquet": _pf(),
+        "predictor/price_cache_slim/SPY.parquet": _pf(start=500),
+    }
+    monkeypatch.setattr(
+        "boto3.client", lambda svc: _FakeS3(store)
+    )
+
+    import logging
+    with _capture_logs("analysis.exit_timing") as recs:
+        cache = _load_price_cache(["AAPL", "SPY"])
+
+    assert set(cache) == {"AAPL", "SPY"}
+    lines = [r for r in recs if "WAVE4_PARITY_METRIC exit_timing" in r]
+    assert len(lines) == 1
+    import json
+    payload = json.loads(lines[0].split("WAVE4_PARITY_METRIC exit_timing ", 1)[1])
+    assert payload["passed"] is True
+    assert payload["max_abs_value_delta"] == 0.0
+
+
+def test_load_price_cache_falls_back_to_parquet_when_arctic_empty(monkeypatch):
+    monkeypatch.setattr(
+        "analysis.exit_timing.load_universe_ohlcv",
+        lambda bucket, symbols: {},
+    )
+    store = {
+        "predictor/price_cache_slim/AAPL.parquet": _pf(),
+        "predictor/price_cache/MSFT.parquet": _pf(start=300),  # 10y leg
+    }
+    monkeypatch.setattr(
+        "boto3.client", lambda svc: _FakeS3(store)
+    )
+    cache = _load_price_cache(["AAPL", "MSFT", "GONE"])
+    assert set(cache) == {"AAPL", "MSFT"}  # slim + price_cache legs; GONE absent
+
+
+def test_load_price_cache_arctic_failure_is_caught(monkeypatch):
+    def _boom(bucket, symbols):
+        raise RuntimeError("ArcticDB down")
+
+    monkeypatch.setattr("analysis.exit_timing.load_universe_ohlcv", _boom)
+    store = {"predictor/price_cache/AAPL.parquet": _pf()}
+    monkeypatch.setattr(
+        "boto3.client", lambda svc: _FakeS3(store)
+    )
+    cache = _load_price_cache(["AAPL"])
+    assert set(cache) == {"AAPL"}  # graceful fallback, no raise
+
+
+import contextlib  # noqa: E402
+import logging  # noqa: E402
+
+
+@contextlib.contextmanager
+def _capture_logs(logger_name):
+    recs: list[str] = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            recs.append(record.getMessage())
+
+    lg = logging.getLogger(logger_name)
+    h = _H()
+    lg.addHandler(h)
+    old = lg.level
+    lg.setLevel(logging.INFO)
+    try:
+        yield recs
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old)

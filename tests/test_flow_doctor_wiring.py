@@ -374,12 +374,13 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.16.0" in text, (
-            "alpha-engine-lib should pin to v0.16.0 (load_latest_eval_artifact "
-            "+ list_eval_artifacts canonical readers — required transitively "
-            "by the executor's signal_reader at test time for simulate-via-"
-            "deciders parity. Lockstep with the alpha-engine executor pin "
-            "bumped 2026-05-14 for the Stage D' Wire 2 sizing wire + the "
-            "T2 stratified-Sortino runner; update this test if the pin "
-            "moves further forward."
+        assert "@v0.20.0" in text, (
+            "alpha-engine-lib should pin to v0.20.0 (Wave-4 predictor/"
+            "price_cache_slim deletion: load_universe_ohlcv added in v0.19.0, "
+            "load_macro_series + shared read-core in v0.20.0 — exit_timing's "
+            "_load_price_cache reads the ArcticDB universe lib via "
+            "load_universe_ohlcv with a slim->price_cache parquet fallback "
+            "and a reconcile parity emit. Bumped from v0.16.0 2026-05-19; "
+            "still carries the v0.16.0 eval_artifacts canonical readers "
+            "transitively. Update this test if the pin moves further forward."
         )
