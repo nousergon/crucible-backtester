@@ -359,46 +359,32 @@ class _FakeS3:
 
 
 def test_load_price_cache_arcticdb_primary_no_parquet_needed(monkeypatch):
+    """Wave-4 terminal: ArcticDB returns all tickers -> no parquet read,
+    no slim, no parity emit."""
     monkeypatch.setattr(
         "analysis.exit_timing.load_universe_ohlcv",
         lambda bucket, symbols: {"AAPL": _pf(), "SPY": _pf(start=500)},
     )
-    # S3 store empty except slim parity copies (identical -> parity PASS)
-    store = {
-        "predictor/price_cache_slim/AAPL.parquet": _pf(),
-        "predictor/price_cache_slim/SPY.parquet": _pf(start=500),
-    }
-    monkeypatch.setattr(
-        "boto3.client", lambda svc: _FakeS3(store)
-    )
-
-    import logging
-    with _capture_logs("analysis.exit_timing") as recs:
-        cache = _load_price_cache(["AAPL", "SPY"])
-
+    monkeypatch.setattr("boto3.client", lambda svc: _FakeS3({}))
+    cache = _load_price_cache(["AAPL", "SPY"])
     assert set(cache) == {"AAPL", "SPY"}
-    lines = [r for r in recs if "WAVE4_PARITY_METRIC exit_timing" in r]
-    assert len(lines) == 1
-    import json
-    payload = json.loads(lines[0].split("WAVE4_PARITY_METRIC exit_timing ", 1)[1])
-    assert payload["passed"] is True
-    assert payload["max_abs_value_delta"] == 0.0
 
 
-def test_load_price_cache_falls_back_to_parquet_when_arctic_empty(monkeypatch):
+def test_load_price_cache_falls_back_to_price_cache_when_arctic_empty(monkeypatch):
+    """Sole fallback is predictor/price_cache (10y) — the slim leg is gone."""
     monkeypatch.setattr(
         "analysis.exit_timing.load_universe_ohlcv",
         lambda bucket, symbols: {},
     )
     store = {
+        # slim is deleted: a slim-only ticker is now unrecoverable.
         "predictor/price_cache_slim/AAPL.parquet": _pf(),
-        "predictor/price_cache/MSFT.parquet": _pf(start=300),  # 10y leg
+        "predictor/price_cache/MSFT.parquet": _pf(start=300),
     }
-    monkeypatch.setattr(
-        "boto3.client", lambda svc: _FakeS3(store)
-    )
+    monkeypatch.setattr("boto3.client", lambda svc: _FakeS3(store))
     cache = _load_price_cache(["AAPL", "MSFT", "GONE"])
-    assert set(cache) == {"AAPL", "MSFT"}  # slim + price_cache legs; GONE absent
+    # Only the price_cache(10y) leg is consulted now -> MSFT only.
+    assert set(cache) == {"MSFT"}
 
 
 def test_load_price_cache_arctic_failure_is_caught(monkeypatch):
@@ -407,32 +393,6 @@ def test_load_price_cache_arctic_failure_is_caught(monkeypatch):
 
     monkeypatch.setattr("analysis.exit_timing.load_universe_ohlcv", _boom)
     store = {"predictor/price_cache/AAPL.parquet": _pf()}
-    monkeypatch.setattr(
-        "boto3.client", lambda svc: _FakeS3(store)
-    )
+    monkeypatch.setattr("boto3.client", lambda svc: _FakeS3(store))
     cache = _load_price_cache(["AAPL"])
     assert set(cache) == {"AAPL"}  # graceful fallback, no raise
-
-
-import contextlib  # noqa: E402
-import logging  # noqa: E402
-
-
-@contextlib.contextmanager
-def _capture_logs(logger_name):
-    recs: list[str] = []
-
-    class _H(logging.Handler):
-        def emit(self, record):
-            recs.append(record.getMessage())
-
-    lg = logging.getLogger(logger_name)
-    h = _H()
-    lg.addHandler(h)
-    old = lg.level
-    lg.setLevel(logging.INFO)
-    try:
-        yield recs
-    finally:
-        lg.removeHandler(h)
-        lg.setLevel(old)
