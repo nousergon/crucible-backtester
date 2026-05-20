@@ -824,3 +824,163 @@ class TestPreferRiskMatchedAlpha:
         # 0.051 vs 0.05 = 2% lift, below 20% gate.
         assert result["status"] == "no_improvement"
         assert "alpha_vs_ew_high_vol" in result["note"]
+
+
+# ── Alpha-floor constraint (canonical-alpha framework SOTA gate) ─────────────
+#
+# Origin: 2026-05-20 audit. Live executor_params.json carried min_score=75
+# with best_alpha=-2.5427 (Sharpe-ranked) while the Sortino-ranked shadow
+# history converged on the same params (best_alpha=-2.5641) — both single-
+# objective rankings reward variance-reduction, so absent an alpha-floor
+# constraint both paths converge on alpha-negative "do nothing" configs.
+# Per the system Objective ("Maximize long-term alpha") and the canonical-
+# alpha framework ([[anchor-gates-on-skilled-risk-not-sharpe]]), alpha-
+# positive is a hard constraint, not a presentation field.
+
+
+class TestAlphaFloorConstraint:
+    """alpha_floor config knob — when set, filter sweep_df to alpha >= floor
+    BEFORE ranking. Default off (None) preserves prior behavior."""
+
+    def test_alpha_floor_unset_preserves_prior_behavior(self):
+        """alpha_floor=None (default): negative-alpha combos can still rank +
+        promote under the skill-composite path (matches
+        test_skill_negative_alpha_does_not_block — alpha is presentation
+        framing unless the gate is activated)."""
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": -2.5,
+             "sortino_ratio": 0.95, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": -1.0,
+             "sortino_ratio": 0.50, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 3.0})
+        assert result["status"] == "ok"
+        assert result["best_alpha"] == -2.5  # promoted despite negative alpha
+
+    def test_alpha_floor_zero_blocks_when_all_combos_alpha_negative(self):
+        """alpha_floor=0.0 with all combos alpha-negative — refuse to
+        promote. Reproduces the exact 2026-05-20 incident config (both
+        combos backtest alpha-negative, best Sortino=0.95 looks great
+        without the alpha gate, but is a "trade nothing" config)."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "alpha_floor": 0.0,
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": -2.5,
+             "sortino_ratio": 0.95, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": -1.0,
+             "sortino_ratio": 0.50, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={})
+        assert result["status"] == "alpha_below_floor"
+        assert result["alpha_floor"] == 0.0
+        assert result["n_combos_below_floor"] == 2
+        assert result["best_alpha_in_sweep"] == -1.0
+        assert "canonical-alpha framework" in result["note"]
+
+    def test_alpha_floor_zero_filters_then_ranks_remaining(self):
+        """alpha_floor=0.0 with mixed combos — drop alpha-negative ones,
+        then rank by Sortino among the survivors. The combo with the
+        highest Sortino overall (combo B, sortino=0.95) is alpha-negative
+        and gets dropped; the alpha-positive combo with the lower Sortino
+        (combo A, sortino=0.7) wins the filtered ranking."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "alpha_floor": 0.0,
+            "min_sortino_improvement": -1.0,  # disable improvement gate
+        })
+        rows = [
+            # combo A: alpha-positive but lower Sortino — wins after filter
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.15,
+             "sortino_ratio": 0.70, "total_trades": 50},
+            # combo B: highest Sortino but alpha-negative — filtered out
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": -0.5,
+             "sortino_ratio": 0.95, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 2.0})
+        assert result["status"] == "ok"
+        assert result["recommended_params"]["atr_multiplier"] == 2.0
+        assert result["best_sortino"] == 0.70
+        assert result["best_alpha"] == 0.15
+
+    def test_alpha_floor_positive_value_requires_alpha_cushion(self):
+        """alpha_floor>0 (e.g. 0.05 = 500bps alpha cushion) raises the bar.
+        Combo at 0.03 alpha gets dropped despite being alpha-positive;
+        only the 0.10-alpha combo survives."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "alpha_floor": 0.05,
+            "min_sortino_improvement": -1.0,
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.10,
+             "sortino_ratio": 0.80, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": 0.03,
+             "sortino_ratio": 0.95, "total_trades": 50},  # below 0.05 floor
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 2.0})
+        assert result["status"] == "ok"
+        assert result["recommended_params"]["atr_multiplier"] == 2.0
+        assert result["best_alpha"] == 0.10
+
+    def test_alpha_floor_with_no_total_alpha_column_skips_gate(self):
+        """Older sweep runs without total_alpha column — gate is a no-op
+        (the column-absence path means the filter never runs). Other gates
+        still apply; we don't fail the run for missing diagnostics."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "alpha_floor": 0.0,
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "sortino_ratio": 0.6,
+             "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "sortino_ratio": 0.9,
+             "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 2.0})
+        assert result["status"] == "ok"
+        assert result["best_sortino"] == 0.9
+
+    def test_alpha_floor_at_zero_allows_exact_zero_alpha(self):
+        """alpha_floor uses >= (non-negative), not > (strict positive). A
+        flat-alpha config (SPY clone) is at worst neutral, not destructive,
+        and shouldn't be filtered."""
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "alpha_floor": 0.0,
+            "min_sortino_improvement": -1.0,
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.5, "total_alpha": 0.0,
+             "sortino_ratio": 0.70, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.5, "total_alpha": -0.01,
+             "sortino_ratio": 0.95, "total_trades": 50},  # just below floor
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={"atr_multiplier": 2.0})
+        assert result["status"] == "ok"
+        assert result["recommended_params"]["atr_multiplier"] == 2.0
+        assert result["best_alpha"] == 0.0
+
+    def test_alpha_floor_legacy_path_also_filters(self):
+        """alpha_floor applies in BOTH paths (legacy Sharpe + skill-composite).
+        Per canonical-alpha framework, alpha-positive is a system-wide
+        constraint, not a path-specific one. Legacy callers that explicitly
+        set alpha_floor get the same protection."""
+        _init_default_config({"alpha_floor": 0.0})  # default legacy path
+        rows = [
+            {"atr_multiplier": 2.0, "sharpe_ratio": 0.7, "total_alpha": -2.5,
+             "sortino_ratio": 0.85, "max_drawdown": -0.05, "total_trades": 50},
+            {"atr_multiplier": 3.0, "sharpe_ratio": 0.6, "total_alpha": -1.0,
+             "sortino_ratio": 0.70, "max_drawdown": -0.08, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={})
+        assert result["status"] == "alpha_below_floor"

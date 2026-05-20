@@ -296,6 +296,55 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     if not param_cols:
         return {"status": "no_params", "note": "No safe params found in sweep results"}
 
+    # Hard alpha-floor constraint — canonical-alpha framework gate.
+    #
+    # Filter `valid` down to combos whose backtest total_alpha >= alpha_floor
+    # BEFORE ranking. Without this, single-objective ranking on Sharpe or
+    # Sortino will happily promote alpha-negative "do nothing" configurations
+    # (the 2026-05-20 incident: live executor_params.json carried
+    # min_score=75 with best_alpha=-2.5427, both Sharpe-ranked live AND
+    # Sortino-ranked shadow agreed because both ratios reward variance-
+    # reduction). Per the system Objective in ~/Development/CLAUDE.md
+    # ("Maximize long-term alpha") and the canonical-alpha framework spec
+    # ([[anchor-gates-on-skilled-risk-not-sharpe]]), alpha-positive is
+    # a hard CONSTRAINT, not a side-output — combos that fail it should
+    # never reach the ranker.
+    #
+    # ``alpha_floor=None`` (default in this module; activated via
+    # executor_optimizer.alpha_floor in backtester config.yaml) leaves the
+    # gate inactive — preserves prior behavior for legacy callers / tests.
+    # ``alpha_floor=0.0`` is the SOTA default; positive values (e.g. require
+    # a 200bps alpha cushion) compose cleanly.
+    alpha_floor = _cfg.get("alpha_floor")
+    if alpha_floor is not None and "total_alpha" in valid.columns:
+        n_before = len(valid)
+        alpha_pos = valid[valid["total_alpha"] >= alpha_floor].copy()
+        n_dropped = n_before - len(alpha_pos)
+        best_alpha_in_sweep = _safe_float(valid["total_alpha"].max())
+        if len(alpha_pos) == 0:
+            return {
+                "status": "alpha_below_floor",
+                "alpha_floor": float(alpha_floor),
+                "n_combos_below_floor": int(n_dropped),
+                "best_alpha_in_sweep": best_alpha_in_sweep,
+                "note": (
+                    f"All {n_before} valid combos backtested with "
+                    f"total_alpha < {alpha_floor} (best in sweep: "
+                    f"{best_alpha_in_sweep}). Refusing to promote — per the "
+                    f"canonical-alpha framework, alpha-positive is a hard "
+                    f"constraint, not a side-output. Either signal quality "
+                    f"or the param sweep grid needs review."
+                ),
+            }
+        logger.info(
+            "executor_optimizer: alpha_floor=%s dropped %d/%d combos; "
+            "%d alpha-positive combos remain for ranking (best alpha in "
+            "sweep: %s).",
+            alpha_floor, n_dropped, n_before, len(alpha_pos),
+            best_alpha_in_sweep,
+        )
+        valid = alpha_pos
+
     # Gate: refuse to promote when the best combo has too few trades.
     # With small sample sizes the Sharpe is dominated by noise — any
     # "optimal" params are just overfitting to a handful of outcomes.
