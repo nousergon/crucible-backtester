@@ -80,3 +80,57 @@ def test_cleanup_still_terminates():
         "cleanup() must still terminate the instance after the diagnostic "
         "(don't trade cost-guard for observability)."
     )
+
+
+def test_cleanup_fans_out_via_lib_alerts_cli():
+    """L2246 SOTA upgrade per the CLAUDE.md sub-sub-rule (lift-to-lib for
+    ≥2 consumers): the dispatcher cleanup must publish the diagnostic via
+    `python -m alpha_engine_lib.alerts publish` so the operator gets an
+    independent-channel alert (SNS + Telegram) regardless of whether the
+    SF wrapper's own NotifyComplete/HandleFailure path fired. Pins the
+    full invocation contract."""
+    text = _read_script()
+    m = re.search(r"^cleanup\(\) \{.*?^\}", text, re.MULTILINE | re.DOTALL)
+    assert m, "no cleanup() function found — spot_backtest.sh structure changed"
+    body = m.group(0)
+    assert "alpha_engine_lib.alerts publish" in body, (
+        "cleanup() must fan out the diagnostic via the lib alerts CLI "
+        "(L2246 SOTA upgrade — see CLAUDE.md sub-sub-rule). Mirrors the "
+        "L117 'Lambda CI canary rollback should Telegram/email the "
+        "operator on rollback' pattern via the canonical primitive."
+    )
+    assert "--severity error" in body, (
+        "alerts.publish call must tag severity=error so Telegram pushes "
+        "(rather than silent in-channel)."
+    )
+    assert "--source alpha-engine-backtester/spot_backtest.sh" in body, (
+        "alerts.publish call must identify itself via --source so the "
+        "operator can triage at a glance."
+    )
+    # Best-effort fallback — the alert is independent fan-out, not a
+    # cleanup blocker. The wrapping `|| echo ...` keeps cleanup running
+    # even when Python / lib / SNS / Telegram are all unreachable.
+    assert "alerts.publish fan-out failed" in body or "|| true" in body, (
+        "alerts.publish must be best-effort — never block cleanup on "
+        "secondary surveillance failure."
+    )
+
+
+def test_lib_pin_at_least_v0_21_0():
+    """The dispatcher's alerts.publish call requires alpha_engine_lib >=
+    v0.21.0 (the version that ships the new `alerts` module + CLI). Pin
+    the floor; lib bumps for unrelated reasons are fine but a downgrade
+    below v0.21.0 would silently break the alert fan-out."""
+    from pathlib import Path
+
+    reqs = (
+        Path(__file__).resolve().parent.parent / "requirements.txt"
+    ).read_text()
+    m = re.search(r"alpha-engine-lib\[[^\]]+\]\s*@\s*git\+https://[^@]+@v(\d+)\.(\d+)\.(\d+)", reqs)
+    assert m, "no alpha-engine-lib version pin found in requirements.txt"
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    assert (major, minor, patch) >= (0, 21, 0), (
+        f"alpha-engine-lib pin v{major}.{minor}.{patch} is below the "
+        f"v0.21.0 floor required by the dispatcher's alerts.publish call. "
+        f"Re-pin or remove the alerts call."
+    )
