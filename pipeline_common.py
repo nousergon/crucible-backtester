@@ -857,13 +857,28 @@ def load_sector_map(config: dict) -> dict[str, str] | None:
             with open(map_path) as f:
                 return json.load(f)
 
-    try:
-        s3 = boto3.client("s3")
-        bucket = config.get("signals_bucket", "alpha-engine-research")
-        resp = s3.get_object(
-            Bucket=bucket, Key="predictor/price_cache/sector_map.json"
-        )
-        return json.load(resp["Body"])
-    except Exception as e:
-        logger.warning("Could not load sector_map.json: %s", e)
-        return None
+    # Wave-3 reader migration (ROADMAP L1401): try the new
+    # ``reference/price_cache/`` prefix first, fall back to legacy
+    # ``predictor/price_cache/`` during the producer write-both soak
+    # (PR1 alpha-engine-data#270 shipped 2026-05-19; soak ≥1 week to
+    # ~2026-05-26). After Wave-3 PR4 retires legacy, the fallback
+    # branch becomes dead and can be dropped.
+    s3 = boto3.client("s3")
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    for key in (
+        "reference/price_cache/sector_map.json",
+        "predictor/price_cache/sector_map.json",
+    ):
+        try:
+            resp = s3.get_object(Bucket=bucket, Key=key)
+            return json.load(resp["Body"])
+        except Exception as e:
+            logger.debug(
+                "[pipeline_common] sector_map.json miss at s3://%s/%s: %s",
+                bucket, key, type(e).__name__,
+            )
+    logger.warning(
+        "Could not load sector_map.json from either prefix "
+        "(reference/ or predictor/)",
+    )
+    return None

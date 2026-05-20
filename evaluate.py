@@ -711,16 +711,15 @@ def _run_optimizers(
     )
 
     # Tech weight ablation — per-sector recommendation by sub-score
-    # rank-correlation grid search. Recommendation-only; pairs with
-    # PR-A's quant_rank_quality diagnostic + PR-B's research v15
-    # sub-score persistence. Status="insufficient_data" until ≥30 rows
-    # per team have populated sub-scores.
+    # rank-correlation grid search. Pairs with PR-A's quant_rank_quality
+    # diagnostic + PR-B's research v15 sub-score persistence.
+    # Status="insufficient_data" until ≥30 rows per team have populated
+    # sub-scores. Apply path is gated behind two flags
+    # (use_tech_ablation_target + enforce_tech_ablation) and a 4-week
+    # reproduction guard — see optimizer/tech_weight_ablation.apply().
     results["tech_weight_ablation"] = tracker.run_module(
         "tech_weight_ablation",
-        lambda: tech_weight_ablation.compute_tech_weight_ablation(
-            db_path=config.get("research_db"),
-            run_date=config.get("_run_date"),
-        ),
+        lambda: _run_tech_weight_ablation(config, freeze),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
     )
@@ -845,6 +844,29 @@ def _run_cio_opt(e2e_lift: dict, freeze: bool, bucket: str) -> dict:
     return result
 
 
+def _run_tech_weight_ablation(config: dict, freeze: bool) -> dict:
+    """Run tech_weight_ablation compute + apply path (ROADMAP L2553).
+
+    Apply contract mirrors executor_optimizer: compute the
+    recommendation, then call ``apply()`` to (optionally) write shadow
+    + live S3 artifacts. ``freeze=True`` short-circuits the apply()
+    call entirely so ``--freeze`` evaluator runs produce zero S3 side
+    effects.
+    """
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    result = tech_weight_ablation.compute_tech_weight_ablation(
+        db_path=config.get("research_db"),
+        run_date=config.get("_run_date"),
+    )
+    if freeze:
+        result["apply_result"] = {
+            "applied": False, "reason": "frozen (--freeze flag)",
+        }
+    else:
+        result["apply_result"] = tech_weight_ablation.apply(result, bucket)
+    return result
+
+
 def _run_executor_opt(config: dict, sweep_df, freeze: bool) -> dict:
     if sweep_df is None or (hasattr(sweep_df, "empty") and sweep_df.empty):
         return {
@@ -948,6 +970,7 @@ def main() -> None:
     executor_optimizer.init_config(config)
     veto_analysis.init_config(config)
     research_optimizer.init_config(config)
+    tech_weight_ablation.init_config(config)
 
     # Set the assembler-cutover flag from config — when true, individual
     # optimizers' apply() skip their legacy live-key writes and the

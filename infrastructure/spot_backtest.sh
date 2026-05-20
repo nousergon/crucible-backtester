@@ -546,7 +546,13 @@ set -euo pipefail
 CACHE_DIR="/home/ec2-user/alpha-engine-predictor/data/cache"
 mkdir -p "$CACHE_DIR"
 if command -v aws &>/dev/null; then
-    aws s3 cp s3://alpha-engine-research/predictor/price_cache/sector_map.json "$CACHE_DIR/sector_map.json" 2>/dev/null || true
+    # Wave-3 reader migration (ROADMAP L1401): try new
+    # reference/price_cache/sector_map.json first, fall back to
+    # legacy predictor/price_cache/ during the write-both soak
+    # (PR1 alpha-engine-data#270; soak ~2026-05-19 → 2026-05-26).
+    aws s3 cp s3://alpha-engine-research/reference/price_cache/sector_map.json "$CACHE_DIR/sector_map.json" 2>/dev/null \
+        || aws s3 cp s3://alpha-engine-research/predictor/price_cache/sector_map.json "$CACHE_DIR/sector_map.json" 2>/dev/null \
+        || true
     aws s3 sync s3://alpha-engine-research/predictor/price_cache_slim/ "$CACHE_DIR/" --quiet 2>/dev/null || true
 fi
 echo "Predictor cache dir: $(ls "$CACHE_DIR"/*.parquet 2>/dev/null | wc -l) parquet files"

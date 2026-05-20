@@ -26,12 +26,19 @@ import pytest
 
 from optimizer.tech_weight_ablation import (
     DEFAULT_GRID,
+    S3_LIVE_KEY,
+    S3_SHADOW_PREFIX,
     WeightConfig,
+    _MIN_CONSECUTIVE_WEEKS,
     _MIN_IMPROVEMENT,
     _MIN_ROWS_PER_TEAM,
+    _build_per_sector_payload,
+    _check_reproduction_gate,
     _evaluate_team_under_config,
     _load_live_composite_weights_per_sector,
+    apply,
     compute_tech_weight_ablation,
+    init_config,
 )
 
 
@@ -299,10 +306,12 @@ class TestComputeTechWeightAblation:
             db_conn=conn, run_date="2026-04-30",
         )
         assert result["status"] == "ok"
-        # Must NEVER auto-apply in this PR — that's the parallel-
-        # observation cutover follow-up.
+        # compute_tech_weight_ablation() itself NEVER auto-applies;
+        # apply() is a separate call gated on two flags + the
+        # reproduction guard (ROADMAP L2553 auto-apply cutover).
         assert result["applied"] is False
-        assert "recommendation-only" in result["apply_note"]
+        assert "apply()" in result["apply_note"]
+        assert "use_tech_ablation_target" in result["apply_note"]
 
     def test_window_filtering(self, conn):
         # Old rows outside window must be excluded
@@ -419,3 +428,290 @@ class TestLiveBaselineWeightsReader:
         # No override for technology → field present but None
         assert "live_baseline_weights" in tech
         assert tech["live_baseline_weights"] is None
+
+
+# ── Auto-apply path (ROADMAP L2553) ─────────────────────────────────────────
+
+
+class _StubS3:
+    """In-memory S3 stub for apply()/_check_reproduction_gate() tests.
+
+    Mirrors the shape the boto3 client returns: put_object stores a
+    body; get_object raises ClientError-shaped NoSuchKey on miss;
+    list_objects_v2 walks keys by prefix.
+    """
+
+    class _ClientError(Exception):
+        def __init__(self, code: str = "NoSuchKey") -> None:
+            self.response = {"Error": {"Code": code}}
+
+    def __init__(self) -> None:
+        self.store: dict[tuple[str, str], bytes] = {}
+
+    def put_object(self, *, Bucket, Key, Body, ContentType=None, **kw):
+        body = Body if isinstance(Body, (bytes, bytearray)) else str(Body).encode()
+        self.store[(Bucket, Key)] = bytes(body)
+        return {"ETag": "stub"}
+
+    def get_object(self, *, Bucket, Key):
+        from io import BytesIO
+        if (Bucket, Key) not in self.store:
+            raise self._ClientError("NoSuchKey")
+        return {"Body": BytesIO(self.store[(Bucket, Key)])}
+
+    def list_objects_v2(self, *, Bucket, Prefix, **kw):
+        return {
+            "Contents": [
+                {"Key": k} for (b, k) in self.store
+                if b == Bucket and k.startswith(Prefix)
+            ],
+        }
+
+
+@pytest.fixture(autouse=True)
+def _reset_cfg():
+    """Each test runs against a fresh tech_weight_ablation config block."""
+    init_config({})
+    yield
+    init_config({})
+
+
+def _ok_result(recommendations: dict[str, str]) -> dict:
+    """Synthesize a compute_tech_weight_ablation 'ok' result with
+    the given recommendations dict."""
+    return {
+        "status": "ok",
+        "run_date": "2026-05-19",
+        "min_improvement": _MIN_IMPROVEMENT,
+        "recommendations": recommendations,
+        "per_team": [
+            {"team_id": tid, "status": "ok", "best_config": cfg}
+            for tid, cfg in recommendations.items()
+        ],
+    }
+
+
+class TestBuildPerSectorPayload:
+    def test_maps_recommendation_names_to_weight_dicts(self):
+        result = _ok_result({"healthcare": "rsi_only", "technology": "trend_only"})
+        payload = _build_per_sector_payload(result)
+        assert set(payload.keys()) == {"healthcare", "technology"}
+        # rsi_only: 100% RSI
+        assert payload["healthcare"] == {
+            "rsi": 1.0, "macd": 0.0, "ma50": 0.0, "ma200": 0.0, "momentum": 0.0,
+        }
+        # trend_only: 25/25/25/25 (no RSI)
+        assert payload["technology"] == {
+            "rsi": 0.0, "macd": 0.25, "ma50": 0.25, "ma200": 0.25, "momentum": 0.25,
+        }
+
+    def test_unknown_config_name_is_dropped(self):
+        result = _ok_result({"healthcare": "definitely_not_in_grid"})
+        assert _build_per_sector_payload(result) == {}
+
+    def test_empty_recommendations_yields_empty_payload(self):
+        assert _build_per_sector_payload(_ok_result({})) == {}
+
+
+class TestApplyShadowGating:
+    def test_flag_off_skips_all_writes(self):
+        s3 = _StubS3()
+        # default _cfg is empty → use_tech_ablation_target=False
+        out = apply(
+            _ok_result({"healthcare": "rsi_only"}), "alpha-engine-research",
+        )
+        assert out["applied"] is False
+        assert out["reason"] == "use_tech_ablation_target=False"
+        # No S3 side effects at all.
+        assert len(s3.store) == 0
+
+    def test_status_not_ok_skips(self):
+        init_config({"tech_weight_ablation": {"use_tech_ablation_target": True}})
+        out = apply({"status": "insufficient_data"}, "alpha-engine-research")
+        assert out["applied"] is False
+        assert "status=insufficient_data" in out["reason"]
+
+    def test_empty_recommendations_skips(self):
+        init_config({"tech_weight_ablation": {"use_tech_ablation_target": True}})
+        out = apply(_ok_result({}), "alpha-engine-research")
+        assert out["applied"] is False
+        assert "no per-sector recommendation" in out["reason"]
+
+    def test_shadow_only_writes_archive_not_live(self, monkeypatch):
+        """flag on, enforce off → shadow archive written, live key untouched."""
+        s3 = _StubS3()
+        monkeypatch.setattr(
+            "boto3.client", lambda svc, *a, **kw: s3,
+        )
+        init_config({"tech_weight_ablation": {
+            "use_tech_ablation_target": True,
+            "enforce_tech_ablation": False,
+        }})
+        out = apply(
+            _ok_result({"healthcare": "rsi_only"}),
+            "alpha-engine-research",
+        )
+        assert out["applied"] is False
+        assert "shadow mode" in out["reason"]
+        assert "shadow_key" in out
+        # Shadow archive present
+        assert any(
+            k.startswith(S3_SHADOW_PREFIX + "/") and k.endswith(".json")
+            for (_, k) in s3.store
+        )
+        # Live key NOT written
+        assert ("alpha-engine-research", S3_LIVE_KEY) not in s3.store
+
+
+class TestReproductionGate:
+    def test_insufficient_history_fails_gate(self):
+        s3 = _StubS3()
+        # Empty bucket → no prior archives
+        current = {"healthcare": {"rsi": 1.0, "macd": 0, "ma50": 0, "ma200": 0, "momentum": 0}}
+        out = _check_reproduction_gate(s3, "alpha-engine-research", current)
+        assert out["passed"] is False
+        assert "only 0 prior shadow archive" in out["reason"]
+        assert out["n_consecutive"] == 0
+
+    def test_exact_match_across_min_consecutive_passes(self, monkeypatch):
+        s3 = _StubS3()
+        current = {"healthcare": {"rsi": 1.0, "macd": 0, "ma50": 0, "ma200": 0, "momentum": 0}}
+        # Seed _MIN_CONSECUTIVE_WEEKS prior archives, all matching
+        import json as _json
+        for i in range(_MIN_CONSECUTIVE_WEEKS):
+            # Lexicographically-sorted YYMMDDHHMM-style keys
+            key = f"{S3_SHADOW_PREFIX}/26051{i}1234_result.json"
+            s3.store[("alpha-engine-research", key)] = _json.dumps({
+                "per_sector": current,
+            }).encode()
+        out = _check_reproduction_gate(s3, "alpha-engine-research", current)
+        assert out["passed"] is True
+        assert out["n_consecutive"] == _MIN_CONSECUTIVE_WEEKS
+
+    def test_one_drift_breaks_streak(self, monkeypatch):
+        s3 = _StubS3()
+        current = {"healthcare": {"rsi": 1.0, "macd": 0, "ma50": 0, "ma200": 0, "momentum": 0}}
+        drift = {"healthcare": {"rsi": 0.5, "macd": 0.5, "ma50": 0, "ma200": 0, "momentum": 0}}
+        # 3 matches then 1 drift — sorted-desc means drift is in position [3]
+        # (oldest of the 4 we read); should fail at the last archive.
+        import json as _json
+        # YYMMDDHHMM keys, sorted desc means biggest first (most recent first)
+        payloads = [current, current, current, drift]
+        for i, payload in enumerate(payloads):
+            # newer keys = bigger lex prefix
+            key = f"{S3_SHADOW_PREFIX}/2605{9 - i}01234_result.json"
+            s3.store[("alpha-engine-research", key)] = _json.dumps({
+                "per_sector": payload,
+            }).encode()
+        out = _check_reproduction_gate(s3, "alpha-engine-research", current)
+        assert out["passed"] is False
+        assert "reproduction gate broken at archive[-4]" in out["reason"]
+
+
+class TestApplyLiveGating:
+    def _seed_matching_history(self, s3, current_payload, n: int):
+        """Plant n shadow archives that all match current_payload."""
+        import json as _json
+        for i in range(n):
+            key = f"{S3_SHADOW_PREFIX}/26050{i}1234_result.json"
+            s3.store[("alpha-engine-research", key)] = _json.dumps({
+                "per_sector": current_payload,
+            }).encode()
+
+    def test_enforce_with_insufficient_history_writes_shadow_not_live(
+        self, monkeypatch,
+    ):
+        """enforce=True but reproduction gate fails → shadow yes, live no."""
+        s3 = _StubS3()
+        monkeypatch.setattr("boto3.client", lambda svc, *a, **kw: s3)
+        init_config({"tech_weight_ablation": {
+            "use_tech_ablation_target": True,
+            "enforce_tech_ablation": True,
+        }})
+        out = apply(
+            _ok_result({"healthcare": "rsi_only"}),
+            "alpha-engine-research",
+        )
+        assert out["applied"] is False
+        assert "reproduction gate" in out["reason"]
+        # Shadow archive written
+        assert any(
+            k.startswith(S3_SHADOW_PREFIX + "/")
+            for (_, k) in s3.store
+        )
+        # Live NOT written
+        assert ("alpha-engine-research", S3_LIVE_KEY) not in s3.store
+
+    def test_enforce_with_full_reproduction_writes_live(self, monkeypatch):
+        s3 = _StubS3()
+        monkeypatch.setattr("boto3.client", lambda svc, *a, **kw: s3)
+        # Pre-seed: _MIN_CONSECUTIVE_WEEKS - 1 prior shadow archives all
+        # matching this week's payload. apply() writes this week's shadow
+        # first (making it the {n}th in the streak), then checks the gate.
+        rsi_only = {
+            "rsi": 1.0, "macd": 0.0, "ma50": 0.0,
+            "ma200": 0.0, "momentum": 0.0,
+        }
+        current = {"healthcare": rsi_only}
+        self._seed_matching_history(
+            s3, current, n=_MIN_CONSECUTIVE_WEEKS - 1,
+        )
+        init_config({"tech_weight_ablation": {
+            "use_tech_ablation_target": True,
+            "enforce_tech_ablation": True,
+        }})
+        out = apply(
+            _ok_result({"healthcare": "rsi_only"}),
+            "alpha-engine-research",
+        )
+        assert out["applied"] is True, out
+        assert out["live_key"] == S3_LIVE_KEY
+        assert out["per_sector"] == current
+        # Live key written
+        assert ("alpha-engine-research", S3_LIVE_KEY) in s3.store
+        # Shadow archive also present
+        assert any(
+            k.startswith(S3_SHADOW_PREFIX + "/")
+            and k.endswith(".json")
+            and not k.endswith("/latest.json")
+            for (_, k) in s3.store
+        )
+
+    def test_drift_in_history_blocks_live_write(self, monkeypatch):
+        s3 = _StubS3()
+        monkeypatch.setattr("boto3.client", lambda svc, *a, **kw: s3)
+        rsi_only = {
+            "rsi": 1.0, "macd": 0.0, "ma50": 0.0,
+            "ma200": 0.0, "momentum": 0.0,
+        }
+        # Pre-seed 2 matching + 1 drift → reproduction breaks at the drift.
+        # After apply() writes this week's archive, that's 3 in a row of
+        # matching + 1 drift before; gate requires 4-in-a-row so blocks.
+        drift_payload = {"healthcare": {
+            "rsi": 0.5, "macd": 0.5, "ma50": 0.0, "ma200": 0.0, "momentum": 0.0,
+        }}
+        import json as _json
+        # Older drift archive (smaller lex prefix), then 2 matching newer.
+        s3.store[("alpha-engine-research",
+                  f"{S3_SHADOW_PREFIX}/2605011234_result.json")] = (
+            _json.dumps({"per_sector": drift_payload}).encode()
+        )
+        s3.store[("alpha-engine-research",
+                  f"{S3_SHADOW_PREFIX}/2605051234_result.json")] = (
+            _json.dumps({"per_sector": {"healthcare": rsi_only}}).encode()
+        )
+        s3.store[("alpha-engine-research",
+                  f"{S3_SHADOW_PREFIX}/2605091234_result.json")] = (
+            _json.dumps({"per_sector": {"healthcare": rsi_only}}).encode()
+        )
+        init_config({"tech_weight_ablation": {
+            "use_tech_ablation_target": True,
+            "enforce_tech_ablation": True,
+        }})
+        out = apply(
+            _ok_result({"healthcare": "rsi_only"}),
+            "alpha-engine-research",
+        )
+        assert out["applied"] is False
+        assert "reproduction gate broken" in out["reason"]
+        assert ("alpha-engine-research", S3_LIVE_KEY) not in s3.store
