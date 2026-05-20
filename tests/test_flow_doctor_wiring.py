@@ -374,13 +374,12 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.20.0" in text, (
-            "alpha-engine-lib should pin to v0.20.0 (Wave-4 predictor/"
-            "price_cache_slim deletion: load_universe_ohlcv added in v0.19.0, "
-            "load_macro_series + shared read-core in v0.20.0 — exit_timing's "
-            "_load_price_cache reads the ArcticDB universe lib via "
-            "load_universe_ohlcv with a slim->price_cache parquet fallback "
-            "and a reconcile parity emit. Bumped from v0.16.0 2026-05-19; "
-            "still carries the v0.16.0 eval_artifacts canonical readers "
-            "transitively. Update this test if the pin moves further forward."
+        assert "@v0.21.0" in text, (
+            "alpha-engine-lib should pin to v0.21.0 (adds alpha_engine_lib.alerts "
+            "module + `python -m alpha_engine_lib.alerts publish` CLI — required "
+            "by spot_backtest.sh's dispatcher cleanup() L2246 SOTA upgrade per "
+            "the CLAUDE.md sub-sub-rule. Bumped from v0.20.0 2026-05-20; still "
+            "carries the v0.20.0 load_universe_ohlcv + load_macro_series + "
+            "v0.16.0 eval_artifacts canonical readers transitively. Update this "
+            "test if the pin moves further forward."
         )

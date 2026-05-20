@@ -314,9 +314,45 @@ INSTANCE_ID=$(aws ec2 run-instances \
 
 echo "  Instance ID: $INSTANCE_ID"
 
-# Cleanup function — always terminate the instance
+# Last `run_remote` command — captured for the EXIT-trap diagnostic so
+# a non-zero exit prints which remote call ran last. L2246.
+LAST_RUN_REMOTE_CMD=""
+
+# Cleanup function — always terminate the instance, with diagnostics on failure
 cleanup() {
+    local exit_code=$?
     echo ""
+    echo "==> Dispatcher EXIT (code=$exit_code)"
+    if [ "$exit_code" -ne 0 ]; then
+        local last_cmd="${LAST_RUN_REMOTE_CMD:-<none — failed before any remote call>}"
+        echo "    last run_remote: $last_cmd"
+        local state="<not yet provisioned>"
+        if [ -n "${INSTANCE_ID:-}" ]; then
+            state=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "<lookup-failed>")
+            echo "    spot state: $state"
+        fi
+        # Independent-channel surveillance: fan out the diagnostic via
+        # alpha_engine_lib.alerts (SNS + Telegram). Mirrors the L117
+        # "Lambda CI canary rollback should Telegram/email the operator
+        # on rollback" pattern and the CLAUDE.md SOTA rule sub-sub-rule
+        # (lift-to-lib for ≥2 consumers; this is consumer #1 of the new
+        # `python -m alpha_engine_lib.alerts publish` CLI primitive).
+        # Best-effort: ``|| true`` keeps cleanup running even if Python /
+        # the lib / SNS / Telegram are all unreachable — the local stdout
+        # diagnostic above is the primary surface; the alert is the
+        # independent fan-out.
+        local _alert_python
+        if [ -x "$(dirname "$0")/../.venv/bin/python" ]; then
+            _alert_python="$(dirname "$0")/../.venv/bin/python"
+        else
+            _alert_python="$(command -v python3 || command -v python || echo python)"
+        fi
+        "$_alert_python" -m alpha_engine_lib.alerts publish \
+            --message "exit_code=$exit_code last_run_remote='$last_cmd' spot_state=$state instance_id=${INSTANCE_ID:-<none>}" \
+            --severity error \
+            --source alpha-engine-backtester/spot_backtest.sh \
+            > /dev/null 2>&1 || echo "    (alerts.publish fan-out failed; primary stdout diagnostic above is the surface)"
+    fi
     echo "==> Terminating spot instance $INSTANCE_ID..."
     aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
     echo "  Instance terminated."
@@ -357,8 +393,16 @@ for i in $(seq 1 30); do
     sleep 5
 done
 
-# Helper: run command on EC2
+# Helper: run command on EC2. Records the last invocation in
+# LAST_RUN_REMOTE_CMD (truncated to 200 chars to keep heredoc dumps
+# bounded) so the EXIT trap can name it in the diagnostic on failure.
 run_remote() {
+    local _cmd="$*"
+    if [ "${#_cmd}" -gt 200 ]; then
+        LAST_RUN_REMOTE_CMD="${_cmd:0:200}... (+$((${#_cmd} - 200)) chars)"
+    else
+        LAST_RUN_REMOTE_CMD="$_cmd"
+    fi
     ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "$@"
 }
 
