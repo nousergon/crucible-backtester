@@ -150,6 +150,60 @@ _MIN_TRADES_TO_PROMOTE = 50
 # veto skill-composite cutover (alpha-engine-backtester #166).
 _MIN_PSR = 0.95
 
+# Floor for the |baseline| denominator in improvement_pct, preventing
+# blow-ups when the baseline rank metric (Sortino / Sharpe / risk-matched
+# alpha) is near zero. Without this, baseline≈0 produced inf or 9828×
+# readings (observed in executor_params_shadow_history/latest.json
+# 2026-05-18). Operators should read `improvement_delta` (signed
+# absolute) for the meaningful number when |baseline| < this floor.
+_IMPROVEMENT_DENOM_FLOOR = 1e-6
+
+# Minimum |baseline_rank| magnitude at which the percent-improvement
+# framing is statistically meaningful, per rank metric. Below this
+# floor, the clamp-floor above still prevents division blow-ups but
+# the resulting `improvement_pct` is structurally misleading (e.g.
+# baseline=1e-4 + best=0.01 → 99× "improvement" reading from absolute
+# deltas of 0.01). When the baseline magnitude falls under the floor,
+# the optimizer refuses to promote — the strategy's baseline is
+# statistical noise and no ratio off noise can justify a config flip.
+# Matches the institutional "constrained optimization, not post-hoc
+# check" framing from the 2026-05-20 alpha-floor arc (CLAUDE.md SOTA
+# rule).
+#
+# Floors are metric-specific because the rank columns roll in
+# structurally different units:
+#  * sortino_ratio / sharpe_ratio: dimensionless risk-adjusted return
+#    ratios; typical 0–2 range, 0.05 is the floor at which the ratio
+#    becomes distinguishable from zero on typical 10–12 month sweep
+#    windows.
+#  * alpha_vs_ew_high_vol: raw return (portfolio - vol-matched basket);
+#    typical 0.01–0.10 range, 50bps (0.005) is the noise floor at
+#    which the risk-matched-alpha basket comparison becomes
+#    statistically meaningful.
+# Operator overrides:
+#  * ``executor_optimizer.min_baseline_magnitude`` (single float) is
+#    honoured for backward compatibility — applied uniformly when set.
+#  * ``executor_optimizer.min_baseline_magnitude_by_rank`` (dict) is
+#    the per-rank-metric override path (e.g.
+#    ``{sortino_ratio: 0.1, alpha_vs_ew_high_vol: 0.01}``).
+_MIN_BASELINE_MAGNITUDE_BY_RANK: dict[str, float] = {
+    "sortino_ratio": 0.05,
+    "sharpe_ratio": 0.05,
+    "alpha_vs_ew_high_vol": 0.005,
+}
+
+
+def _resolve_min_baseline_magnitude(rank_metric: str) -> float:
+    """Pick the significance floor for ``rank_metric``, honouring
+    operator overrides at config-write time."""
+    by_rank_override = _cfg.get("min_baseline_magnitude_by_rank") or {}
+    if rank_metric in by_rank_override:
+        return float(by_rank_override[rank_metric])
+    single_override = _cfg.get("min_baseline_magnitude")
+    if single_override is not None:
+        return float(single_override)
+    return _MIN_BASELINE_MAGNITUDE_BY_RANK.get(rank_metric, 0.05)
+
 # Module-level config ref — set by init_config() from backtest.py
 _cfg: dict = {}
 
@@ -257,6 +311,11 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
             "best_alpha": float | None,
             "baseline_alpha": float | None,
             "improvement_pct": float,
+            "improvement_delta": float | None,  # signed absolute delta, read this
+                                                 # when |baseline_rank| < ε
+            "improvement_significant": bool,    # False ⇒ baseline magnitude is
+                                                 # noise, refusing to promote
+            "min_baseline_magnitude": float,    # threshold for above
             ...
         }
     """
@@ -452,6 +511,22 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     best_alpha_vs_ew_high_vol = _safe_float(best_row.get("alpha_vs_ew_high_vol"))
     baseline_alpha_vs_ew_high_vol = _safe_float(baseline_row.get("alpha_vs_ew_high_vol"))
 
+    # Baseline-significance floor: when |baseline_rank| is below this
+    # magnitude, the % framing of improvement_pct is structurally
+    # noise — operator can read `improvement_delta` but the optimizer
+    # refuses to promote off such a baseline (see the gate branches
+    # below). Floor is per rank metric (different units across the
+    # three paths); _resolve_min_baseline_magnitude honours operator
+    # overrides.
+    if use_skill_composite:
+        _rank_metric_name = (
+            "alpha_vs_ew_high_vol" if prefer_risk_matched_alpha
+            else "sortino_ratio"
+        )
+    else:
+        _rank_metric_name = "sharpe_ratio"
+    min_baseline_magnitude = _resolve_min_baseline_magnitude(_rank_metric_name)
+
     if use_skill_composite:
         # Improvement gate is rank-col-based: sortino_ratio (default) or
         # alpha_vs_ew_high_vol when prefer_risk_matched_alpha is on.
@@ -463,15 +538,24 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
             baseline_rank = baseline_sortino
         if baseline_rank is None or best_rank is None:
             improvement_pct = 0.0
-        elif baseline_rank == 0:
-            improvement_pct = float("inf") if best_rank > 0 else 0.0
+            improvement_delta = None
+            improvement_significant = False
         else:
-            improvement_pct = (best_rank - baseline_rank) / abs(baseline_rank)
+            improvement_delta = best_rank - baseline_rank
+            improvement_pct = improvement_delta / max(
+                abs(baseline_rank), _IMPROVEMENT_DENOM_FLOOR
+            )
+            improvement_significant = (
+                abs(baseline_rank) >= min_baseline_magnitude
+            )
     else:
-        if baseline_sharpe == 0:
-            improvement_pct = float("inf") if best_sharpe > 0 else 0.0
-        else:
-            improvement_pct = (best_sharpe - baseline_sharpe) / abs(baseline_sharpe)
+        improvement_delta = best_sharpe - baseline_sharpe
+        improvement_pct = improvement_delta / max(
+            abs(baseline_sharpe), _IMPROVEMENT_DENOM_FLOOR
+        )
+        improvement_significant = (
+            abs(baseline_sharpe) >= min_baseline_magnitude
+        )
 
     recommended = {col: best_row[col] for col in param_cols if pd.notna(best_row[col])}
     # Convert numpy types to native Python
@@ -515,6 +599,11 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         "best_alpha_vs_ew_high_vol": best_alpha_vs_ew_high_vol,
         "baseline_alpha_vs_ew_high_vol": baseline_alpha_vs_ew_high_vol,
         "improvement_pct": round(improvement_pct, 4),
+        "improvement_delta": (
+            round(float(improvement_delta), 6) if improvement_delta is not None else None
+        ),
+        "improvement_significant": bool(improvement_significant),
+        "min_baseline_magnitude": min_baseline_magnitude,
         "baseline_combo_rank": baseline_combo_rank,
         "baseline_distance": round(float(baseline_dist), 4),
         "n_closer_combos": n_closer_combos,
@@ -571,6 +660,42 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
                         f"D risk-matched skill check."
                     ),
                 }
+
+        # Baseline-significance gate — refuse promotion off a near-zero
+        # baseline ratio (improvement_pct is structurally noise when
+        # |baseline_rank| < min_baseline_magnitude; see the constant's
+        # docstring above). Ordered AFTER negative-Sortino /
+        # negative-alpha_vs_ew_high_vol so those clearer-failure modes
+        # surface their own statuses first, and BEFORE the
+        # improvement-pct gate so the latter never fires off a
+        # noise-baseline ratio. Constrained-optimization framing per
+        # the 2026-05-20 alpha-floor arc (CLAUDE.md SOTA rule).
+        if not improvement_significant:
+            if prefer_risk_matched_alpha:
+                rank_baseline = baseline_alpha_vs_ew_high_vol
+                rank_label = "alpha_vs_ew_high_vol"
+            else:
+                rank_baseline = baseline_sortino
+                rank_label = "Sortino"
+            _baseline_display = (
+                f"{rank_baseline:.4f}" if rank_baseline is not None else "None"
+            )
+            _delta_display = (
+                f"{improvement_delta:.4f}"
+                if improvement_delta is not None else "None"
+            )
+            return {
+                "status": "baseline_insignificant",
+                **common_fields,
+                "note": (
+                    f"Baseline {rank_label} ({_baseline_display}) magnitude is "
+                    f"below the {min_baseline_magnitude:.3f} significance floor — "
+                    f"any improvement ratio off this baseline is structural "
+                    f"noise. Refusing to auto-apply (improvement_delta="
+                    f"{_delta_display}). Need more sweep history / higher-"
+                    f"quality baseline before promotion."
+                ),
+            }
 
         min_improvement = _cfg.get("min_sortino_improvement", _MIN_SORTINO_IMPROVEMENT)
         if improvement_pct < min_improvement:
@@ -659,6 +784,22 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
             "note": (
                 f"Best Sharpe ({best_sharpe:.4f}) is negative — all combos lost money. "
                 f"Refusing to auto-apply. Review signal quality and backtest data before tuning."
+            ),
+        }
+
+    # Baseline-significance gate — mirror of the skill-composite path.
+    # Refuse promotion when baseline_sharpe magnitude is below the
+    # significance floor (improvement_pct would be a noise ratio).
+    if not improvement_significant:
+        return {
+            "status": "baseline_insignificant",
+            **common_fields,
+            "note": (
+                f"Baseline Sharpe ({baseline_sharpe:.4f}) magnitude is below "
+                f"the {min_baseline_magnitude:.3f} significance floor — any "
+                f"improvement ratio off this baseline is structural noise. "
+                f"Refusing to auto-apply (improvement_delta={improvement_delta:.4f}). "
+                f"Need more sweep history / higher-quality baseline before promotion."
             ),
         }
 

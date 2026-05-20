@@ -984,3 +984,286 @@ class TestAlphaFloorConstraint:
         df = _make_sweep_df(rows)
         result = recommend(df, base_config={})
         assert result["status"] == "alpha_below_floor"
+
+
+class TestImprovementPctNearZeroBaseline:
+    """Regression for ROADMAP L120 — improvement_pct used to blow up
+    (inf, or 9828× misleading readings) when the baseline rank metric
+    was at or near zero. The fix clamps the denominator to
+    _IMPROVEMENT_DENOM_FLOOR (1e-6) and exposes the signed
+    `improvement_delta` as the operator-meaningful absolute number.
+
+    Observed in production: executor_params_shadow_history/latest.json
+    (2026-05-18) carried `improvement_pct: 9828.0`."""
+
+    def test_skill_baseline_sortino_exactly_zero_does_not_return_inf(self):
+        # Sortino = 0 for the closest-to-current combo, > 0 for best.
+        # Pre-fix: improvement_pct = float("inf"); post-fix: bounded.
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.5,
+             "max_drawdown": -0.10, "total_trades": 80},
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.50, "total_alpha": 0.10, "sortino_ratio": 0.0,
+             "max_drawdown": -0.05, "total_trades": 100},
+        ]
+        df = _make_sweep_df(rows)
+        # Pin baseline to combo 2 (sortino=0) via current_params proximity.
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["baseline_sortino"] == 0.0
+        # No inf. improvement_pct stays finite (a large but bounded number,
+        # roughly best_sortino / 1e-6).
+        import math
+        assert math.isfinite(result["improvement_pct"])
+        # improvement_delta surfaces the operator-meaningful absolute value:
+        # 0.5 - 0.0 = 0.5.
+        assert result["improvement_delta"] == 0.5
+
+    def test_skill_baseline_sortino_near_zero_no_overflow(self):
+        # Sortino baseline = 1e-4 (the 2026-05-18 9828× case had a
+        # divisor in this ballpark). Pre-fix: 9828×-style reading.
+        # Post-fix: improvement_pct = improvement_delta / max(|baseline|, 1e-6).
+        # When |baseline| > 1e-6, the floor is inert (improvement_pct stays
+        # equal to the pre-clamp ratio); `improvement_delta` surfaces the
+        # signed absolute number so operators don't have to interpret a
+        # near-zero-baseline ratio.
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.01,
+             "max_drawdown": -0.10, "total_trades": 80},
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.50, "total_alpha": 0.10,
+             "sortino_ratio": 0.0001, "max_drawdown": -0.05,
+             "total_trades": 100},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["baseline_sortino"] == 0.0001
+        # improvement_delta is the meaningful number: 0.01 - 0.0001 ≈ 0.0099.
+        assert abs(result["improvement_delta"] - 0.0099) < 1e-6
+        # improvement_pct = improvement_delta / 0.0001 = 99.0
+        # (NOT 9828.0; the small but non-zero baseline divides cleanly).
+        # Pin the math so a future refactor of the floor doesn't silently
+        # change the contract.
+        assert abs(result["improvement_pct"] - 99.0) < 1e-3
+
+    def test_legacy_baseline_sharpe_exactly_zero_does_not_return_inf(self):
+        # Same regression on the legacy Sharpe path. Pre-fix:
+        # improvement_pct = float("inf"); post-fix: bounded.
+        _init_default_config()
+        rows = [
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.5, "total_alpha": 0.0, "sortino_ratio": 0.5,
+             "max_drawdown": -0.05, "total_trades": 50},
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.0, "total_alpha": 0.0, "sortino_ratio": 0.0,
+             "max_drawdown": -0.05, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["baseline_sharpe"] == 0.0
+        import math
+        assert math.isfinite(result["improvement_pct"])
+        assert result["improvement_delta"] == 0.5
+
+    def test_improvement_delta_surfaces_for_skill_path(self):
+        # Sanity: improvement_delta is always present (not None) when
+        # both best_rank and baseline_rank are computable.
+        _init_default_config({"use_skill_composite_target": True})
+        df = _make_sweep_df(COMBOS)
+        result = recommend(df, base_config={})
+        assert "improvement_delta" in result
+        assert result["improvement_delta"] is not None
+        # COMBOS: best Sortino 0.95 (combo B), worst-by-rank 0.70 (combo C)
+        # → improvement_delta = 0.95 - 0.70 = 0.25.
+        assert abs(result["improvement_delta"] - 0.25) < 1e-6
+
+
+class TestBaselineSignificanceGate:
+    """Per CLAUDE.md SOTA rule + ROADMAP L120 follow-up: a near-zero
+    baseline rank metric is structural noise; promoting based on a
+    ratio off such a baseline is misleading regardless of the
+    improvement_pct value. The gate refuses promotion when the
+    baseline magnitude falls under the per-metric significance floor
+    (constrained optimization, not post-hoc check)."""
+
+    def test_skill_baseline_below_floor_refuses_promotion(self):
+        # baseline_sortino = 0.0 → magnitude 0 < default floor 0.05 →
+        # status: baseline_insignificant. Pre-gate this would have
+        # returned status: ok (the clamp made improvement_pct finite +
+        # large + >> the 10% min_sortino_improvement threshold).
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.5,
+             "max_drawdown": -0.10, "total_trades": 80},
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.50, "total_alpha": 0.10, "sortino_ratio": 0.0,
+             "max_drawdown": -0.05, "total_trades": 100},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["status"] == "baseline_insignificant"
+        assert result["improvement_significant"] is False
+        assert result["baseline_sortino"] == 0.0
+        # The deviation/operator info still surfaces — refusing to
+        # promote does NOT suppress the diagnostic numbers.
+        assert result["improvement_delta"] == 0.5
+        assert result["min_baseline_magnitude"] == 0.05
+
+    def test_skill_baseline_at_floor_promotes(self):
+        # baseline_sortino = 0.06 ≥ 0.05 floor → significance ok →
+        # normal min_improvement gate applies.
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.5,
+             "max_drawdown": -0.10, "total_trades": 80},
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.50, "total_alpha": 0.10, "sortino_ratio": 0.06,
+             "max_drawdown": -0.05, "total_trades": 100},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["status"] == "ok"
+        assert result["improvement_significant"] is True
+        assert result["baseline_sortino"] == 0.06
+
+    def test_legacy_sharpe_baseline_below_floor_refuses_promotion(self):
+        # Symmetric guard on the legacy Sharpe path. baseline_sharpe =
+        # 0.0 (< 0.05 floor) → baseline_insignificant.
+        _init_default_config()
+        rows = [
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.5, "total_alpha": 0.0, "sortino_ratio": 0.5,
+             "max_drawdown": -0.05, "total_trades": 50},
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.0, "total_alpha": 0.0, "sortino_ratio": 0.0,
+             "max_drawdown": -0.05, "total_trades": 50},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["status"] == "baseline_insignificant"
+        assert result["improvement_significant"] is False
+        assert result["min_baseline_magnitude"] == 0.05
+
+    def test_risk_matched_alpha_floor_lower_than_sortino_floor(self):
+        # alpha_vs_ew_high_vol rolls in raw-return units (typical
+        # 0.01–0.10), not ratio units; its default floor is 0.005
+        # (50bps), not 0.05. baseline_alpha_vs_ew_high_vol = 0.01
+        # passes that floor; pre-gate this raised the bug where the
+        # original 0.05 single-floor would have wrongly refused.
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "prefer_risk_matched_alpha": True,
+        })
+        rows = [
+            # combo A: best risk-matched alpha (0.08)
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.75,
+             "alpha_vs_ew_high_vol": 0.08, "max_drawdown": -0.10, "total_trades": 80},
+            # combo B: baseline (0.01 — just above the 0.005 floor)
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.50, "total_alpha": 0.10, "sortino_ratio": 0.5,
+             "alpha_vs_ew_high_vol": 0.01, "max_drawdown": -0.05, "total_trades": 100},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["status"] == "ok"
+        assert result["improvement_significant"] is True
+        # The resolved floor matches the per-metric default for the
+        # risk-matched-alpha rank column.
+        assert result["min_baseline_magnitude"] == 0.005
+
+    def test_operator_can_override_floor_uniformly(self):
+        # Single-float override (back-compat ergonomics) applies
+        # uniformly across the rank column.
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "min_baseline_magnitude": 0.10,
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.5,
+             "max_drawdown": -0.10, "total_trades": 80},
+            # baseline_sortino = 0.08 — clears default 0.05 floor but
+            # NOT the operator's tighter 0.10 override.
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.50, "total_alpha": 0.10, "sortino_ratio": 0.08,
+             "max_drawdown": -0.05, "total_trades": 100},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["status"] == "baseline_insignificant"
+        assert result["min_baseline_magnitude"] == 0.10
+
+    def test_operator_can_override_floor_per_metric(self):
+        # Per-metric override path (the institutional one — different
+        # rank columns have different units).
+        _init_default_config({
+            "use_skill_composite_target": True,
+            "min_baseline_magnitude_by_rank": {"sortino_ratio": 0.01},
+        })
+        rows = [
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.5,
+             "max_drawdown": -0.10, "total_trades": 80},
+            # baseline_sortino = 0.02 — below the default 0.05 floor,
+            # but above the per-metric override 0.01.
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.50, "total_alpha": 0.10, "sortino_ratio": 0.02,
+             "max_drawdown": -0.05, "total_trades": 100},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["status"] == "ok"
+        assert result["min_baseline_magnitude"] == 0.01
+
+    def test_significance_gate_fires_before_min_improvement_gate(self):
+        # Ordering invariant: baseline_insignificant takes precedence
+        # over no_improvement so the operator sees the right diagnosis
+        # (baseline is noise, not just "improvement is too small").
+        # baseline_sortino = 0.0001 (well below floor) + best_sortino
+        # = 0.0002 (improvement_pct = ~99%, way above 10% gate). Pre-
+        # gate this would have reported no_improvement-or-ok; post-
+        # gate it reports baseline_insignificant.
+        _init_default_config({"use_skill_composite_target": True})
+        rows = [
+            {"atr_multiplier": 2.0, "min_score": 70, "max_position_pct": 0.05,
+             "sharpe_ratio": 0.55, "total_alpha": 0.30, "sortino_ratio": 0.0002,
+             "max_drawdown": -0.10, "total_trades": 80},
+            {"atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+             "sharpe_ratio": 0.50, "total_alpha": 0.10, "sortino_ratio": 0.0001,
+             "max_drawdown": -0.05, "total_trades": 100},
+        ]
+        df = _make_sweep_df(rows)
+        result = recommend(df, base_config={}, current_params={
+            "atr_multiplier": 3.0, "min_score": 75, "max_position_pct": 0.10,
+        })
+        assert result["status"] == "baseline_insignificant"
+        assert result["improvement_significant"] is False
+        # The misleading 99× reading is still in the diagnostic
+        # (clamped + visible), but the operator sees the
+        # baseline_insignificant status and the improvement_delta tiny
+        # number (0.0001), which together correctly tell the story.
+        assert abs(result["improvement_delta"] - 0.0001) < 1e-9
