@@ -917,9 +917,16 @@ class TestChangelogAutoEmitOnAnomaly:
             "2026-04-11": baseline_df,
         })
         build_cost_section("2026-05-09", s3_client=stub)
-        # Exactly one put_object call — the changelog auto-emit
-        assert stub.put_object.call_count == 1
-        call = stub.put_object.call_args_list[0]
+        # Exactly one changelog put_object call. (A sibling put_object
+        # writes the anomaly-alert dedup marker to
+        # ``decision_artifacts/_anomaly_alerts/sent/...`` — filtered out
+        # here so this test stays focused on the changelog contract.)
+        changelog_calls = [
+            c for c in stub.put_object.call_args_list
+            if c.kwargs.get("Key", "").startswith("changelog/entries/")
+        ]
+        assert len(changelog_calls) == 1
+        call = changelog_calls[0]
         assert call.kwargs["Bucket"] == "alpha-engine-research"
         assert call.kwargs["Key"].startswith("changelog/entries/")
         assert call.kwargs["Key"].endswith(".json")
@@ -1257,3 +1264,245 @@ class TestAnomalyAlertPublish:
         })
         build_cost_section("2026-05-09", s3_client=stub)
         assert calls == []
+
+
+class TestAnomalyAlertDedup:
+    """S3-marker idempotency for ``_publish_anomaly_alert``.
+
+    Surfaced 2026-05-21 by an SNS-email screenshot: multiple identical
+    ``[ERROR] alpha-engine-backtester/analysis/cost_report.py: LLM cost
+    anomaly`` emails arriving for the same (date, ratio, current,
+    baseline) tuple. Cause: every invocation of ``build_cost_section``
+    (Saturday SF main run + smoke-mode re-runs + mid-week evaluate.py
+    round-trips) fires its own publish call.
+
+    Fix: write a deterministic marker at
+    ``decision_artifacts/_anomaly_alerts/sent/{run_date}_{hash7}.json``
+    after the first publish; subsequent invocations find the marker
+    and skip.
+    """
+
+    def test_dedup_key_is_deterministic_across_invocations(self):
+        """Same anomaly → same key regardless of when computed."""
+        from analysis.cost_report import _anomaly_alert_dedup_key
+
+        anomaly = {
+            "current_total_usd": 10.0,
+            "baseline_mean_usd": 1.0,
+            "ratio": 10.0,
+            "threshold_ratio": 2.0,
+        }
+        key1 = _anomaly_alert_dedup_key("2026-05-09", anomaly)
+        key2 = _anomaly_alert_dedup_key("2026-05-09", anomaly)
+        assert key1 == key2
+        assert key1.startswith("decision_artifacts/_anomaly_alerts/sent/2026-05-09_")
+        assert key1.endswith(".json")
+
+    def test_dedup_key_changes_when_anomaly_changes(self):
+        """Different (current, baseline, ratio) → different key."""
+        from analysis.cost_report import _anomaly_alert_dedup_key
+
+        anomaly_a = {
+            "current_total_usd": 10.0, "baseline_mean_usd": 1.0,
+            "ratio": 10.0, "threshold_ratio": 2.0,
+        }
+        anomaly_b = {
+            "current_total_usd": 10.5, "baseline_mean_usd": 1.0,
+            "ratio": 10.5, "threshold_ratio": 2.0,
+        }
+        assert (
+            _anomaly_alert_dedup_key("2026-05-09", anomaly_a)
+            != _anomaly_alert_dedup_key("2026-05-09", anomaly_b)
+        )
+
+    def test_dedup_key_changes_when_date_changes(self):
+        """Same numeric anomaly on different dates → different keys."""
+        from analysis.cost_report import _anomaly_alert_dedup_key
+
+        anomaly = {
+            "current_total_usd": 10.0, "baseline_mean_usd": 1.0,
+            "ratio": 10.0, "threshold_ratio": 2.0,
+        }
+        assert (
+            _anomaly_alert_dedup_key("2026-05-09", anomaly)
+            != _anomaly_alert_dedup_key("2026-05-16", anomaly)
+        )
+
+    def test_first_invocation_publishes_and_writes_marker(self, monkeypatch):
+        """Marker absent → publish fires + marker written."""
+        monkeypatch.delenv("ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED", raising=False)
+
+        from analysis.cost_report import build_cost_section
+
+        publish_calls: list[dict] = []
+
+        class _FakeResult:
+            class _Chan:
+                ok = True
+            sns = _Chan()
+            telegram = _Chan()
+            any_ok = True
+            all_ok = True
+
+        def _spy(message, **kwargs):
+            publish_calls.append({"message": message, **kwargs})
+            return _FakeResult()
+
+        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _spy)
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+        assert len(publish_calls) == 1
+        marker_writes = [
+            c for c in stub.put_object.call_args_list
+            if c.kwargs.get("Key", "").startswith("decision_artifacts/_anomaly_alerts/sent/")
+        ]
+        assert len(marker_writes) == 1
+
+    def test_second_invocation_finds_marker_and_skips_publish(self, monkeypatch):
+        """Marker present → publish is suppressed (the N-emails storm fix)."""
+        monkeypatch.delenv("ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED", raising=False)
+
+        from analysis.cost_report import _anomaly_alert_dedup_key, build_cost_section
+
+        publish_calls: list[dict] = []
+
+        class _FakeResult:
+            class _Chan:
+                ok = True
+            sns = _Chan()
+            telegram = _Chan()
+            any_ok = True
+            all_ok = True
+
+        def _spy(message, **kwargs):
+            publish_calls.append({"message": message, **kwargs})
+            return _FakeResult()
+
+        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _spy)
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        existing_marker_key = _anomaly_alert_dedup_key(
+            "2026-05-09",
+            {"current_total_usd": 10.0, "baseline_mean_usd": 1.0,
+             "ratio": 10.0, "threshold_ratio": 2.0},
+        )
+
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        original_get = stub.get_object.side_effect
+
+        def _get_with_marker(*, Bucket: str, Key: str):
+            if Key == existing_marker_key:
+                marker_body = json.dumps({
+                    "run_date": "2026-05-09",
+                    "first_published_at": "2026-05-21T20:00:00Z",
+                }).encode()
+                return {"Body": _StubBody(marker_body)}
+            return original_get(Bucket=Bucket, Key=Key)
+
+        stub.get_object.side_effect = _get_with_marker
+
+        build_cost_section("2026-05-09", s3_client=stub)
+        assert publish_calls == []
+        marker_writes = [
+            c for c in stub.put_object.call_args_list
+            if c.kwargs.get("Key", "").startswith("decision_artifacts/_anomaly_alerts/sent/")
+        ]
+        assert marker_writes == []
+
+    def test_marker_check_s3_error_fails_safe_to_publish(self, monkeypatch, caplog):
+        """Transient S3 error on marker check → publish anyway (fail-safe)."""
+        monkeypatch.delenv("ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED", raising=False)
+
+        from analysis.cost_report import _anomaly_alert_already_sent
+
+        bad_s3 = MagicMock()
+        bad_s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "ServiceUnavailable", "Message": "transient"}},
+            "GetObject",
+        )
+
+        with caplog.at_level("WARNING"):
+            assert _anomaly_alert_already_sent(
+                "decision_artifacts/_anomaly_alerts/sent/2026-05-09_abc1234.json",
+                bucket="alpha-engine-research",
+                s3_client=bad_s3,
+            ) is False
+        assert any("marker check errored" in r.message for r in caplog.records)
+
+    def test_marker_write_failure_does_not_break_cost_section(self, monkeypatch):
+        """Marker-write failure is logged but never raises — publish has
+        already happened, so worst case is one duplicate alert next time."""
+        monkeypatch.delenv("ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED", raising=False)
+
+        from analysis.cost_report import build_cost_section
+
+        class _FakeResult:
+            class _Chan:
+                ok = True
+            sns = _Chan()
+            telegram = _Chan()
+            any_ok = True
+            all_ok = True
+
+        monkeypatch.setattr(
+            "alpha_engine_lib.alerts.publish",
+            lambda *a, **k: _FakeResult(),
+        )
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        original_put = stub.put_object
+
+        def _put_marker_raises(**kwargs):
+            if kwargs.get("Key", "").startswith("decision_artifacts/_anomaly_alerts/sent/"):
+                raise ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "no perms"}},
+                    "PutObject",
+                )
+            return original_put(**kwargs)
+
+        stub.put_object = MagicMock(side_effect=_put_marker_raises)
+
+        md = build_cost_section("2026-05-09", s3_client=stub)
+        assert "ANOMALY DETECTED" in md
