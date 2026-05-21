@@ -1096,3 +1096,164 @@ class TestChangelogAutoEmitOnAnomaly:
         hash_a = key_a.rsplit("_", 1)[-1].split(".")[0]
         hash_b = key_b.rsplit("_", 1)[-1].split(".")[0]
         assert hash_a == hash_b
+
+
+class TestAnomalyAlertPublish:
+    """Operator-facing SNS+Telegram fan-out on cost anomalies (ROADMAP L717).
+
+    Uses alpha_engine_lib.alerts (v0.21.0+) — the same canonical
+    primitive the dispatcher EXIT-trap diagnostic in spot_backtest.sh
+    consumes. Verifies the publish call fires on anomaly status, is
+    suppressed on quiet weeks, and never breaks build_cost_section
+    when the underlying publish raises.
+    """
+
+    def test_anomaly_status_invokes_alerts_publish(self, monkeypatch):
+        """On status=anomaly, build_cost_section calls alerts.publish once."""
+        from analysis import cost_report
+        from analysis.cost_report import build_cost_section
+
+        calls: list[dict] = []
+
+        class _FakeResult:
+            sns_ok = True
+            telegram_ok = True
+
+        def _fake_publish(message, *, severity="error", source=None,
+                          sns=True, telegram=True, sns_topic_arn=None):
+            calls.append({
+                "message": message, "severity": severity, "source": source,
+            })
+            return _FakeResult()
+
+        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _fake_publish)
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+        assert len(calls) == 1
+        payload = calls[0]
+        assert payload["severity"] == "error"
+        assert "backtester/analysis/cost_report.py" in (payload["source"] or "")
+        body = payload["message"]
+        assert "2026-05-09" in body
+        assert "10.00x" in body  # ratio
+        assert "$10.0000" in body  # current
+        assert "$1.0000" in body  # baseline
+
+    def test_ok_status_does_not_publish(self, monkeypatch):
+        """Quiet weeks (status=ok) → no publish call."""
+        from analysis import cost_report
+        from analysis.cost_report import build_cost_section
+
+        calls: list = []
+
+        class _FakeResult:
+            class _Chan:
+                ok = True
+            sns = _Chan()
+            telegram = _Chan()
+            any_ok = True
+
+        def _spy(*a, **k):
+            calls.append((a, k))
+            return _FakeResult()
+
+        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _spy)
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=0.01),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=0.01),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+        assert calls == []
+
+    def test_publish_failure_does_not_break_cost_section(self, monkeypatch):
+        """Network/transport failure in alerts.publish must be swallowed —
+        the markdown section, WARN log, and changelog entry all remain.
+        """
+        from analysis import cost_report
+        from analysis.cost_report import build_cost_section
+
+        def _raises(*a, **k):
+            raise RuntimeError("fake SNS endpoint timeout")
+
+        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _raises)
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        md = build_cost_section("2026-05-09", s3_client=stub)
+        # Section still renders the anomaly block + the changelog auto-emit
+        # still ran (put_object called once for the entry).
+        assert "ANOMALY DETECTED" in md
+        assert stub.put_object.call_count == 1
+
+    def test_disabled_env_var_suppresses_publish(self, monkeypatch):
+        """ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED=1 → no publish attempted."""
+        from analysis import cost_report
+        from analysis.cost_report import build_cost_section
+
+        monkeypatch.setenv("ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED", "1")
+
+        calls: list = []
+
+        def _spy(*a, **k):
+            calls.append((a, k))
+            return MagicMock()
+
+        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _spy)
+
+        current_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        stub = _make_multi_date_stub_with_put({
+            "2026-05-09": current_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+        assert calls == []
