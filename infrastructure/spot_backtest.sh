@@ -783,12 +783,46 @@ fi
 # enforce per-mode wall-clock budgets from timing_budget.yaml. Ordered
 # fastest → slowest so a failure in an earlier mode short-circuits
 # the harder ones. ROADMAP Backtester P0 #3.
+#
+# Timestamp capture for the L280 SUPPRESS contract canary below — the
+# smoke-param-sweep mode is the hot-loop site that would emit ~50k-200k
+# decision_artifacts/ S3 PUTs if SUPPRESS were broken. Captured BEFORE
+# the loop so the canary's LastModified filter covers every smoke mode
+# that touches executor code, not just smoke-param-sweep.
+SMOKE_SWEEP_START_ISO=\$(date -u +%Y-%m-%dT%H:%M:%S)
 for SMOKE_PHASE_MODE in smoke-simulate smoke-param-sweep smoke-predictor-backtest smoke-phase4 smoke-predictor-param-sweep; do
     if ! _smoke_run_mode "\$SMOKE_PHASE_MODE"; then
         echo "ERROR: smoke phase \$SMOKE_PHASE_MODE FAILED — aborting smoke-only run"
         exit 1
     fi
 done
+
+# ── L280 SUPPRESS contract canary ─────────────────────────────────────────
+# Asserts ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true (exported in
+# ENV_SOURCE above) actually prevented decision_artifacts/ S3 PUTs
+# during the smoke window. Catches operational-side regressions the
+# in-process CI test (tests/test_param_sweep_decision_capture_suppress.py)
+# cannot: ENV_SOURCE drift on the spot AMI / .env override resetting
+# the flag / IAM-role substitution that lib gating doesn't see.
+# Composes with the CI test which catches code-review-time regressions
+# (env-var rename, gate-semantics flip, new bypassing capture site).
+echo ""
+echo "==> [suppress-canary] checking decision_artifacts/ writes during smoke window..."
+SUPPRESS_PREFIX="decision_artifacts/\$(date -u +%Y/%m/%d)/"
+SUPPRESS_HITS=\$(aws s3api list-objects-v2 \\
+    --bucket "\${BUCKET}" \\
+    --prefix "\${SUPPRESS_PREFIX}" \\
+    --query "Contents[?LastModified >= '\${SMOKE_SWEEP_START_ISO}'] | length(@)" \\
+    --output text 2>/dev/null || echo 0)
+SUPPRESS_HITS=\${SUPPRESS_HITS:-0}
+[ "\${SUPPRESS_HITS}" = "None" ] && SUPPRESS_HITS=0
+if [ "\${SUPPRESS_HITS}" != "0" ]; then
+    echo "ERROR [suppress-canary] \${SUPPRESS_HITS} \${SUPPRESS_PREFIX} keys appeared since \${SMOKE_SWEEP_START_ISO} — ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS contract REGRESSED. Investigate ENV_SOURCE export / .env override / lib gating semantics / new bypassing capture site. ROADMAP L280." >&2
+    _smoke_record "suppress-canary" "FAIL" "0s" "" ""
+    exit 1
+fi
+echo "[suppress-canary] OK — zero \${SUPPRESS_PREFIX} writes since \${SMOKE_SWEEP_START_ISO} (SUPPRESS contract holding)"
+_smoke_record "suppress-canary" "ok" "0s" "" ""
 
 echo ""
 echo "==> Resolving most recent backtest artifact date from s3://\${BUCKET}/backtest/..."
