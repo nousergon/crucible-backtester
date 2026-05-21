@@ -49,3 +49,44 @@ def _isolate_secrets_from_ssm(monkeypatch):
     clear_cache()
     yield
     clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _block_real_alerts_publish(monkeypatch):
+    """Default-deny real ``alpha_engine_lib.alerts.publish`` for every test.
+
+    History: 2026-05-21 a buggy monkeypatch in test_cost_report.py let the
+    real publish through on a failing test run, firing a real Telegram
+    alert + (likely) SNS publish to the operator. The corrected test pins
+    the publish via ``monkeypatch.setattr`` — but that's opt-in per test;
+    a future test that forgets to stub can again reach production channels.
+
+    This autouse fixture closes the recurrence class: every test starts
+    with publish replaced by a no-op that returns a synthetic success.
+    Tests that want to assert on publish calls override this with their
+    own ``monkeypatch.setattr("alpha_engine_lib.alerts.publish", spy)``
+    — which works because monkeypatch reverts in LIFO order at teardown.
+    """
+    try:
+        import alpha_engine_lib.alerts  # noqa: F401
+    except ImportError:
+        # lib pin <v0.21.0 → no alerts module to block. Pre-v0.21.0
+        # callers can't reach the channels anyway.
+        yield
+        return
+
+    class _Chan:
+        ok = True
+        detail = "blocked by conftest autouse fixture"
+
+    class _Result:
+        sns = _Chan()
+        telegram = _Chan()
+        any_ok = True
+        all_ok = True
+
+    def _noop(*args, **kwargs):
+        return _Result()
+
+    monkeypatch.setattr("alpha_engine_lib.alerts.publish", _noop)
+    yield
