@@ -60,6 +60,12 @@ _ANOMALY_RATIO_ENV_VAR = "ALPHA_ENGINE_COST_ANOMALY_RATIO"
 _ANOMALY_RATIO_DEFAULT = 2.0
 _ANOMALY_BASELINE_WEEKS = 4  # rolling window per ROADMAP P5
 
+# Opt-out gate for the operator-facing SNS+Telegram fan-out (ROADMAP L717).
+# Default-on — anomaly entries always publish unless explicitly disabled.
+# Tests set this to "1" to suppress real-network attempts inside the
+# moto-stubbed S3 paths.
+_ANOMALY_ALERT_DISABLED_ENV_VAR = "ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED"
+
 # Registry row id read from alpha_engine_lib.transparency_inventory.yaml
 # to source the cost-telemetry effective_date (the floor of the
 # rolling baseline window). Keep in sync with the row id in lib's
@@ -595,6 +601,7 @@ def build_cost_section(
         _emit_changelog_anomaly_entry(
             anomaly, run_date=cost_label_date, bucket=bucket, s3_client=client,
         )
+        _publish_anomaly_alert(anomaly, run_date=cost_label_date)
     return main_md + "\n" + render_anomaly_section(anomaly)
 
 
@@ -759,3 +766,69 @@ def _emit_changelog_anomaly_entry(
             e,
         )
         return None
+
+
+def _publish_anomaly_alert(
+    anomaly: dict,
+    *,
+    run_date: str,
+) -> None:
+    """Fan an anomaly out to the operator-facing surveillance channels
+    via ``alpha_engine_lib.alerts.publish`` (SNS → email + Telegram).
+
+    Mirrors the canonical lift-to-lib pattern shipped 2026-05-20 with
+    lib v0.21.0 — same primitive used by the dispatcher EXIT-trap
+    diagnostic in ``infrastructure/spot_backtest.sh``.
+
+    Best-effort: any import failure or network exception is logged at
+    WARN and swallowed. The WARN log + the rendered email anomaly
+    section + the changelog auto-emit all remain in place, so no
+    signal is lost when the SNS+Telegram fan-out misfires.
+
+    Opt-out via ``ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED=1``
+    (tests use this to keep moto-only paths from reaching real boto3).
+    """
+    if os.environ.get(_ANOMALY_ALERT_DISABLED_ENV_VAR, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return
+    try:
+        from alpha_engine_lib import alerts  # noqa: PLC0415 — lazy import
+    except ImportError as e:
+        logger.warning(
+            "[cost_report] alerts publish skipped — alpha_engine_lib.alerts "
+            "unavailable (lib pin <v0.21.0?): %s", e,
+        )
+        return
+    ratio = anomaly.get("ratio")
+    baseline_mean = anomaly.get("baseline_mean_usd")
+    current_total = anomaly.get("current_total_usd")
+    threshold = anomaly.get("threshold_ratio")
+    baseline_dates = anomaly.get("baseline_dates_found") or []
+    ratio_str = f"{ratio:.2f}x" if ratio is not None else "n/a"
+    baseline_str = f"${baseline_mean:.4f}" if baseline_mean is not None else "n/a"
+    current_str = f"${current_total:.4f}" if current_total is not None else "n/a"
+    threshold_str = f"{threshold:.2f}x" if threshold is not None else "n/a"
+    message = (
+        f"LLM cost anomaly on {run_date}: {ratio_str} of "
+        f"{len(baseline_dates)}-week baseline "
+        f"(current={current_str}, baseline_mean={baseline_str}, "
+        f"threshold={threshold_str}). "
+        f"See evaluator email '## LLM cost report' section + "
+        f"changelog/entries/{run_date}/."
+    )
+    try:
+        result = alerts.publish(
+            message,
+            severity="error",
+            source="alpha-engine-backtester/analysis/cost_report.py",
+        )
+        logger.info(
+            "[cost_report] anomaly alert publish: sns_ok=%s telegram_ok=%s any_ok=%s",
+            result.sns.ok, result.telegram.ok, result.any_ok,
+        )
+    except Exception as e:
+        logger.warning(
+            "[cost_report] anomaly alert publish failed (best-effort, swallowed): %s",
+            e,
+        )
