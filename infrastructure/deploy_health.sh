@@ -154,6 +154,16 @@ if [ "$CANARY_STATUS" != "200" ]; then
   echo ""
   echo "ERROR: Canary returned status $CANARY_STATUS"
   echo "  Check CloudWatch Logs: /aws/lambda/${LAMBDA_FUNCTION}"
+  # ROADMAP L221 — independent-channel surveillance. NOTE: this script
+  # promotes live BEFORE canary runs, so a canary failure leaves the
+  # live alias pointing at the broken version (separate failure-class
+  # not in this PR's scope). Best-effort; trailing || true never
+  # overrides exit 1.
+  python3 -m alpha_engine_lib.alerts publish \
+    --severity error \
+    --source "alpha-engine-backtester/infrastructure/deploy_health.sh" \
+    --message "Canary failed: ${LAMBDA_FUNCTION}:${VERSION} canary returned statusCode=${CANARY_STATUS}. WARNING: live alias was already promoted to v${VERSION} before canary ran — operator must manually rollback. See CloudWatch /aws/lambda/${LAMBDA_FUNCTION}." \
+    || true
   exit 1
 fi
 echo "  Canary passed (status=$CANARY_STATUS)"
