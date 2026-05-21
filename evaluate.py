@@ -493,6 +493,24 @@ def _run_diagnostics(
         required_inputs={},
     )
 
+    # Stance-distribution drift — Phase 5 acceptance check
+    # (attractiveness-pillars-260520.md). Compares this week's
+    # predictor/predictions/{date}.json stance counts to the prior 4 ISO
+    # weeks' mean ± 2σ; fires a Telegram + SNS alert via
+    # alpha_engine_lib.alerts.publish on FAIL. Defense-in-depth against
+    # the pillar-aware classify_stance code path collapsing the
+    # distribution into a single stance without surfacing through NAV
+    # for weeks. ROADMAP L1614.
+    from analysis import stance_distribution
+    results["stance_distribution_drift"] = tracker.run_module(
+        "stance_distribution_drift",
+        lambda: stance_distribution.compute_stance_distribution_drift(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            current_date=config.get("_run_date") or date.today().isoformat(),
+        ),
+        required_inputs={},
+    )
+
     # Executor-side decision-capture coverage (L2308 PR 5). Sibling of the
     # research-side coverage above; reads executor:* artifacts emitted by
     # L2308 PRs 1-4 producers (entry_triggers / position_sizer /
