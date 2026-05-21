@@ -168,6 +168,15 @@ if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "PARTIAL" ]; then
   echo ""
   echo "ERROR: Canary returned status $CANARY_STATUS"
   echo "  Check CloudWatch Logs: /aws/lambda/${LAMBDA_FUNCTION}"
+  # ROADMAP L221 — independent-channel surveillance. live alias was
+  # already promoted to v${VERSION} before canary ran — operator must
+  # manually rollback. Best-effort; trailing || true never overrides
+  # exit 1.
+  python3 -m alpha_engine_lib.alerts publish \
+    --severity error \
+    --source "alpha-engine-backtester/infrastructure/deploy_counterfactual.sh" \
+    --message "Canary failed: ${LAMBDA_FUNCTION}:${VERSION} canary returned status='${CANARY_STATUS}'. WARNING: live alias already promoted to v${VERSION} — operator must manually rollback. See CloudWatch /aws/lambda/${LAMBDA_FUNCTION}." \
+    || true
   exit 1
 fi
 echo "  Canary passed (status=$CANARY_STATUS)"
