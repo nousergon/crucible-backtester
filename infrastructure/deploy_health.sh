@@ -132,20 +132,24 @@ echo ""
 echo "==> Waiting for Lambda update to complete..."
 aws lambda wait function-updated --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}"
 
-# ── Step 6: Publish version and update 'live' alias ──────────────────────────
+# ── Step 6: Publish version (do NOT promote 'live' yet) ──────────────────────
 echo ""
 echo "==> Publishing Lambda version..."
 VERSION=$(aws lambda publish-version --function-name "${LAMBDA_FUNCTION}" --query "Version" --output text --region "${AWS_REGION}")
 echo "  Published version: ${VERSION}"
 
-echo "==> Updating 'live' alias → version ${VERSION}"
-aws lambda update-alias --function-name "${LAMBDA_FUNCTION}" --name live --function-version "${VERSION}" --region "${AWS_REGION}" 2>/dev/null || aws lambda create-alias --function-name "${LAMBDA_FUNCTION}" --name live --function-version "${VERSION}" --region "${AWS_REGION}"
-
-# ── Step 7: Canary invocation ───────────────────────────────────────────────
+# ── Step 7: Canary invocation against the NEW VERSION ────────────────────────
+# Canary runs BEFORE promoting 'live' so a canary failure leaves the live
+# alias pointing at the prior good version — no manual rollback owed.
+# Pre-2026-05-22 these scripts promoted live first, ran canary second
+# (filed in alpha-engine-config PR #272 as the L221-audit follow-up
+# "Backtester Lambda deploy scripts move canary BEFORE the live-alias
+# promote"). Sibling research/predictor/data deploy scripts already
+# follow the canary-first pattern.
 echo ""
-echo "==> Running canary invocation (dry_run=true)..."
+echo "==> Running canary invocation against :${VERSION} (dry_run=true)..."
 CANARY_OUT=$(mktemp)
-aws lambda invoke --function-name "${LAMBDA_FUNCTION}:live" --payload '{"dry_run": true}' --cli-binary-format raw-in-base64-out --cli-read-timeout 300 --region "${AWS_REGION}" "$CANARY_OUT" > /dev/null
+aws lambda invoke --function-name "${LAMBDA_FUNCTION}:${VERSION}" --payload '{"dry_run": true}' --cli-binary-format raw-in-base64-out --cli-read-timeout 300 --region "${AWS_REGION}" "$CANARY_OUT" > /dev/null
 
 CANARY_STATUS=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
 rm -f "$CANARY_OUT"
@@ -154,19 +158,25 @@ if [ "$CANARY_STATUS" != "200" ]; then
   echo ""
   echo "ERROR: Canary returned status $CANARY_STATUS"
   echo "  Check CloudWatch Logs: /aws/lambda/${LAMBDA_FUNCTION}"
-  # ROADMAP L221 — independent-channel surveillance. NOTE: this script
-  # promotes live BEFORE canary runs, so a canary failure leaves the
-  # live alias pointing at the broken version (separate failure-class
-  # not in this PR's scope). Best-effort; trailing || true never
-  # overrides exit 1.
+  echo "  'live' alias UNCHANGED — still points at prior good version."
+  # ROADMAP L221 — independent-channel surveillance. dedup_key collapses
+  # an image-wide rebuild that breaks N Lambdas' canaries within the hour
+  # into one alert per (Lambda, version). Best-effort; trailing || true
+  # never overrides exit 1.
   python3 -m alpha_engine_lib.alerts publish \
     --severity error \
     --source "alpha-engine-backtester/infrastructure/deploy_health.sh" \
-    --message "Canary failed: ${LAMBDA_FUNCTION}:${VERSION} canary returned statusCode=${CANARY_STATUS}. WARNING: live alias was already promoted to v${VERSION} before canary ran — operator must manually rollback. See CloudWatch /aws/lambda/${LAMBDA_FUNCTION}." \
+    --dedup-key "canary-fail-${LAMBDA_FUNCTION}-v${VERSION}" \
+    --message "Canary failed: ${LAMBDA_FUNCTION}:${VERSION} canary returned statusCode=${CANARY_STATUS}. 'live' alias is UNCHANGED (still on prior good version) — no manual rollback owed; investigate the canary failure and re-deploy. See CloudWatch /aws/lambda/${LAMBDA_FUNCTION}." \
     || true
   exit 1
 fi
 echo "  Canary passed (status=$CANARY_STATUS)"
+
+# ── Step 8: Promote 'live' alias only on canary success ──────────────────────
+echo ""
+echo "==> Promoting 'live' alias → version ${VERSION}"
+aws lambda update-alias --function-name "${LAMBDA_FUNCTION}" --name live --function-version "${VERSION}" --region "${AWS_REGION}" 2>/dev/null || aws lambda create-alias --function-name "${LAMBDA_FUNCTION}" --name live --function-version "${VERSION}" --region "${AWS_REGION}"
 
 echo ""
 echo "==> Deploy complete!"

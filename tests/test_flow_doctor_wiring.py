@@ -374,12 +374,13 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.21.0" in text, (
-            "alpha-engine-lib should pin to v0.21.0 (adds alpha_engine_lib.alerts "
-            "module + `python -m alpha_engine_lib.alerts publish` CLI — required "
-            "by spot_backtest.sh's dispatcher cleanup() L2246 SOTA upgrade per "
-            "the CLAUDE.md sub-sub-rule. Bumped from v0.20.0 2026-05-20; still "
-            "carries the v0.20.0 load_universe_ohlcv + load_macro_series + "
-            "v0.16.0 eval_artifacts canonical readers transitively. Update this "
-            "test if the pin moves further forward."
+        assert "@v0.24.0" in text, (
+            "alpha-engine-lib should pin to v0.24.0 (adds the alerts dedup "
+            "substrate: ``dedup_key`` + ``dedup_window_min`` + ``dedup_bucket`` "
+            "params on alerts.publish + matching CLI flags; required by "
+            "analysis/cost_report.py's lib-dedup migration (closes the local "
+            "_anomaly_alert_dedup_key / _already_sent / _write_marker helpers). "
+            "Bumped from v0.21.0 2026-05-22; still carries the v0.21.0 alerts "
+            "module + v0.20.0 load_universe_ohlcv + v0.16.0 eval_artifacts "
+            "transitively. Update this test if the pin moves further forward."
         )
