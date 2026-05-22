@@ -191,6 +191,15 @@ def compute_production_health(
     # ── Regime-stratified IC ─────────────────────────────────────────────────
     regime_ic = _compute_regime_ic(df, bucket)
 
+    # ── Per-L1 + L2 IC decomposition (ROADMAP L135) ──────────────────────────
+    # Diagnostic for which ensemble component is contributing or drifting:
+    # Spearman IC against canonical_actual for each L1 (momentum,
+    # volatility, research_calibrator) plus L2 (predicted_alpha) separately,
+    # so meta-learner-vs-L1-baseline is comparable. The per-L1 values aren't
+    # persisted to ``predictor_outcomes`` — read from the per-date
+    # predictions/{date}.json artifacts and merged in-memory.
+    ic_decomposition = _compute_l1_l2_ic_decomposition(df, bucket)
+
     # ── Training IC comparison ───────────────────────────────────────────────
     # Reference IC must be the model's OOS performance at the active horizon,
     # NOT in-sample fit. See _load_training_ic for the preference chain — the
@@ -220,6 +229,14 @@ def compute_production_health(
         "degradation_flag": degradation_flag,
         "prediction_distribution": prediction_distribution,
         "mode_collapse_flag": mode_collapse_flag,
+        # ROADMAP L135 — per-L1 component IC + L2 stacker IC + L2 lift.
+        # `None` for any component when the join with predictions/{date}.json
+        # couldn't be performed (early-window, missing artifacts) or sample
+        # count fell below ``_MIN_SAMPLES``.
+        "l1_components": ic_decomposition["per_l1"],
+        "l2_alpha_ic": ic_decomposition["l2_alpha"],
+        "l2_lift_vs_l1_mean": ic_decomposition["l2_lift_vs_l1_mean"],
+        "l1_l2_n_joined": ic_decomposition["n_joined"],
     }
 
     log.info(
@@ -228,6 +245,134 @@ def compute_production_health(
     )
     _persist_metric(bucket, _PROD_HEALTH_KEY, result)
     return result
+
+
+# ── L1 + L2 IC decomposition (ROADMAP L135) ──────────────────────────────────
+
+
+_L1_COMPONENT_FIELDS = {
+    # L1 component name on production_health.json → field in predictions/{date}.json
+    "momentum": "momentum_confirmation",
+    "volatility": "expected_move",
+    "research_calibrator": "research_calibrator_prob",
+}
+
+
+def _load_l1_predictions_for_dates(
+    bucket: str, dates: list[str], s3_client=None
+) -> pd.DataFrame:
+    """Return per-(symbol, date) L1 component values + L2 ``predicted_alpha``
+    from ``predictor/predictions/{date}.json`` for the given dates.
+
+    Empty DataFrame when no dates parse or every artifact fetch fails —
+    callers degrade gracefully (decomposition values become ``None``).
+    """
+    if not dates:
+        return pd.DataFrame()
+    s3 = s3_client or boto3.client("s3")
+    rows: list[dict] = []
+    for d in sorted({str(d) for d in dates if d}):
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=f"predictor/predictions/{d}.json")
+            payload = json.loads(obj["Body"].read())
+        except Exception as e:  # noqa: BLE001 — secondary observability; primary IC path unaffected
+            log.debug("L1 decomposition: predictions/%s.json fetch failed: %s", d, e)
+            continue
+        for p in payload.get("predictions", []) or []:
+            ticker = p.get("ticker")
+            if not ticker:
+                continue
+            rows.append(
+                {
+                    "symbol": ticker,
+                    "prediction_date": d,
+                    "momentum_confirmation": p.get("momentum_confirmation"),
+                    "expected_move": p.get("expected_move"),
+                    "research_calibrator_prob": p.get("research_calibrator_prob"),
+                    "predicted_alpha": p.get("predicted_alpha"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _spearman_or_none(x: pd.Series, y: pd.Series) -> float | None:
+    """Compute Spearman rank correlation; ``None`` on insufficient samples
+    or zero-variance series (rank tie collapse).
+    """
+    if len(x) < _MIN_SAMPLES:
+        return None
+    if x.nunique() < 2 or y.nunique() < 2:
+        return None
+    from scipy.stats import spearmanr  # local — avoid eager import at module load
+
+    rho, _ = spearmanr(x, y)
+    if rho is None or pd.isna(rho):
+        return None
+    return round(float(rho), 4)
+
+
+def _compute_l1_l2_ic_decomposition(df: pd.DataFrame, bucket: str) -> dict:
+    """Per-L1 + L2 Spearman IC against ``canonical_actual``.
+
+    Returns a dict with shape::
+
+        {
+          "per_l1": {"momentum": float|None, "volatility": float|None,
+                     "research_calibrator": float|None},
+          "l2_alpha": float|None,
+          "l2_lift_vs_l1_mean": float|None,
+          "n_joined": int,
+        }
+
+    ``l2_lift_vs_l1_mean`` is the load-bearing diagnostic per ROADMAP L135 —
+    if the L2 stacker is not lifting above the L1-mean baseline, ensemble
+    averaging would do as well as the Ridge meta-learner. ``None`` when
+    fewer than 1 valid L1 IC was computable (e.g. early-window predictions
+    artifacts haven't been written yet).
+    """
+    out: dict = {
+        "per_l1": {name: None for name in _L1_COMPONENT_FIELDS},
+        "l2_alpha": None,
+        "l2_lift_vs_l1_mean": None,
+        "n_joined": 0,
+    }
+
+    if df.empty:
+        return out
+
+    dates = df["prediction_date"].dropna().astype(str).unique().tolist()
+    l1_df = _load_l1_predictions_for_dates(bucket, dates)
+    if l1_df.empty:
+        log.debug("L1 decomposition: zero predictions artifacts joined")
+        return out
+
+    merged = df.merge(l1_df, on=["symbol", "prediction_date"], how="left")
+    out["n_joined"] = int(merged[[c for c in l1_df.columns if c not in {"symbol", "prediction_date"}]].notna().any(axis=1).sum())
+
+    valid_actual = merged["actual"].notna()
+
+    for component, field_name in _L1_COMPONENT_FIELDS.items():
+        if field_name not in merged.columns:
+            continue
+        col_valid = valid_actual & merged[field_name].notna()
+        subset = merged.loc[col_valid]
+        out["per_l1"][component] = _spearman_or_none(subset[field_name], subset["actual"])
+
+    if "predicted_alpha" in merged.columns:
+        l2_valid = valid_actual & merged["predicted_alpha"].notna()
+        l2_subset = merged.loc[l2_valid]
+        out["l2_alpha"] = _spearman_or_none(l2_subset["predicted_alpha"], l2_subset["actual"])
+
+    l1_ics = [v for v in out["per_l1"].values() if v is not None]
+    if out["l2_alpha"] is not None and l1_ics:
+        l1_mean = sum(l1_ics) / len(l1_ics)
+        out["l2_lift_vs_l1_mean"] = round(out["l2_alpha"] - l1_mean, 4)
+
+    log.info(
+        "L1/L2 IC decomposition: per_l1=%s  l2=%s  l2_lift=%s  n_joined=%d",
+        out["per_l1"], out["l2_alpha"], out["l2_lift_vs_l1_mean"], out["n_joined"],
+    )
+    return out
 
 
 def _compute_regime_ic(df: pd.DataFrame, bucket: str) -> dict[str, float | None]:
