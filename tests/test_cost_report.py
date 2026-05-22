@@ -978,11 +978,14 @@ class TestChangelogAutoEmitOnAnomaly:
         assert ca["current_total_usd"] == 10.0
         assert ca["baseline_mean_usd"] == 1.0
         assert ca["baseline_dates_found"] == ["2026-05-02"]
-        # event_id format mirrors the SNS-mirror + cloudwatch-mirror scheme
-        parts = body["event_id"].split("_")
-        assert len(parts) == 3  # ts_actor_hash
-        assert parts[1] == "alpha-engine-cost-telemetry"
-        assert len(parts[2]) == 7  # 7-hex sha1 prefix
+        # event_id format: ``cost_anomaly_{run_date}_{actor}_{7-hex sha1}``
+        # — stable on (run_date, current_total, ratio), no wall-clock.
+        # Different from the SNS-mirror + cloudwatch-mirror scheme because
+        # those mirrors fire on operational events at write time while
+        # cost-anomaly entries are logically tied to a calendar
+        # observation (run_date) and must overwrite cleanly on re-run.
+        assert body["event_id"].startswith("cost_anomaly_2026-05-09_alpha-engine-cost-telemetry_")
+        assert len(body["event_id"].rsplit("_", 1)[-1]) == 7  # 7-hex sha1 prefix
 
     def test_ok_status_does_not_emit_changelog_entry(self):
         """No anomaly → no put_object call. Quiet weeks stay quiet."""
@@ -1075,8 +1078,16 @@ class TestChangelogAutoEmitOnAnomaly:
 
     def test_event_id_idempotent_on_same_inputs(self):
         """Re-running build_cost_section with the same anomaly inputs
-        produces the same event_id (and the same S3 key — overwrite, not
-        duplicate)."""
+        produces the FULL same S3 key — re-runs overwrite, not duplicate.
+
+        Pre-2026-05-22 the test only checked the hash segment matched;
+        meanwhile the event_id embedded ``ts_id`` (wall-clock UTC) and
+        ``entry_date`` was UTC TODAY, so re-runs across a UTC midnight
+        boundary or wall-clock seconds wrote DIFFERENT keys despite the
+        helper's docstring claiming idempotent re-runs. The fix anchors
+        both ``entry_date`` and ``event_id`` to ``run_date``. This test
+        now pins the full key so the regression can't sneak back.
+        """
         from analysis.cost_report import _emit_changelog_anomaly_entry
 
         anomaly = {
@@ -1091,18 +1102,29 @@ class TestChangelogAutoEmitOnAnomaly:
         }
         stub_a = MagicMock()
         stub_b = MagicMock()
-        # Same run_date + ratio + total → same event_hash → same event_id
-        # tail (the timestamp prefix differs by wall-clock; we check the hash)
         _emit_changelog_anomaly_entry(anomaly, run_date="2026-05-09",
                                       bucket="alpha-engine-research", s3_client=stub_a)
         _emit_changelog_anomaly_entry(anomaly, run_date="2026-05-09",
                                       bucket="alpha-engine-research", s3_client=stub_b)
         key_a = stub_a.put_object.call_args.kwargs["Key"]
         key_b = stub_b.put_object.call_args.kwargs["Key"]
-        # Hash segment (last 7 hex chars before .json) is identical
-        hash_a = key_a.rsplit("_", 1)[-1].split(".")[0]
-        hash_b = key_b.rsplit("_", 1)[-1].split(".")[0]
-        assert hash_a == hash_b
+        assert key_a == key_b, (
+            f"Same (run_date, ratio, current_total) must produce the "
+            f"identical S3 key — re-runs MUST overwrite. Got:\n"
+            f"  key_a = {key_a}\n  key_b = {key_b}"
+        )
+        # Pin the anchor: entry_date == run_date (not wall-clock UTC today)
+        assert "/2026-05-09/" in key_a, (
+            "Changelog entry date must be the anomaly's run_date, not "
+            "wall-clock UTC today — otherwise a re-run crossing a UTC "
+            "midnight writes a second entry."
+        )
+        # Pin the event_id prefix: no wall-clock timestamp
+        event_id = key_a.rsplit("/", 1)[-1].removesuffix(".json")
+        assert event_id.startswith("cost_anomaly_2026-05-09_"), (
+            f"event_id must anchor on run_date with no wall-clock "
+            f"timestamp prefix; got {event_id!r}"
+        )
 
 
 class TestAnomalyAlertPublish:
@@ -1123,13 +1145,22 @@ class TestAnomalyAlertPublish:
         calls: list[dict] = []
 
         class _FakeResult:
-            sns_ok = True
-            telegram_ok = True
+            class _Chan:
+                ok = True
+            sns = _Chan()
+            telegram = _Chan()
+            any_ok = True
+            all_ok = True
+            dedup_skipped = False
+            dedup_reason = None
 
-        def _fake_publish(message, *, severity="error", source=None,
-                          sns=True, telegram=True, sns_topic_arn=None):
+        def _fake_publish(message, **kwargs):
             calls.append({
-                "message": message, "severity": severity, "source": source,
+                "message": message,
+                "severity": kwargs.get("severity"),
+                "source": kwargs.get("source"),
+                "dedup_key": kwargs.get("dedup_key"),
+                "dedup_window_min": kwargs.get("dedup_window_min", "UNSET"),
             })
             return _FakeResult()
 
@@ -1174,6 +1205,9 @@ class TestAnomalyAlertPublish:
             sns = _Chan()
             telegram = _Chan()
             any_ok = True
+            all_ok = True
+            dedup_skipped = False
+            dedup_reason = None
 
         def _spy(*a, **k):
             calls.append((a, k))
@@ -1267,23 +1301,23 @@ class TestAnomalyAlertPublish:
 
 
 class TestAnomalyAlertDedup:
-    """S3-marker idempotency for ``_publish_anomaly_alert``.
+    """Lib v0.24.0 dedup_key contract for cost-anomaly publish.
 
-    Surfaced 2026-05-21 by an SNS-email screenshot: multiple identical
-    ``[ERROR] alpha-engine-backtester/analysis/cost_report.py: LLM cost
-    anomaly`` emails arriving for the same (date, ratio, current,
-    baseline) tuple. Cause: every invocation of ``build_cost_section``
-    (Saturday SF main run + smoke-mode re-runs + mid-week evaluate.py
-    round-trips) fires its own publish call.
+    The local ``_anomaly_alert_already_sent`` / ``_write_anomaly_alert_marker``
+    helpers were retired 2026-05-22 in favor of lib v0.24.0's built-in
+    ``dedup_key`` substrate (PR L69). The lib now owns the marker
+    read/write at ``s3://{bucket}/_alerts/_dedup/{sha1(dedup_key)[:16]}.json``;
+    this consumer only owns the dedup_key string and the
+    ``dedup_window_min`` value.
 
-    Fix: write a deterministic marker at
-    ``decision_artifacts/_anomaly_alerts/sent/{run_date}_{hash7}.json``
-    after the first publish; subsequent invocations find the marker
-    and skip.
+    Coverage: the dedup_key is deterministic on (run_date, current, baseline,
+    ratio), varies appropriately, and is forwarded to ``alerts.publish``
+    with ``dedup_window_min=None`` (forever — matches the pre-lift "marker
+    once" semantics).
     """
 
     def test_dedup_key_is_deterministic_across_invocations(self):
-        """Same anomaly → same key regardless of when computed."""
+        """Same anomaly → identical dedup_key regardless of when computed."""
         from analysis.cost_report import _anomaly_alert_dedup_key
 
         anomaly = {
@@ -1295,8 +1329,7 @@ class TestAnomalyAlertDedup:
         key1 = _anomaly_alert_dedup_key("2026-05-09", anomaly)
         key2 = _anomaly_alert_dedup_key("2026-05-09", anomaly)
         assert key1 == key2
-        assert key1.startswith("decision_artifacts/_anomaly_alerts/sent/2026-05-09_")
-        assert key1.endswith(".json")
+        assert key1.startswith("cost_anomaly|2026-05-09|")
 
     def test_dedup_key_changes_when_anomaly_changes(self):
         """Different (current, baseline, ratio) → different key."""
@@ -1328,10 +1361,14 @@ class TestAnomalyAlertDedup:
             != _anomaly_alert_dedup_key("2026-05-16", anomaly)
         )
 
-    def test_first_invocation_publishes_and_writes_marker(self, monkeypatch):
-        """Marker absent → publish fires + marker written."""
+    def test_publish_forwards_dedup_key_and_window_to_lib(self, monkeypatch):
+        """The publish call forwards ``dedup_key`` + ``dedup_window_min=None``
+        to ``alerts.publish`` — lib v0.24.0 owns the marker read/write.
+        ``window_min=None`` matches the pre-lift "marker once, never re-publish"
+        semantics; once the marker is laid down, same dedup_key never fires
+        again (until the marker is manually expired).
+        """
         monkeypatch.delenv("ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED", raising=False)
-
         from analysis.cost_report import build_cost_section
 
         publish_calls: list[dict] = []
@@ -1343,6 +1380,8 @@ class TestAnomalyAlertDedup:
             telegram = _Chan()
             any_ok = True
             all_ok = True
+            dedup_skipped = False
+            dedup_reason = None
 
         def _spy(message, **kwargs):
             publish_calls.append({"message": message, **kwargs})
@@ -1367,114 +1406,36 @@ class TestAnomalyAlertDedup:
         })
         build_cost_section("2026-05-09", s3_client=stub)
         assert len(publish_calls) == 1
-        marker_writes = [
-            c for c in stub.put_object.call_args_list
-            if c.kwargs.get("Key", "").startswith("decision_artifacts/_anomaly_alerts/sent/")
-        ]
-        assert len(marker_writes) == 1
-
-    def test_second_invocation_finds_marker_and_skips_publish(self, monkeypatch):
-        """Marker present → publish is suppressed (the N-emails storm fix)."""
-        monkeypatch.delenv("ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED", raising=False)
-
-        from analysis.cost_report import _anomaly_alert_dedup_key, build_cost_section
-
-        publish_calls: list[dict] = []
-
-        class _FakeResult:
-            class _Chan:
-                ok = True
-            sns = _Chan()
-            telegram = _Chan()
-            any_ok = True
-            all_ok = True
-
-        def _spy(message, **kwargs):
-            publish_calls.append({"message": message, **kwargs})
-            return _FakeResult()
-
-        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _spy)
-
-        current_df = pd.DataFrame([
-            _make_row(agent_id="ic_cio", sector_team_id=None,
-                     model_name="claude-sonnet-4-6", cost_usd=10.00),
-        ])
-        baseline_df = pd.DataFrame([
-            _make_row(agent_id="ic_cio", sector_team_id=None,
-                     model_name="claude-sonnet-4-6", cost_usd=1.00),
-        ])
-        existing_marker_key = _anomaly_alert_dedup_key(
-            "2026-05-09",
-            {"current_total_usd": 10.0, "baseline_mean_usd": 1.0,
-             "ratio": 10.0, "threshold_ratio": 2.0},
+        kw = publish_calls[0]
+        assert "dedup_key" in kw and kw["dedup_key"].startswith(
+            "cost_anomaly|2026-05-09|"
+        ), f"dedup_key must be forwarded; got {kw.get('dedup_key')!r}"
+        assert kw.get("dedup_window_min") is None, (
+            "dedup_window_min must be None (forever) — matches pre-lift "
+            "'marker once, never re-publish' semantics."
         )
 
-        stub = _make_multi_date_stub_with_put({
-            "2026-05-09": current_df,
-            "2026-05-02": baseline_df,
-            "2026-04-25": baseline_df,
-            "2026-04-18": baseline_df,
-            "2026-04-11": baseline_df,
-        })
-        original_get = stub.get_object.side_effect
-
-        def _get_with_marker(*, Bucket: str, Key: str):
-            if Key == existing_marker_key:
-                marker_body = json.dumps({
-                    "run_date": "2026-05-09",
-                    "first_published_at": "2026-05-21T20:00:00Z",
-                }).encode()
-                return {"Body": _StubBody(marker_body)}
-            return original_get(Bucket=Bucket, Key=Key)
-
-        stub.get_object.side_effect = _get_with_marker
-
-        build_cost_section("2026-05-09", s3_client=stub)
-        assert publish_calls == []
-        marker_writes = [
-            c for c in stub.put_object.call_args_list
-            if c.kwargs.get("Key", "").startswith("decision_artifacts/_anomaly_alerts/sent/")
-        ]
-        assert marker_writes == []
-
-    def test_marker_check_s3_error_fails_safe_to_publish(self, monkeypatch, caplog):
-        """Transient S3 error on marker check → publish anyway (fail-safe)."""
+    def test_lib_dedup_skipped_result_does_not_break_section(self, monkeypatch):
+        """When lib v0.24.0 reports ``dedup_skipped=True`` (marker already
+        present), the consumer logs INFO and continues rendering — same
+        contract as a successful publish from the caller's perspective.
+        """
         monkeypatch.delenv("ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED", raising=False)
-
-        from analysis.cost_report import _anomaly_alert_already_sent
-
-        bad_s3 = MagicMock()
-        bad_s3.get_object.side_effect = ClientError(
-            {"Error": {"Code": "ServiceUnavailable", "Message": "transient"}},
-            "GetObject",
-        )
-
-        with caplog.at_level("WARNING"):
-            assert _anomaly_alert_already_sent(
-                "decision_artifacts/_anomaly_alerts/sent/2026-05-09_abc1234.json",
-                bucket="alpha-engine-research",
-                s3_client=bad_s3,
-            ) is False
-        assert any("marker check errored" in r.message for r in caplog.records)
-
-    def test_marker_write_failure_does_not_break_cost_section(self, monkeypatch):
-        """Marker-write failure is logged but never raises — publish has
-        already happened, so worst case is one duplicate alert next time."""
-        monkeypatch.delenv("ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED", raising=False)
-
         from analysis.cost_report import build_cost_section
 
-        class _FakeResult:
+        class _DedupSkippedResult:
             class _Chan:
-                ok = True
+                ok = False
             sns = _Chan()
             telegram = _Chan()
-            any_ok = True
-            all_ok = True
+            any_ok = True  # logically in the operator's hands via prior publish
+            all_ok = False
+            dedup_skipped = True
+            dedup_reason = "marker_present"
 
         monkeypatch.setattr(
             "alpha_engine_lib.alerts.publish",
-            lambda *a, **k: _FakeResult(),
+            lambda *a, **k: _DedupSkippedResult(),
         )
 
         current_df = pd.DataFrame([
@@ -1492,17 +1453,6 @@ class TestAnomalyAlertDedup:
             "2026-04-18": baseline_df,
             "2026-04-11": baseline_df,
         })
-        original_put = stub.put_object
-
-        def _put_marker_raises(**kwargs):
-            if kwargs.get("Key", "").startswith("decision_artifacts/_anomaly_alerts/sent/"):
-                raise ClientError(
-                    {"Error": {"Code": "AccessDenied", "Message": "no perms"}},
-                    "PutObject",
-                )
-            return original_put(**kwargs)
-
-        stub.put_object = MagicMock(side_effect=_put_marker_raises)
-
         md = build_cost_section("2026-05-09", s3_client=stub)
+        # Section still renders the anomaly block — dedup is upstream of UI.
         assert "ANOMALY DETECTED" in md

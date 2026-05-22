@@ -681,20 +681,25 @@ def _emit_changelog_anomaly_entry(
     try:
         ts = datetime.now(timezone.utc)
         ts_utc = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-        entry_date = ts.strftime("%Y-%m-%d")
-        ts_id = ts_utc.replace(":", "-").rstrip("Z")
         actor = "alpha-engine-cost-telemetry"
         ratio = anomaly.get("ratio")
         baseline_mean = anomaly.get("baseline_mean_usd")
         current_total = anomaly.get("current_total_usd")
         threshold = anomaly.get("threshold_ratio")
 
-        # event_id hashes on the run_date + ratio so re-running build_cost_section
-        # on the same date produces the same event_id (idempotent — re-runs
-        # overwrite rather than duplicate).
+        # event_id + entry_date are STABLE on (run_date, current_total, ratio)
+        # so re-running build_cost_section on the same anomaly overwrites
+        # the same S3 key instead of writing N copies under wall-clock-
+        # stamped names. Pre-2026-05-22 the event_id embedded ``ts_id``
+        # (UTC wall-clock to the second) and entry_date used UTC TODAY,
+        # so each evaluate.py re-run wrote a NEW changelog entry despite
+        # the docstring claiming idempotent re-runs. The fix anchors both
+        # to ``run_date`` (the anomaly's logical date) — see ROADMAP P1
+        # entry filed 2026-05-22.
+        entry_date = run_date
         digest_input = f"{run_date}|{current_total}|{ratio}".encode()
         event_hash = sha1(digest_input).hexdigest()[:7]
-        event_id = f"{ts_id}_{actor}_{event_hash}"
+        event_id = f"cost_anomaly_{run_date}_{actor}_{event_hash}"
 
         ratio_str = f"{ratio:.2f}x" if ratio is not None else "n/a"
         baseline_str = f"${baseline_mean:.4f}" if baseline_mean is not None else "n/a"
@@ -771,11 +776,8 @@ def _emit_changelog_anomaly_entry(
         return None
 
 
-_ALERT_DEDUP_MARKER_PREFIX = "decision_artifacts/_anomaly_alerts/sent"
-
-
 def _anomaly_alert_dedup_key(run_date: str, anomaly: dict) -> str:
-    """Deterministic dedup key for a single cost-anomaly event.
+    """Deterministic dedup key string for a single cost-anomaly event.
 
     Hashes ``(run_date, current_total, baseline_mean, ratio)`` — the
     same anomaly observed twice produces the same key. Excludes wall-
@@ -783,90 +785,20 @@ def _anomaly_alert_dedup_key(run_date: str, anomaly: dict) -> str:
     re-run / mid-week evaluate.py round-trips all collapse to one
     publish.
 
-    Returns the marker S3 key (``{prefix}/{run_date}_{hash7}.json``).
+    Returns a string consumed by ``alpha_engine_lib.alerts.publish``'s
+    ``dedup_key`` parameter — the lib hashes it internally and writes
+    its marker at ``s3://{bucket}/_alerts/_dedup/{sha1(...)[:16]}.json``.
     """
     current_total = anomaly.get("current_total_usd")
     baseline_mean = anomaly.get("baseline_mean_usd")
     ratio = anomaly.get("ratio")
     # Format with fixed precision so float-noise doesn't shift the hash.
-    digest_input = (
-        f"{run_date}|"
+    return (
+        f"cost_anomaly|{run_date}|"
         f"current={current_total:.6f}|"
         f"baseline={baseline_mean:.6f}|"
         f"ratio={ratio:.6f}"
-    ).encode()
-    hash7 = sha1(digest_input).hexdigest()[:7]
-    return f"{_ALERT_DEDUP_MARKER_PREFIX}/{run_date}_{hash7}.json"
-
-
-def _anomaly_alert_already_sent(
-    marker_key: str, *, bucket: str, s3_client: Any,
-) -> bool:
-    """Check S3 for a dedup marker; True iff a prior publish already wrote it.
-
-    Fail-safe: any error other than NoSuchKey returns False so the
-    caller proceeds to publish. The cost of a duplicate alert on a
-    transient S3 hiccup is lower than the cost of silently dropping an
-    anomaly notification.
-    """
-    try:
-        s3_client.get_object(Bucket=bucket, Key=marker_key)
-        return True
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code == "NoSuchKey":
-            return False
-        logger.warning(
-            "[cost_report] dedup marker check errored (proceeding to publish "
-            "fail-safe): %s", e,
-        )
-        return False
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "[cost_report] dedup marker check raised non-S3 exception "
-            "(proceeding to publish fail-safe): %s", e,
-        )
-        return False
-
-
-def _write_anomaly_alert_marker(
-    marker_key: str,
-    *,
-    bucket: str,
-    s3_client: Any,
-    anomaly: dict,
-    run_date: str,
-    message: str,
-) -> None:
-    """Persist the dedup marker so subsequent invocations skip the publish.
-
-    Best-effort: write failure leaves the door open for a duplicate
-    alert on the next invocation (acceptable degradation) but does NOT
-    break the cost-section render — the publish has already happened.
-    """
-    payload = {
-        "run_date": run_date,
-        "first_published_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "anomaly": {
-            "current_total_usd": anomaly.get("current_total_usd"),
-            "baseline_mean_usd": anomaly.get("baseline_mean_usd"),
-            "ratio": anomaly.get("ratio"),
-            "threshold_ratio": anomaly.get("threshold_ratio"),
-        },
-        "message": message,
-    }
-    try:
-        s3_client.put_object(
-            Bucket=bucket,
-            Key=marker_key,
-            Body=json.dumps(payload).encode("utf-8"),
-            ContentType="application/json",
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "[cost_report] dedup marker write failed (best-effort, swallowed; "
-            "next invocation may re-publish): %s", e,
-        )
+    )
 
 
 def _publish_anomaly_alert(
@@ -879,24 +811,18 @@ def _publish_anomaly_alert(
     """Fan an anomaly out to the operator-facing surveillance channels
     via ``alpha_engine_lib.alerts.publish`` (SNS → email + Telegram).
 
-    Mirrors the canonical lift-to-lib pattern shipped 2026-05-20 with
-    lib v0.21.0 — same primitive used by the dispatcher EXIT-trap
-    diagnostic in ``infrastructure/spot_backtest.sh``.
-
     Best-effort: any import failure or network exception is logged at
     WARN and swallowed. The WARN log + the rendered email anomaly
     section + the changelog auto-emit all remain in place, so no
     signal is lost when the SNS+Telegram fan-out misfires.
 
-    **Idempotent across invocations** (2026-05-21 fix): writes a dedup
-    marker to ``s3://{bucket}/decision_artifacts/_anomaly_alerts/sent/
-    {run_date}_{hash7}.json`` after the first publish for a given
-    (run_date, current_total, baseline_mean, ratio) tuple. Subsequent
-    invocations on the same anomaly find the marker and skip publish
-    — addresses the N-emails-for-one-anomaly storm operators see when
-    ``evaluate.py`` runs multiple times for the same date (Saturday-SF
-    main run + smoke-mode re-runs + mid-week evaluate.py round-trips
-    all collapse to one alert).
+    **Idempotent across invocations** via lib v0.24.0's ``dedup_key``
+    primitive — same anomaly across the Saturday-SF main run, smoke-mode
+    re-runs, and mid-week ``evaluate.py`` round-trips all collapse to
+    one publish. ``dedup_window_min=None`` matches the pre-lift local
+    helpers' "marker once, never re-publish" semantics; on lib upgrade
+    paths the marker lives at
+    ``s3://{ALPHA_ENGINE_ALERTS_DEDUP_BUCKET or bucket}/_alerts/_dedup/{sha1(dedup_key)[:16]}.json``.
 
     Opt-out via ``ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED=1``
     (tests use this to keep moto-only paths from reaching real boto3).
@@ -910,17 +836,7 @@ def _publish_anomaly_alert(
     except ImportError as e:
         logger.warning(
             "[cost_report] alerts publish skipped — alpha_engine_lib.alerts "
-            "unavailable (lib pin <v0.21.0?): %s", e,
-        )
-        return
-
-    client = s3_client if s3_client is not None else boto3.client("s3")
-    marker_key = _anomaly_alert_dedup_key(run_date, anomaly)
-    if _anomaly_alert_already_sent(marker_key, bucket=bucket, s3_client=client):
-        logger.info(
-            "[cost_report] anomaly alert already sent for run_date=%s "
-            "(marker=s3://%s/%s) — skipping duplicate publish",
-            run_date, bucket, marker_key,
+            "unavailable (lib pin <v0.24.0?): %s", e,
         )
         return
 
@@ -941,30 +857,28 @@ def _publish_anomaly_alert(
         f"See evaluator email '## LLM cost report' section + "
         f"changelog/entries/{run_date}/."
     )
+    dedup_key = _anomaly_alert_dedup_key(run_date, anomaly)
     try:
         result = alerts.publish(
             message,
             severity="error",
             source="alpha-engine-backtester/analysis/cost_report.py",
+            dedup_key=dedup_key,
+            dedup_window_min=None,  # forever — matches pre-lift "marker once" semantics
         )
-        logger.info(
-            "[cost_report] anomaly alert publish: sns_ok=%s telegram_ok=%s any_ok=%s",
-            result.sns.ok, result.telegram.ok, result.any_ok,
-        )
+        if result.dedup_skipped:
+            logger.info(
+                "[cost_report] anomaly alert deduped (run_date=%s, "
+                "reason=%s) — skipping duplicate publish",
+                run_date, result.dedup_reason,
+            )
+        else:
+            logger.info(
+                "[cost_report] anomaly alert publish: sns_ok=%s telegram_ok=%s any_ok=%s",
+                result.sns.ok, result.telegram.ok, result.any_ok,
+            )
     except Exception as e:
         logger.warning(
             "[cost_report] anomaly alert publish failed (best-effort, swallowed): %s",
             e,
         )
-        return
-
-    # Write the dedup marker AFTER a successful publish so a failed
-    # publish doesn't latch out future retries.
-    _write_anomaly_alert_marker(
-        marker_key,
-        bucket=bucket,
-        s3_client=client,
-        anomaly=anomaly,
-        run_date=run_date,
-        message=message,
-    )

@@ -140,21 +140,20 @@ echo "==> Waiting for Lambda update to complete..."
 aws lambda wait function-updated --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}"
 
 echo ""
-echo "==> Publishing Lambda version..."
+echo "==> Publishing Lambda version (do NOT promote 'live' yet)..."
 VERSION=$(aws lambda publish-version --function-name "${LAMBDA_FUNCTION}" --query "Version" --output text --region "${AWS_REGION}")
 echo "  Published version: ${VERSION}"
 
-echo "==> Updating 'live' alias → version ${VERSION}"
-aws lambda update-alias --function-name "${LAMBDA_FUNCTION}" --name live --function-version "${VERSION}" --region "${AWS_REGION}" 2>/dev/null || \
-aws lambda create-alias --function-name "${LAMBDA_FUNCTION}" --name live --function-version "${VERSION}" --region "${AWS_REGION}"
-
-# Canary: dry_run=true skips CloudWatch + S3 puts. Lists candidate
-# artifacts only — completes in seconds.
+# Canary runs BEFORE promoting 'live' so a canary failure leaves the live
+# alias pointing at the prior good version — no manual rollback owed.
+# Pre-2026-05-22 these scripts promoted live first, ran canary second
+# (filed in alpha-engine-config PR #272 as the L221-audit follow-up).
+# Sibling research/predictor/data deploys already follow canary-first.
 echo ""
-echo "==> Running canary invocation (dry_run=true, window_days=14)..."
+echo "==> Running canary invocation against :${VERSION} (dry_run=true, window_days=14)..."
 CANARY_OUT=$(mktemp)
 aws lambda invoke \
-  --function-name "${LAMBDA_FUNCTION}:live" \
+  --function-name "${LAMBDA_FUNCTION}:${VERSION}" \
   --payload '{"dry_run": true, "window_days": 14}' \
   --cli-binary-format raw-in-base64-out \
   --cli-read-timeout 60 \
@@ -168,18 +167,25 @@ if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "PARTIAL" ]; then
   echo ""
   echo "ERROR: Canary returned status $CANARY_STATUS"
   echo "  Check CloudWatch Logs: /aws/lambda/${LAMBDA_FUNCTION}"
-  # ROADMAP L221 — independent-channel surveillance. live alias was
-  # already promoted to v${VERSION} before canary ran — operator must
-  # manually rollback. Best-effort; trailing || true never overrides
-  # exit 1.
+  echo "  'live' alias UNCHANGED — still points at prior good version."
+  # ROADMAP L221 — independent-channel surveillance. dedup_key collapses
+  # an image-wide rebuild that breaks N Lambdas' canaries within the
+  # hour into one alert per (Lambda, version). Best-effort; trailing
+  # || true never overrides exit 1.
   python3 -m alpha_engine_lib.alerts publish \
     --severity error \
     --source "alpha-engine-backtester/infrastructure/deploy_counterfactual.sh" \
-    --message "Canary failed: ${LAMBDA_FUNCTION}:${VERSION} canary returned status='${CANARY_STATUS}'. WARNING: live alias already promoted to v${VERSION} — operator must manually rollback. See CloudWatch /aws/lambda/${LAMBDA_FUNCTION}." \
+    --dedup-key "canary-fail-${LAMBDA_FUNCTION}-v${VERSION}" \
+    --message "Canary failed: ${LAMBDA_FUNCTION}:${VERSION} canary returned status='${CANARY_STATUS}'. 'live' alias is UNCHANGED (still on prior good version) — no manual rollback owed; investigate and re-deploy. See CloudWatch /aws/lambda/${LAMBDA_FUNCTION}." \
     || true
   exit 1
 fi
 echo "  Canary passed (status=$CANARY_STATUS)"
+
+echo ""
+echo "==> Promoting 'live' alias → version ${VERSION}"
+aws lambda update-alias --function-name "${LAMBDA_FUNCTION}" --name live --function-version "${VERSION}" --region "${AWS_REGION}" 2>/dev/null || \
+aws lambda create-alias --function-name "${LAMBDA_FUNCTION}" --name live --function-version "${VERSION}" --region "${AWS_REGION}"
 
 echo ""
 echo "==> Deploy complete!"
