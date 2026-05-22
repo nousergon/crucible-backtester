@@ -374,13 +374,20 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.24.0" in text, (
-            "alpha-engine-lib should pin to v0.24.0 (adds the alerts dedup "
-            "substrate: ``dedup_key`` + ``dedup_window_min`` + ``dedup_bucket`` "
-            "params on alerts.publish + matching CLI flags; required by "
-            "analysis/cost_report.py's lib-dedup migration (closes the local "
-            "_anomaly_alert_dedup_key / _already_sent / _write_marker helpers). "
-            "Bumped from v0.21.0 2026-05-22; still carries the v0.21.0 alerts "
-            "module + v0.20.0 load_universe_ohlcv + v0.16.0 eval_artifacts "
+        assert "@v0.25.0" in text, (
+            "alpha-engine-lib should pin to v0.25.0 (adds "
+            "``alpha_engine_lib.ssm_log_capture`` — Python CLI chokepoint "
+            "for SSM-step log capture, replacing the inline bash trap + "
+            "tee pattern across the alpha-engine SF fleet; forced by the "
+            "2026-05-22 Saturday-SF Friday-PM dry-pass break where ASL "
+            "``States.Array`` didn't unescape ``\\'`` and the inline trap "
+            "rendered as literal backslash-apostrophe pairs in 8 spot "
+            "states. Backtester / Parity / Evaluator spots install this "
+            "version on bootstrap so the SF JSON's "
+            "``python -m alpha_engine_lib.ssm_log_capture run --slug X "
+            "--log Y -- bash spot_backtest.sh ...`` invocation resolves. "
+            "Bumped from v0.24.0 2026-05-22 evening (lib PR #57); still "
+            "carries v0.24.0 alerts dedup + v0.21.0 alerts module + "
+            "v0.20.0 load_universe_ohlcv + v0.16.0 eval_artifacts "
             "transitively. Update this test if the pin moves further forward."
         )
