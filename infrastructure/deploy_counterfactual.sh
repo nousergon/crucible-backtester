@@ -93,47 +93,6 @@ else
     --output json | python3 -c "import sys,json; d=json.load(sys.stdin); print('  FunctionArn:', d.get('FunctionArn','?'))"
 fi
 
-# Sync env vars from master .env (mirrors deploy_concordance.sh).
-LAMBDA_ENV_FILE="$(dirname "$REPO_ROOT")/alpha-engine-data/.env"
-if [ ! -f "$LAMBDA_ENV_FILE" ]; then
-  LAMBDA_ENV_FILE="$REPO_ROOT/.env"
-fi
-if [ -f "$LAMBDA_ENV_FILE" ]; then
-  LAMBDA_ENV_JSON=$(python3 -c "
-import json
-env = {}
-with open('$LAMBDA_ENV_FILE') as f:
-    for line in f:
-        line = line.strip()
-        if line == '# LAMBDA_SKIP':
-            break
-        if not line or line.startswith('#'):
-            continue
-        if '=' not in line:
-            continue
-        key, val = line.split('=', 1)
-        key, val = key.strip(), val.strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('\"', \"'\"):
-            val = val[1:-1]
-        if key and val:
-            env[key] = val
-if env:
-    print(json.dumps({'Variables': env}))
-else:
-    print('')
-")
-  if [ -n "$LAMBDA_ENV_JSON" ]; then
-    echo ""
-    echo "==> Syncing env vars from $LAMBDA_ENV_FILE"
-    aws lambda wait function-updated --function-name "${LAMBDA_FUNCTION}" --region "${AWS_REGION}" 2>/dev/null || sleep 5
-    aws lambda update-function-configuration \
-      --function-name "${LAMBDA_FUNCTION}" \
-      --environment "$LAMBDA_ENV_JSON" \
-      --region "${AWS_REGION}" > /dev/null
-  fi
-else
-  echo "  WARNING: No .env file found — Lambda env vars not updated"
-fi
 
 echo ""
 echo "==> Waiting for Lambda update to complete..."
