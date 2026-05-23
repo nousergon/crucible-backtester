@@ -26,7 +26,7 @@ COPY requirements-health.txt .
 # why the health Lambda image stayed frozen at its 2026-04-08 build and
 # re-raised the already-fixed 2026-05-11 false-positive retrain alert.
 RUN microdnf install -y git && microdnf clean all
-RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.25.0" && \
+RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/cipher813/alpha-engine-lib@v0.26.0" && \
     pip install --no-cache-dir -r requirements-health.txt && \
     rm -rf /root/.cache/pip
 
