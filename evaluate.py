@@ -885,12 +885,83 @@ def _run_tech_weight_ablation(config: dict, freeze: bool) -> dict:
     return result
 
 
+def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
+    """Fire a named alert when ``executor_optimizer.recommend()`` returns
+    a non-``ok`` status — closes 5/23-SF P0 sweep item (c).
+
+    Pre-fix: REJECTED status surfaced ONLY in ``report.md`` ("Refusing to
+    promote — per the canonical-alpha framework, alpha-positive is a hard
+    constraint, not a side-output"). No CW metric, no Telegram, no SNS.
+    Operator only saw it if they read the report.
+
+    Post-fix: status ∈ {``alpha_below_floor``, ``insufficient_data``,
+    ``no_params``, ``no_improvement``, ``insufficient_trades``,
+    ``insufficient_psr_confidence``, ``degraded``, ...} → publish a WARN
+    alert via ``alpha_engine_lib.alerts.publish`` with dedup_key keyed on
+    ``(run_date, status)`` so a recurring class doesn't N-spam the operator.
+    Mirrors the stance_distribution + cost_report patterns.
+    """
+    import os
+    if os.environ.get("ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS", "").lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return
+    status = result.get("status")
+    if status == "ok":
+        return
+    try:
+        from alpha_engine_lib import alerts  # noqa: PLC0415
+    except ImportError as e:
+        logger.warning(
+            "[executor_optimizer] alerts publish skipped — alpha_engine_lib.alerts "
+            "unavailable (lib pin <v0.21.0?): %s", e,
+        )
+        return
+    run_date = config.get("run_date") or result.get("run_date") or "unknown"
+    note = result.get("note") or result.get("degradation_reason") or "(no note)"
+    # `degraded` is the "sweep_df missing entirely" wrapper status set
+    # immediately above this function; `alpha_below_floor` is the
+    # canonical-alpha hard-constraint rejection. Both are operator-
+    # visible failures the canonical-alpha framework would want surfaced
+    # before the next Saturday cycle.
+    message = (
+        f"executor_optimizer REJECTED on {run_date}: status={status}. "
+        f"Note: {note}. "
+        f"Live `executor_params.json` was NOT updated. "
+        f"See backtester `report.md` ({run_date}) Executor Optimizer section "
+        f"and ROADMAP item (c) of the 5/23-SF aggregate-cycle P0 sweep."
+    )
+    try:
+        publish_result = alerts.publish(
+            message,
+            severity="warning",
+            source="alpha-engine-backtester/evaluate.py::_run_executor_opt",
+            dedup_key=f"executor_optimizer_rejected_{run_date}_{status}",
+            dedup_window_min=1440,  # one alert per (run_date, status) per day
+        )
+        logger.info(
+            "[executor_optimizer] REJECTED alert publish: sns_ok=%s telegram_ok=%s "
+            "any_ok=%s dedup_skipped=%s",
+            publish_result.sns.ok,
+            publish_result.telegram.ok,
+            publish_result.any_ok,
+            getattr(publish_result, "dedup_skipped", False),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[executor_optimizer] REJECTED alert publish failed (best-effort, "
+            "swallowed): %s", e,
+        )
+
+
 def _run_executor_opt(config: dict, sweep_df, freeze: bool) -> dict:
     if sweep_df is None or (hasattr(sweep_df, "empty") and sweep_df.empty):
-        return {
+        result = {
             "status": "degraded",
             "degradation_reason": "no sweep_df available (simulation did not run or failed)",
         }
+        _publish_executor_opt_rejection_alert(result, config)
+        return result
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
     current_params = read_params_pit_or_current(executor_optimizer, bucket, config)
@@ -900,6 +971,8 @@ def _run_executor_opt(config: dict, sweep_df, freeze: bool) -> dict:
             result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         else:
             result["apply_result"] = executor_optimizer.apply(result, bucket)
+    else:
+        _publish_executor_opt_rejection_alert(result, config)
     return result
 
 
