@@ -179,21 +179,31 @@ class TestPortfolioStatsExtensions:
 
     def test_ew_high_vol_basket_returns_emits_total_return_and_alpha(self):
         try:
-            from vectorbt_bridge import portfolio_stats
+            from vectorbt_bridge import _compute_active_window, portfolio_stats
             pf = self._build_portfolio()
         except Exception:
             pytest.skip("vectorbt unavailable in this test env")
         # Synthetic basket: constant +0.1% daily, indexed to the portfolio's
-        # active dates. Compounded over 10 days → ~1.0045 → ~0.45% total.
+        # active dates. Compounded over the active window only (post-fix
+        # 2026-05-24) — the entry fills on day 0 but NAV stays flat until
+        # day 1 when prices move, so the active window typically excludes
+        # the entry-day itself.
         basket = pd.Series(
             0.001, index=pf.wrapper.index, name="ew_high_vol",
         )
         stats = portfolio_stats(pf, ew_high_vol_basket_returns=basket)
         assert stats["ew_high_vol_return"] is not None
         assert stats["alpha_vs_ew_high_vol"] is not None
-        # Compounded basket return matches (1.001 ** 10) - 1 over the 10
-        # active days.
-        expected_basket_total = float((1.001 ** len(pf.wrapper.index)) - 1.0)
+        # Determine the actual active window length (varies by 1 with vbt's
+        # fill semantics) instead of hardcoding `len(pf.wrapper.index)` —
+        # the pre-fix test was pinning the buggy "compound over the full
+        # wrapper" semantic.
+        window = _compute_active_window(pf)
+        assert window is not None
+        active_dates = pf.wrapper.index[
+            (pf.wrapper.index >= window[0]) & (pf.wrapper.index <= window[1])
+        ]
+        expected_basket_total = float((1.001 ** len(active_dates)) - 1.0)
         assert stats["ew_high_vol_return"] == pytest.approx(
             expected_basket_total, rel=1e-6,
         )
@@ -205,12 +215,12 @@ class TestPortfolioStatsExtensions:
 
     def test_ew_high_vol_aligns_only_overlapping_dates(self):
         try:
-            from vectorbt_bridge import portfolio_stats
+            from vectorbt_bridge import _compute_active_window, portfolio_stats
             pf = self._build_portfolio()
         except Exception:
             pytest.skip("vectorbt unavailable in this test env")
-        # Basket extends beyond portfolio's window — reindex should
-        # narrow to portfolio dates, NaN-extending dates dropped.
+        # Basket extends beyond portfolio's window — active-window narrowing
+        # restricts the compound to the portfolio's active dates only.
         extended_dates = pd.date_range(
             pf.wrapper.index[0] - pd.Timedelta(days=5),
             pf.wrapper.index[-1] + pd.Timedelta(days=5),
@@ -218,9 +228,14 @@ class TestPortfolioStatsExtensions:
         )
         basket = pd.Series(0.002, index=extended_dates, name="ew_high_vol")
         stats = portfolio_stats(pf, ew_high_vol_basket_returns=basket)
-        # Compounded over only the portfolio's own dates (10 days), not
-        # the extended 20-day series.
-        expected = float((1.002 ** len(pf.wrapper.index)) - 1.0)
+        # Compounded over only the portfolio's ACTIVE window (post-fix
+        # 2026-05-24) — same active-window-length adjustment as above.
+        window = _compute_active_window(pf)
+        assert window is not None
+        active_dates = pf.wrapper.index[
+            (pf.wrapper.index >= window[0]) & (pf.wrapper.index <= window[1])
+        ]
+        expected = float((1.002 ** len(active_dates)) - 1.0)
         assert stats["ew_high_vol_return"] == pytest.approx(expected, rel=1e-6)
 
     def test_ew_high_vol_insufficient_overlap_returns_none(self):
@@ -240,3 +255,204 @@ class TestPortfolioStatsExtensions:
         stats = portfolio_stats(pf, ew_high_vol_basket_returns=basket)
         assert stats["ew_high_vol_return"] is None
         assert stats["alpha_vs_ew_high_vol"] is None
+
+
+class TestActiveWindowAnchoring:
+    """Pin the active-window-anchored benchmark comparison fix (2026-05-24).
+
+    Pre-fix bug: ``portfolio_stats`` compared ``total_return`` (effectively
+    the portfolio's active-window P&L) against ``spy_return`` /
+    ``ew_high_vol_return`` compounded over the FULL ``pf.wrapper.index``
+    (typically a 10-year price-matrix when the simulator only traded the
+    final weeks). The 2026-05-24 backtester run surfaced this as
+    ``ew_high_vol_return: 960%`` (10y basket compound) /
+    ``alpha_vs_ew_high_vol: -954%`` against a portfolio that had a
+    1.7% active-window return. The fix anchors both benchmark legs on
+    the portfolio's active window (first non-flat NAV through last
+    wrapper date) so the comparison is apples-to-apples.
+    """
+
+    def _build_flat_prefix_portfolio(self, n_flat: int = 20, n_active: int = 10):
+        """Portfolio that holds no positions for ``n_flat`` days then trades
+        for ``n_active`` days. NAV is constant at initial cash through the
+        flat prefix, then changes once entries fire.
+        """
+        import vectorbt as vbt
+
+        total = n_flat + n_active
+        dates = pd.date_range("2026-01-02", periods=total, freq="B")
+        prices = pd.DataFrame(
+            {
+                "AAA": np.concatenate([
+                    np.full(n_flat, 100.0),
+                    np.linspace(100.0, 110.0, num=n_active),
+                ]),
+            },
+            index=dates,
+        )
+        entries = pd.DataFrame(False, index=dates, columns=["AAA"])
+        exits = pd.DataFrame(False, index=dates, columns=["AAA"])
+        sizes = pd.DataFrame(0.0, index=dates, columns=["AAA"])
+        # Enter on first active day; exit on last day.
+        entries.iloc[n_flat] = True
+        sizes.iloc[n_flat] = [100.0]
+        exits.iloc[-1] = True
+
+        return vbt.Portfolio.from_signals(
+            close=prices,
+            entries=entries,
+            exits=exits,
+            size=sizes,
+            size_type="Amount",
+            init_cash=100_000.0,
+            cash_sharing=True,
+            group_by=True,
+            fees=0.0,
+            freq="D",
+        )
+
+    def test_compute_active_window_skips_flat_prefix(self):
+        try:
+            from vectorbt_bridge import _compute_active_window
+            pf = self._build_flat_prefix_portfolio(n_flat=20, n_active=10)
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        window = _compute_active_window(pf)
+        assert window is not None, "active window should not be None for trading portfolio"
+        active_start, active_end = window
+        wrapper_index = pf.wrapper.index
+        # active_start must be AFTER the 20-day flat prefix (the entry fires
+        # at iloc[20]); active_end must be the final wrapper date.
+        assert active_start > wrapper_index[19], (
+            f"active_start={active_start} should be after the flat prefix's last "
+            f"date {wrapper_index[19]}"
+        )
+        assert active_end == wrapper_index[-1]
+
+    def test_compute_active_window_none_when_no_trades(self):
+        try:
+            import vectorbt as vbt
+            from vectorbt_bridge import _compute_active_window
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        # All-False entries — portfolio never trades; NAV stays constant.
+        dates = pd.date_range("2026-01-02", periods=10, freq="B")
+        prices = pd.DataFrame(
+            {"AAA": np.linspace(100.0, 110.0, num=10)}, index=dates,
+        )
+        entries = pd.DataFrame(False, index=dates, columns=["AAA"])
+        exits = pd.DataFrame(False, index=dates, columns=["AAA"])
+        sizes = pd.DataFrame(0.0, index=dates, columns=["AAA"])
+        pf = vbt.Portfolio.from_signals(
+            close=prices,
+            entries=entries,
+            exits=exits,
+            size=sizes,
+            size_type="Amount",
+            init_cash=100_000.0,
+            cash_sharing=True,
+            group_by=True,
+            fees=0.0,
+            freq="D",
+        )
+        assert _compute_active_window(pf) is None
+
+    def test_ew_high_vol_compounds_over_active_window_not_full_wrapper(self):
+        """The bug class: a 20-day-flat + 10-day-active portfolio compared
+        against a 30-day basket should compound the basket over the 10-day
+        active window, NOT the full 30-day wrapper.
+        """
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_flat_prefix_portfolio(n_flat=20, n_active=10)
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        # Basket: +0.1% daily for all 30 wrapper dates.
+        basket = pd.Series(0.001, index=pf.wrapper.index, name="ew_high_vol")
+        stats = portfolio_stats(pf, ew_high_vol_basket_returns=basket)
+
+        # Pre-fix would compound (1.001 ** 30) - 1 ≈ 3.04%; post-fix compounds
+        # ONLY over the active window starting at the first NAV change, which
+        # is approximately 10 dates → (1.001 ** ~10) - 1 ≈ ~1.0%. Concretely
+        # the basket return must be substantially SMALLER than the full-wrapper
+        # compound. We assert the active-window result is closer in magnitude
+        # to a 10-day compound than to a 30-day compound.
+        ten_day_compound = (1.001 ** 10) - 1.0
+        thirty_day_compound = (1.001 ** 30) - 1.0
+        emitted = stats["ew_high_vol_return"]
+        assert emitted is not None
+        # Magnitude must be closer to the 10-day compound than the 30-day.
+        # This is the load-bearing assertion that pins the active-window fix.
+        assert abs(emitted - ten_day_compound) < abs(emitted - thirty_day_compound), (
+            f"basket_return={emitted} is closer to the 30-day compound "
+            f"{thirty_day_compound} than to the 10-day compound "
+            f"{ten_day_compound} — active-window narrowing is not in effect"
+        )
+
+    def test_spy_return_anchored_on_active_window(self):
+        """SPY-side mirror of the basket test: spy_return should reflect SPY's
+        return over the portfolio's active window only, not the full 10y
+        wrapper window.
+        """
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_flat_prefix_portfolio(n_flat=20, n_active=10)
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        # SPY: monotonically rising over the full 30-day wrapper from 100 → 130.
+        # Full-wrapper return = (130/100) - 1 = 30%.
+        # Active-window return must be SMALLER (SPY only rose from ~119 to
+        # 130 across the active window, ≈ 9%).
+        spy_prices = pd.Series(
+            np.linspace(100.0, 130.0, num=len(pf.wrapper.index)),
+            index=pf.wrapper.index,
+            name="SPY",
+        )
+        stats = portfolio_stats(pf, spy_prices=spy_prices)
+        assert stats["spy_return"] is not None
+        full_wrapper_return = (130.0 / 100.0) - 1.0  # 30%
+        # Active-window SPY return must be materially smaller than the full
+        # 30% wrapper compound.
+        assert stats["spy_return"] < full_wrapper_return * 0.6, (
+            f"spy_return={stats['spy_return']} is not materially smaller than "
+            f"the full-wrapper return {full_wrapper_return} — active-window "
+            f"narrowing is not in effect"
+        )
+
+    def test_null_legs_listed_when_legs_missing(self):
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_flat_prefix_portfolio(n_flat=20, n_active=10)
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        # No spy_prices, no basket — both legs degrade to None and the
+        # surface ``null_legs`` lists every null field for caller alerting.
+        stats = portfolio_stats(pf)
+        assert stats.get("spy_return") is None
+        assert stats.get("ew_high_vol_return") is None
+        null_legs = stats.get("null_legs", [])
+        assert "spy_return" in null_legs
+        assert "total_alpha" in null_legs
+        # basket-side legs were not requested (None passed), so they're
+        # NOT in null_legs — the surface only fires for "requested but
+        # could not compute" cases. spy_prices=None counts as "could not
+        # compute" because spy_return is canonical / always-expected.
+
+    def test_no_null_legs_when_legs_compute_cleanly(self):
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_flat_prefix_portfolio(n_flat=20, n_active=10)
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        spy_prices = pd.Series(
+            np.linspace(100.0, 130.0, num=len(pf.wrapper.index)),
+            index=pf.wrapper.index,
+            name="SPY",
+        )
+        basket = pd.Series(0.001, index=pf.wrapper.index, name="ew_high_vol")
+        stats = portfolio_stats(
+            pf, spy_prices=spy_prices, ew_high_vol_basket_returns=basket,
+        )
+        # All four legs compute cleanly — null_legs should be absent
+        # (or empty) since no caller-action is owed.
+        assert stats.get("null_legs", []) == []
