@@ -6,13 +6,44 @@ analytics engine. Everything else (Sharpe, drawdown, alpha, benchmark comparison
 is handled by vbt.Portfolio methods directly.
 """
 
+import logging
 import math
 
 import numpy as np
 import pandas as pd
 import vectorbt as vbt
 
+logger = logging.getLogger(__name__)
+
 _TRADING_DAYS_PER_YEAR = 252
+
+
+def _compute_active_window(pf: vbt.Portfolio) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Compute the portfolio's active date range — first non-flat NAV through last wrapper date.
+
+    For a portfolio that doesn't trade for some prefix of its wrapper.index (typical when
+    a 10y price-matrix is supplied but the simulator only enters positions in the final
+    weeks), returns the window starting at the first NAV change. Anchoring benchmark
+    comparisons (SPY, EW-high-vol) on this window prevents apples-to-oranges errors
+    where the flat-prefix portfolio's `total_return` reflects only its active period
+    but the benchmark return compounds over the full wrapper — the symptom that
+    surfaced on the 2026-05-24 backtest as `ew_high_vol_return: 960%`,
+    `alpha_vs_ew_high_vol: -954%` (10y basket compound vs 27-day portfolio return).
+
+    Returns ``None`` if the portfolio never trades (NAV constant across the whole
+    wrapper) or if the wrapper has fewer than 2 dates.
+    """
+    wrapper_index = pf.wrapper.index
+    if len(wrapper_index) < 2:
+        return None
+
+    value = pf.value()
+    initial_value = float(value.iloc[0])
+    nav_changes = value[~np.isclose(value.to_numpy(dtype=np.float64), initial_value, atol=1e-9)]
+    if len(nav_changes) == 0:
+        return None
+
+    return nav_changes.index[0], wrapper_index[-1]
 
 
 def _compute_sortino_ratio(daily_returns: pd.Series, target: float = 0.0) -> float:
@@ -194,6 +225,14 @@ def portfolio_stats(
         # available" to downstream gates.
         psr_scalar = None
 
+    # Resolve the portfolio's active date range up front — SPY + basket legs
+    # both need it to avoid the 10y-wrapper-vs-27-day-portfolio mismatch that
+    # produced the 2026-05-24 `ew_high_vol_return: 960%` / `alpha_vs_ew_high_vol:
+    # -954%` regression. ``None`` means "portfolio never traded" — both
+    # benchmark legs degrade to ``None`` for that case (and emit a WARN).
+    active_window = _compute_active_window(pf)
+    null_legs: list[str] = []
+
     stats = {
         "total_return": total_return,
         "sharpe_ratio": float(pf.sharpe_ratio()),
@@ -208,10 +247,31 @@ def portfolio_stats(
         "daily_log_returns": daily_log_returns,
     }
 
-    # Compute alpha vs SPY over the portfolio's active date range
-    if spy_prices is not None:
-        pf_dates = pf.wrapper.index
-        spy_aligned = spy_prices.reindex(pf_dates).dropna()
+    # Compute alpha vs SPY over the portfolio's ACTIVE date range — anchoring
+    # on `pf.wrapper.index` directly (the prior implementation) compares
+    # `total_return` (effectively a 27-day P&L expressed as fraction of initial
+    # capital) against `spy_return` compounded over the full 10y wrapper.
+    if spy_prices is None:
+        stats["spy_return"] = None
+        stats["total_alpha"] = None
+        logger.warning(
+            "vectorbt_bridge.portfolio_stats: spy_prices not provided — "
+            "spy_return/total_alpha emit as null"
+        )
+        null_legs.append("spy_return")
+        null_legs.append("total_alpha")
+    elif active_window is None:
+        stats["spy_return"] = None
+        stats["total_alpha"] = None
+        logger.warning(
+            "vectorbt_bridge.portfolio_stats: portfolio NAV never changed across "
+            "wrapper.index (no active window) — spy_return/total_alpha emit as null"
+        )
+        null_legs.append("spy_return")
+        null_legs.append("total_alpha")
+    else:
+        active_start, active_end = active_window
+        spy_aligned = spy_prices.loc[active_start:active_end].dropna()
         if len(spy_aligned) >= 2:
             spy_return = float((spy_aligned.iloc[-1] / spy_aligned.iloc[0]) - 1.0)
             stats["spy_return"] = spy_return
@@ -219,21 +279,38 @@ def portfolio_stats(
         else:
             stats["spy_return"] = None
             stats["total_alpha"] = None
-    else:
-        stats["spy_return"] = None
-        stats["total_alpha"] = None
+            logger.warning(
+                "vectorbt_bridge.portfolio_stats: spy_prices has <2 aligned values "
+                "within active window [%s, %s] — spy_return/total_alpha emit as null",
+                active_start,
+                active_end,
+            )
+            null_legs.append("spy_return")
+            null_legs.append("total_alpha")
 
     # Compute alpha vs EW-high-vol basket — institutional skill-isolation
     # framing per evaluator-revamp-260506.md Workstream D. Basket holds the
     # top vol-quartile of the agent's decision universe, equal-weighted +
     # rebalanced weekly; ``construct_ew_high_vol_benchmark`` produces the
     # daily-returns series this kwarg expects. Compounded over the
-    # portfolio's active date range to a single total-return scalar before
+    # portfolio's ACTIVE date range to a single total-return scalar before
     # differencing — matches ``total_alpha``'s shape so consumers can swap
     # which one they rank on without other plumbing changes.
-    if ew_high_vol_basket_returns is not None:
-        pf_dates = pf.wrapper.index
-        basket_aligned = ew_high_vol_basket_returns.reindex(pf_dates).dropna()
+    if ew_high_vol_basket_returns is None:
+        stats["ew_high_vol_return"] = None
+        stats["alpha_vs_ew_high_vol"] = None
+    elif active_window is None:
+        stats["ew_high_vol_return"] = None
+        stats["alpha_vs_ew_high_vol"] = None
+        logger.warning(
+            "vectorbt_bridge.portfolio_stats: portfolio NAV never changed across "
+            "wrapper.index — ew_high_vol_return/alpha_vs_ew_high_vol emit as null"
+        )
+        null_legs.append("ew_high_vol_return")
+        null_legs.append("alpha_vs_ew_high_vol")
+    else:
+        active_start, active_end = active_window
+        basket_aligned = ew_high_vol_basket_returns.loc[active_start:active_end].dropna()
         if len(basket_aligned) >= 2:
             basket_total_return = float((1.0 + basket_aligned).prod() - 1.0)
             stats["ew_high_vol_return"] = basket_total_return
@@ -241,8 +318,17 @@ def portfolio_stats(
         else:
             stats["ew_high_vol_return"] = None
             stats["alpha_vs_ew_high_vol"] = None
-    else:
-        stats["ew_high_vol_return"] = None
-        stats["alpha_vs_ew_high_vol"] = None
+            logger.warning(
+                "vectorbt_bridge.portfolio_stats: ew_high_vol_basket_returns has "
+                "<2 aligned values within active window [%s, %s] — "
+                "ew_high_vol_return/alpha_vs_ew_high_vol emit as null",
+                active_start,
+                active_end,
+            )
+            null_legs.append("ew_high_vol_return")
+            null_legs.append("alpha_vs_ew_high_vol")
+
+    if null_legs:
+        stats["null_legs"] = null_legs
 
     return stats
