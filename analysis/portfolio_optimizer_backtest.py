@@ -48,7 +48,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -571,3 +571,199 @@ def _safe_ratio(numerator: float | None, denominator: float | None) -> float | N
     if numerator is None or denominator is None or denominator == 0:
         return None
     return float(numerator) / float(denominator)
+
+
+# ─── A.4: Covariance-estimator sweep harness ────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §A.4
+#
+# Sweeps the covariance-estimator dimension introduced by alpha-engine A.1
+# (sigma_horizon_days), A.2 (ewma), A.3 (oas). Per-cell metrics use the same
+# skilled-risk basket as the legacy comparator (Sortino primary, PSR
+# confidence gate, CVaR + max_dd risk floors); winner is the Sortino-max
+# cell that clears the absolute risk floors.
+#
+# Compensating λ rescale: when sigma_horizon_days=H≠1, λ is divided by H to
+# keep the effective risk-aversion-against-21d-variance constant across
+# cells (scaling-invariance proof from alpha-engine A.1). Without this, the
+# H=21 cells would silently behave like λ=5/21 vs the H=1 cells at λ=5 — an
+# unfair comparison that would always crown H=21 the winner.
+
+_DEFAULT_BASE_RISK_AVERSION = 5.0
+
+
+def _build_cell_cfg(
+    estimator: str,
+    sigma_horizon_days: int,
+    *,
+    ewma_lambda_decay: float | None = None,
+    base_risk_aversion: float = _DEFAULT_BASE_RISK_AVERSION,
+) -> dict:
+    """Build an optimizer cfg for one sweep cell with compensating λ rescale."""
+    cfg: dict[str, Any] = {
+        "covariance_shrinkage": estimator,
+        "sigma_horizon_days": sigma_horizon_days,
+        # Keep effective risk-aversion constant: solving (Σ_H, λ/H) yields
+        # the same optimum as (Σ_1, λ) per the A.1 scaling-invariance proof.
+        "risk_aversion": base_risk_aversion / sigma_horizon_days,
+    }
+    if estimator == "ewma":
+        if ewma_lambda_decay is None:
+            raise ValueError("ewma cells must specify ewma_lambda_decay")
+        cfg["ewma_lambda_decay"] = ewma_lambda_decay
+    return cfg
+
+
+def default_cov_sweep_cells(
+    base_risk_aversion: float = _DEFAULT_BASE_RISK_AVERSION,
+) -> list[tuple[str, dict]]:
+    """Eight-cell default sweep covering LW × OAS × EWMA × H ∈ {1, 21}
+    × λ_decay ∈ {0.94, 0.97} (EWMA only). Baseline is the first cell."""
+    return [
+        ("ledoit_wolf_h1",     _build_cell_cfg("ledoit_wolf", 1,  base_risk_aversion=base_risk_aversion)),
+        ("ledoit_wolf_h21",    _build_cell_cfg("ledoit_wolf", 21, base_risk_aversion=base_risk_aversion)),
+        ("oas_h1",             _build_cell_cfg("oas",         1,  base_risk_aversion=base_risk_aversion)),
+        ("oas_h21",            _build_cell_cfg("oas",         21, base_risk_aversion=base_risk_aversion)),
+        ("ewma_lambda094_h1",  _build_cell_cfg("ewma",        1,  ewma_lambda_decay=0.94, base_risk_aversion=base_risk_aversion)),
+        ("ewma_lambda097_h1",  _build_cell_cfg("ewma",        1,  ewma_lambda_decay=0.97, base_risk_aversion=base_risk_aversion)),
+        ("ewma_lambda094_h21", _build_cell_cfg("ewma",        21, ewma_lambda_decay=0.94, base_risk_aversion=base_risk_aversion)),
+        ("ewma_lambda097_h21", _build_cell_cfg("ewma",        21, ewma_lambda_decay=0.97, base_risk_aversion=base_risk_aversion)),
+    ]
+
+
+def run_cov_estimator_sweep(
+    predictions_by_date: dict[str, dict[str, float]],
+    price_matrix: pd.DataFrame,
+    spy_prices: pd.Series,
+    sector_map: dict[str, str],
+    executor_path: str,
+    *,
+    cells: list[tuple[str, dict]] | None = None,
+    rebalance_freq_days: int = _DEFAULT_REBALANCE_FREQ,
+    universe_cap: int = _DEFAULT_UNIVERSE_CAP,
+    init_cash: float = 1_000_000.0,
+    fees: float = 0.001,
+    max_position_pct: float = 0.08,
+    min_score_proxy: float | None = None,
+    backtest_runner: Callable | None = None,
+) -> dict:
+    """Run the same backtest over multiple covariance-estimator configurations.
+
+    Returns a structured report dict shaped for the cutover-gate validator:
+
+      {
+        "cells": {name: metrics_dict, ...},
+        "baseline_name": str,                # first cell, conventionally LW H=1
+        "winner_name": str | None,           # Sortino-max cell that clears gate
+        "gate_passes_per_cell": {name: bool}, # per-cell verdict
+        "ranking": [(name, sortino), ...],   # desc by Sortino, None last
+        "cells_with_solver_failures": {name: count},
+      }
+
+    Args:
+        predictions_by_date, price_matrix, spy_prices, sector_map, executor_path,
+        rebalance_freq_days, universe_cap, init_cash, fees, max_position_pct,
+        min_score_proxy: passed through to ``run_optimizer_backtest`` for each cell.
+        cells: list of ``(name, optimizer_cfg)`` pairs. None → ``default_cov_sweep_cells()``.
+        backtest_runner: injected for testing. Default uses ``run_optimizer_backtest``.
+    """
+    if cells is None:
+        cells = default_cov_sweep_cells()
+    if not cells:
+        raise ValueError("Empty cell list — sweep must have at least one cell")
+
+    runner = backtest_runner if backtest_runner is not None else run_optimizer_backtest
+
+    metrics_by_cell: dict[str, dict] = {}
+    failures_by_cell: dict[str, int] = {}
+    for name, cfg in cells:
+        logger.info(f"Running cov-sweep cell {name!r}: cfg={cfg}")
+        result = runner(
+            predictions_by_date=predictions_by_date,
+            price_matrix=price_matrix,
+            spy_prices=spy_prices,
+            sector_map=sector_map,
+            executor_path=executor_path,
+            rebalance_freq_days=rebalance_freq_days,
+            universe_cap=universe_cap,
+            init_cash=init_cash,
+            fees=fees,
+            optimizer_cfg=cfg,
+            max_position_pct=max_position_pct,
+            min_score_proxy=min_score_proxy,
+        )
+        metrics_by_cell[name] = dict(result.metrics)
+        metrics_by_cell[name]["cell_cfg"] = dict(cfg)
+        failures_by_cell[name] = int(result.n_solver_failures)
+
+    baseline_name = cells[0][0]
+    baseline_metrics = metrics_by_cell.get(baseline_name)
+
+    ranking = sorted(
+        ((name, m.get("sortino_ratio")) for name, m in metrics_by_cell.items()),
+        key=lambda kv: (kv[1] is None, -(kv[1] or 0.0)),
+    )
+
+    gate_passes_per_cell = {
+        name: _cell_passes_gate(metrics, baseline_metrics)
+        for name, metrics in metrics_by_cell.items()
+    }
+    winner_name = next(
+        (name for name, _ in ranking if gate_passes_per_cell.get(name, False)),
+        None,
+    )
+
+    return {
+        "cells": metrics_by_cell,
+        "baseline_name": baseline_name,
+        "winner_name": winner_name,
+        "gate_passes_per_cell": gate_passes_per_cell,
+        "ranking": [(name, sortino) for name, sortino in ranking],
+        "cells_with_solver_failures": failures_by_cell,
+        "gate_thresholds": _gate_thresholds(
+            metrics_by_cell.get(winner_name, baseline_metrics or {}),
+            baseline_metrics,
+        ),
+    }
+
+
+def _cell_passes_gate(cell_metrics: dict, baseline_metrics: dict | None) -> bool:
+    """Apply the skilled-risk gate to a single sweep cell.
+
+    Same rules as ``_gate_thresholds`` / ``compare_to_legacy``: PSR ≥ 0.95
+    confidence floor, absolute max_drawdown / CVaR risk floors, and (when
+    baseline exists) Sortino ≥ baseline × 0.9. No baseline → only the
+    absolute floors apply, mirroring ``compare_to_legacy`` semantics.
+    """
+    psr = cell_metrics.get("psr")
+    if psr is None or psr < _DEFAULT_MIN_PSR:
+        return False
+    max_dd = cell_metrics.get("max_drawdown")
+    if max_dd is None or max_dd < _ABS_MAX_DRAWDOWN_FLOOR:
+        return False
+    cvar_95 = cell_metrics.get("cvar_95")
+    if cvar_95 is None or cvar_95 < _ABS_CVAR_95_FLOOR:
+        return False
+    if baseline_metrics is not None:
+        cell_sortino = cell_metrics.get("sortino_ratio") or 0.0
+        baseline_sortino = baseline_metrics.get("sortino_ratio") or 0.0
+        if cell_sortino < baseline_sortino * _DEFAULT_SORTINO_DEGRADE_RATIO:
+            return False
+    return True
+
+
+def compare_cov_sweep_to_baseline(sweep_report: dict) -> dict:
+    """Reshape a ``run_cov_estimator_sweep`` report into the cutover-gate
+    validator input shape (one ``compare_to_legacy``-style entry per cell)."""
+    cells = sweep_report["cells"]
+    baseline_name = sweep_report["baseline_name"]
+    baseline_metrics = cells.get(baseline_name)
+    return {
+        "baseline_name": baseline_name,
+        "winner_name": sweep_report.get("winner_name"),
+        "comparisons": {
+            name: compare_to_legacy(metrics, baseline_metrics, signal_source="synthetic")
+            for name, metrics in cells.items()
+        },
+        "ranking": sweep_report["ranking"],
+        "gate_passes_per_cell": sweep_report["gate_passes_per_cell"],
+    }

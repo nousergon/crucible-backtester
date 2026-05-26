@@ -22,10 +22,15 @@ from analysis.portfolio_optimizer_backtest import (
     _ABS_CVAR_95_FLOOR,
     _ABS_MAX_DRAWDOWN_FLOOR,
     OptimizerBacktestResult,
+    _build_cell_cfg,
+    _cell_passes_gate,
     _ensure_spy_column,
     _gate_thresholds,
     _select_rebalance_dates,
+    compare_cov_sweep_to_baseline,
     compare_to_legacy,
+    default_cov_sweep_cells,
+    run_cov_estimator_sweep,
     run_optimizer_backtest,
 )
 
@@ -259,3 +264,271 @@ class TestEndToEndIntegration:
             assert non_spy_nonzero <= cap, (
                 f"At {date}, {non_spy_nonzero} non-SPY tickers have nonzero weight; cap={cap}"
             )
+
+
+# ─── A.4 covariance-estimator sweep tests ───────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §A.4
+#
+# Sweep harness is tested with an injected stub backtest runner so unit
+# tests don't require vectorbt + a synthetic-data pipeline. End-to-end is
+# covered by TestEndToEndIntegration (single-cell) above; sweep semantics
+# (ranking, gate, baseline) are isolated here.
+
+
+def _stub_runner_factory(metrics_by_cfg: dict[tuple, dict]):
+    """Build a stub backtest_runner that returns metrics keyed by a
+    sortable signature of the cell cfg."""
+    def _key(cfg: dict) -> tuple:
+        return (
+            cfg.get("covariance_shrinkage"),
+            cfg.get("sigma_horizon_days"),
+            cfg.get("ewma_lambda_decay"),
+        )
+
+    def _runner(*, optimizer_cfg: dict, **_kwargs) -> OptimizerBacktestResult:
+        metrics = dict(metrics_by_cfg[_key(optimizer_cfg)])
+        n_failures = int(metrics.pop("_n_solver_failures", 0))
+        return OptimizerBacktestResult(
+            target_weights=pd.DataFrame(),
+            metrics=metrics,
+            rebalance_dates=[],
+            n_rebalances=0,
+            n_solver_failures=n_failures,
+            diagnostics_per_rebalance=[],
+        )
+    return _runner
+
+
+def _ok_metrics(sortino: float | None, **overrides) -> dict:
+    """Build a metrics dict that passes the absolute risk floors so the
+    sortino comparison is the load-bearing piece. Override individual
+    fields to force gate failures in specific tests."""
+    base = {
+        "sortino_ratio": sortino,
+        "psr": 0.97,
+        "cvar_95": -0.02,
+        "max_drawdown": -0.10,
+        "calmar_ratio": 1.5,
+        "tracking_error_ann": 0.04,
+        "mean_active_share": 0.15,
+        "mean_spy_weight": 0.85,
+        "turnover_one_way_ann": 2.0,
+        "sharpe_ratio": (sortino * 0.7) if sortino is not None else None,
+        "total_return": 0.20,
+        "spy_return": 0.10,
+        "total_alpha": 0.10,
+        "total_trades": 200,
+        "win_rate": 0.55,
+        "n_rebalances": 50,
+        "n_solver_failures": 0,
+        "rebalance_freq_days": 5,
+        "universe_cap": 30,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestBuildCellCfg:
+    def test_lw_h1_baseline_cell(self):
+        cfg = _build_cell_cfg("ledoit_wolf", 1)
+        assert cfg["covariance_shrinkage"] == "ledoit_wolf"
+        assert cfg["sigma_horizon_days"] == 1
+        assert cfg["risk_aversion"] == 5.0
+        assert "ewma_lambda_decay" not in cfg
+
+    def test_h21_applies_compensating_lambda_rescale(self):
+        cfg_h1 = _build_cell_cfg("ledoit_wolf", 1)
+        cfg_h21 = _build_cell_cfg("ledoit_wolf", 21)
+        assert cfg_h21["risk_aversion"] == pytest.approx(cfg_h1["risk_aversion"] / 21.0)
+
+    def test_ewma_cell_requires_lambda_decay(self):
+        with pytest.raises(ValueError, match="ewma cells must specify ewma_lambda_decay"):
+            _build_cell_cfg("ewma", 1)
+
+    def test_ewma_cell_propagates_lambda(self):
+        cfg = _build_cell_cfg("ewma", 1, ewma_lambda_decay=0.97)
+        assert cfg["ewma_lambda_decay"] == 0.97
+
+
+class TestDefaultCovSweepCells:
+    def test_eight_default_cells_unique_names(self):
+        cells = default_cov_sweep_cells()
+        names = [n for n, _ in cells]
+        assert len(names) == 8
+        assert len(set(names)) == 8
+
+    def test_baseline_is_ledoit_wolf_h1(self):
+        cells = default_cov_sweep_cells()
+        baseline_name, baseline_cfg = cells[0]
+        assert baseline_name == "ledoit_wolf_h1"
+        assert baseline_cfg["covariance_shrinkage"] == "ledoit_wolf"
+        assert baseline_cfg["sigma_horizon_days"] == 1
+
+
+class TestCellPassesGate:
+    def test_passes_when_metrics_clear_all_floors(self):
+        baseline = _ok_metrics(sortino=1.0)
+        cell = _ok_metrics(sortino=1.1)
+        assert _cell_passes_gate(cell, baseline) is True
+
+    def test_fails_on_low_psr(self):
+        baseline = _ok_metrics(sortino=1.0)
+        cell = _ok_metrics(sortino=1.5, psr=0.5)
+        assert _cell_passes_gate(cell, baseline) is False
+
+    def test_fails_on_drawdown_floor_violation(self):
+        baseline = _ok_metrics(sortino=1.0)
+        cell = _ok_metrics(sortino=1.5, max_drawdown=-0.50)  # worse than -0.35 floor
+        assert _cell_passes_gate(cell, baseline) is False
+
+    def test_fails_on_cvar_floor_violation(self):
+        baseline = _ok_metrics(sortino=1.0)
+        cell = _ok_metrics(sortino=1.5, cvar_95=-0.10)  # worse than -0.05 floor
+        assert _cell_passes_gate(cell, baseline) is False
+
+    def test_fails_when_sortino_below_baseline_x_0_9(self):
+        baseline = _ok_metrics(sortino=2.0)
+        cell = _ok_metrics(sortino=1.0)  # < 2.0 × 0.9 = 1.8
+        assert _cell_passes_gate(cell, baseline) is False
+
+    def test_no_baseline_only_absolute_floors_apply(self):
+        cell = _ok_metrics(sortino=0.1)  # very low sortino
+        assert _cell_passes_gate(cell, None) is True  # only PSR/dd/CVaR matter without baseline
+
+
+class TestRunCovEstimatorSweep:
+    def test_sweep_runs_each_cell_and_returns_report_shape(self):
+        cells = [
+            ("lw_h1", _build_cell_cfg("ledoit_wolf", 1)),
+            ("lw_h21", _build_cell_cfg("ledoit_wolf", 21)),
+        ]
+        metrics_by_cfg = {
+            ("ledoit_wolf", 1, None): _ok_metrics(sortino=1.0),
+            ("ledoit_wolf", 21, None): _ok_metrics(sortino=1.3),
+        }
+        report = run_cov_estimator_sweep(
+            predictions_by_date={},
+            price_matrix=pd.DataFrame(),
+            spy_prices=pd.Series(dtype=float),
+            sector_map={},
+            executor_path="/nonexistent",
+            cells=cells,
+            backtest_runner=_stub_runner_factory(metrics_by_cfg),
+        )
+        assert set(report["cells"].keys()) == {"lw_h1", "lw_h21"}
+        assert report["baseline_name"] == "lw_h1"
+        # lw_h21 has higher sortino (1.3 vs 1.0) → ranks first
+        assert report["ranking"][0][0] == "lw_h21"
+        assert report["ranking"][0][1] == pytest.approx(1.3)
+        # Both cells pass the gate; winner is highest-sortino passing cell
+        assert report["winner_name"] == "lw_h21"
+        assert report["gate_passes_per_cell"] == {"lw_h1": True, "lw_h21": True}
+
+    def test_empty_cell_list_raises(self):
+        with pytest.raises(ValueError, match="Empty cell list"):
+            run_cov_estimator_sweep(
+                predictions_by_date={},
+                price_matrix=pd.DataFrame(),
+                spy_prices=pd.Series(dtype=float),
+                sector_map={},
+                executor_path="/nonexistent",
+                cells=[],
+                backtest_runner=_stub_runner_factory({}),
+            )
+
+    def test_winner_is_none_when_no_cell_passes_gate(self):
+        cells = [
+            ("lw_h1", _build_cell_cfg("ledoit_wolf", 1)),
+            ("oas_h1", _build_cell_cfg("oas", 1)),
+        ]
+        # Both cells violate the drawdown floor
+        metrics_by_cfg = {
+            ("ledoit_wolf", 1, None): _ok_metrics(sortino=1.0, max_drawdown=-0.50),
+            ("oas", 1, None): _ok_metrics(sortino=1.5, max_drawdown=-0.45),
+        }
+        report = run_cov_estimator_sweep(
+            predictions_by_date={},
+            price_matrix=pd.DataFrame(),
+            spy_prices=pd.Series(dtype=float),
+            sector_map={},
+            executor_path="/nonexistent",
+            cells=cells,
+            backtest_runner=_stub_runner_factory(metrics_by_cfg),
+        )
+        assert report["winner_name"] is None
+        assert all(v is False for v in report["gate_passes_per_cell"].values())
+
+    def test_sortino_max_cell_winning_gate_is_selected_even_when_lower_sharpe(self):
+        """Confirms Sortino — NOT raw Sharpe — is the ranking metric per the
+        skilled-risk framework (evaluator-revamp-260506.md)."""
+        cells = [
+            ("a", _build_cell_cfg("ledoit_wolf", 1)),
+            ("b", _build_cell_cfg("oas", 1)),
+        ]
+        metrics_by_cfg = {
+            # Cell A: high Sharpe (3.0), low Sortino (1.0)
+            ("ledoit_wolf", 1, None): _ok_metrics(sortino=1.0, sharpe_ratio=3.0),
+            # Cell B: low Sharpe (0.5), high Sortino (2.0)
+            ("oas", 1, None): _ok_metrics(sortino=2.0, sharpe_ratio=0.5),
+        }
+        report = run_cov_estimator_sweep(
+            predictions_by_date={},
+            price_matrix=pd.DataFrame(),
+            spy_prices=pd.Series(dtype=float),
+            sector_map={},
+            executor_path="/nonexistent",
+            cells=cells,
+            backtest_runner=_stub_runner_factory(metrics_by_cfg),
+        )
+        assert report["winner_name"] == "b"  # Sortino-max, not Sharpe-max
+
+    def test_cells_with_none_sortino_rank_last(self):
+        """Failed cells (None sortino) must not crash the ranking and must
+        rank after any cell with a real sortino."""
+        cells = [
+            ("a", _build_cell_cfg("ledoit_wolf", 1)),
+            ("b", _build_cell_cfg("oas", 1)),
+        ]
+        metrics_by_cfg = {
+            ("ledoit_wolf", 1, None): _ok_metrics(sortino=1.0),
+            ("oas", 1, None): _ok_metrics(sortino=None),  # broken cell
+        }
+        report = run_cov_estimator_sweep(
+            predictions_by_date={},
+            price_matrix=pd.DataFrame(),
+            spy_prices=pd.Series(dtype=float),
+            sector_map={},
+            executor_path="/nonexistent",
+            cells=cells,
+            backtest_runner=_stub_runner_factory(metrics_by_cfg),
+        )
+        ranking_names = [name for name, _ in report["ranking"]]
+        assert ranking_names == ["a", "b"]  # a (1.0) before b (None)
+
+
+class TestCompareCovSweepToBaseline:
+    def test_produces_per_cell_compare_to_legacy_entries(self):
+        cells = [
+            ("baseline", _build_cell_cfg("ledoit_wolf", 1)),
+            ("challenger", _build_cell_cfg("oas", 1)),
+        ]
+        metrics_by_cfg = {
+            ("ledoit_wolf", 1, None): _ok_metrics(sortino=1.0),
+            ("oas", 1, None): _ok_metrics(sortino=1.5),
+        }
+        sweep = run_cov_estimator_sweep(
+            predictions_by_date={},
+            price_matrix=pd.DataFrame(),
+            spy_prices=pd.Series(dtype=float),
+            sector_map={},
+            executor_path="/nonexistent",
+            cells=cells,
+            backtest_runner=_stub_runner_factory(metrics_by_cfg),
+        )
+        verdict = compare_cov_sweep_to_baseline(sweep)
+        assert verdict["baseline_name"] == "baseline"
+        assert verdict["winner_name"] == "challenger"
+        assert set(verdict["comparisons"].keys()) == {"baseline", "challenger"}
+        # Challenger's compare_to_legacy entry has the Sortino delta we'd expect
+        delta = verdict["comparisons"]["challenger"]["deltas"]["sortino_delta"]
+        assert delta == pytest.approx(0.5)
