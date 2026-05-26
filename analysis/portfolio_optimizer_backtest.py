@@ -90,6 +90,7 @@ def run_optimizer_backtest(
     optimizer_cfg: dict | None = None,
     max_position_pct: float = 0.08,
     min_score_proxy: float | None = None,
+    alpha_uncertainty_by_date: dict[str, dict[str, float]] | None = None,
 ) -> OptimizerBacktestResult:
     """
     Backtest the constrained MVO optimizer over historical synthetic predictions.
@@ -173,13 +174,19 @@ def run_optimizer_backtest(
                 max_position_pct=max_position_pct,
                 min_score_proxy=min_score_proxy,
                 cfg=effective_cfg,
+                alpha_uncertainty_for_date=(
+                    alpha_uncertainty_by_date.get(rebal_date, {})
+                    if alpha_uncertainty_by_date is not None
+                    else None
+                ),
             )
         except _InsufficientHistoryError as e:
             logger.debug(f"{rebal_date}: skipped — {e}")
             diagnostics.append({"date": rebal_date, "status": "skipped_insufficient_history"})
             continue
 
-        result = solve_target_weights(**kwargs)
+        alpha_uncertainty = kwargs.pop("alpha_uncertainty", None)
+        result = solve_target_weights(**kwargs, alpha_uncertainty=alpha_uncertainty)
         if result.diagnostics["status"] == "infeasible_fallback":
             n_solver_failures += 1
         diagnostics.append({
@@ -253,6 +260,7 @@ def _build_optimizer_inputs(
     max_position_pct: float,
     min_score_proxy: float | None,
     cfg: dict,
+    alpha_uncertainty_for_date: dict[str, float] | None = None,
 ) -> dict:
     rebal_ts = pd.Timestamp(rebal_date)
     if rebal_ts not in price_matrix.index:
@@ -323,6 +331,27 @@ def _build_optimizer_inputs(
     w_prev = np.zeros(N)
     w_prev[cash_idx] = 1.0
 
+    # B.4 (optimizer-sota-upgrades-260526.md §B.4b): per-ticker σ_α̂ from
+    # the BayesianRidge posterior. None when caller didn't pass uncertainty
+    # → solve_target_weights treats as absent (penalty term skipped).
+    # SPY/CASH always 0; missing entries → NaN, downstream B.3 path treats
+    # as zero penalty per partial-rollout contract.
+    alpha_uncertainty: np.ndarray | None = None
+    if alpha_uncertainty_for_date is not None:
+        alpha_uncertainty = np.full(N, np.nan)
+        for i, t in enumerate(selected):
+            v = alpha_uncertainty_for_date.get(t)
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(fv) and fv >= 0.0:
+                alpha_uncertainty[i] = fv
+        alpha_uncertainty[spy_idx] = 0.0
+        alpha_uncertainty[cash_idx] = 0.0
+
     return {
         "tickers": universe,
         "alpha_hat": alpha_hat,
@@ -334,6 +363,7 @@ def _build_optimizer_inputs(
         "spy_idx": spy_idx,
         "cash_idx": cash_idx,
         "cfg": cfg,
+        "alpha_uncertainty": alpha_uncertainty,
     }
 
 
@@ -766,4 +796,139 @@ def compare_cov_sweep_to_baseline(sweep_report: dict) -> dict:
         },
         "ranking": sweep_report["ranking"],
         "gate_passes_per_cell": sweep_report["gate_passes_per_cell"],
+    }
+
+
+# ─── B.4b: α̂-uncertainty γ-sweep harness ───────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §B.4b
+#
+# Sweeps cfg["alpha_uncertainty_penalty"] = γ over a log-spaced grid to
+# find the γ that maximizes Sortino on the synthetic-replay backtest.
+# Mirror of A.4 cov-sweep architecture: per-cell run_optimizer_backtest,
+# Sortino ranking, absolute-floor gate, baseline = γ=0 (legacy MVO).
+#
+# Compensating note: γ=0 produces the SAME result regardless of whether
+# alpha_uncertainty is provided (per the B.3 contract: γ=0 → penalty
+# skipped). So the γ=0 cell is the legacy baseline by construction —
+# perfect for the cutover decision.
+
+
+def default_gamma_sweep_cells() -> list[tuple[str, dict]]:
+    """Log-spaced γ grid covering the realistic operating range for
+    a 21d-horizon canonical-alpha book.
+
+    γ semantics: the penalty is γ · sum_i(σ_α̂_i² · w_i²). With typical
+    σ_α̂ ≈ 0.02 (2% log-domain 21d std) and w_i² ≈ 0.08² ≈ 6e-3, one
+    pick's penalty contribution is γ · 4e-4 · 6e-3 ≈ γ · 2.4e-6.
+
+    The α̂ gain per pick is roughly α̂ · w ≈ 0.05 · 0.08 = 4e-3. So:
+      • γ = 10 → penalty ≈ 2.4e-5 per pick (∼0.6% of α̂ gain — negligible)
+      • γ = 100 → penalty ≈ 2.4e-4 per pick (∼6% of α̂ gain — small tilt)
+      • γ = 1000 → penalty ≈ 2.4e-3 per pick (∼60% of α̂ gain — strong)
+      • γ = 10000 → penalty dominates the α̂ gain → conviction picks shrink
+        substantially
+
+    Baseline is γ=0 (legacy MVO behavior, no penalty).
+    """
+    return [
+        ("baseline_gamma_0",   {"alpha_uncertainty_penalty": 0.0}),
+        ("gamma_10",           {"alpha_uncertainty_penalty": 10.0}),
+        ("gamma_100",          {"alpha_uncertainty_penalty": 100.0}),
+        ("gamma_1000",         {"alpha_uncertainty_penalty": 1000.0}),
+        ("gamma_10000",        {"alpha_uncertainty_penalty": 10000.0}),
+    ]
+
+
+def run_gamma_sweep(
+    predictions_by_date: dict[str, dict[str, float]],
+    price_matrix: pd.DataFrame,
+    spy_prices: pd.Series,
+    sector_map: dict[str, str],
+    executor_path: str,
+    alpha_uncertainty_by_date: dict[str, dict[str, float]],
+    *,
+    cells: list[tuple[str, dict]] | None = None,
+    base_optimizer_cfg: dict | None = None,
+    rebalance_freq_days: int = _DEFAULT_REBALANCE_FREQ,
+    universe_cap: int = _DEFAULT_UNIVERSE_CAP,
+    init_cash: float = 1_000_000.0,
+    fees: float = 0.001,
+    max_position_pct: float = 0.08,
+    min_score_proxy: float | None = None,
+    backtest_runner: Callable | None = None,
+) -> dict:
+    """Sweep alpha_uncertainty_penalty γ to find the value that maximizes
+    Sortino on the synthetic-replay backtest.
+
+    ``alpha_uncertainty_by_date`` is required: a γ-sweep against missing
+    σ_α̂ would have every cell behave identically (B.3 skips the penalty
+    when alpha_uncertainty has no signal) — so caller MUST provide it.
+
+    Report shape matches ``run_cov_estimator_sweep`` so the same downstream
+    operator tooling can read both verdicts uniformly.
+    """
+    if alpha_uncertainty_by_date is None:
+        raise ValueError(
+            "alpha_uncertainty_by_date is required for γ-sweep — without "
+            "uncertainty input every γ cell collapses to the baseline solve. "
+            "Generate σ_α̂ inputs (BayesianRidge posterior — predictor B.1) "
+            "before running the sweep."
+        )
+    if cells is None:
+        cells = default_gamma_sweep_cells()
+    if not cells:
+        raise ValueError("Empty cell list — sweep must have at least one cell")
+
+    runner = backtest_runner if backtest_runner is not None else run_optimizer_backtest
+    base_cfg = dict(base_optimizer_cfg or {})
+
+    metrics_by_cell: dict[str, dict] = {}
+    failures_by_cell: dict[str, int] = {}
+    for name, gamma_overrides in cells:
+        cfg = {**base_cfg, **gamma_overrides}
+        logger.info(f"Running γ-sweep cell {name!r}: cfg={cfg}")
+        result = runner(
+            predictions_by_date=predictions_by_date,
+            price_matrix=price_matrix,
+            spy_prices=spy_prices,
+            sector_map=sector_map,
+            executor_path=executor_path,
+            rebalance_freq_days=rebalance_freq_days,
+            universe_cap=universe_cap,
+            init_cash=init_cash,
+            fees=fees,
+            optimizer_cfg=cfg,
+            max_position_pct=max_position_pct,
+            min_score_proxy=min_score_proxy,
+            alpha_uncertainty_by_date=alpha_uncertainty_by_date,
+        )
+        metrics_by_cell[name] = dict(result.metrics)
+        metrics_by_cell[name]["cell_cfg"] = dict(cfg)
+        failures_by_cell[name] = int(result.n_solver_failures)
+
+    baseline_name = cells[0][0]  # γ=0 by convention
+    baseline_metrics = metrics_by_cell.get(baseline_name)
+    ranking = sorted(
+        ((name, m.get("sortino_ratio")) for name, m in metrics_by_cell.items()),
+        key=lambda kv: (kv[1] is None, -(kv[1] or 0.0)),
+    )
+    gate_passes_per_cell = {
+        name: _cell_passes_gate(metrics, baseline_metrics)
+        for name, metrics in metrics_by_cell.items()
+    }
+    winner_name = next(
+        (name for name, _ in ranking if gate_passes_per_cell.get(name, False)),
+        None,
+    )
+    return {
+        "cells": metrics_by_cell,
+        "baseline_name": baseline_name,
+        "winner_name": winner_name,
+        "gate_passes_per_cell": gate_passes_per_cell,
+        "ranking": [(name, sortino) for name, sortino in ranking],
+        "cells_with_solver_failures": failures_by_cell,
+        "gate_thresholds": _gate_thresholds(
+            metrics_by_cell.get(winner_name, baseline_metrics or {}),
+            baseline_metrics,
+        ),
     }

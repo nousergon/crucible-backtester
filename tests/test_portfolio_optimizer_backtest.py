@@ -30,7 +30,9 @@ from analysis.portfolio_optimizer_backtest import (
     compare_cov_sweep_to_baseline,
     compare_to_legacy,
     default_cov_sweep_cells,
+    default_gamma_sweep_cells,
     run_cov_estimator_sweep,
+    run_gamma_sweep,
     run_optimizer_backtest,
 )
 
@@ -532,3 +534,283 @@ class TestCompareCovSweepToBaseline:
         # Challenger's compare_to_legacy entry has the Sortino delta we'd expect
         delta = verdict["comparisons"]["challenger"]["deltas"]["sortino_delta"]
         assert delta == pytest.approx(0.5)
+
+
+# ─── B.4b γ-sweep tests ─────────────────────────────────────────────────────
+# Plan: alpha-engine-docs/private/optimizer-sota-upgrades-260526.md §B.4b
+#
+# Sweeps cfg["alpha_uncertainty_penalty"] over a log-spaced grid. Mirror
+# of A.4 cov-sweep — stub backtest_runner so tests don't need vectorbt.
+
+
+def _gamma_stub_runner_factory(metrics_by_gamma: dict[float, dict]):
+    """Stub runner keyed by the γ value in optimizer_cfg.
+    Captures alpha_uncertainty_by_date so tests can assert it was threaded."""
+    captured: dict[str, object] = {}
+
+    def _runner(*, optimizer_cfg: dict, alpha_uncertainty_by_date=None, **_kwargs):
+        gamma = float(optimizer_cfg.get("alpha_uncertainty_penalty", 0.0))
+        captured["last_alpha_uncertainty_by_date"] = alpha_uncertainty_by_date
+        metrics = dict(metrics_by_gamma[gamma])
+        n_failures = int(metrics.pop("_n_solver_failures", 0))
+        return OptimizerBacktestResult(
+            target_weights=pd.DataFrame(),
+            metrics=metrics,
+            rebalance_dates=[],
+            n_rebalances=0,
+            n_solver_failures=n_failures,
+            diagnostics_per_rebalance=[],
+        )
+    _runner.captured = captured  # type: ignore[attr-defined]
+    return _runner
+
+
+class TestDefaultGammaSweepCells:
+    def test_five_cells_with_baseline_first(self):
+        cells = default_gamma_sweep_cells()
+        assert len(cells) == 5
+        names = [n for n, _ in cells]
+        assert names[0] == "baseline_gamma_0"
+        assert len(set(names)) == 5
+
+    def test_baseline_is_gamma_zero(self):
+        cells = default_gamma_sweep_cells()
+        baseline_name, baseline_cfg = cells[0]
+        assert baseline_cfg["alpha_uncertainty_penalty"] == 0.0
+
+    def test_grid_is_log_spaced(self):
+        cells = default_gamma_sweep_cells()
+        gammas = [c["alpha_uncertainty_penalty"] for _, c in cells]
+        # 0, 10, 100, 1000, 10000
+        assert gammas == [0.0, 10.0, 100.0, 1000.0, 10000.0]
+
+
+class TestRunGammaSweep:
+    def _stub_alpha_uncertainty_by_date(self):
+        return {"2024-01-08": {"AAPL": 0.025, "MSFT": 0.015}}
+
+    def test_sweep_runs_each_cell_and_threads_uncertainty(self):
+        cells = [
+            ("g0",   {"alpha_uncertainty_penalty": 0.0}),
+            ("g100", {"alpha_uncertainty_penalty": 100.0}),
+        ]
+        metrics_by_gamma = {
+            0.0: _ok_metrics(sortino=1.0),
+            100.0: _ok_metrics(sortino=1.4),
+        }
+        runner = _gamma_stub_runner_factory(metrics_by_gamma)
+        unc = self._stub_alpha_uncertainty_by_date()
+        report = run_gamma_sweep(
+            predictions_by_date={},
+            price_matrix=pd.DataFrame(),
+            spy_prices=pd.Series(dtype=float),
+            sector_map={},
+            executor_path="/nonexistent",
+            alpha_uncertainty_by_date=unc,
+            cells=cells,
+            backtest_runner=runner,
+        )
+        # Both cells ran
+        assert set(report["cells"].keys()) == {"g0", "g100"}
+        # g100 wins on Sortino
+        assert report["ranking"][0][0] == "g100"
+        assert report["winner_name"] == "g100"
+        assert report["baseline_name"] == "g0"
+        # uncertainty was threaded into each runner call
+        assert runner.captured["last_alpha_uncertainty_by_date"] is unc
+
+    def test_alpha_uncertainty_by_date_required_raises(self):
+        """γ-sweep without σ_α̂ inputs has every cell behave identically.
+        Plan policy: raise rather than emit a meaningless sweep report."""
+        with pytest.raises(ValueError, match="required for γ-sweep"):
+            run_gamma_sweep(
+                predictions_by_date={},
+                price_matrix=pd.DataFrame(),
+                spy_prices=pd.Series(dtype=float),
+                sector_map={},
+                executor_path="/nonexistent",
+                alpha_uncertainty_by_date=None,
+                cells=default_gamma_sweep_cells(),
+                backtest_runner=lambda **_: None,
+            )
+
+    def test_empty_cell_list_raises(self):
+        with pytest.raises(ValueError, match="Empty cell list"):
+            run_gamma_sweep(
+                predictions_by_date={},
+                price_matrix=pd.DataFrame(),
+                spy_prices=pd.Series(dtype=float),
+                sector_map={},
+                executor_path="/nonexistent",
+                alpha_uncertainty_by_date={},
+                cells=[],
+                backtest_runner=lambda **_: None,
+            )
+
+    def test_baseline_wins_when_uncertainty_signal_is_noise(self):
+        """When σ_α̂ is uninformative, higher γ doesn't help — the baseline
+        γ=0 wins on Sortino. Verifies the sweep doesn't artificially favor
+        the new term."""
+        cells = default_gamma_sweep_cells()
+        # All cells perform identically except baseline marginally better
+        metrics_by_gamma = {
+            0.0:     _ok_metrics(sortino=1.2),
+            10.0:    _ok_metrics(sortino=1.15),
+            100.0:   _ok_metrics(sortino=1.10),
+            1000.0:  _ok_metrics(sortino=1.05),
+            10000.0: _ok_metrics(sortino=0.95),  # too much penalty hurts
+        }
+        runner = _gamma_stub_runner_factory(metrics_by_gamma)
+        report = run_gamma_sweep(
+            predictions_by_date={},
+            price_matrix=pd.DataFrame(),
+            spy_prices=pd.Series(dtype=float),
+            sector_map={},
+            executor_path="/nonexistent",
+            alpha_uncertainty_by_date={"d": {}},
+            cells=cells,
+            backtest_runner=runner,
+        )
+        # Baseline wins on Sortino
+        assert report["winner_name"] == "baseline_gamma_0"
+
+    def test_high_gamma_wins_when_uncertainty_signal_is_informative(self):
+        """When the uncertainty signal is genuinely informative, the
+        optimal γ is non-zero — the sweep identifies it."""
+        cells = default_gamma_sweep_cells()
+        # Inverted-U: γ=100 optimal
+        metrics_by_gamma = {
+            0.0:     _ok_metrics(sortino=1.0),
+            10.0:    _ok_metrics(sortino=1.2),
+            100.0:   _ok_metrics(sortino=1.6),  # peak
+            1000.0:  _ok_metrics(sortino=1.3),
+            10000.0: _ok_metrics(sortino=0.7),
+        }
+        runner = _gamma_stub_runner_factory(metrics_by_gamma)
+        report = run_gamma_sweep(
+            predictions_by_date={},
+            price_matrix=pd.DataFrame(),
+            spy_prices=pd.Series(dtype=float),
+            sector_map={},
+            executor_path="/nonexistent",
+            alpha_uncertainty_by_date={"d": {}},
+            cells=cells,
+            backtest_runner=runner,
+        )
+        assert report["winner_name"] == "gamma_100"
+        # Ranking reflects the inverted-U
+        ranked_names = [n for n, _ in report["ranking"]]
+        assert ranked_names[0] == "gamma_100"
+
+    def test_winner_none_when_all_cells_fail_gate(self):
+        """If every γ produces metrics that violate absolute risk floors,
+        no winner is named — surfaces the failure rather than picking the
+        least-bad cell."""
+        cells = default_gamma_sweep_cells()
+        # Every cell violates the drawdown floor (-0.35 absolute)
+        metrics_by_gamma = {
+            g: _ok_metrics(sortino=1.0 + i * 0.1, max_drawdown=-0.50)
+            for i, g in enumerate([0.0, 10.0, 100.0, 1000.0, 10000.0])
+        }
+        runner = _gamma_stub_runner_factory(metrics_by_gamma)
+        report = run_gamma_sweep(
+            predictions_by_date={},
+            price_matrix=pd.DataFrame(),
+            spy_prices=pd.Series(dtype=float),
+            sector_map={},
+            executor_path="/nonexistent",
+            alpha_uncertainty_by_date={"d": {}},
+            cells=cells,
+            backtest_runner=runner,
+        )
+        assert report["winner_name"] is None
+        assert all(v is False for v in report["gate_passes_per_cell"].values())
+
+
+class TestBuildOptimizerInputsAlphaUncertainty:
+    """The new alpha_uncertainty_for_date passthrough on _build_optimizer_inputs
+    populates the optimizer kwargs cleanly."""
+
+    def test_alpha_uncertainty_populated_when_provided(self):
+        from analysis.portfolio_optimizer_backtest import _build_optimizer_inputs
+
+        tickers = ["AAPL", "MSFT"]
+        sector_map = {t: "Technology" for t in tickers}
+        price_matrix = _synthetic_price_matrix(tickers, n_days=200, seed=0)
+        spy = _synthetic_spy_series(n_days=200, seed=99).reindex(price_matrix.index)
+        price_matrix["SPY"] = spy
+        predictions = {"AAPL": 0.04, "MSFT": 0.02}
+        rebal_date = str(price_matrix.index[150].date())
+        kwargs = _build_optimizer_inputs(
+            rebal_date=rebal_date,
+            predictions=predictions,
+            price_matrix=price_matrix,
+            sector_map=sector_map,
+            universe_cap=30,
+            max_position_pct=0.08,
+            min_score_proxy=None,
+            cfg={},
+            alpha_uncertainty_for_date={"AAPL": 0.025, "MSFT": 0.015},
+        )
+        unc = kwargs["alpha_uncertainty"]
+        assert unc is not None
+        # Tickers order: selected (AAPL, MSFT) + SPY + CASH
+        idx_aapl = kwargs["tickers"].index("AAPL")
+        idx_msft = kwargs["tickers"].index("MSFT")
+        idx_spy = kwargs["tickers"].index("SPY")
+        idx_cash = kwargs["tickers"].index("CASH")
+        assert unc[idx_aapl] == pytest.approx(0.025)
+        assert unc[idx_msft] == pytest.approx(0.015)
+        assert unc[idx_spy] == 0.0
+        assert unc[idx_cash] == 0.0
+
+    def test_alpha_uncertainty_is_none_when_not_provided(self):
+        """Backwards-compat: when caller doesn't pass uncertainty (legacy
+        callsite or pre-B.4b), kwargs["alpha_uncertainty"] is None and
+        solve_target_weights' B.3 path treats it as 'no penalty.'"""
+        from analysis.portfolio_optimizer_backtest import _build_optimizer_inputs
+
+        tickers = ["AAPL", "MSFT"]
+        sector_map = {t: "Technology" for t in tickers}
+        price_matrix = _synthetic_price_matrix(tickers, n_days=200, seed=0)
+        spy = _synthetic_spy_series(n_days=200, seed=99).reindex(price_matrix.index)
+        price_matrix["SPY"] = spy
+        predictions = {"AAPL": 0.04, "MSFT": 0.02}
+        rebal_date = str(price_matrix.index[150].date())
+        kwargs = _build_optimizer_inputs(
+            rebal_date=rebal_date,
+            predictions=predictions,
+            price_matrix=price_matrix,
+            sector_map=sector_map,
+            universe_cap=30,
+            max_position_pct=0.08,
+            min_score_proxy=None,
+            cfg={},
+        )
+        assert kwargs["alpha_uncertainty"] is None
+
+    def test_missing_ticker_std_yields_nan(self):
+        """Per-ticker missing entry → NaN in the array (B.3 path skips penalty)."""
+        from analysis.portfolio_optimizer_backtest import _build_optimizer_inputs
+
+        tickers = ["AAPL", "MSFT"]
+        sector_map = {t: "Technology" for t in tickers}
+        price_matrix = _synthetic_price_matrix(tickers, n_days=200, seed=0)
+        spy = _synthetic_spy_series(n_days=200, seed=99).reindex(price_matrix.index)
+        price_matrix["SPY"] = spy
+        predictions = {"AAPL": 0.04, "MSFT": 0.02}
+        rebal_date = str(price_matrix.index[150].date())
+        kwargs = _build_optimizer_inputs(
+            rebal_date=rebal_date,
+            predictions=predictions,
+            price_matrix=price_matrix,
+            sector_map=sector_map,
+            universe_cap=30,
+            max_position_pct=0.08,
+            min_score_proxy=None,
+            cfg={},
+            alpha_uncertainty_for_date={"AAPL": 0.025},  # MSFT missing
+        )
+        unc = kwargs["alpha_uncertainty"]
+        idx_msft = kwargs["tickers"].index("MSFT")
+        assert np.isnan(unc[idx_msft])
