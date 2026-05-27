@@ -160,3 +160,12 @@ full_run_hard_caps_seconds:
   # which is the operator-recognizable signal that one cell is
   # solver-degenerate.
   cov_estimator_sweep: 1800.0
+
+  # gamma_sweep (ROADMAP B.4b, 2026-05-27): 5 sweep cells × the same
+  # optimizer backtest the gate above runs, plus a one-time predictor
+  # backtest fetch (~4 min, shared with run_portfolio_optimizer_gate
+  # but called separately inside this stage). Auto-skips when σ_α̂
+  # coverage from production predictions archive is insufficient
+  # (before B.1 BayesianRidge has accumulated enough Saturday cycles).
+  # 30 min cap absorbs cold spot variance + the 5× repeat.
+  gamma_sweep: 1800.0
