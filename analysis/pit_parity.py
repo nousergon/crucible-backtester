@@ -33,6 +33,86 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = "pit_parity-1.0.0"
 
+# Runtime handles that live on ``config`` but cannot be deep-copied. The
+# PhaseRegistry's ``.s3_client`` carries botocore service-model references
+# that recurse past the Python stack limit (caught 2026-04-27 spot smoke v2
+# at ``backtest.py::merge_executor_params``; re-bit pit_parity 2026-05-17
+# through 2026-05-24 — 4 Saturday firings silently swallowed RecursionError
+# in the outer non-fatal handler). Mirror the explicit-allowlist strip
+# pattern at ``backtest.py:862`` rather than a prefix-based filter so
+# load-bearing ``_run_date`` (read at line 213) is never accidentally
+# dropped.
+_RUNTIME_HANDLE_KEYS = ("_phase_registry",)
+
+
+def _config_without_runtime_handles(config: dict) -> dict:
+    """Return a shallow dict-view of ``config`` with non-copyable runtime
+    handles removed so the result is safe to ``copy.deepcopy``.
+
+    ``run_predictor_backtest`` reads only data keys (``executor_paths``,
+    ``init_cash``, ``simulation_fees``, ``use_vectorized_sweep``,
+    ``walk_forward``) — none of the runtime handles — so dropping them is
+    behaviour-neutral for both parity passes.
+    """
+    return {k: v for k, v in config.items() if k not in _RUNTIME_HANDLE_KEYS}
+
+
+def write_failure_artifact(
+    config: dict,
+    exc: BaseException,
+) -> dict:
+    """Construct and upload a ``status=failed`` artifact when
+    ``run_pit_parity`` raises an unhandled exception (e.g., the
+    RecursionError class). The always-emit-artifact contract guarantees
+    the operator's manual-flip gate always has something to read — no
+    Saturday produces zero artifacts.
+
+    Returns the failure report (with ``_s3_key`` populated on upload
+    success). Never raises — observability path only.
+    """
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    run_date = config.get("_run_date") or _dt.date.today().isoformat()
+    report = {
+        "schema": SCHEMA,
+        "run_date": run_date,
+        "status": "failed",
+        "error_class": type(exc).__name__,
+        "error_msg": str(exc)[:1000],
+        "observational": True,
+    }
+    key = _write_artifact_to_s3(bucket, run_date, report)
+    if key is not None:
+        report["_s3_key"] = key
+    return report
+
+
+def _write_artifact_to_s3(bucket: str, run_date: str, report: dict) -> str | None:
+    """Best-effort upload of the parity report to the canonical S3 key.
+
+    Returns the S3 key on success, ``None`` on failure. Never raises — pit_parity
+    is observational and a failed upload must not fail the spot run. The
+    fail-loud surface is ``alpha_engine_lib.alerts.publish`` at the
+    ``backtest.py::main`` outer handler (per ``feedback_no_silent_fails``
+    secondary-observability carve-out: the primary deliverable is the
+    weights archive + the spot run; pit_parity is the secondary record).
+    """
+    key = f"backtest/{run_date}/pit_parity.json"
+    try:
+        import boto3
+        boto3.client("s3").put_object(
+            Bucket=bucket, Key=key,
+            Body=json.dumps(report, indent=2, default=str),
+            ContentType="application/json",
+        )
+        logger.info("[pit_parity] report → s3://%s/%s", bucket, key)
+        return key
+    except Exception as e:
+        logger.warning(
+            "[pit_parity] S3 upload failed (best-effort, observational): %s", e
+        )
+        return None
+
+
 # The skilled-risk basket (plan §3 invariant 4). Sortino is primary; PSR is
 # the basket's deflation member; CVaR + max-DD are the tail/drawdown legs.
 # Sharpe is deliberately absent.
@@ -212,12 +292,16 @@ def run_pit_parity(config: dict) -> dict:
     bucket = config.get("signals_bucket", "alpha-engine-research")
     run_date = config.get("_run_date") or _dt.date.today().isoformat()
 
-    cur_cfg = copy.deepcopy(config)
+    # Strip non-copyable runtime handles before deepcopy. See module-level
+    # ``_RUNTIME_HANDLE_KEYS`` comment for the failure-mode history.
+    safe_config = _config_without_runtime_handles(config)
+
+    cur_cfg = copy.deepcopy(safe_config)
     cur_cfg["walk_forward"] = False
     logger.info("[pit_parity] pass 1/2 — legacy single-pass (look-ahead)")
     cur_stats = run_predictor_backtest(cur_cfg)
 
-    pit_cfg = copy.deepcopy(config)
+    pit_cfg = copy.deepcopy(safe_config)
     pit_cfg["walk_forward"] = True
     logger.info("[pit_parity] pass 2/2 — walk-forward PIT")
     pit_stats = run_predictor_backtest(pit_cfg)
@@ -229,32 +313,27 @@ def run_pit_parity(config: dict) -> dict:
             "(current=%s, pit=%s) — emitting a status-only report",
             cur_stats.get("status"), pit_stats.get("status"),
         )
-        return {
+        report = {
             "schema": SCHEMA, "run_date": run_date, "status": "incomplete",
             "current_status": cur_stats.get("status"),
             "pit_status": pit_stats.get("status"),
             "observational": True,
         }
+        # Always-emit-artifact contract: the operator's manual-flip gate
+        # (plan §5 / ROADMAP L2371) depends on a weekly artifact existing.
+        # A silent skip of the upload on the incomplete path would replay
+        # the 2026-05-17→2026-05-24 silent-fail incident.
+        key = _write_artifact_to_s3(bucket, run_date, report)
+        if key is not None:
+            report["_s3_key"] = key
+        return report
 
     wf_meta = (pit_stats.get("predictor_metadata") or {}).get("walk_forward")
     report = build_contamination_report(
         cur_stats, pit_stats, run_date=run_date, wf_meta=wf_meta,
     )
 
-    # Best-effort S3 upload to the spot RUN_DATE prefix. Never raises —
-    # this is observational; a failed upload must not fail the spot run.
-    key = f"backtest/{run_date}/pit_parity.json"
-    try:
-        import boto3
-        boto3.client("s3").put_object(
-            Bucket=bucket, Key=key,
-            Body=json.dumps(report, indent=2, default=str),
-            ContentType="application/json",
-        )
-        logger.info("[pit_parity] report → s3://%s/%s", bucket, key)
+    key = _write_artifact_to_s3(bucket, run_date, report)
+    if key is not None:
         report["_s3_key"] = key
-    except Exception as e:
-        logger.warning(
-            "[pit_parity] S3 upload failed (best-effort, observational): %s", e
-        )
     return report

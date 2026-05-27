@@ -4461,7 +4461,7 @@ def main() -> None:
     # the contamination report and returns. Never raises into the SF — the
     # spot stage that invokes it is best-effort and non-blocking.
     if args.pit_parity:
-        from analysis.pit_parity import run_pit_parity
+        from analysis.pit_parity import run_pit_parity, write_failure_artifact
         try:
             report = run_pit_parity(config)
             print(json.dumps(
@@ -4472,10 +4472,47 @@ def main() -> None:
                 indent=2, default=str,
             ))
         except Exception as e:
+            # Per ``feedback_no_silent_fails`` secondary-observability
+            # carve-out: spot run continues (primary deliverable = weights
+            # archive + sweep), pit_parity failure is recorded on two
+            # surfaces — (1) always-emit S3 artifact at
+            # ``backtest/{date}/pit_parity.json`` with status=failed +
+            # error_class + error_msg so the operator's manual-flip gate
+            # never sees a missing artifact again; (2) Telegram + SNS
+            # alert via ``alpha_engine_lib.alerts.publish`` (sev=warning,
+            # dedup-keyed on run_date so a swept-cycle retry collapses to
+            # one alert). The 2026-05-17→2026-05-24 incident swallowed
+            # 4 silent failures with only an spot-stdout log line —
+            # the operator's gate was unreachable for 11 days.
             logger.error(
                 "[pit_parity] run failed (observational, non-fatal): %s",
                 e, exc_info=True,
             )
+            try:
+                write_failure_artifact(config, e)
+            except Exception as artifact_err:
+                logger.error(
+                    "[pit_parity] failure-artifact write also failed: %s",
+                    artifact_err,
+                )
+            try:
+                from alpha_engine_lib.alerts import publish as _alerts_publish
+                run_date = config.get("_run_date") or "unknown"
+                _alerts_publish(
+                    f"pit_parity failed on {run_date}: "
+                    f"{type(e).__name__}: {str(e)[:200]} — "
+                    f"see s3://{config.get('signals_bucket', 'alpha-engine-research')}/"
+                    f"backtest/{run_date}/pit_parity.json",
+                    severity="warning",
+                    source="alpha-engine-backtester/pit_parity",
+                    dedup_key=f"pit_parity_failed_{run_date}",
+                    dedup_window_min=720,  # 12h — one alert per Saturday cycle
+                )
+            except Exception as alert_err:
+                logger.error(
+                    "[pit_parity] operator alert publish also failed: %s",
+                    alert_err,
+                )
         return
 
     _init_pipeline(args, config)
