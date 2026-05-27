@@ -41,11 +41,24 @@
 #                                                       #   v14 spot validation confirms parity.
 #
 # Prerequisites:
-#   - AWS CLI configured (uses alpha-engine-executor-profile for S3/SES access)
-#   - SSH key at ~/.ssh/alpha-engine-key.pem
-#   - Code committed and pushed to origin (instance clones from GitHub)
-#   - .env file with EMAIL_SENDER, EMAIL_RECIPIENTS, GMAIL_APP_PASSWORD
-#   - config.yaml (gitignored — SCP'd to EC2 by this script)
+#   - AWS CLI with perms to RunInstances / TerminateInstances /
+#     DescribeInstances / SendCommand / GetCommandInvocation
+#   - alpha-engine-lib installed in the dispatcher venv (ec2_spot +
+#     ssm_dispatcher CLIs); LIB_PYTHON points at it
+#   - Code committed and pushed to origin (instance clones from GitHub
+#     via HTTPS — no SSH key needed)
+#   - .env file with EMAIL_SENDER, EMAIL_RECIPIENTS (staged to S3 by this script)
+#   - config.yaml + executor risk.yaml + predictor predictor.yaml
+#     (gitignored — staged to S3 by this script for the spot to fetch
+#     via its alpha-engine-executor-profile IAM role)
+#
+# **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 3).**
+# Mirrors alpha-engine-data PR 2 (#330). Communication with the spot is
+# now via `aws ssm send-command` wrapped at the lib chokepoint
+# `python -m alpha_engine_lib.ssm_dispatcher run`. No port-22 inbound on
+# the spot SG; no ssh / scp / ssh-keyscan. The .env + 3 config files are
+# staged to a temporary S3 prefix and pulled down by the spot. PR 3 of
+# the 5-PR L342 arc.
 #
 # For scheduled weekly runs, call this script from the always-on EC2 cron
 # or from an EventBridge → Lambda trigger:
@@ -93,8 +106,13 @@ AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
 # historically runs 60-100 min. 120 min with headroom. Bump (don't
 # silently rely on the orphan reaper) if a run legitimately needs more.
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-7200}"
+# KEY_NAME kept ONLY as launch attribute for alpha_engine_lib.ec2_spot's
+# --key-name flag — the spot still launches with the key associated, but
+# NOTHING in this script SSHs in. Communication is via SSM. KEY_FILE was
+# removed in the 2026-05-27 SSH→SSM migration (PR 3 of L342); manual
+# break-glass SSH is possible only by temporarily re-opening the SG's
+# port-22 inbound (which it should NOT be in steady state).
 KEY_NAME="alpha-engine-key"
-KEY_FILE="$HOME/.ssh/alpha-engine-key.pem"
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 # All 6 default-VPC subnets across us-east-1{a..f}. The lib CLI rotates
 # across this list on capacity error. Lockstep with data + predictor
@@ -298,15 +316,47 @@ echo "  S3 bucket     : $S3_BUCKET"
 echo ""
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
-if [ ! -f "$KEY_FILE" ]; then
-    echo "ERROR: SSH key not found at $KEY_FILE"
-    exit 1
-fi
-
 if [ ! -f "$REPO_ROOT/config.yaml" ]; then
     echo "ERROR: config.yaml not found — copy from config.yaml.example"
     exit 1
 fi
+
+# Locate the executor risk.yaml + predictor predictor.yaml on the dispatcher
+# so we can stage them to S3 for the spot. Mirrors the legacy SCP-source
+# resolution; only the transport changed.
+EXECUTOR_CONFIG=""
+for candidate in \
+    "$HOME/alpha-engine-config/executor/risk.yaml" \
+    "$HOME/Development/alpha-engine-config/executor/risk.yaml" \
+    "$HOME/alpha-engine/config/risk.yaml" \
+    "$HOME/Development/alpha-engine/config/risk.yaml"; do
+    if [ -f "$candidate" ]; then
+        EXECUTOR_CONFIG="$candidate"
+        break
+    fi
+done
+if [ -z "$EXECUTOR_CONFIG" ]; then
+    echo "ERROR: executor risk.yaml not found in any search path:" >&2
+    echo "  ~/alpha-engine-config/executor/risk.yaml" >&2
+    echo "  ~/Development/alpha-engine-config/executor/risk.yaml" >&2
+    echo "  ~/alpha-engine/config/risk.yaml (legacy)" >&2
+    echo "  ~/Development/alpha-engine/config/risk.yaml (legacy)" >&2
+    echo "Backtester simulation cannot run without the executor config — silently" >&2
+    echo "falling back to risk.yaml.example produces all-placeholder bucket names" >&2
+    echo "and ArcticDB KeyNotFoundException deep in the executor-sim run." >&2
+    exit 1
+fi
+
+PREDICTOR_CONFIG=""
+for candidate in \
+    "$HOME/alpha-engine-predictor/config/predictor.yaml" \
+    "$HOME/Development/alpha-engine-predictor/config/predictor.yaml"; do
+    if [ -f "$candidate" ]; then
+        PREDICTOR_CONFIG="$candidate"
+        break
+    fi
+done
+# PREDICTOR_CONFIG may be empty — predictor backtest is skipped if so.
 
 # ── Launch spot instance ──────────────────────────────────────────────────────
 # Capacity-resilient launch via alpha_engine_lib.ec2_spot (lib v0.26.0+).
@@ -335,18 +385,24 @@ fi
 
 echo "  Instance ID: $INSTANCE_ID"
 
-# Last `run_remote` command — captured for the EXIT-trap diagnostic so
-# a non-zero exit prints which remote call ran last. L2246.
-LAST_RUN_REMOTE_CMD=""
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${INSTANCE_ID}"
+S3_STAGING_PREFIX="tmp/spot_backtest/${RUN_ID}"
+S3_STAGING="s3://${S3_BUCKET}/${S3_STAGING_PREFIX}"
 
-# Cleanup function — always terminate the instance, with diagnostics on failure
+# Last SSM dispatch description — captured for the EXIT-trap diagnostic
+# so a non-zero exit prints which run_ssm call ran last. L2246
+# (originally LAST_RUN_REMOTE_CMD pre-2026-05-27 SSH→SSM migration).
+LAST_SSM_DESC=""
+
+# Cleanup function — always terminate the instance + clean S3 staging,
+# with diagnostics on failure.
 cleanup() {
     local exit_code=$?
     echo ""
     echo "==> Dispatcher EXIT (code=$exit_code)"
     if [ "$exit_code" -ne 0 ]; then
-        local last_cmd="${LAST_RUN_REMOTE_CMD:-<none — failed before any remote call>}"
-        echo "    last run_remote: $last_cmd"
+        local last_desc="${LAST_SSM_DESC:-<none — failed before any SSM call>}"
+        echo "    last run_ssm: $last_desc"
         local state="<not yet provisioned>"
         if [ -n "${INSTANCE_ID:-}" ]; then
             state=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "<lookup-failed>")
@@ -369,14 +425,15 @@ cleanup() {
             _alert_python="$(command -v python3 || command -v python || echo python)"
         fi
         "$_alert_python" -m alpha_engine_lib.alerts publish \
-            --message "exit_code=$exit_code last_run_remote='$last_cmd' spot_state=$state instance_id=${INSTANCE_ID:-<none>}" \
+            --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state instance_id=${INSTANCE_ID:-<none>}" \
             --severity error \
             --source alpha-engine-backtester/spot_backtest.sh \
             > /dev/null 2>&1 || echo "    (alerts.publish fan-out failed; primary stdout diagnostic above is the surface)"
     fi
     echo "==> Terminating spot instance $INSTANCE_ID..."
     aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
-    echo "  Instance terminated."
+    aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
+    echo "  Instance terminated; S3 staging cleaned."
 }
 trap cleanup EXIT
 
@@ -384,109 +441,150 @@ trap cleanup EXIT
 echo "==> Waiting for instance to enter running state..."
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
 
-# Get public IP
-PUBLIC_IP=$(aws ec2 describe-instances \
-    --instance-ids "$INSTANCE_ID" \
-    --query 'Reservations[0].Instances[0].PublicIpAddress' \
-    --output text \
-    --region "$AWS_REGION")
+# ── Stage .env + config files to S3 ──────────────────────────────────────────
+# Replaces the pre-2026-05-27 SCP path. The spot pulls each file via its
+# existing alpha-engine-executor-profile IAM role's s3:GetObject grant.
+echo "==> Staging configs to ${S3_STAGING}/"
 
-if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
-    echo "ERROR: Instance has no public IP. Check subnet/VPC configuration."
+# .env: non-secret runtime config (EMAIL_*, S3_BUCKET, etc.).
+if [ ! -f "$ENV_FILE" ]; then
+    echo "ERROR: .env not found (checked alpha-engine-data/.env, ~/.alpha-engine.env, ./.env)"
     exit 1
 fi
+aws s3 cp "$ENV_FILE" "${S3_STAGING}/backtester.env" --region "$AWS_REGION" --quiet
+echo "  staged .env from $ENV_FILE"
 
-echo "  Public IP: $PUBLIC_IP"
+# config.yaml: gitignored backtester runtime config.
+aws s3 cp "$REPO_ROOT/config.yaml" "${S3_STAGING}/config.yaml" --region "$AWS_REGION" --quiet
+echo "  staged config.yaml"
 
-# ── Wait for SSH ──────────────────────────────────────────────────────────────
-echo "==> Waiting for SSH to become available..."
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o LogLevel=ERROR"
+# Executor risk.yaml: prod path is alpha-engine-config/executor/risk.yaml
+# (private config repo pulled daily on ae-dashboard by boot-pull). Legacy
+# alpha-engine/config/ path is kept for local dev fallback but has not
+# been populated on ae-dashboard since the config-repo split (2026-04-07).
+# Hit 2026-04-20: spot silently fell back to risk.yaml.example, executor
+# read placeholder signals_bucket="your-research-bucket-name", ArcticDB
+# KeyNotFound on a nonexistent bucket. The pre-launch resolver above
+# already confirms existence — fail-loud at staging if the file went
+# missing in the gap.
+aws s3 cp "$EXECUTOR_CONFIG" "${S3_STAGING}/risk.yaml" --region "$AWS_REGION" --quiet
+echo "  staged risk.yaml from $EXECUTOR_CONFIG"
 
-for i in $(seq 1 30); do
-    if ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "echo ok" 2>/dev/null; then
-        echo "  SSH ready."
+# Predictor predictor.yaml: optional — predictor backtest is skipped if
+# absent. The pre-launch resolver above sets PREDICTOR_CONFIG="" when
+# unfound; encode that state into S3 via a sentinel file so the spot
+# bootstrap knows to skip the download.
+if [ -n "$PREDICTOR_CONFIG" ]; then
+    aws s3 cp "$PREDICTOR_CONFIG" "${S3_STAGING}/predictor.yaml" --region "$AWS_REGION" --quiet
+    echo "  staged predictor.yaml from $PREDICTOR_CONFIG"
+    STAGED_PREDICTOR_CONFIG=1
+else
+    echo "  WARNING: predictor.yaml not found — predictor backtest will be skipped"
+    STAGED_PREDICTOR_CONFIG=0
+fi
+
+# ── Wait for the SSM agent to register ───────────────────────────────────────
+# Replaces the old SSH-readiness poll. AL2023 ships the SSM agent; with the
+# instance profile's AmazonSSMManagedInstanceCore (in alpha-engine-executor-
+# profile) it registers within ~1 min.
+echo "==> Waiting for SSM agent to come Online..."
+for i in $(seq 1 36); do  # 36 × 5s = 180s budget
+    ping=$(aws ssm describe-instance-information \
+        --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+        --query 'InstanceInformationList[0].PingStatus' \
+        --output text --region "$AWS_REGION" 2>/dev/null || true)
+    if [ "$ping" = "Online" ]; then
+        echo "  SSM agent Online."
         break
     fi
-    if [ "$i" -eq 30 ]; then
-        echo "ERROR: SSH not available after 150s"
+    if [ "$i" -eq 36 ]; then
+        echo "ERROR: SSM agent not Online after 180s (instance $INSTANCE_ID)"
         exit 1
     fi
     sleep 5
 done
 
-# Helper: run command on EC2. Records the last invocation in
-# LAST_RUN_REMOTE_CMD (truncated to 200 chars to keep heredoc dumps
-# bounded) so the EXIT trap can name it in the diagnostic on failure.
-run_remote() {
-    local _cmd="$*"
-    if [ "${#_cmd}" -gt 200 ]; then
-        LAST_RUN_REMOTE_CMD="${_cmd:0:200}... (+$((${#_cmd} - 200)) chars)"
-    else
-        LAST_RUN_REMOTE_CMD="$_cmd"
-    fi
-    ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "$@"
+# ── SSM dispatch primitive (lib chokepoint) ──────────────────────────────────
+# run_ssm "<description>" [timeout_seconds] <<HEREDOC ... HEREDOC
+#
+# Thin wrapper around `python -m alpha_engine_lib.ssm_dispatcher run`
+# (lib v0.35.0+). Body read from stdin via --script-stdin so the
+# dispatcher's bash parser does not scan it for quote/paren balance.
+# Records the description in LAST_SSM_DESC so the EXIT trap can name
+# which call ran last on failure. Mirrors ae-data PR 2 (#330).
+run_ssm() {
+    local description="$1" timeout_s="${2:-3600}"
+    LAST_SSM_DESC="$description"
+    "$LIB_PYTHON" -m alpha_engine_lib.ssm_dispatcher run \
+        --instance-id "$INSTANCE_ID" \
+        --description "backtester: $description" \
+        --timeout "$timeout_s" \
+        --output-bucket "$S3_BUCKET" \
+        --output-key-prefix "${S3_STAGING_PREFIX}/ssm-output" \
+        --region "$AWS_REGION" \
+        --script-stdin
 }
 
-# ── Spot-side watchdog ──────────────────────────────────────────────────────
-# Dispatcher-side `trap cleanup EXIT` only fires when THIS bash script exits
-# cleanly. If the dispatcher SSM command is cancelled, the dispatcher EC2
-# is stopped mid-run, or the shell gets SIGKILLed, the trap never runs and
+# ── Bootstrap spot: watchdog + python + git + clone + fetch configs ─────────
+# Single SSM call covering: spot-side hard-timeout watchdog,
+# python3.12/git install, the 3 HTTPS repo clones, .env + 3 config-file
+# fetches from S3 staging. Watchdog rationale: dispatcher-side
+# `trap cleanup EXIT` only fires when THIS bash script exits cleanly.
+# If the dispatcher SSM command is cancelled, the dispatcher EC2 is
+# stopped mid-run, or the shell gets SIGKILLed, the trap never runs and
 # the spot orphans until manually terminated — hit 3 times in April 2026.
-# Transient systemd timer on the spot fires shutdown -h now after
+# Transient systemd timer fires shutdown -h now after
 # MAX_RUNTIME_SECONDS regardless of dispatcher state.
-echo "==> Installing spot-side watchdog (${MAX_RUNTIME_SECONDS}s = $((MAX_RUNTIME_SECONDS / 60)) min)..."
-run_remote "sudo systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now"
+echo "==> Bootstrapping spot (watchdog, python, clone, configs)..."
+run_ssm "bootstrap" 600 <<BOOTSTRAP
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=${AWS_REGION} AWS_DEFAULT_REGION=${AWS_REGION}
 
-# ── Bootstrap environment ──────────────────────────────────────────────────────
-echo "==> Bootstrapping EC2 environment..."
-run_remote bash -s <<'BOOTSTRAP'
-set -euo pipefail
+# Spot-side hard-timeout watchdog (see bootstrap-step rationale above).
+systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog \
+    --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now
 
-# Amazon Linux 2023: install Python 3.12, git, gcc
-sudo dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
-    sudo dnf install -y -q python3 python3-pip python3-devel git gcc
+dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
+    dnf install -y -q python3 python3-pip python3-devel git gcc
+command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3
+echo "Using: \$(\$PYTHON_BIN --version)"
 
-if command -v python3.12 &>/dev/null; then
-    PYTHON=python3.12
-else
-    PYTHON=python3
-fi
-echo "Using: $($PYTHON --version)"
-
-# SSH for GitHub
-mkdir -p ~/.ssh
-ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-BOOTSTRAP
-
-echo "==> Cloning repositories (branch: $BRANCH)..."
 # flow-doctor is now pulled in via alpha-engine-lib[flow_doctor] from
 # requirements.txt — no bundled editable install needed.
+# Three HTTPS clones (no SSH key needed; alpha-engine-lib went public
+# 2026-05-03 and these repos are public siblings).
 for REPO in alpha-engine-backtester alpha-engine alpha-engine-predictor; do
-    echo "  Cloning $REPO..."
-    ssh -A $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" \
-        "git clone --depth 1 --branch $BRANCH git@github.com:cipher813/$REPO.git /home/ec2-user/$REPO" 2>/dev/null || {
-        HTTPS_URL="https://github.com/cipher813/$REPO.git"
-        run_remote "git clone --depth 1 --branch $BRANCH $HTTPS_URL /home/ec2-user/$REPO"
-    }
+    echo "Cloning \$REPO ..."
+    git clone --depth 1 --branch ${BRANCH} https://github.com/cipher813/\$REPO.git /home/ec2-user/\$REPO
 done
 
-# ── Upload .env BEFORE pip install ─────────────────────────────────────────────
-# .env carries non-secret runtime config (EMAIL_*, S3_BUCKET, etc.) that the
-# workload sources before running. alpha-engine-lib was flipped public
-# 2026-05-03, so the spot installs it directly from git+https with no auth —
-# earlier versions of this script fetched a PAT from SSM /alpha-engine/lib-token.
-if [ ! -f "$ENV_FILE" ]; then
-    echo "ERROR: .env not found (checked alpha-engine-data/.env, ~/.alpha-engine.env, ./.env)"
-    exit 1
-fi
-echo "==> Uploading .env to spot instance..."
-scp $SSH_OPTS -i "$KEY_FILE" \
-    "$ENV_FILE" \
-    ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-backtester/.env
+# Fetch staged configs from S3.
+aws s3 cp ${S3_STAGING}/backtester.env /home/ec2-user/alpha-engine-backtester/.env --region ${AWS_REGION} --quiet
+echo "Fetched .env from ${S3_STAGING}/backtester.env"
 
+aws s3 cp ${S3_STAGING}/config.yaml /home/ec2-user/alpha-engine-backtester/config.yaml --region ${AWS_REGION} --quiet
+echo "Fetched config.yaml"
+
+mkdir -p /home/ec2-user/alpha-engine/config
+aws s3 cp ${S3_STAGING}/risk.yaml /home/ec2-user/alpha-engine/config/risk.yaml --region ${AWS_REGION} --quiet
+echo "Fetched risk.yaml"
+
+if [ "${STAGED_PREDICTOR_CONFIG}" = "1" ]; then
+    mkdir -p /home/ec2-user/alpha-engine-predictor/config
+    aws s3 cp ${S3_STAGING}/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml --region ${AWS_REGION} --quiet
+    echo "Fetched predictor.yaml"
+else
+    echo "predictor.yaml NOT staged (predictor backtest will be skipped)"
+fi
+
+echo "Bootstrap complete: 3 repos cloned, 3-4 configs fetched from ${S3_STAGING}."
+BOOTSTRAP
+
+# ── Install python dependencies ──────────────────────────────────────────────
 echo "==> Installing Python dependencies..."
-run_remote bash -s <<'DEPS'
-set -euo pipefail
+run_ssm "deps" 1200 <<DEPS
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=${AWS_REGION} AWS_DEFAULT_REGION=${AWS_REGION}
 cd /home/ec2-user/alpha-engine-backtester
 
 # Source .env for non-secret runtime vars (EMAIL_*, S3_BUCKET, etc.).
@@ -497,112 +595,44 @@ set -a
 source /home/ec2-user/alpha-engine-backtester/.env
 set +a
 
-if command -v python3.12 &>/dev/null; then
-    PIP="python3.12 -m pip"
-else
-    PIP="python3 -m pip"
-fi
+command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
 
-$PIP install --upgrade pip -q
-$PIP install -q -r requirements.txt
+\$PIP install --upgrade pip -q
+\$PIP install -q -r requirements.txt
 
 # Also install predictor deps (needed for GBM inference + feature computation)
 cd /home/ec2-user/alpha-engine-predictor
 if [ -f requirements.txt ]; then
-    $PIP install -q -r requirements.txt 2>/dev/null || true
+    \$PIP install -q -r requirements.txt 2>/dev/null || true
 fi
 
 # Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)
-$PIP install -q 'numpy<2'
+\$PIP install -q 'numpy<2'
 
 echo "Dependencies installed."
 DEPS
 
-# ── Copy remaining config files ─────────────────────────────────────────────────
-echo "==> Uploading config.yaml..."
-scp $SSH_OPTS -i "$KEY_FILE" \
-    "$REPO_ROOT/config.yaml" \
-    ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-backtester/config.yaml
-
-# Copy executor config (needed for simulation).
-# Prod path is alpha-engine-config/executor/risk.yaml — the private config
-# repo pulled daily on ae-dashboard by boot-pull. Legacy alpha-engine/config/
-# path is kept for local dev fallback but has not been populated on
-# ae-dashboard since the config-repo split (2026-04-07). Hit 2026-04-20:
-# spot silently fell back to risk.yaml.example, executor read placeholder
-# signals_bucket="your-research-bucket-name", ArcticDB KeyNotFound on a
-# nonexistent bucket.
-EXECUTOR_CONFIG=""
-for candidate in \
-    "$HOME/alpha-engine-config/executor/risk.yaml" \
-    "$HOME/Development/alpha-engine-config/executor/risk.yaml" \
-    "$HOME/alpha-engine/config/risk.yaml" \
-    "$HOME/Development/alpha-engine/config/risk.yaml"; do
-    if [ -f "$candidate" ]; then
-        EXECUTOR_CONFIG="$candidate"
-        break
-    fi
-done
-
-if [ -z "$EXECUTOR_CONFIG" ]; then
-    echo "ERROR: executor risk.yaml not found in any search path:" >&2
-    echo "  ~/alpha-engine-config/executor/risk.yaml" >&2
-    echo "  ~/Development/alpha-engine-config/executor/risk.yaml" >&2
-    echo "  ~/alpha-engine/config/risk.yaml (legacy)" >&2
-    echo "  ~/Development/alpha-engine/config/risk.yaml (legacy)" >&2
-    echo "Backtester simulation cannot run without the executor config — silently" >&2
-    echo "falling back to risk.yaml.example produces all-placeholder bucket names" >&2
-    echo "and ArcticDB KeyNotFoundException deep in the executor-sim run." >&2
-    exit 1
-fi
-echo "  Uploading risk.yaml from $EXECUTOR_CONFIG"
-run_remote "mkdir -p /home/ec2-user/alpha-engine/config"
-scp $SSH_OPTS -i "$KEY_FILE" \
-    "$EXECUTOR_CONFIG" \
-    ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine/config/risk.yaml
-
-# Copy predictor config (needed for predictor backtest).
-PREDICTOR_CONFIG=""
-for candidate in \
-    "$HOME/alpha-engine-predictor/config/predictor.yaml" \
-    "$HOME/Development/alpha-engine-predictor/config/predictor.yaml"; do
-    if [ -f "$candidate" ]; then
-        PREDICTOR_CONFIG="$candidate"
-        break
-    fi
-done
-
-if [ -n "$PREDICTOR_CONFIG" ]; then
-    echo "  Uploading predictor.yaml from $PREDICTOR_CONFIG"
-    run_remote "mkdir -p /home/ec2-user/alpha-engine-predictor/config"
-    scp $SSH_OPTS -i "$KEY_FILE" \
-        "$PREDICTOR_CONFIG" \
-        ec2-user@"$PUBLIC_IP":/home/ec2-user/alpha-engine-predictor/config/predictor.yaml
-else
-    echo "  WARNING: predictor.yaml not found — predictor backtest will be skipped"
-fi
-
-# Bootstrap predictor data cache: only sector_map.json is consumed
-# (predictor_backtest.load_sector_map). The former price_cache_slim sync
-# was Wave-4 dead staging — predictor_backtest loads prices+features from
-# ArcticDB (load_universe_from_arctic), never the local cache parquets;
-# verified no data/cache/*.parquet reader exists. Removed in Wave-4 PR4.
+# ── Predictor sector_map cache fetch ─────────────────────────────────────────
+# Only sector_map.json is consumed (predictor_backtest.load_sector_map).
+# The former price_cache_slim sync was Wave-4 dead staging —
+# predictor_backtest loads prices+features from ArcticDB
+# (load_universe_from_arctic), never the local cache parquets; verified
+# no data/cache/*.parquet reader exists. Removed in Wave-4 PR4.
 echo "==> Downloading predictor sector_map from S3..."
-run_remote bash -s <<'CACHE'
-set -euo pipefail
+run_ssm "predictor-cache" 300 <<'CACHE'
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp
 CACHE_DIR="/home/ec2-user/alpha-engine-predictor/data/cache"
 mkdir -p "$CACHE_DIR"
-if command -v aws &>/dev/null; then
-    # Wave-3 reader migration (ROADMAP L1401): try new
-    # reference/price_cache/sector_map.json first, fall back to
-    # legacy predictor/price_cache/ during the write-both soak.
-    # Wave-4: former `aws s3 sync price_cache_slim/` removed — dead
-    # staging (predictor_backtest loads from ArcticDB, never reads
-    # data/cache/*.parquet).
-    aws s3 cp s3://alpha-engine-research/reference/price_cache/sector_map.json "$CACHE_DIR/sector_map.json" 2>/dev/null \
-        || aws s3 cp s3://alpha-engine-research/predictor/price_cache/sector_map.json "$CACHE_DIR/sector_map.json" 2>/dev/null \
-        || true
-fi
+# Wave-3 reader migration (ROADMAP L1401): try new
+# reference/price_cache/sector_map.json first, fall back to legacy
+# predictor/price_cache/ during the write-both soak. Wave-4: former
+# `aws s3 sync price_cache_slim/` removed — dead staging
+# (predictor_backtest loads from ArcticDB, never reads
+# data/cache/*.parquet).
+aws s3 cp s3://alpha-engine-research/reference/price_cache/sector_map.json "$CACHE_DIR/sector_map.json" 2>/dev/null \
+    || aws s3 cp s3://alpha-engine-research/predictor/price_cache/sector_map.json "$CACHE_DIR/sector_map.json" 2>/dev/null \
+    || true
 echo "Predictor cache dir: sector_map.json $([ -f "$CACHE_DIR/sector_map.json" ] && echo present || echo MISSING)"
 CACHE
 
@@ -633,10 +663,17 @@ CACHE
 # ${AWS_REGION:-us-east-1} defaults). Origin: 2026-05-16 Saturday SF
 # PredictorTraining failure (spot_train.sh sibling) — audited forward to
 # prevent the identical Backtester/Parity/Evaluator failure.
-ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1;'
+ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1; command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3; export PYTHON_BIN;'
 
-# Determine python binary on remote
-REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
+# Spot-side python is resolved inline per SSM step via PYTHON_BIN in the
+# ENV_SOURCE above. The pre-2026-05-27 SSH transport captured this on the
+# dispatcher with `REMOTE_PYTHON=$(run_remote "command -v ...")` — under
+# SSM there's no native way to capture inner-script stdout into a
+# dispatcher variable, so the resolution is repeated inside each heredoc
+# (cheap — just a $PATH probe). REMOTE_PYTHON kept as a name alias for
+# the per-heredoc reference, set to the env-var form $PYTHON_BIN that
+# ENV_SOURCE binds at runtime on the spot.
+REMOTE_PYTHON='$PYTHON_BIN'
 
 # ── Preflight-only (Friday shell_run dry path) ──────────────────────────────
 # ROADMAP "Friday shell-run — per-module dry-path activation" owed-item #3.
@@ -680,8 +717,8 @@ if [ "$PREFLIGHT_ONLY" = "1" ]; then
     echo "  then exit 0 — NO sweep / sim / parity / evaluator / auto-apply,"
     echo "  ZERO external API calls, ZERO S3/config writes."
     echo "═══════════════════════════════════════════════════════════════"
-    run_remote bash -s <<PREFLIGHT
-set -euo pipefail
+    run_ssm "preflight-only" 900 <<PREFLIGHT
+set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
@@ -713,8 +750,8 @@ if [ "$RUN_MODE" = "smoke-only" ]; then
     # at startup — no drift between bash-driven smoke and in-process
     # pipeline validation. Evaluate-mode smoke follows: artifact-read
     # path + BacktesterPreflight(mode="evaluate").
-    run_remote bash -s <<SMOKE
-set -euo pipefail
+    run_ssm "smoke" 3600 <<SMOKE
+set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
@@ -901,8 +938,8 @@ echo "  FULL BACKTEST (--mode $BACKTEST_MODE)"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
-run_remote bash -s <<BACKTEST
-set -euo pipefail
+run_ssm "backtest" "$MAX_RUNTIME_SECONDS" <<BACKTEST
+set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
