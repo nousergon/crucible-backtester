@@ -512,6 +512,13 @@ done
 # dispatcher's bash parser does not scan it for quote/paren balance.
 # Records the description in LAST_SSM_DESC so the EXIT trap can name
 # which call ran last on failure. Mirrors ae-data PR 2 (#330).
+#
+# L394 cascade: --diagnostics-bucket + --diagnostics-prefix activate the
+# lib v0.39.0 chokepoint that writes a JSON failure record (status +
+# command_id + 4KB stdout/stderr tails + instance_id) to
+# s3://${S3_BUCKET}/_spot_diagnostics/ae-backtester/{YYYY-MM-DD}.json on
+# terminal non-Success. Best-effort write inside the lib — S3 failure
+# swallowed; inner SSM exit always preserved. No-op on Success.
 run_ssm() {
     local description="$1" timeout_s="${2:-3600}"
     LAST_SSM_DESC="$description"
@@ -522,6 +529,8 @@ run_ssm() {
         --output-bucket "$S3_BUCKET" \
         --output-key-prefix "${S3_STAGING_PREFIX}/ssm-output" \
         --region "$AWS_REGION" \
+        --diagnostics-bucket "$S3_BUCKET" \
+        --diagnostics-prefix "_spot_diagnostics/ae-backtester" \
         --script-stdin
 }
 
