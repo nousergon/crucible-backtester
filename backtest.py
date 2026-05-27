@@ -2290,6 +2290,98 @@ def run_portfolio_optimizer_gate(
     return payload
 
 
+def run_cov_estimator_sweep_stage(
+    config: dict,
+    run_date: str,
+    s3_client=None,
+) -> dict:
+    """Run the covariance-estimator sweep (A.4) over synthetic predictor
+    history and persist the verdict to
+    ``s3://{bucket}/backtest/{run_date}/cov_sweep.json``.
+
+    ROADMAP A.4b — without this CLI wiring the sweep verdict is operator-
+    on-demand. Saturday SF integration: when ``--mode all`` runs (or
+    ``portfolio-optimizer-backtest`` for ad-hoc), this stage fires the
+    8-cell LW/OAS/EWMA × H × λ sweep and writes the report alongside
+    the existing ``portfolio_optimizer_gate`` artifact for the operator's
+    covariance-cutover decision.
+
+    The sweep itself is non-fatal — like the optimizer gate, this is
+    observability, not a backtester-pipeline blocker. Returns the
+    report dict; raises on construction failure (mirrors
+    ``run_portfolio_optimizer_gate`` semantics).
+
+    Default cells (from ``analysis.portfolio_optimizer_backtest.default_cov_sweep_cells``):
+    LW (Ledoit-Wolf) × OAS × pure EWMA × EWMA+Ledoit-Wolf, each at
+    H ∈ {1, 21} sigma_horizon_days and λ_decay ∈ {0.94, 0.97} for the
+    EWMA variants. Baseline (first cell) is LW + H=1 (legacy MVO).
+    """
+    import os
+    import boto3
+    from analysis.portfolio_optimizer_backtest import (
+        run_cov_estimator_sweep,
+    )
+    from synthetic.predictor_backtest import run as run_predictor_pipeline
+
+    logger.info("cov_estimator_sweep: starting")
+
+    executor_paths = config.get("executor_paths", [])
+    if isinstance(executor_paths, str):
+        executor_paths = [executor_paths]
+    executor_path = next((p for p in executor_paths if os.path.isdir(p)), None)
+    if not executor_path:
+        raise ValueError(
+            f"executor_paths not found on disk: {executor_paths}. "
+            "Add the alpha-engine repo root to executor_paths in config.yaml."
+        )
+
+    pred_result = run_predictor_pipeline(config, keep_predictions=True)
+    if pred_result.get("status") != "ok":
+        logger.warning(
+            "cov_estimator_sweep: predictor backtest status=%s — sweep skipped",
+            pred_result.get("status"),
+        )
+        return {
+            "run_date": run_date,
+            "status": "skipped",
+            "reason": f"predictor backtest status={pred_result.get('status')!r}",
+        }
+
+    sweep_report = run_cov_estimator_sweep(
+        predictions_by_date=pred_result["predictions_by_date"],
+        price_matrix=pred_result["price_matrix"],
+        spy_prices=pred_result["spy_prices"],
+        sector_map=pred_result["sector_map"],
+        executor_path=executor_path,
+    )
+
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    key = f"backtest/{run_date}/cov_sweep.json"
+    payload = {
+        "run_date": run_date,
+        "status": "ok",
+        **sweep_report,
+    }
+    body = json.dumps(payload, default=str, indent=2).encode("utf-8")
+
+    s3 = s3_client or boto3.client("s3")
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+        logger.info("cov_estimator_sweep: persisted s3://%s/%s", bucket, key)
+    except Exception as exc:
+        logger.warning(
+            "cov_estimator_sweep: S3 persist failed (non-fatal): %s", exc,
+        )
+
+    logger.info(
+        "cov_estimator_sweep: baseline=%s winner=%s ranking_top=%s",
+        sweep_report.get("baseline_name"),
+        sweep_report.get("winner_name"),
+        (sweep_report.get("ranking") or [(None, None)])[0],
+    )
+    return payload
+
+
 def run_predictor_backtest(config: dict) -> dict:
     """
     Run predictor-only historical backtest: generate synthetic signals from
@@ -4299,6 +4391,36 @@ def main() -> None:
             if fd:
                 fd.report(exc, severity="warning", context={
                     "site": "portfolio_optimizer_gate", "mode": args.mode})
+
+    # ── Covariance-estimator sweep (A.4) ──────────────────────────────────
+    # ROADMAP A.4b — runs the 8-cell LW/OAS/EWMA × H × λ sweep over the
+    # SAME predictor backtest history the optimizer gate above consumes
+    # (a separate run_predictor_pipeline call inside the stage; ~+4 min
+    # bounded). Persists the verdict to s3://{bucket}/backtest/{date}/
+    # cov_sweep.json so the operator + Saturday SF Backtester report
+    # can read the winner without an on-demand dispatch.
+    #
+    # Non-fatal — sweep failures are observability, not a backtester-
+    # pipeline blocker. The flip from baseline cov estimator to the
+    # sweep winner is operator-gated (see ROADMAP A.4 cutover verdict
+    # gate: PSR ≥ 0.95, max_dd ≥ -0.35, CVaR ≥ -0.05, Sortino ≥
+    # baseline × 0.9). This wiring emits the report; the flip itself is
+    # a separate config edit in alpha-engine-config/executor/risk.yaml.
+    if args.mode in ("portfolio-optimizer-backtest", "all"):
+        try:
+            with registry.phase("cov_estimator_sweep", mode=args.mode):
+                run_cov_estimator_sweep_stage(
+                    config=config,
+                    run_date=args.date,
+                )
+        except Exception as exc:
+            logger.warning(
+                "cov_estimator_sweep phase failed (non-fatal): %s",
+                exc, exc_info=True,
+            )
+            if fd:
+                fd.report(exc, severity="warning", context={
+                    "site": "cov_estimator_sweep", "mode": args.mode})
 
     # ── Export simulation artifacts for evaluator ────────────────────────
     if args.mode in ("simulate", "param-sweep", "all", "predictor-backtest"):

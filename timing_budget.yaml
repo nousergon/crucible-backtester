@@ -150,3 +150,13 @@ full_run_hard_caps_seconds:
   # absorb cold spot variance + cvxpy ECOS solver outliers; if a run trips
   # this, investigate before widening — the optimizer should be fast.
   portfolio_optimizer_gate: 1800.0
+
+  # cov_estimator_sweep (ROADMAP A.4b, 2026-05-27): 8 sweep cells × the
+  # same optimizer backtest the gate above runs. Each cell = ~10s of
+  # solve + dataframe ops, plus a one-time predictor backtest fetch
+  # (~4 min, shared with run_portfolio_optimizer_gate but called
+  # separately inside this stage). 30 min cap absorbs cold spot
+  # variance + the 8× repeat. The 5%-of-budget alarm fires at ~90s/cell,
+  # which is the operator-recognizable signal that one cell is
+  # solver-degenerate.
+  cov_estimator_sweep: 1800.0
