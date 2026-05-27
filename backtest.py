@@ -2382,6 +2382,172 @@ def run_cov_estimator_sweep_stage(
     return payload
 
 
+def _load_alpha_uncertainty_from_predictions_archive(
+    bucket: str,
+    target_dates: list[str],
+    s3_client=None,
+) -> dict[str, dict[str, float]]:
+    """Load ``predicted_alpha_std`` per ticker from the production
+    predictions archive for each date in ``target_dates``.
+
+    Returns ``{date: {ticker: std}}`` filtered to dates where the
+    archive carries non-None std values. Dates without the archive
+    file are silently skipped (None means BR cutover hadn't promoted
+    yet for that date). The caller decides whether the resulting
+    coverage is sufficient.
+    """
+    import boto3
+
+    s3 = s3_client or boto3.client("s3")
+    out: dict[str, dict[str, float]] = {}
+    for date_str in target_dates:
+        key = f"predictor/predictions/{date_str}.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+        except Exception:
+            continue
+        try:
+            doc = json.loads(obj["Body"].read())
+        except Exception:
+            continue
+        per_ticker = {
+            ticker: float(entry["predicted_alpha_std"])
+            for ticker, entry in (doc.get("predictions") or {}).items()
+            if isinstance(entry, dict)
+            and entry.get("predicted_alpha_std") is not None
+        }
+        if per_ticker:
+            out[date_str] = per_ticker
+    return out
+
+
+_GAMMA_SWEEP_MIN_DATE_COVERAGE = 10
+
+
+def run_gamma_sweep_stage(
+    config: dict,
+    run_date: str,
+    s3_client=None,
+) -> dict:
+    """Run the α̂-uncertainty γ-sweep (B.4) over synthetic predictor history
+    augmented with production σ_α̂, and persist the verdict to
+    ``s3://{bucket}/backtest/{run_date}/gamma_sweep.json``.
+
+    ROADMAP B.4b — without this CLI wiring the sweep verdict is operator-
+    on-demand. Auto-skips when σ_α̂ coverage is insufficient (i.e.
+    before predictor B.1 has accumulated enough Saturday cycles emitting
+    non-None ``predicted_alpha_std``); activates automatically once
+    coverage clears the ``_GAMMA_SWEEP_MIN_DATE_COVERAGE`` threshold.
+
+    The sweep itself is non-fatal — like the optimizer gate and cov-
+    sweep, this is observability, not a backtester-pipeline blocker.
+
+    Default cells from ``default_gamma_sweep_cells()``: γ ∈ {0.0, 0.05,
+    0.10, 0.20, 0.40}. Baseline (first cell) is γ=0 (legacy MVO behavior).
+    """
+    import os
+    import boto3
+    from analysis.portfolio_optimizer_backtest import (
+        run_gamma_sweep,
+    )
+    from synthetic.predictor_backtest import run as run_predictor_pipeline
+
+    logger.info("gamma_sweep: starting")
+
+    executor_paths = config.get("executor_paths", [])
+    if isinstance(executor_paths, str):
+        executor_paths = [executor_paths]
+    executor_path = next((p for p in executor_paths if os.path.isdir(p)), None)
+    if not executor_path:
+        raise ValueError(
+            f"executor_paths not found on disk: {executor_paths}. "
+            "Add the alpha-engine repo root to executor_paths in config.yaml."
+        )
+
+    pred_result = run_predictor_pipeline(config, keep_predictions=True)
+    if pred_result.get("status") != "ok":
+        logger.warning(
+            "gamma_sweep: predictor backtest status=%s — sweep skipped",
+            pred_result.get("status"),
+        )
+        return {
+            "run_date": run_date,
+            "status": "skipped",
+            "reason": f"predictor backtest status={pred_result.get('status')!r}",
+        }
+
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    target_dates = sorted(pred_result["predictions_by_date"].keys())
+    alpha_uncertainty_by_date = (
+        _load_alpha_uncertainty_from_predictions_archive(
+            bucket=bucket,
+            target_dates=target_dates,
+            s3_client=s3_client,
+        )
+    )
+
+    if len(alpha_uncertainty_by_date) < _GAMMA_SWEEP_MIN_DATE_COVERAGE:
+        # σ_α̂ coverage too sparse — γ-sweep against missing uncertainty
+        # collapses every cell to the baseline solve, so the verdict
+        # carries no information. Skip until predictor B.1 has accumulated
+        # enough Saturday cycles emitting non-None predicted_alpha_std.
+        reason = (
+            f"insufficient σ_α̂ coverage: "
+            f"{len(alpha_uncertainty_by_date)} of {len(target_dates)} dates "
+            f"have non-None predicted_alpha_std "
+            f"(threshold {_GAMMA_SWEEP_MIN_DATE_COVERAGE}); "
+            "γ-sweep cannot meaningfully run yet. Activates automatically "
+            "once predictor B.1 (BayesianRidge) has emitted std on enough "
+            "Saturday cycles."
+        )
+        logger.warning("gamma_sweep: skipped — %s", reason)
+        return {
+            "run_date": run_date,
+            "status": "skipped",
+            "reason": reason,
+            "n_dates_with_uncertainty": len(alpha_uncertainty_by_date),
+            "n_target_dates": len(target_dates),
+        }
+
+    sweep_report = run_gamma_sweep(
+        predictions_by_date=pred_result["predictions_by_date"],
+        price_matrix=pred_result["price_matrix"],
+        spy_prices=pred_result["spy_prices"],
+        sector_map=pred_result["sector_map"],
+        executor_path=executor_path,
+        alpha_uncertainty_by_date=alpha_uncertainty_by_date,
+    )
+
+    key = f"backtest/{run_date}/gamma_sweep.json"
+    payload = {
+        "run_date": run_date,
+        "status": "ok",
+        "n_dates_with_uncertainty": len(alpha_uncertainty_by_date),
+        "n_target_dates": len(target_dates),
+        **sweep_report,
+    }
+    body = json.dumps(payload, default=str, indent=2).encode("utf-8")
+
+    s3 = s3_client or boto3.client("s3")
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+        logger.info("gamma_sweep: persisted s3://%s/%s", bucket, key)
+    except Exception as exc:
+        logger.warning(
+            "gamma_sweep: S3 persist failed (non-fatal): %s", exc,
+        )
+
+    logger.info(
+        "gamma_sweep: baseline=%s winner=%s ranking_top=%s coverage=%d/%d",
+        sweep_report.get("baseline_name"),
+        sweep_report.get("winner_name"),
+        (sweep_report.get("ranking") or [(None, None)])[0],
+        len(alpha_uncertainty_by_date),
+        len(target_dates),
+    )
+    return payload
+
+
 def run_predictor_backtest(config: dict) -> dict:
     """
     Run predictor-only historical backtest: generate synthetic signals from
@@ -4421,6 +4587,42 @@ def main() -> None:
             if fd:
                 fd.report(exc, severity="warning", context={
                     "site": "cov_estimator_sweep", "mode": args.mode})
+
+    # ── α̂-uncertainty γ-sweep (B.4) ──────────────────────────────────────
+    # ROADMAP B.4b — runs the γ-sweep over the same predictor backtest
+    # history the optimizer gate above consumes (a separate
+    # run_predictor_pipeline call inside the stage; ~+4 min bounded),
+    # augmented with σ_α̂ loaded from the production predictions
+    # archive. Persists verdict to s3://{bucket}/backtest/{date}/
+    # gamma_sweep.json.
+    #
+    # Auto-skips when σ_α̂ coverage is insufficient (i.e. before
+    # predictor B.1 has accumulated enough Saturday cycles emitting
+    # non-None predicted_alpha_std). Activates automatically once
+    # coverage clears the _GAMMA_SWEEP_MIN_DATE_COVERAGE threshold —
+    # no operator flip needed.
+    #
+    # Non-fatal — sweep failures are observability, not a backtester-
+    # pipeline blocker. The flip from γ=0 (baseline MVO) to the
+    # sweep winner is operator-gated (see ROADMAP B.5 cutover gate:
+    # PSR ≥ 0.95, max_dd ≥ -0.35, CVaR ≥ -0.05, Sortino ≥ baseline ×
+    # 0.9, AND ≥2-3 trading days of shadow-log ablation deltas AND
+    # operator explicit go-ahead).
+    if args.mode in ("portfolio-optimizer-backtest", "all"):
+        try:
+            with registry.phase("gamma_sweep", mode=args.mode):
+                run_gamma_sweep_stage(
+                    config=config,
+                    run_date=args.date,
+                )
+        except Exception as exc:
+            logger.warning(
+                "gamma_sweep phase failed (non-fatal): %s",
+                exc, exc_info=True,
+            )
+            if fd:
+                fd.report(exc, severity="warning", context={
+                    "site": "gamma_sweep", "mode": args.mode})
 
     # ── Export simulation artifacts for evaluator ────────────────────────
     if args.mode in ("simulate", "param-sweep", "all", "predictor-backtest"):
