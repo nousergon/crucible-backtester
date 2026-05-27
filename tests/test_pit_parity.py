@@ -150,6 +150,143 @@ def test_run_pit_parity_incomplete_pass_yields_status_report(monkeypatch):
     fake_bt = types.ModuleType("backtest")
     fake_bt.run_predictor_backtest = lambda cfg: {"status": "insufficient_data"}
     monkeypatch.setitem(sys.modules, "backtest", fake_bt)
+
+    # Always-emit-artifact contract: the incomplete-status path must also
+    # upload, not just return a dict. Prior to 2026-05-27 this path was
+    # silent — same bug class as the cyclic-deepcopy incident.
+    captured: list[dict] = []
+
+    class _RecordingS3:
+        def put_object(self, **kw):
+            captured.append(kw)
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _RecordingS3()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
     rep = pp.run_pit_parity({"signals_bucket": "b", "_run_date": "2026-05-17"})
     assert rep["status"] == "incomplete"
     assert rep["observational"] is True
+    assert rep["_s3_key"] == "backtest/2026-05-17/pit_parity.json"
+    assert len(captured) == 1
+    body = captured[0]["Body"]
+    assert b'"status": "incomplete"' in body if isinstance(body, bytes) else \
+        '"status": "incomplete"' in body
+
+
+def test_run_pit_parity_survives_cyclic_runtime_handle(monkeypatch):
+    """Regression for 2026-05-17→2026-05-24 silent failure.
+
+    The live ``config`` carries ``_phase_registry`` whose ``.s3_client``
+    has botocore service-model backrefs that recurse past the Python
+    stack limit under ``copy.deepcopy``. Saturday SF firings since
+    #221 merged silently swallowed the RecursionError, leaving Brian's
+    manual-flip gate unreachable for 11 days.
+
+    Mirror the existing strip-pattern at ``backtest.py:862`` and pin
+    behaviour against the failure shape that bit us.
+    """
+    # Build a self-referential cyclic object — same shape as
+    # PhaseRegistry.s3_client's botocore service_model chain. Plain
+    # deepcopy on this raises RecursionError.
+    class _Cycle:
+        pass
+    cyclic = _Cycle()
+    cyclic.back = cyclic  # type: ignore[attr-defined]
+
+    seen: list[bool] = []
+
+    def fake_run_predictor_backtest(cfg):
+        # Whatever escapes the strip+deepcopy must NOT carry the cyclic
+        # runtime handle into the per-pass cfg.
+        assert "_phase_registry" not in cfg
+        seen.append(cfg["walk_forward"])
+        s = _stats(1.0 if not cfg["walk_forward"] else 0.7,
+                   0.9, -0.03, -0.15, [0.01, 0.0], 0.03)
+        if cfg["walk_forward"]:
+            s["predictor_metadata"] = {"walk_forward": {"n_folds": 8}}
+        return s
+
+    fake_bt = types.ModuleType("backtest")
+    fake_bt.run_predictor_backtest = fake_run_predictor_backtest
+    monkeypatch.setitem(sys.modules, "backtest", fake_bt)
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: type(
+        "_S", (), {"put_object": lambda self, **kw: None}
+    )()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    config = {
+        "signals_bucket": "b",
+        "_run_date": "2026-05-24",
+        "_phase_registry": cyclic,  # the failure-mode key
+    }
+
+    # Must not raise — and BOTH passes must run with walk_forward toggled.
+    rep = pp.run_pit_parity(config)
+    assert seen == [False, True]
+    assert rep["delta_pit_minus_current"]["sortino_ratio"] == pytest.approx(-0.3)
+
+
+def test_config_without_runtime_handles_explicit_allowlist():
+    """The strip is an explicit-allowlist, NOT a prefix filter.
+
+    Load-bearing ``_run_date`` (read at line 213 of run_pit_parity) must
+    survive the strip; only the named runtime handles are dropped.
+    """
+    cfg = {
+        "signals_bucket": "b",
+        "_run_date": "2026-05-24",
+        "_phase_registry": object(),
+        "walk_forward": False,
+    }
+    safe = pp._config_without_runtime_handles(cfg)
+    assert "_phase_registry" not in safe
+    assert safe["_run_date"] == "2026-05-24"  # not stripped
+    assert safe["signals_bucket"] == "b"
+    assert safe["walk_forward"] is False
+
+
+def test_write_failure_artifact_uploads_status_failed(monkeypatch):
+    """The outer-exception path emits a ``status=failed`` artifact so
+    Brian's manual-flip gate always has something to read. Pins the
+    artifact shape that the operator's review process depends on.
+    """
+    captured: list[dict] = []
+
+    class _RecordingS3:
+        def put_object(self, **kw):
+            captured.append(kw)
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _RecordingS3()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    config = {"signals_bucket": "b", "_run_date": "2026-05-24"}
+    rep = pp.write_failure_artifact(config, RecursionError("maximum recursion depth exceeded"))
+
+    assert rep["status"] == "failed"
+    assert rep["error_class"] == "RecursionError"
+    assert "recursion" in rep["error_msg"]
+    assert rep["_s3_key"] == "backtest/2026-05-24/pit_parity.json"
+    assert len(captured) == 1
+
+
+def test_write_failure_artifact_swallows_upload_error(monkeypatch):
+    """Failure-artifact write is itself observational — an S3 failure
+    on the failure-write path must not raise. The Telegram alert in
+    ``backtest.py::main`` is the redundant surface."""
+    class _Boom:
+        def put_object(self, **kw):
+            raise RuntimeError("S3 down")
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _Boom()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    rep = pp.write_failure_artifact(
+        {"signals_bucket": "b", "_run_date": "2026-05-24"},
+        ValueError("synthetic"),
+    )
+    assert rep["status"] == "failed"
+    assert "_s3_key" not in rep  # upload failed but write_failure_artifact returned

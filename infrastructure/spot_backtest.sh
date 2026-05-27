@@ -1025,9 +1025,20 @@ fi
 # if the dispatcher bake is ever bypassed).
 if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ] && ! _stage_skipped backtest; then
     echo "▶ stage=pit_parity START at \$(date -u +%H:%M:%S) (observational, non-blocking)"
+    # Swallow on non-zero exit per feedback_no_silent_fails secondary-
+    # observability carve-out: (a) failure mode swallowed = pit_parity
+    # exception path (backtester continues either way); (b) primary
+    # deliverable survives = weights archive + sweep + evaluator pipeline
+    # are independent of pit_parity; (c) concrete recording surfaces =
+    # (1) S3 artifact at backtest/{date}/pit_parity.json with status=failed
+    # always emitted by backtest.py::main pit_parity branch (since
+    # 2026-05-27); (2) Telegram + SNS alert via alpha_engine_lib.alerts
+    # (sev=warning, dedup-keyed on run_date). 2026-05-17→2026-05-24
+    # incident: this swallow ate 4 RecursionError silently before the
+    # contract was added.
     $REMOTE_PYTHON -u backtest.py --mode predictor-backtest --pit-parity \\
         --date "\${RUN_DATE}" --log-level INFO 2>&1 \\
-        || echo "WARNING: pit_parity stage failed (observational — spot run continues)"
+        || echo "WARNING: pit_parity stage failed (observational — spot run continues; failure-artifact + Telegram alert published by the inner Python)"
     echo "▶ stage=pit_parity END at \$(date -u +%H:%M:%S)"
 else
     echo "⊘ stage=pit_parity SKIPPED (PIT_PARITY_ENABLED!=1 — opt-in observational)"
