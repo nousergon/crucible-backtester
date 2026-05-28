@@ -132,6 +132,26 @@ class TestLoadPrecomputedFeatureMaps:
             f"Expected only GOOD; got {atr}"
         )
 
+    def test_dropped_atr_tickers_named_in_warning(self, caplog):
+        """No-silent-fails (L3147): dropped tickers + reasons must be named
+        in a WARN, not just counted. A cohort ticker in this set is the
+        opaque ``atr_map missing {ticker}`` failure deep in decide_entries."""
+        import logging
+        dates = pd.DatetimeIndex(["2024-01-02"])
+        rows = {
+            "NANATR": pd.DataFrame({"atr_14_pct": [float("nan")], "VWAP": [100.0]}, index=dates),
+            "NOATRCOL": pd.DataFrame({"VWAP": [50.0]}, index=dates),
+            "GOOD": pd.DataFrame({"atr_14_pct": [0.02], "VWAP": [100.0]}, index=dates),
+        }
+        with _mock_bulk_read(rows):
+            with caplog.at_level(logging.WARNING, logger="store.feature_maps"):
+                feature_maps.load_precomputed_feature_maps("test-bucket")
+
+        warns = " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "NANATR" in warns and "nan_last_row" in warns
+        assert "NOATRCOL" in warns and "missing_atr_14_pct_column" in warns
+        assert "GOOD" not in warns
+
     def test_library_open_failure_hard_fails(self):
         fake_adb = MagicMock()
         fake_adb.Arctic.side_effect = RuntimeError("arctic unreachable")

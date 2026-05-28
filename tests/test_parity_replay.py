@@ -1003,6 +1003,31 @@ class TestEmitDegradedParityResult:
         assert df.iloc[0]["capture_rate"] == 0.0
         assert df.iloc[0]["run_date"] == "2026-04-26"
 
+    def test_backtester_replay_error_emits_report_and_row(self, monkeypatch, tmp_path):
+        # L3147: a raising replay (e.g. cohort ticker with NaN ATR hard-fails
+        # decide_entries) must still produce parity_report.json + a metrics
+        # row so the trend shows a step-change, not a silent gap.
+        store: dict = {}
+        self._patch_s3(monkeypatch, store)
+        monkeypatch.setenv("PARITY_REPORT_DIR", str(tmp_path))
+        monkeypatch.setenv("PARITY_RUN_DATE", "2026-05-30")
+        _emit_degraded_parity_result(
+            data_state="backtester_replay_error",
+            n_live_trades_total=42,
+            n_excluded=5,
+            n_live_enters_matchable=37,
+            bucket="test-bucket",
+            note="Backtester replay raised RuntimeError: atr_map missing PRU",
+        )
+        import json
+        report = json.loads((tmp_path / "parity_report.json").read_text())
+        assert report["data_state"] == "backtester_replay_error"
+        assert report["metrics"]["capture_rate"] == 0.0
+        assert report["n_live_trades_total"] == 42
+        df = pd.read_csv(io.BytesIO(store["backtest/parity_metrics.csv"]))
+        assert df.iloc[0]["data_state"] == "backtester_replay_error"
+        assert df.iloc[0]["run_date"] == "2026-05-30"
+
     def test_skip_metrics_write_env_honored(self, monkeypatch, tmp_path):
         # Local dev runs may want to skip the S3 append; the env flag
         # must still produce a per-run report.
@@ -1111,7 +1136,33 @@ def test_parity_replay_end_to_end():
     # producing orders tagged with `o["date"] = signal_date` — which equals
     # signal_trading_day on the live side post-backfill. The cohort key
     # matches across both sides without further translation.
-    replay_orders = _run_backtester_for_dates(dates, bucket, trades_db_path=db_path)
+    #
+    # Always-emit contract (sibling to the pit_parity 5/17→5/27 silence):
+    # the replay can raise — e.g. a cohort ticker whose latest atr_14_pct is
+    # NaN/non-positive hard-fails decide_entries with `atr_map missing
+    # {ticker}` (L3147). Before this guard the exception propagated out of
+    # the test, skipping the parity_report.json + metrics-CSV write entirely,
+    # so the time series went silent for weeks. Catch, emit a degraded result
+    # naming the error (data_state="backtester_replay_error"), and return so
+    # the trend shows a step-change instead of a gap. feature_maps WARN-logs
+    # the offending ticker + reason at load time (full context lives there).
+    try:
+        replay_orders = _run_backtester_for_dates(dates, bucket, trades_db_path=db_path)
+    except Exception as exc:
+        _emit_degraded_parity_result(
+            data_state="backtester_replay_error",
+            n_live_trades_total=len(trades_df),
+            n_excluded=n_excluded,
+            n_live_enters_matchable=len(matchable),
+            bucket=bucket,
+            note=(
+                f"Backtester replay raised {exc.__class__.__name__}: {exc}. "
+                f"Window={dates[0]}..{dates[-1]} ({len(dates)} cohort dates). "
+                f"If 'atr_map missing <TICKER>', see feature_maps WARN for the "
+                f"drop reason (NaN/non-positive latest atr_14_pct) — L3147."
+            ),
+        )
+        return
 
     # Filter both sides to ENTERs for cohort matching. Exits don't have
     # signal_trading_day on the live side (NULL by design), so cohort
