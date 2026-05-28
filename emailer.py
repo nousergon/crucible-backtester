@@ -1,24 +1,16 @@
 """
-emailer.py — send weekly backtest report via Gmail SMTP (primary) or AWS SES (fallback).
+emailer.py — build + send the weekly backtest report.
 
-Matches the style and config conventions of executor/eod_emailer.py.
-Sender and recipients come from config.yaml (email_sender / email_recipients).
-
-Gmail path: set GMAIL_APP_PASSWORD env var (16-char App Password).
-SES fallback: used automatically when GMAIL_APP_PASSWORD is absent.
+SMTP/SES dispatch is delegated to ``alpha_engine_lib.email_sender.send_email``
+(L4356 chokepoint). This module owns the report-specific subject + HTML/MD
+body builders only.
 """
 
 from __future__ import annotations
 
 import logging
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
-import boto3
-from botocore.exceptions import ClientError
-
-from alpha_engine_lib.secrets import get_secret
+from alpha_engine_lib.email_sender import send_email
 
 logger = logging.getLogger(__name__)
 
@@ -59,79 +51,31 @@ def send_report_email(
     region: str = "us-east-1",
     product_name: str = "Backtester",
 ) -> None:
-    """
-    Send the weekly backtest/evaluator report via SES.
+    """Build + send the weekly backtest/evaluator report.
+
+    Delegates SMTP/SES dispatch to ``alpha_engine_lib.email_sender.send_email``.
+    The legacy local ``_send_via_smtp`` used ``SMTP_SSL:465``; the lib uses
+    ``SMTP:587`` with STARTTLS — both are Gmail-supported, the latter is
+    the standard pattern across alpha-engine consumers and the one the lib
+    already exercises in production.
 
     Args:
         run_date:    Date string for subject line and footer.
         report_md:   Markdown report string from reporter.build_report().
         status:      "ok" | "insufficient_data" | "error" — shown in subject.
-        sender:      SES-verified from address.
-        recipients:  List of to addresses.
+        sender:      Explicit From address (overrides EMAIL_SENDER secret).
+        recipients:  Explicit recipient list (overrides EMAIL_RECIPIENTS secret).
         s3_bucket:   If set, include S3 link to report in footer.
         s3_prefix:   S3 prefix for report location (default "backtest").
-        region:      AWS region for SES.
+        region:      AWS region for SES fallback (overrides AWS_REGION).
     """
     subject = _build_subject(run_date, status, product_name)
     html_body, plain_body = _build_body(run_date, report_md, s3_bucket, s3_prefix, product_name)
-
-    gmail_pw = get_secret("GMAIL_APP_PASSWORD", required=False, default="")
-    if gmail_pw:
-        _send_via_smtp(subject, plain_body, html_body, sender, recipients, gmail_pw)
-    else:
-        _send_via_ses(subject, plain_body, html_body, sender, recipients, region)
-
-
-def _send_via_smtp(
-    subject: str,
-    plain_body: str,
-    html_body: str,
-    sender: str,
-    recipients: list[str],
-    gmail_pw: str,
-) -> None:
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(plain_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender, gmail_pw)
-            server.sendmail(sender, recipients, msg.as_string())
-        logger.info("Backtest report email sent via Gmail SMTP: '%s' → %s", subject, recipients)
-    except Exception as exc:
-        logger.warning("Gmail SMTP failed (%s) — falling back to SES", exc)
-        _send_via_ses(subject, plain_body, html_body, sender, recipients, "us-east-1")
-
-
-def _send_via_ses(
-    subject: str,
-    plain_body: str,
-    html_body: str,
-    sender: str,
-    recipients: list[str],
-    region: str,
-) -> None:
-    ses = boto3.client("ses", region_name=region)
-    try:
-        ses.send_email(
-            Source=sender,
-            Destination={"ToAddresses": recipients},
-            Message={
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": {
-                    "Text": {"Data": plain_body, "Charset": "UTF-8"},
-                    "Html": {"Data": html_body, "Charset": "UTF-8"},
-                },
-            },
-        )
-        logger.info("Backtest report email sent via SES: '%s' → %s", subject, recipients)
-    except ClientError as e:
-        logger.error("SES send failed: %s", e.response["Error"]["Message"])
-    except Exception as e:
-        logger.error("Email error: %s", e)
+    send_email(
+        subject, plain_body,
+        recipients=recipients, html=html_body,
+        sender=sender, region=region,
+    )
 
 
 def _build_subject(run_date: str, status: str, product_name: str = "Backtester") -> str:
