@@ -432,6 +432,12 @@ def compute_regime_spread(
             if by_regime.get("neutral") and by_regime["neutral"].annualized_sortino is not None
             else None
         ),
+        # caution_sortino — 3-class Ang-Bekaert taxonomy retired the
+        # macro caution tier in v0.42.0 (caution-regime-retirement-260528.md).
+        # Field preserved for grandfather attribution on pre-v0.42.0
+        # rows; new emissions never populate by_regime["caution"]
+        # (returns None — backward-compatible with the existing
+        # field's nullable contract).
         "caution_sortino": (
             by_regime["caution"].annualized_sortino
             if by_regime.get("caution") and by_regime["caution"].annualized_sortino is not None

@@ -231,8 +231,12 @@ def _extract_macro_economist(
     """macro_economist per-run (macro indicators) → regime literal.
 
     The macro agent receives macro indicators (SPY trend, VIX, yield
-    curve, breadth) and emits a regime literal (bull / neutral / bear /
-    caution). One row per artifact.
+    curve, breadth) and emits a regime literal (bull / neutral / bear).
+    One row per artifact. Legacy 4-class "caution" tolerated on the
+    enum for grandfather replay over pre-v0.42.0 archives (the
+    macro_agent's _validate_regime coerces raw LLM "caution" to
+    "neutral" upstream post-cutover —
+    caution-regime-retirement-260528.md).
 
     Snapshot shape (varies):
         {"macro_indicators": {"spy_20d_return": ...,
@@ -241,7 +245,8 @@ def _extract_macro_economist(
                               "market_breadth": ...,
                               ...}}
     Output shape:
-        {"market_regime": "bull"|"neutral"|"bear"|"caution", ...}
+        {"market_regime": "bull"|"neutral"|"bear" (post-v0.42.0)
+                          | legacy "caution" (grandfather), ...}
     """
     regime = output.get("market_regime")
     if regime not in ("bull", "neutral", "bear", "caution"):

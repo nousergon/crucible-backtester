@@ -392,6 +392,12 @@ def _compute_regime_ic(df: pd.DataFrame, bucket: str) -> dict[str, float | None]
     # _compute_regime_ic receives the same DataFrame so the column is present.
     df["actual"] = pd.to_numeric(df["canonical_actual"], errors="coerce")
 
+    # 3-class Ang-Bekaert macro taxonomy (v0.42.0 / 2026-05-28 —
+    # caution-regime-retirement-260528.md). Iterate the legacy 4-class
+    # set so pre-v0.42.0 score_performance rows whose market_regime
+    # carries "caution" still surface a stratified IC for grandfather
+    # attribution continuity. New (post-cutover) rows never populate
+    # the caution bucket — its IC is None for those windows.
     regime_ic = {}
     for regime in ["bull", "neutral", "bear", "caution"]:
         subset = df[df["regime"] == regime].dropna(subset=["net_signal", "actual"])
