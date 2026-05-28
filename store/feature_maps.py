@@ -97,20 +97,9 @@ def load_precomputed_feature_maps(
     # Lazy import so test suites without arcticdb installed can still
     # import this module and monkey-patch. Matches the pattern in
     # executor/price_cache.py.
-    import arcticdb as adb
-
-    # URI format matches store/arctic_reader.py::_get_arctic and
-    # alpha_engine_lib's arctic_uri helper — keep consistent with
-    # whatever the rest of the repo uses for consistency of log grep.
-    import os
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    uri = (
-        f"s3s://s3.{region}.amazonaws.com:{bucket}"
-        f"?path_prefix=arcticdb&aws_auth=true"
-    )
+    from alpha_engine_lib.arcticdb import open_universe_lib
     try:
-        arctic = adb.Arctic(uri)
-        universe = arctic.get_library("universe")
+        universe = open_universe_lib(bucket)
     except Exception as exc:
         raise RuntimeError(
             f"feature_maps: ArcticDB universe library open failed "
