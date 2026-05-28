@@ -45,7 +45,7 @@ _MAX_ERROR_RATE = 0.05
 
 
 def _get_arctic(bucket: str) -> adb.Arctic:
-    """Create ArcticDB connection. Raises on unreachable.
+    """Create ArcticDB connection via the lib chokepoint (L2771).
 
     Logs the resolved URI + library list at DEBUG level so subprocess-vs-
     parent Arctic-state divergence (e.g. 2026-04-24 parity incident:
@@ -53,14 +53,11 @@ def _get_arctic(bucket: str) -> adb.Arctic:
     the same spot saw 0) can be diagnosed from the stream without a
     separate instrumentation pass.
     """
-    region = os.environ.get("AWS_REGION", "us-east-1")
-    uri = f"s3s://s3.{region}.amazonaws.com:{bucket}?path_prefix={ARCTIC_PREFIX}&aws_auth=true"
+    from alpha_engine_lib.arcticdb import open_arctic
     try:
-        arctic = adb.Arctic(uri)
+        arctic = open_arctic(bucket)
     except Exception as exc:
-        raise RuntimeError(
-            f"ArcticDB unreachable at {uri}: {exc}"
-        ) from exc
+        raise RuntimeError(str(exc)) from exc
     # Log connection details once per process so subprocess/parent
     # divergence is greppable. At INFO level on first call only — repeat
     # calls in the same process would spam.
