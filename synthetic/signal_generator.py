@@ -53,10 +53,26 @@ _ETF_TO_SECTOR = {
 # ── Technical scoring (same formulas as executor/technical_scorer.py) ────────
 # Inlined here to avoid cross-repo import from alpha-engine.
 
-def _score_rsi(rsi: float, market_regime: str = "neutral") -> float:
-    if market_regime == "bull":
+def _score_rsi(
+    rsi: float,
+    market_regime: str = "neutral",
+    drawdown_tier: str | None = None,
+) -> float:
+    # 3-class Ang-Bekaert macro regime (v0.42.0 / 2026-05-28 —
+    # caution-regime-retirement-260528.md). Legacy 4-class "caution"
+    # at market_regime is grandfathered for replay over historical
+    # signals.json artifacts; new synthetic signal generation should
+    # pass drawdown_tier on the orthogonal drawdown axis for the
+    # protective-RSI window (the institutional 3-state Bridgewater
+    # hysteresis pattern preserved in the drawdown leg).
+    bear_window = (
+        market_regime == "bear"
+        or market_regime == "caution"  # legacy grandfather
+        or (drawdown_tier is not None and drawdown_tier in ("caution", "risk_off"))
+    )
+    if market_regime == "bull" and not bear_window:
         overbought, oversold, max_os = 80, 30, 100.0
-    elif market_regime in ("bear", "caution"):
+    elif bear_window:
         overbought, oversold, max_os = 70, 40, 65.0
     else:
         overbought, oversold, max_os = 70, 30, 100.0
@@ -310,7 +326,10 @@ def predictions_to_signals(
         ``indicators_from_precomputed`` for this date. Required input
         (Option A step 9 cleanup deleted the scalar fallback path that
         accepted raw OHLCV here).
-    market_regime : 'bull' | 'neutral' | 'caution' | 'bear'.
+    market_regime : 'bull' | 'neutral' | 'bear' (3-class Ang-Bekaert; the
+        legacy 4th value 'caution' is grandfathered on read for historical
+        signals.json artifacts post v0.42.0 —
+        caution-regime-retirement-260528.md).
     top_n : max ENTER signals per date.
     min_score : minimum trading_score for ENTER.
     gbm_enrichment_max : max ±pts GBM can adjust technical score.
