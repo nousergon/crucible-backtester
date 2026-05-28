@@ -65,8 +65,12 @@ def load_precomputed_feature_maps(
     atr_by_ticker : dict[ticker, float]
         Most-recent ``atr_14_pct`` per ticker. Matches the
         last-row-wins semantics of ``executor.price_cache.load_atr_14_pct``.
-        Missing / non-positive values are omitted (the executor's
-        ``.get(ticker)`` lookup returns None naturally).
+        Missing / NaN / non-positive values are omitted (the executor's
+        ``.get(ticker)`` lookup returns None naturally) — but the drop is
+        NOT silent: every omitted ticker + reason is named in a WARN log
+        before return, per feedback_no_silent_fails. A cohort ticker in that
+        set is the L3147 failure mode (opaque ``atr_map missing {ticker}``
+        downstream in ``decide_entries``).
 
     vwap_series_by_ticker : dict[ticker, pd.Series]
         Full VWAP time-series per ticker (pd.Series indexed by date).
@@ -126,8 +130,17 @@ def load_precomputed_feature_maps(
     atr_by_ticker: dict[str, float] = {}
     vwap_series_by_ticker: dict[str, pd.Series] = {}
     coverage_by_ticker: dict[str, float] = {}
+    # Identities + reasons for every ticker dropped from atr_by_ticker. We
+    # CANNOT keep a ticker with a NaN/non-positive ATR (the executor's
+    # decide_entries hard-fails on a bogus zero ATR — correct, mirrors live
+    # load_atr_14_pct). But the DROP must not be silent: per
+    # feedback_no_silent_fails, (a) the swallowed failure = a universe ticker
+    # whose latest ATR is missing/NaN/non-positive, and (c) the recording
+    # surface = a WARN log naming each dropped ticker + reason below. Without
+    # this, a cohort ticker that lands in this set surfaces only as an opaque
+    # `atr_map missing {ticker}` RuntimeError deep in decide_entries (L3147).
+    dropped_atr_reasons: dict[str, str] = {}
     n_err = 0
-    n_missing_atr = 0
     n_missing_vwap = 0
     n_zero_coverage = 0
 
@@ -155,10 +168,12 @@ def load_precomputed_feature_maps(
                 val = df["atr_14_pct"].iloc[-1]
                 if pd.notna(val) and val > 0:
                     atr_by_ticker[ticker] = float(val)
+                elif pd.isna(val):
+                    dropped_atr_reasons[ticker] = "nan_last_row"
                 else:
-                    n_missing_atr += 1
+                    dropped_atr_reasons[ticker] = f"non_positive_last_row({float(val)})"
             else:
-                n_missing_atr += 1
+                dropped_atr_reasons[ticker] = "missing_atr_14_pct_column"
 
             # VWAP: full series (per-date resolution happens per call)
             if "VWAP" in df.columns:
@@ -189,8 +204,21 @@ def load_precomputed_feature_maps(
         "feature_maps: loaded atr=%d, vwap=%d, coverage=%d, missing_atr=%d, "
         "missing_vwap=%d, zero_coverage=%d, read_errors=%d (of %d tickers)",
         len(atr_by_ticker), len(vwap_series_by_ticker), len(coverage_by_ticker),
-        n_missing_atr, n_missing_vwap, n_zero_coverage, n_err, len(symbols),
+        len(dropped_atr_reasons), n_missing_vwap, n_zero_coverage, n_err, len(symbols),
     )
+    # No-silent-fails recording surface: name every ticker dropped from the
+    # ATR map (+ reason) at WARN. A cohort ticker present in this list is the
+    # L3147 root cause — decide_entries will hard-fail on it downstream. Cap
+    # the inline list so a wholesale ATR-column regression doesn't flood the
+    # log, but always report the full count.
+    if dropped_atr_reasons:
+        _preview = dict(sorted(dropped_atr_reasons.items())[:40])
+        log.warning(
+            "feature_maps: %d ticker(s) dropped from atr_by_ticker (latest "
+            "atr_14_pct missing/NaN/non-positive) — these will hard-fail "
+            "decide_entries if they enter a signal cohort. reasons[:40]=%s",
+            len(dropped_atr_reasons), _preview,
+        )
     return atr_by_ticker, vwap_series_by_ticker, coverage_by_ticker
 
 
