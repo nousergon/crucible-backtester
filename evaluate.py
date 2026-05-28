@@ -1343,6 +1343,32 @@ def main() -> None:
                 "",
             ])
 
+        # Judge-calibration κ section (ROADMAP L480). Embeds the
+        # pre-rendered markdown written weekly by alpha-engine-research
+        # (evals/calibration_kappa.py) from the operator review corpus.
+        # Always renders a placeholder if the report is absent, so the
+        # calibration surface is always visible. build_calibration_section
+        # never raises, but the call is still guarded to match the cost
+        # section's contract (the evaluator's primary deliverables must
+        # not be blocked by a section render).
+        try:
+            from analysis.calibration_report import build_calibration_section
+            report_md = report_md + "\n" + build_calibration_section()
+        except Exception as cal_err:  # noqa: BLE001 — see cost section above
+            logger.error(
+                "[calibration_report] section render failed: %s — emitting "
+                "error placeholder so operators see the regression",
+                cal_err,
+            )
+            report_md = report_md + "\n" + "\n".join([
+                "## Judge calibration (κ)",
+                "",
+                f"- _Calibration report render failed: `{cal_err}`._",
+                "  Investigate `analysis/calibration_report.py` + the report at "
+                "`s3://alpha-engine-research/decision_artifacts/_calibration/_report/latest/kappa.md`.",
+                "",
+            ])
+
         # Save
         out_dir = save(
             report_md=report_md,
