@@ -103,11 +103,19 @@ _CONVICTION_CODE = {
     "declining": CONV_DECLINING,
 }
 
+# Market regime codes. 3-class Ang-Bekaert macro vocabulary post v0.42.0
+# (caution-regime-retirement-260528.md). The legacy "caution" → REGIME_CAUTION
+# mapping is grandfathered for replay over historical signals.json
+# artifacts (their market_regime field carried "caution" prior to the
+# retirement); new emissions from the macro-agent are 3-class only,
+# and the drawdown leg's protective hysteresis (risk_on/caution/risk_off)
+# is a SEPARATE axis read via the drawdown_protective_severity ordinal
+# in the predictor regime substrate JSON.
 _REGIME_CODE = {
     "bull": REGIME_BULL,
     "neutral": REGIME_NEUTRAL,
     "bear": REGIME_BEAR,
-    "caution": REGIME_CAUTION,
+    "caution": REGIME_CAUTION,  # legacy grandfather for historical replay
 }
 
 # Default sector ETF map (mirrors executor.strategies.exit_manager.SECTOR_ETF_MAP)
