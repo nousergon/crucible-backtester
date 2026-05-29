@@ -64,7 +64,7 @@ from analysis import shadow_book as shadow_book_analysis
 from analysis import exit_timing, macro_eval
 from analysis import regime_stratified_sortino_runner
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
-from optimizer import trigger_optimizer, predictor_sizing_optimizer
+from optimizer import trigger_optimizer, predictor_sizing_optimizer, barrier_sizing_optimizer
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
 from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_report_email
@@ -757,6 +757,17 @@ def _run_optimizers(
         skip_if_missing=["research_db"],
     )
 
+    # Barrier-win-prob sizing optimizer (Task B3). IC-criterion promotion gate
+    # for the executor's dormant barrier_win_prob sizing multiplier; mirrors
+    # predictor_sizing. Reports column_absent until alpha-engine-data records
+    # barrier_win_prob into predictor_outcomes (B3 activation prerequisite).
+    results["barrier_sizing"] = tracker.run_module(
+        "barrier_sizing",
+        lambda: _run_barrier_sizing(db_path, freeze, bucket),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
     # Scanner optimizer
     results["scanner_opt"] = tracker.run_module(
         "scanner_optimizer",
@@ -875,6 +886,16 @@ def _run_predictor_sizing(db_path: str, freeze: bool, bucket: str) -> dict:
             result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         elif result.get("recommendation") == "enable":
             result["apply_result"] = predictor_sizing_optimizer.apply(result, bucket)
+    return result
+
+
+def _run_barrier_sizing(db_path: str, freeze: bool, bucket: str) -> dict:
+    result = barrier_sizing_optimizer.analyze(db_path)
+    if result.get("status") == "ok":
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        elif result.get("recommendation") == "enable":
+            result["apply_result"] = barrier_sizing_optimizer.apply(result, bucket)
     return result
 
 
