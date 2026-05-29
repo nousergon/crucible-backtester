@@ -287,7 +287,7 @@ def compute_decision_capture_coverage(
     try:
         end_date = datetime.strptime(run_date, "%Y-%m-%d")
     except ValueError as e:
-        return {"status": "error", "error": f"invalid run_date: {e}"}
+        return {"status": "error", "coverage_pct": 0.0, "error": f"invalid run_date: {e}"}
 
     s3 = s3_client or boto3.client("s3")
 
@@ -298,11 +298,12 @@ def compute_decision_capture_coverage(
         )
     except Exception as e:
         logger.exception("decision_capture_coverage: S3 listing failed")
-        return {"status": "error", "error": f"S3 listing failed: {e}"}
+        return {"status": "error", "coverage_pct": 0.0, "error": f"S3 listing failed: {e}"}
 
     if most_recent is None:
         return {
             "status": "no_recent_sf_run",
+            "coverage_pct": 0.0,
             "run_date": run_date,
             "reason": (
                 f"no Saturday with captures within 7 days of {run_date} "

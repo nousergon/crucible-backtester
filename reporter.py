@@ -1022,7 +1022,29 @@ def save(
         (out_dir / "attribution.json").write_text(json.dumps(attribution, indent=2, default=str))
         logger.info("Wrote %s", out_dir / "attribution.json")
 
-    # Structured analysis files for dashboard consumption
+    # Structured analysis files for dashboard consumption.
+    #
+    # ALWAYS-EMIT contract (freshness-monitored artifacts): write on every
+    # non-None producer return — including no-data / error statuses — so that
+    # *absence* of the S3 object unambiguously means "the diagnostic never
+    # ran" (an infra failure), never "ran but found no upstream captures" (a
+    # legitimate recovery-stitched cycle state). The producer status is
+    # preserved in the body for the consumer/monitor to classify. Without
+    # this, the substrate-health agent_decisions check could not distinguish a
+    # data gap from a missing diagnostic — both read as absence.
+    # See feedback_observational_stages_always_emit_artifact and the
+    # artifact-completion monitoring design (alpha-engine-config private-docs).
+    for filename, data in [
+        ("decision_capture_coverage.json", decision_capture_coverage),
+        ("executor_decision_capture_coverage.json", executor_decision_capture_coverage),
+    ]:
+        if data is not None:
+            (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
+            logger.info("Wrote %s (status=%s)", out_dir / filename, data.get("status"))
+
+    # OK-ONLY contract (dashboard panels): write only on a meaningful result.
+    # Migrating the rest of these to the always-emit contract is a filed
+    # follow-up — each needs its consumer's None/non-ok tolerance verified.
     for filename, data in [
         ("grading.json", grading),
         ("trigger_scorecard.json", trigger_scorecard),
@@ -1031,8 +1053,6 @@ def save(
         ("e2e_lift.json", e2e_lift),
         ("veto_analysis.json", veto_result),
         ("confusion_matrix.json", confusion_matrix),
-        ("decision_capture_coverage.json", decision_capture_coverage),
-        ("executor_decision_capture_coverage.json", executor_decision_capture_coverage),
         ("provenance_grounding.json", provenance_grounding),
         ("quant_rank_quality.json", quant_rank_quality),
         ("agent_justification.json", agent_justification),

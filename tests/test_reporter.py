@@ -647,3 +647,67 @@ class TestSortinoHeadlineMetric:
         assert "| **Sortino ratio** | **1.930** |" in md
         assert "| Sharpe ratio | 1.210 |" in md
         assert md.index("Sortino ratio") < md.index("Sharpe ratio")
+
+
+# ── always-emit contract for freshness-monitored artifacts ──────────────────
+
+
+class TestAlwaysEmitDecisionCapture:
+    """``save`` must write decision_capture_coverage.json (and the executor
+    sibling) on EVERY non-None producer return — including no-data / error
+    statuses — so that absence of the S3 object means "diagnostic never ran",
+    never "ran but found no upstream captures". Regression guard for the
+    substrate-health agent_decisions false-absence bug (2026-05-29)."""
+
+    def _save(self, tmp_path, **kwargs):
+        from reporter import save
+        return save(
+            report_md="# r",
+            signal_quality={"status": "ok", "overall": {}},
+            score_analysis=[],
+            run_date="2026-05-29",
+            results_dir=str(tmp_path),
+            **kwargs,
+        )
+
+    def test_no_recent_sf_run_is_still_written(self, tmp_path):
+        out = self._save(
+            tmp_path,
+            decision_capture_coverage={
+                "status": "no_recent_sf_run", "coverage_pct": 0.0,
+                "reason": "no Saturday with captures",
+            },
+        )
+        import json
+        f = out / "decision_capture_coverage.json"
+        assert f.exists(), "no_recent_sf_run must still emit the artifact"
+        assert json.loads(f.read_text())["status"] == "no_recent_sf_run"
+
+    def test_error_status_is_still_written(self, tmp_path):
+        out = self._save(
+            tmp_path,
+            executor_decision_capture_coverage={
+                "status": "insufficient_data", "coverage_pct": 0.0,
+            },
+        )
+        assert (out / "executor_decision_capture_coverage.json").exists()
+
+    def test_ok_status_is_written(self, tmp_path):
+        out = self._save(
+            tmp_path,
+            decision_capture_coverage={"status": "ok", "coverage_pct": 100.0},
+        )
+        assert (out / "decision_capture_coverage.json").exists()
+
+    def test_none_is_not_written(self, tmp_path):
+        """None means the module was never invoked → absence is correct."""
+        out = self._save(tmp_path, decision_capture_coverage=None)
+        assert not (out / "decision_capture_coverage.json").exists()
+
+    def test_ok_only_artifact_skips_error_status(self, tmp_path):
+        """A non-always-emit artifact (barrier_coherence) keeps ok-only."""
+        out = self._save(
+            tmp_path,
+            barrier_coherence={"status": "error", "error": "boom"},
+        )
+        assert not (out / "barrier_coherence.json").exists()
