@@ -414,6 +414,16 @@ def _run_diagnostics(
         skip_if_missing=["trades_db"],
     )
 
+    # Barrier coherence (predictor labels ↔ executor exits). The static
+    # definition-divergence leg runs even with no trades, so this is NOT gated on
+    # trades_db availability — it always emits an artifact (per the
+    # always-emit-observational-artifact convention).
+    results["barrier_coherence"] = tracker.run_module(
+        "barrier_coherence",
+        lambda: _run_barrier_coherence(config, trades_db),
+        required_inputs={},
+    )
+
     # Factor blend sensitivity — config-vs-realized stance ordering check.
     # PR 6 of scanner-placement arc + follow-up wire-in. Reads existing
     # score_performance df_base; backtester config may override regime
@@ -588,6 +598,51 @@ def _run_confusion_matrix(db_path: str) -> dict:
 def _run_post_trade(trades_db: str) -> dict:
     from analysis.post_trade import compute_post_trade_analysis
     return compute_post_trade_analysis(trades_db)
+
+
+def _run_barrier_coherence(config: dict, trades_db: str) -> dict:
+    """Predictor↔executor triple-barrier coherence diagnostic.
+
+    Reads the LIVE, sweep-tuned executor barriers from
+    ``config/executor_params.json`` on S3 so leg (a) compares against the real
+    execution policy, not stale defaults. On any S3 failure we fall back to the
+    documented defaults but record the fallback in ``exec_params_source`` and
+    WARN-log it — not a silent swallow (the diagnostic still runs; the source is
+    visible in the rendered artifact).
+    """
+    from analysis.barrier_coherence import compute_barrier_coherence
+
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    exec_params: dict | None = None
+    exec_source = "defaults (executor/strategies/config.py)"
+    _BARRIER_KEYS = (
+        "atr_multiplier",
+        "profit_take_pct",
+        "time_decay_reduce_days",
+        "time_decay_exit_days",
+    )
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key="config/executor_params.json")
+        data = json.loads(obj["Body"].read())
+        exec_params = {k: data[k] for k in _BARRIER_KEYS if k in data}
+        if exec_params:
+            exec_source = "live S3 config/executor_params.json (sweep-tuned)"
+        else:
+            exec_params = None
+            logger.warning(
+                "barrier_coherence: executor_params.json present but carried no "
+                "barrier keys; falling back to documented defaults"
+            )
+    except Exception as e:  # noqa: BLE001 — best-effort live read; fallback recorded, not swallowed.
+        logger.warning(
+            "barrier_coherence: could not read live executor_params.json (%s); "
+            "using documented defaults", e
+        )
+
+    return compute_barrier_coherence(
+        trades_db, exec_params=exec_params, exec_params_source=exec_source
+    )
 
 
 def _run_monte_carlo(config: dict) -> dict:
@@ -1286,6 +1341,7 @@ def main() -> None:
             post_trade=diagnostics.get("post_trade"),
             monte_carlo=diagnostics.get("monte_carlo"),
             factor_blend_sensitivity=diagnostics.get("factor_blend_sensitivity"),
+            barrier_coherence=diagnostics.get("barrier_coherence"),
         )
 
         # Prepend completeness summary to report
@@ -1392,6 +1448,7 @@ def main() -> None:
             provenance_grounding=diagnostics.get("provenance_grounding"),
             quant_rank_quality=diagnostics.get("quant_rank_quality"),
             agent_justification=diagnostics.get("agent_justification"),
+            barrier_coherence=diagnostics.get("barrier_coherence"),
         )
 
         # Save completeness manifest

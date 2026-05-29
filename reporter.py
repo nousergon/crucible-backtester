@@ -730,6 +730,7 @@ def build_report(
     post_trade: dict | None = None,
     monte_carlo: dict | None = None,
     factor_blend_sensitivity: dict | None = None,
+    barrier_coherence: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -924,6 +925,13 @@ def build_report(
         lines += _section_exit_timing(exit_timing)
         lines += [""]
 
+    # Barrier coherence (predictor labels ↔ executor exits). Renders whenever the
+    # diagnostic ran — the static definition-divergence leg is always present even
+    # at zero trades, so unlike most sections it is not gated on roundtrip count.
+    if barrier_coherence and barrier_coherence.get("status") == "ok":
+        lines += _section_barrier_coherence(barrier_coherence)
+        lines += [""]
+
     # Predictor confusion matrix
     if confusion_matrix and confusion_matrix.get("status") == "ok":
         lines += _section_confusion_matrix(confusion_matrix)
@@ -969,6 +977,7 @@ def save(
     provenance_grounding: dict | None = None,
     quant_rank_quality: dict | None = None,
     agent_justification: dict | None = None,
+    barrier_coherence: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -1027,6 +1036,7 @@ def save(
         ("provenance_grounding.json", provenance_grounding),
         ("quant_rank_quality.json", quant_rank_quality),
         ("agent_justification.json", agent_justification),
+        ("barrier_coherence.json", barrier_coherence),
     ]:
         if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
@@ -2316,6 +2326,96 @@ def _section_exit_timing(result: dict) -> list[str]:
         "exits_too_late": "Exits may be triggering too late — MAE is close to realized losses.",
     }
     lines += ["", f"> **Diagnosis:** {diagnosis_text.get(diagnosis, diagnosis)}"]
+    return lines
+
+
+def _section_barrier_coherence(result: dict) -> list[str]:
+    """Build predictor↔executor triple-barrier coherence section."""
+    div = result.get("definition_divergence", {})
+    vert = div.get("vertical", {})
+    horiz = div.get("horizontal", {})
+    lines = [
+        "## Barrier coherence (predictor labels ↔ executor exits)",
+        "",
+        "_Do the triple-barrier LABELS the predictor trains on match the OCO "
+        "exits the executor REALIZES? Read-only diagnostic (Task A)._",
+        "",
+        f"_Executor params source: {result.get('exec_params_source', 'unknown')}_",
+        "",
+        "### Definition divergence",
+        "",
+        "| Axis | Predictor label | Executor execution | Coherent |",
+        "|------|-----------------|--------------------|----------|",
+        f"| Vertical (time) | {vert.get('label_horizon_trading_days', '?')}d fixed | "
+        f"{vert.get('exec_time_barrier_trading_days', '?')}d ({vert.get('exec_time_barrier_conditional', '')}) | "
+        f"{'✅' if vert.get('coherent') else '❌'} |",
+        f"| Horizontal (price) | {horiz.get('label_geometry', '?')} | "
+        f"{horiz.get('exec_upper', '?')}; {horiz.get('exec_lower', '?')} | "
+        f"{'✅' if horiz.get('coherent') else '❌'} |",
+    ]
+    if vert.get("note"):
+        lines += ["", f"> {vert['note']}"]
+    if horiz.get("note"):
+        lines += ["", f"> {horiz['note']}"]
+
+    # ── Horizon coherence ──────────────────────────────────────────────
+    hc = result.get("horizon_coherence", {})
+    lines += ["", "### Realized holding period vs label horizon", ""]
+    if hc.get("status") == "ok":
+        pct_before = hc.get("pct_exit_before_label_horizon", 0.0)
+        lines += [
+            f"_{hc.get('n', 0)} roundtrips; label vertical barrier = "
+            f"{hc.get('label_horizon_days', '?')} trading days_",
+            "",
+            "| Metric | Value |",
+            "|--------|-------|",
+            f"| Median days held | {hc.get('median_days_held', '?')} |",
+            f"| Mean days held | {hc.get('mean_days_held', '?')} |",
+            f"| IQR (p25–p75) | {hc.get('p25_days_held', '?')}–{hc.get('p75_days_held', '?')} |",
+            f"| **Exit BEFORE label horizon** | **{pct_before:.0%}** "
+            f"({hc.get('n_exit_before_label_horizon', 0)}/{hc.get('n', 0)}) |",
+        ]
+    elif hc.get("status") == "insufficient_data":
+        lines.append(
+            f"_Insufficient data ({hc.get('n', 0)} roundtrips, "
+            f"need ≥{hc.get('min_trades', '?')})._"
+        )
+    else:
+        lines.append(f"_Unavailable: {hc.get('error', 'unknown error')}._")
+
+    # ── Barrier-touch mix ──────────────────────────────────────────────
+    mix = result.get("barrier_touch_mix", {})
+    lines += ["", "### Realized barrier-touch mix", ""]
+    if mix.get("status") == "ok":
+        lines += [
+            f"_{mix.get('n', 0)} exits, classified by triple-barrier analog_",
+            "",
+            "| Barrier class | n | % of exits | Avg days held | Avg alpha |",
+            "|---------------|---|-----------|---------------|-----------|",
+        ]
+        for r in mix.get("by_class", []):
+            dh = r.get("avg_days_held")
+            al = r.get("avg_alpha_pct")
+            lines.append(
+                f"| {r['barrier_class']} | {r['n']} | {r['pct']:.0%} | "
+                f"{dh if dh is not None else '—'} | "
+                f"{f'{al:+.2f}%' if al is not None else '—'} |"
+            )
+    elif mix.get("status") == "insufficient_data":
+        lines.append(
+            f"_Insufficient data ({mix.get('n', 0)} exits, "
+            f"need ≥{mix.get('min_trades', '?')})._"
+        )
+    else:
+        lines.append(f"_Unavailable: {mix.get('error', 'unknown error')}._")
+
+    lines += [
+        "",
+        "> Per-trade label-vs-realized concordance (offline price replay) is the "
+        "deeper leg of Task A and is deferred; this mix vs the symmetric ±kσ / "
+        f"{vert.get('label_horizon_trading_days', '?')}d label assumption already "
+        "shows whether the realized barrier profile diverges from the trained one.",
+    ]
     return lines
 
 
