@@ -50,6 +50,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "backtest.py": 8,
     "health_status.py": 1,
     "optimizer/assembler.py": 5,
+    "optimizer/barrier_sizing_optimizer.py": 1,
     "optimizer/config_archive.py": 1,
     "optimizer/executor_optimizer.py": 5,
     "optimizer/pipeline_optimizer.py": 2,
