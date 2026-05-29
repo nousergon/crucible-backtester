@@ -247,6 +247,7 @@ def compute_executor_decision_capture_coverage(
     if most_recent is None:
         return {
             "status": "insufficient_data",
+            "coverage_pct": 0.0,
             "reason": (
                 f"no executor:* captures found in the trailing "
                 f"{max_lookback_days} days; check that "
