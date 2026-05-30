@@ -67,10 +67,19 @@ def _get_arctic(bucket: str) -> adb.Arctic:
             libs = sorted(arctic.list_libraries())
         except Exception as exc:
             libs = f"<list_libraries failed: {exc}>"
+        # NOTE: the resolved URI + region are now owned by the lib chokepoint
+        # (open_arctic) and are NOT in this scope — the L2771 migration replaced
+        # the local `uri = ...; adb.Arctic(uri)` with `open_arctic(bucket)` but
+        # left this log line referencing the removed `uri`/`region` locals,
+        # raising `NameError: name 'uri' is not defined` on every fresh-process
+        # connect. The main backtest reads prices from S3/yfinance so it never
+        # hit this; pit_parity's replay subprocess connects to ArcticDB and so
+        # failed with backtester_replay_error every cycle. The library list is
+        # the load-bearing divergence signal (the 2026-04-24 incident was 910 vs
+        # 0 symbols) — log bucket + libs, which ARE in scope.
         log.info(
-            "ArcticDB connected: uri=%s libraries=%s region=%s",
-            uri.replace("&aws_auth=true", "&aws_auth=true"),  # URI is already auth-stripped of secrets
-            libs, region,
+            "ArcticDB connected: bucket=%s libraries=%s",
+            bucket, libs,
         )
         _ARCTIC_LOGGED = True
     return arctic
