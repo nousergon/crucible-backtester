@@ -76,6 +76,7 @@ from pipeline_common import (
     init_research_db,
     find_trades_db,
     push_predictor_rolling_metrics,
+    resolve_trading_day,
 )
 
 logger = logging.getLogger(__name__)
@@ -1108,6 +1109,15 @@ def _run_regression(
 
 def main() -> None:
     args = _parse_args()
+
+    # DATE_CONVENTIONS: normalize the run-date label to the NYSE trading day so
+    # the evaluator reads/writes backtest/{trading_day}/ — aligned with the
+    # Backtester + Parity stages (same spot RUN_DATE) and signals/{trading_day}.
+    # Idempotent (no-op on the bash-normalized RUN_DATE). See L4466 + research #257.
+    _orig_date = args.date
+    args.date = resolve_trading_day(args.date)
+    if args.date != _orig_date:
+        logger.info("Normalized run-date %s (calendar) → %s (trading day)", _orig_date, args.date)
 
     # setup_logging already ran at module-top (see comment near the
     # alpha_engine_lib.logging import). Apply the user-requested level here.

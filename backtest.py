@@ -83,6 +83,7 @@ from pipeline_common import (
     load_config,
     load_phase_hard_caps,
     phase,
+    resolve_trading_day,
 )
 
 logger = logging.getLogger(__name__)
@@ -4310,6 +4311,18 @@ def _export_simulation_artifacts(
 
 def main() -> None:
     args = _parse_args()
+
+    # DATE_CONVENTIONS: normalize the run-date label to the NYSE trading day so
+    # every backtest artifact (backtest/{date}/…, incl. pit_parity.json +
+    # parity_metrics) keys by trading day — aligned with signals/{trading_day}/
+    # and the ARTIFACT_REGISTRY trading-day axis. Idempotent: the spot already
+    # normalizes RUN_DATE in spot_backtest.sh, so this re-normalization of
+    # --date is a no-op there and also covers manual `python backtest.py` runs
+    # (whose --date defaults to calendar date.today()). See L4466 + research #257.
+    _orig_date = args.date
+    args.date = resolve_trading_day(args.date)
+    if args.date != _orig_date:
+        logger.info("Normalized run-date %s (calendar) → %s (trading day)", _orig_date, args.date)
 
     # setup_logging already ran at module-top (see comment near the
     # alpha_engine_lib.logging import). Apply the user-requested level here.
