@@ -182,6 +182,26 @@ PIT_PARITY_ENABLED="${PIT_PARITY_ENABLED:-1}"
 # dispatcher→heredoc bake-in mechanism as SKIP_STAGES / PIT_PARITY_ENABLED.
 # Falls back to wall-clock UTC for ad-hoc manual runs that don't inject it.
 RUN_DATE="${RUN_DATE:-$(date -u +%Y-%m-%d)}"
+# DATE_CONVENTIONS: normalize RUN_DATE to the NYSE TRADING DAY at this single
+# dispatcher-side chokepoint, BEFORE it is threaded into every stage's --date
+# AND the bash s3 uploads below (so python + bash never split). The SF threads
+# $.run_date = date(Execution.StartTime) (CALENDAR — Sat 2026-05-30 on a
+# Saturday firing) but Research + signals.json + the standalone scanner key by
+# trading day (Fri 2026-05-29); keying backtest/{date}/ (incl. pit_parity.json
+# + parity_metrics) by the calendar date is what surfaced the research↔backtester
+# pit-parity drift (L4466). $LIB_PYTHON (line ~125) carries alpha_engine_lib.
+# Defensive: keep the calendar value if the lib call fails (a normalization
+# miss must not abort the backtester) — the python entry points re-normalize
+# idempotently as a backstop.
+_RUN_DATE_TD="$("$LIB_PYTHON" -c "import datetime as d; from alpha_engine_lib import trading_calendar as tc; x=d.date.fromisoformat('${RUN_DATE}'[:10]); print(x.isoformat() if tc.is_trading_day(x) else tc.previous_trading_day(x).isoformat())" 2>/dev/null || true)"
+if [ -n "$_RUN_DATE_TD" ]; then
+    if [ "$_RUN_DATE_TD" != "$RUN_DATE" ]; then
+        echo "==> Normalized RUN_DATE ${RUN_DATE} (calendar) → ${_RUN_DATE_TD} (trading day) per DATE_CONVENTIONS"
+    fi
+    RUN_DATE="$_RUN_DATE_TD"
+else
+    echo "WARNING: trading-day normalization of RUN_DATE=${RUN_DATE} failed — keeping calendar value (python entry points will re-normalize)" >&2
+fi
 # Freeze the evaluator (passes --freeze to evaluate.py → suppresses per-
 # optimizer S3 config writes; report artifacts + email still upload). Use
 # for off-cycle test runs so mid-week sweeps don't auto-promote weights/
