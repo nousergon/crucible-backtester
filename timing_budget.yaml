@@ -144,13 +144,25 @@ full_run_hard_caps_seconds:
   # prior 2700s cap (L4470). The DURABLE fix is L4471-L3 (incremental resume)
   # or a per-date regression fix — NOT widening the cap, which hides the
   # regression signal this watchdog exists to surface.
-  # TIME-BOXED DEVIATION (operator-authorized 2026-05-30): there is no time to
-  # build L3 this week and this Saturday's backtest must complete, so the hard
-  # cap is raised to 5400s (90 min) to unblock the run. The signal is NOT lost:
-  # the resilience_ctx projected-overrun WARN stays at 2700s (`budget_warn_s`
-  # in backtest.py::run_simulate), so a >2700s sim still logs loudly — it just
-  # no longer hard-fails. REVERT this to 2700.0 once L4471-L3 lands or the
-  # per-date slowness is fixed (tracked in ROADMAP L4470/L4471).
+  # TIME-BOXED DEVIATION (operator-authorized 2026-05-30): raised to 5400s
+  # (90 min) so the Saturday backtest could complete. WARN stays at 2700s
+  # (`budget_warn_s` in backtest.py::run_simulate) so a >2700s sim still logs.
+  #
+  # 2026-05-31 (L4472 phase-split): the ROADMAP fold-in proposed reverting
+  # this to 2700 alongside the split. KEPT AT 5400 instead — the revert is
+  # DEFERRED, not done. Rationale: the split moves `simulation_pipeline` into
+  # its own SF state (Backtester, --mode=param-sweep) with its own SSM
+  # execution timeout, which fixes the death-by-SUM-of-runtime timeout — but
+  # it does NOT make `simulate` faster. On a FRESH Saturday date there are no
+  # auto-skip markers, so `simulate` runs the full O(t) replay that measured
+  # ≥55 min on 2026-05-30 (still running when killed; no PHASE_END). A 2700s
+  # (45 min) watchdog would fire PhaseTimeoutError mid-`simulate` and re-break
+  # the fresh run — reintroducing L4470. The "cap was never the binding
+  # constraint" reasoning in the L4472 fold-in holds only for RE-RUNS (where
+  # `simulate` auto-skips on markers and the cap never fires); it does not
+  # hold for the fresh-date run the 06-06 cron triggers. REVERT to 2700.0
+  # only once L4471-L3 (incremental cross-run resume → O(Δt)) lands or the
+  # per-date slowness is fixed. Tracked in ROADMAP L4470/L4471/L4472.
   simulation_pipeline: 5400.0
 
   # Portfolio-optimizer cutover gate (ROADMAP L2222 PR 4.5). Runs the
