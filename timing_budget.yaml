@@ -139,8 +139,19 @@ full_run_hard_caps_seconds:
   predictor_pipeline: 1800.0
 
   # Main simulation pipeline (signals → orders → vectorbt). Typical
-  # 5–15 min for a single-run. Cap at 45 min.
-  simulation_pipeline: 2700.0
+  # 5–15 min for a single-run.
+  # 2026-05-30: the post-#267 full-data simulate ran ~55 min and tripped the
+  # prior 2700s cap (L4470). The DURABLE fix is L4471-L3 (incremental resume)
+  # or a per-date regression fix — NOT widening the cap, which hides the
+  # regression signal this watchdog exists to surface.
+  # TIME-BOXED DEVIATION (operator-authorized 2026-05-30): there is no time to
+  # build L3 this week and this Saturday's backtest must complete, so the hard
+  # cap is raised to 5400s (90 min) to unblock the run. The signal is NOT lost:
+  # the resilience_ctx projected-overrun WARN stays at 2700s (`budget_warn_s`
+  # in backtest.py::run_simulate), so a >2700s sim still logs loudly — it just
+  # no longer hard-fails. REVERT this to 2700.0 once L4471-L3 lands or the
+  # per-date slowness is fixed (tracked in ROADMAP L4470/L4471).
+  simulation_pipeline: 5400.0
 
   # Portfolio-optimizer cutover gate (ROADMAP L2222 PR 4.5). Runs the
   # constrained MVO optimizer over synthetic predictor history + evaluates

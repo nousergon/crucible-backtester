@@ -1201,9 +1201,18 @@ def _run_simulation_loop(
     coverage_by_ticker: dict[str, float] | None = None,
     signal_lookups: dict | None = None,
     feature_lookup=None,
+    resilience_ctx: dict | None = None,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
+
+    resilience_ctx (L4471 L1+L2): when non-None (passed ONLY by the standalone
+        ``run_simulate`` simulate phase — never by param-sweep per-combo calls),
+        enables per-date timing/fast-fail instrumentation (L1) and within-run
+        checkpoint/resume (L2). Keys: ``{enabled, bucket, run_date, fingerprint,
+        s3_client, checkpoint_every, per_date_warn_s, budget_warn_s,
+        warmup_dates}``. None (param sweeps) preserves the legacy 250-date
+        heartbeat with no checkpoint I/O.
 
     A fresh SimulatedIBKRClient is created per call so param-sweep combinations
     start from the same initial state. Prices are swapped per date; positions
@@ -1331,11 +1340,44 @@ def _run_simulation_loop(
     # P0 "Diagnose the silent-phase bottleneck" (2026-04-22 4th dry-run).
     _HEARTBEAT_EVERY = 250
     n_dates = len(sim_dates)
-    t0 = _time.monotonic()
 
-    for idx, signal_date in enumerate(sim_dates):
+    # ── L4471 L2: within-run resume ─────────────────────────────────────────
+    # Active only under resilience_ctx (standalone simulate phase). If a valid
+    # checkpoint exists for this (run_date, fingerprint), restore the
+    # carried-forward state and resume from the next date — a failed run
+    # doesn't re-pay the dates it already simulated.
+    _rc = resilience_ctx if (resilience_ctx and resilience_ctx.get("enabled")) else None
+    start_idx = 0
+    if _rc is not None:
+        from store.sim_checkpoint import load_checkpoint, save_checkpoint
+        _ckpt = load_checkpoint(
+            bucket=_rc["bucket"], run_date=_rc["run_date"],
+            fingerprint=_rc["fingerprint"], s3_client=_rc["s3_client"],
+        )
+        if _ckpt is not None:
+            _st = _ckpt["sim_state"]
+            sim_client._cash = _st["cash"]
+            sim_client._positions = _st["positions"]
+            sim_client._peak_nav = _st["peak_nav"]
+            all_orders = list(_ckpt["all_orders"])
+            dates_simulated = _ckpt["dates_simulated"]
+            skip_reasons.update(_ckpt["skip_reasons"])
+            rejected_ticker_counter.update(_ckpt["rejected_ticker_counter"])
+            start_idx = _ckpt["idx"] + 1
+            logger.info(
+                "[sim] RESUMING from checkpoint: %d/%d dates already done (next=%s)",
+                start_idx, n_dates,
+                sim_dates[start_idx] if start_idx < n_dates else "(complete)",
+            )
+
+    t0 = _time.monotonic()
+    _budget_warned = False
+
+    for idx in range(start_idx, n_dates):
+        signal_date = sim_dates[idx]
         signals_override = signals_by_date[signal_date] if signals_by_date is not None else None
         signal_lookup = signal_lookups.get(signal_date) if signal_lookups is not None else None
+        _date_t0 = _time.monotonic()
         orders, skip = _simulate_single_date(
             sim_client=sim_client,
             signal_date=signal_date,
@@ -1353,6 +1395,7 @@ def _run_simulation_loop(
             feature_lookup=feature_lookup,
             coverage_by_ticker=coverage_by_ticker,
         )
+        _date_dt = _time.monotonic() - _date_t0
         if skip is not None:
             skip_reasons[skip] += 1
         else:
@@ -1360,12 +1403,62 @@ def _run_simulation_loop(
                 all_orders.extend(orders)
             dates_simulated += 1
 
-        if (idx + 1) % _HEARTBEAT_EVERY == 0 or (idx + 1) == n_dates:
+        if _rc is not None:
+            # ── L1: per-date instrumentation (makes the simulate cost visible;
+            # the prior heartbeat only fired every 250 dates so a <250-date sim
+            # logged nothing until the end — exactly why the 2026-05-30 overrun
+            # was opaque). Plus a slow-date WARN + projected-overrun WARN. ──
+            cum = _time.monotonic() - t0
+            logger.info(
+                "[sim] date %d/%d %s done in %.1fs (cum %.0fs)",
+                idx + 1, n_dates, signal_date, _date_dt, cum,
+            )
+            if _date_dt > _rc.get("per_date_warn_s", 60):
+                logger.warning(
+                    "[sim] SLOW DATE %s took %.1fs (> %.0fs) — candidate root cause "
+                    "of the simulate-phase overrun (L4470/L4471)",
+                    signal_date, _date_dt, _rc.get("per_date_warn_s", 60),
+                )
+            _done = idx - start_idx + 1
+            _budget = _rc.get("budget_warn_s")
+            if _budget and _done >= _rc.get("warmup_dates", 5) and not _budget_warned:
+                _projected = (cum / _done) * (n_dates - start_idx)
+                if _projected > _budget:
+                    _budget_warned = True
+                    logger.warning(
+                        "[sim] PROJECTED OVERRUN: ~%.0fs for the %d-date sim "
+                        "(rate %.1fs/date) exceeds budget %.0fs — O(t)-slow or "
+                        "stalling; L2 checkpoint lets a re-run resume (L4471)",
+                        _projected, n_dates - start_idx, cum / _done, _budget,
+                    )
+            # ── L2: checkpoint every N dates (best-effort; never aborts) ──
+            if (idx + 1) % _rc.get("checkpoint_every", 5) == 0:
+                save_checkpoint(
+                    bucket=_rc["bucket"], run_date=_rc["run_date"],
+                    fingerprint=_rc["fingerprint"], idx=idx, last_date=signal_date,
+                    sim_state={
+                        "cash": sim_client._cash,
+                        "positions": sim_client._positions,
+                        "peak_nav": sim_client._peak_nav,
+                    },
+                    all_orders=all_orders, dates_simulated=dates_simulated,
+                    skip_reasons=skip_reasons,
+                    rejected_ticker_counter=rejected_ticker_counter,
+                    s3_client=_rc["s3_client"],
+                )
+        elif (idx + 1) % _HEARTBEAT_EVERY == 0 or (idx + 1) == n_dates:
             elapsed = _time.monotonic() - t0
             logger.info(
                 "Simulation loop: %d/%d dates processed (%.1fs elapsed, last=%s)",
                 idx + 1, n_dates, elapsed, signal_date,
             )
+
+    # L2: the sim completed all dates — clear the checkpoint so a fresh run for
+    # this date recomputes (within-run resume is for FAILED runs only; cross-run
+    # incremental resume is L3/deferred).
+    if _rc is not None:
+        from store.sim_checkpoint import clear_checkpoint
+        clear_checkpoint(bucket=_rc["bucket"], run_date=_rc["run_date"], s3_client=_rc["s3_client"])
 
     _MIN_SIMULATION_COVERAGE = 0.80
 
@@ -2148,10 +2241,42 @@ def run_simulate(config: dict) -> dict:
     # effort observability, never load-bearing.
     ew_basket = _try_construct_ew_high_vol_basket(price_matrix)
 
+    # L4471 L1+L2: build the resilience context for the standalone simulate
+    # phase ONLY (param sweeps call _run_simulation_loop without this, so they
+    # keep the legacy heartbeat + pay no checkpoint I/O). Enables per-date
+    # instrumentation + within-run checkpoint/resume keyed on an input
+    # fingerprint (invalidates on executor-param / date / sim-code change).
+    resilience_ctx = None
+    try:
+        import boto3
+        from store.sim_checkpoint import compute_fingerprint
+        _run_date = config.get("_run_date")
+        if _run_date:
+            resilience_ctx = {
+                "enabled": True,
+                "bucket": config.get("signals_bucket", "alpha-engine-research"),
+                "run_date": _run_date,
+                "fingerprint": compute_fingerprint(config, list(dates)),
+                "s3_client": boto3.client("s3"),
+                "checkpoint_every": int(config.get("sim_checkpoint_every", 5)),
+                "per_date_warn_s": float(config.get("sim_per_date_warn_s", 60)),
+                # Budget for the projected-overrun WARN = the simulation_pipeline
+                # phase hard-cap (timing_budget.yaml, 2700s). When the projected
+                # runtime exceeds the cap, WARN early (with the per-date rate) so
+                # the cause is localized BEFORE the watchdog kills the phase —
+                # the fix is a faster sim / L3, never a wider cap.
+                "budget_warn_s": float(config.get("sim_projected_budget_s", 2700)),
+                "warmup_dates": int(config.get("sim_warmup_dates", 5)),
+            }
+    except Exception as exc:  # resilience is best-effort — never block the sim
+        logger.warning("[sim] resilience_ctx setup failed (%s) — running without L1/L2", exc)
+        resilience_ctx = None
+
     return _run_simulation_loop(
         executor_run, SimulatedIBKRClient, dates, price_matrix, config,
         ohlcv_by_ticker=ohlcv,
         ew_high_vol_basket_returns=ew_basket,
+        resilience_ctx=resilience_ctx,
     )
 
 
