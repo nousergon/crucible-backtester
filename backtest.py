@@ -4360,10 +4360,26 @@ def _run_predictor_pipeline(
         predictor_stats = {"status": "error", "error": str(e)}
         predictor_sweep_df = None
 
-    # Auto-apply executor params from predictor sweep (if signal-based sweep
-    # didn't already produce a recommendation)
+    # Auto-apply executor params from the predictor sweep ONLY as the
+    # in-process fallback when the signal-based sweep failed to produce an
+    # "ok" recommendation in THIS process (mode=all). Gated on mode=="all"
+    # for the L4472 phase-split: when the predictor pipeline runs in its own
+    # SF state (--mode=predictor-backtest), the simulation pipeline ran in a
+    # SEPARATE state (Backtester, --mode=param-sweep) and is the SOLE writer
+    # of the `config/executor_params/recommendations/{date}/
+    # from_executor_optimizer.json` artifact. executor_optimizer.apply()
+    # hardcodes optimizer_name="executor_optimizer", so a predictor-side
+    # apply here would clobber that same S3 key with predictor-based params
+    # (the fork). The PredictorBacktest state only runs when the Backtester
+    # state SUCCEEDED (CheckBacktesterStatus: Success -> PredictorBacktest),
+    # i.e. sim produced an "ok" recommendation — exactly the case mode=all
+    # already suppresses predictor's executor-apply. Gating on mode=="all"
+    # therefore preserves monolithic semantics (sim wins; predictor-apply is
+    # the in-process fallback only) while making the split collision-free.
+    # See ROADMAP L4472. mode=all behavior is byte-for-byte unchanged.
     if (
-        (executor_rec is None or executor_rec.get("status") not in ("ok",))
+        args.mode == "all"
+        and (executor_rec is None or executor_rec.get("status") not in ("ok",))
         and predictor_sweep_df is not None
         and not predictor_sweep_df.empty
     ):
