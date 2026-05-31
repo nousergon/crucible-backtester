@@ -139,19 +139,15 @@ full_run_hard_caps_seconds:
   predictor_pipeline: 1800.0
 
   # Main simulation pipeline (signals → orders → vectorbt). Typical
-  # 5–15 min for a single-run historically. Cap WAS 45 min.
-  # 2026-05-30: the 2026-05-30 post-#267 full-data simulate (first run on the
-  # real signals/2026-05-29 after the trading-day fix) ran ~55 min and tripped
-  # this 45-min cap (L4470). Per the cap-discipline above, a trip signals
-  # either a regression OR legitimate O(t) growth (sim-on-every-weekday replays
-  # from a fixed 2026-03-28 bootstrap → grows weekly). We can't yet tell which
-  # (the shipped log truncated at the first date). Bumped 2700→5400 (90 min)
-  # TEMPORARILY so the next run COMPLETES + the new L4471-L1 per-date timing
-  # logging captures the real cost. ACTION: once L1 data lands — if a date/op
-  # regressed, fix it and REVERT to 2700; if legitimate O(t) growth, L4471-L3
-  # (incremental cross-run sim) is the durable fix and this stays bumped with
-  # that rationale. Do NOT treat 5400 as the new normal without that readout.
-  simulation_pipeline: 5400.0
+  # 5–15 min for a single-run. Cap at 45 min.
+  # 2026-05-30: the post-#267 full-data simulate ran ~55 min and tripped this
+  # cap (L4470). Per the cap-discipline above, a trip is a SIGNAL, not a thing
+  # to widen — so this cap is DELIBERATELY LEFT AT 2700. The L4471-L1 per-date
+  # timing logging will localize the cause (a regressed/slow date vs legitimate
+  # O(t) growth of the sim-on-every-weekday replay); the fix is to make the sim
+  # FASTER (or L4471-L3 incremental resume), not to widen the cap. Widening
+  # would hide the regression signal this watchdog exists to surface.
+  simulation_pipeline: 2700.0
 
   # Portfolio-optimizer cutover gate (ROADMAP L2222 PR 4.5). Runs the
   # constrained MVO optimizer over synthetic predictor history + evaluates

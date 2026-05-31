@@ -41,6 +41,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "analysis/cost_report.py": 1,
     "analysis/feature_drift.py": 1,
+    # L4471 L2 within-run sim checkpoint — transient (deleted on success), not a
+    # freshness-tracked SLA artifact; the backtest/{trading_day}/_sim_checkpoint/
+    # prefix is grandfathered in ARTIFACT_REGISTRY.yaml.
+    "store/sim_checkpoint.py": 1,
     "analysis/grade_history.py": 1,
     "analysis/pit_parity.py": 1,
     "analysis/production_health.py": 1,

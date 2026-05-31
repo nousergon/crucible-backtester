@@ -2260,9 +2260,12 @@ def run_simulate(config: dict) -> dict:
                 "s3_client": boto3.client("s3"),
                 "checkpoint_every": int(config.get("sim_checkpoint_every", 5)),
                 "per_date_warn_s": float(config.get("sim_per_date_warn_s", 60)),
-                # Budget for the projected-overrun WARN — the simulation_pipeline
-                # phase hard-cap (timing_budget.yaml) is the natural reference.
-                "budget_warn_s": float(config.get("sim_projected_budget_s", 5400)),
+                # Budget for the projected-overrun WARN = the simulation_pipeline
+                # phase hard-cap (timing_budget.yaml, 2700s). When the projected
+                # runtime exceeds the cap, WARN early (with the per-date rate) so
+                # the cause is localized BEFORE the watchdog kills the phase —
+                # the fix is a faster sim / L3, never a wider cap.
+                "budget_warn_s": float(config.get("sim_projected_budget_s", 2700)),
                 "warmup_dates": int(config.get("sim_warmup_dates", 5)),
             }
     except Exception as exc:  # resilience is best-effort — never block the sim
