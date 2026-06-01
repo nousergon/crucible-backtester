@@ -113,6 +113,25 @@ predictor_backtest:
 # made manually. Set true here or pass --walk-forward.
 walk_forward: false
 
+# ── Transaction-cost model (W3.4, L4469) ─────────────────────────────────────
+# Square-root market-impact (Almgren/Kissell) + half-spread + commission, used
+# by horizon_net_alpha to turn gross per-horizon alpha into NET. Omit the block
+# to use these institutional large-cap / IBKR-paper defaults.
+transaction_cost:
+  half_spread_bps: 2.5           # ≈5bps full spread on liquid large-caps
+  impact_coef_bps: 10.0          # √-law impact (bps at 100% participation)
+  commission_bps: 0.5            # IBKR ~$0.005/share ≈ <1bp on large-caps
+  min_cost_bps: 0.0              # optional per-side floor
+
+# ── Horizon net-alpha study (W3.4, L4469) — OBSERVE ──────────────────────────
+# Per-horizon turnover-adjusted NET alpha (the net-of-cost horizon-cutover
+# judge; gross IC alone doesn't settle it). Writes backtest/{date}/
+# horizon_net_alpha.json. Gates nothing; canonical 21d target unchanged.
+horizon_net_alpha:
+  enabled: true
+  horizons: [5, 10, 21, 60, 90]  # rebalance cadences to compare
+  # top_n defaults to predictor_backtest.top_n_signals_per_day if omitted
+
 # ── Param sweep settings ───────────────────────────────────────────────────
 # mode: "random" samples from the grid; "grid" runs exhaustive search.
 # 60 random trials = 95% confidence of finding a top-5% combination
