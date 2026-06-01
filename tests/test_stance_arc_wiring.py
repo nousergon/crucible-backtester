@@ -22,19 +22,22 @@ import pytest
 
 
 class TestExecutorOptimizerStanceParams:
-    """Stance threshold params must be wired into the auto-tune path."""
+    """L300-a (2026-06-01): the stance GATE thresholds are NO LONGER in the
+    sweep/auto-tune path — they're gated on a per-ticker stance that's None in
+    the predictionless sim (inert no-op). FACTORY_DEFAULTS stay (executor
+    fallback + drift monitoring)."""
 
-    def test_value_drawdown_min_in_safe_params(self):
+    def test_value_drawdown_min_removed_from_safe_params(self):
         from optimizer.executor_optimizer import SAFE_PARAMS
-        assert "value_stance_drawdown_min" in SAFE_PARAMS, (
-            "value_stance_drawdown_min must be in SAFE_PARAMS for the "
-            "auto-tune path to read/write it from "
-            "config/executor_params.json"
+        assert "value_stance_drawdown_min" not in SAFE_PARAMS, (
+            "value_stance_drawdown_min must NOT be in SAFE_PARAMS (L300-a): its "
+            "entry gate (if stance == 'value') never fires in the predictionless "
+            "sim, so sweeping it is a silent no-op."
         )
 
-    def test_quality_threshold_in_safe_params(self):
+    def test_quality_threshold_removed_from_safe_params(self):
         from optimizer.executor_optimizer import SAFE_PARAMS
-        assert "quality_stance_momentum_threshold" in SAFE_PARAMS
+        assert "quality_stance_momentum_threshold" not in SAFE_PARAMS
 
     def test_value_drawdown_min_factory_default(self):
         """Factory default matches the executor-side ``_plan_entries``
@@ -115,34 +118,23 @@ class TestParamSweepStanceSizing:
 
 
 class TestParamSweepStanceRanges:
-    """Sweep search space must include stance thresholds so the
-    optimizer can move them in either direction once data exists."""
+    """L300-a (2026-06-01): the stance GATE thresholds are removed from the
+    sweep grid — gated on a per-ticker stance that's None in the predictionless
+    sim (inert no-op). FACTORY_DEFAULTS retained (executor fallback)."""
 
-    def test_value_drawdown_in_extended_grid(self):
+    def test_value_drawdown_removed_from_extended_grid(self):
         from analysis.param_sweep import EXTENDED_GRID
-        assert "value_stance_drawdown_min" in EXTENDED_GRID
-        candidates = EXTENDED_GRID["value_stance_drawdown_min"]
-        # Cold-start default must be in the range so the sweep at least
-        # re-validates it; bracket ranges (tighter + looser candidates)
-        # let the optimizer move in either direction.
-        assert -0.05 in candidates
-        assert any(v < -0.05 for v in candidates), (
-            "Sweep range must include a TIGHTER (more negative) value "
-            "candidate so optimizer can move toward stricter drawdown "
-            "requirement"
-        )
-        assert any(v > -0.05 for v in candidates), (
-            "Sweep range must include a LOOSER (less negative) value "
-            "candidate so optimizer can move toward easier qualification"
-        )
+        assert "value_stance_drawdown_min" not in EXTENDED_GRID
 
-    def test_quality_threshold_in_extended_grid(self):
+    def test_quality_threshold_removed_from_extended_grid(self):
         from analysis.param_sweep import EXTENDED_GRID
-        assert "quality_stance_momentum_threshold" in EXTENDED_GRID
-        candidates = EXTENDED_GRID["quality_stance_momentum_threshold"]
-        assert -15.0 in candidates
-        assert any(v < -15.0 for v in candidates)
-        assert any(v > -15.0 for v in candidates)
+        assert "quality_stance_momentum_threshold" not in EXTENDED_GRID
+
+    def test_gate_threshold_factory_defaults_retained(self):
+        """Removed from the sweep but kept as executor fallbacks / drift refs."""
+        from optimizer.executor_optimizer import FACTORY_DEFAULTS
+        assert FACTORY_DEFAULTS["value_stance_drawdown_min"] == pytest.approx(-0.05)
+        assert FACTORY_DEFAULTS["quality_stance_momentum_threshold"] == pytest.approx(-15.0)
 
 
 class TestSignalQualityStanceAttribution:

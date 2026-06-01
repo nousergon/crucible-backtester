@@ -92,11 +92,13 @@ SAFE_PARAMS = [
     "correlation_block_threshold",
     "profit_take_pct",
     "momentum_exit_threshold",
-    # Stance taxonomy arc PR 4 (2026-05-11) — executor stance gates consume
-    # these from config/executor_params.json. (These are entry/exit GATE
-    # thresholds, not the inert sizing multipliers L300 removed.)
-    "value_stance_drawdown_min",
-    "quality_stance_momentum_threshold",
+    # L300-a (2026-06-01): value_stance_drawdown_min / quality_stance_momentum_
+    # threshold removed — audit confirmed they're entry GATE thresholds gated on
+    # ``stance == "value"`` / ``"quality"`` in deciders.py, and stance is sourced
+    # only from predictions (None in the predictionless sim) → the gate branches
+    # never fire → sweeping them was a silent no-op. FACTORY_DEFAULTS below keep
+    # them for executor fallback + drift monitoring. A (stance × momentum)
+    # offline gate is the deferred follow-up.
     # L300 (2026-06-01): stance_size_{momentum,value,quality,catalyst} removed —
     # the sweep over them was a silent no-op (predictionless sim → stance None →
     # stance_adj 1.0). They are tuned offline against realized per-stance alpha
