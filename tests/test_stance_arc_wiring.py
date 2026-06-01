@@ -50,15 +50,28 @@ class TestExecutorOptimizerStanceParams:
 
 
 class TestExecutorOptimizerStanceSizing:
-    """Stance-conditional sizing multipliers must be wired into the
-    auto-tune path so the backtester can optimize them weekly."""
+    """L300 (2026-06-01): stance-conditional SIZING multipliers are NO LONGER
+    in the sweep/auto-tune path — the predictionless sim made them inert. They
+    are tuned offline by stance_sizing_optimizer. FACTORY_DEFAULTS stay (executor
+    fallback + drift monitoring)."""
 
     @pytest.mark.parametrize("stance", ["momentum", "value", "quality", "catalyst"])
-    def test_each_stance_size_in_safe_params(self, stance):
+    def test_each_stance_size_removed_from_safe_params(self, stance):
         from optimizer.executor_optimizer import SAFE_PARAMS
         key = f"stance_size_{stance}"
-        assert key in SAFE_PARAMS, (
-            f"{key} must be in SAFE_PARAMS for the auto-tune path"
+        assert key not in SAFE_PARAMS, (
+            f"{key} must NOT be in SAFE_PARAMS (L300): the param sweep over it "
+            "is a silent no-op in the predictionless sim (stance is None → "
+            "stance_adj=1.0). It is tuned offline by stance_sizing_optimizer."
+        )
+
+    @pytest.mark.parametrize("param", ["confidence_sizing_min", "confidence_sizing_range"])
+    def test_confidence_sizing_removed_from_safe_params(self, param):
+        from optimizer.executor_optimizer import SAFE_PARAMS
+        assert param not in SAFE_PARAMS, (
+            f"{param} must NOT be in SAFE_PARAMS (L300): inert in the "
+            "predictionless sim; confidence sizing is tuned offline via p_up "
+            "(predictor_sizing_optimizer)."
         )
 
     def test_stance_size_factory_defaults_match_executor(self):
@@ -87,31 +100,18 @@ class TestExecutorOptimizerStanceSizing:
 
 
 class TestParamSweepStanceSizing:
-    @pytest.mark.parametrize("stance", ["momentum", "value", "quality", "catalyst"])
-    def test_each_stance_size_in_extended_grid(self, stance):
-        from analysis.param_sweep import EXTENDED_GRID
-        key = f"stance_size_{stance}"
-        assert key in EXTENDED_GRID
-        candidates = EXTENDED_GRID[key]
-        # Sweep ranges must include directional candidates so optimizer
-        # can move in either direction
-        assert len(candidates) >= 2
+    """L300 (2026-06-01): stance-conditional SIZING multipliers removed from the
+    sweep grid (silent no-op in the predictionless sim)."""
 
-    def test_stance_size_ranges_bracket_defaults(self):
-        """Each sweep range must contain the factory default so the
-        sweep at least re-validates current values, plus directional
-        candidates (tighter + looser)."""
+    @pytest.mark.parametrize("stance", ["momentum", "value", "quality", "catalyst"])
+    def test_each_stance_size_removed_from_extended_grid(self, stance):
         from analysis.param_sweep import EXTENDED_GRID
-        from optimizer.executor_optimizer import FACTORY_DEFAULTS
-        for stance, factory_default in [
-            ("momentum", 1.0), ("value", 0.7), ("quality", 0.8), ("catalyst", 0.6),
-        ]:
-            key = f"stance_size_{stance}"
-            candidates = EXTENDED_GRID[key]
-            assert factory_default in candidates, (
-                f"sweep range for {key} should include factory default "
-                f"{factory_default}"
-            )
+        assert f"stance_size_{stance}" not in EXTENDED_GRID
+
+    @pytest.mark.parametrize("param", ["confidence_sizing_min", "confidence_sizing_range"])
+    def test_confidence_sizing_removed_from_extended_grid(self, param):
+        from analysis.param_sweep import EXTENDED_GRID
+        assert param not in EXTENDED_GRID
 
 
 class TestParamSweepStanceRanges:

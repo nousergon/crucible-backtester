@@ -75,8 +75,15 @@ EXTENDED_GRID = {
     "profit_take_pct": [0.15, 0.20, 0.25, 0.30],
     "reduce_fraction": [0.25, 0.33, 0.50],
     "atr_sizing_target_risk": [0.01, 0.02, 0.03],
-    "confidence_sizing_min": [0.6, 0.7, 0.8],
-    "confidence_sizing_range": [0.4, 0.6, 0.8],
+    # L300 (2026-06-01): confidence_sizing_min/range REMOVED from the sweep.
+    # They scale position size by per-ticker ``prediction_confidence``, but the
+    # backtester sim runs with ``predictions_by_ticker={}`` → confidence is
+    # always None → the sizer's confidence_adj resolves to 1.0 → sweeping these
+    # was a SILENT NO-OP that still emitted misleading "tuned" recommendations.
+    # Confidence-conditioned sizing is tuned OFFLINE against realized outcomes
+    # (the institutional pattern): predictor_sizing_optimizer already owns the
+    # live confidence path via p_up (use_p_up_sizing). The executor falls back
+    # to its FACTORY_DEFAULTS for confidence_sizing_* (unchanged). See [[feedback_no_silent_fails]].
     "staleness_decay_per_day": [0.02, 0.03, 0.05],
     "earnings_sizing_reduction": [0.30, 0.50, 0.70],
     "earnings_proximity_days": [3, 5, 7],
@@ -92,16 +99,18 @@ EXTENDED_GRID = {
     # can move them in either direction once attribution data exists.
     "value_stance_drawdown_min": [-0.10, -0.05, -0.03],
     "quality_stance_momentum_threshold": [-20.0, -15.0, -10.0],
-    # Stance-conditional sizing multipliers (2026-05-11). Brackets
-    # around the cold-start defaults so the optimizer can move each
-    # in either direction. Momentum kept tight around 1.0 because
-    # that's the baseline; the other three span wider so the value/
-    # quality/catalyst conviction-discount magnitude is the
-    # learn-from-data parameter.
-    "stance_size_momentum": [0.9, 1.0, 1.1],
-    "stance_size_value": [0.5, 0.7, 0.9],
-    "stance_size_quality": [0.6, 0.8, 1.0],
-    "stance_size_catalyst": [0.4, 0.6, 0.8],
+    # L300 (2026-06-01): stance_size_{momentum,value,quality,catalyst} REMOVED
+    # from the sweep. They scale position size by per-ticker ``stance``, but the
+    # backtester sim runs with ``predictions_by_ticker={}`` → stance is always
+    # None → the sizer's stance_adj resolves to 1.0 → sweeping these was a
+    # SILENT NO-OP. They are now tuned OFFLINE against realized per-stance alpha
+    # by ``optimizer/stance_sizing_optimizer.py`` (mirrors the predictor_sizing /
+    # barrier_sizing institutional rank-IC gate). The executor falls back to its
+    # FACTORY_DEFAULTS for stance_size_* (unchanged). NOTE: the stance GATE
+    # thresholds above (value_stance_drawdown_min, quality_stance_momentum_
+    # threshold) are also stance-conditioned and likely equally inert in the
+    # predictionless sim — a sibling L300 follow-up, left in place pending a
+    # consumption-path audit. See [[feedback_no_silent_fails]].
 }
 
 # ── Defaults for sweep mode (override via param_sweep_settings in config.yaml) ──
