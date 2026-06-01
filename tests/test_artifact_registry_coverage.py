@@ -64,6 +64,10 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "optimizer/regression_monitor.py": 5,
     "optimizer/research_optimizer.py": 3,
     "optimizer/scanner_optimizer.py": 3,
+    # L300 (2026-06-01): offline stance-sizing gate, field_overlay to
+    # config/executor_params.json (1 PUT in apply()) — mirrors
+    # barrier_sizing_optimizer; no new freshness-SLA artifact.
+    "optimizer/stance_sizing_optimizer.py": 1,
     "optimizer/tech_weight_ablation.py": 3,
     "optimizer/trigger_optimizer.py": 1,
     "optimizer/weight_optimizer.py": 5,
