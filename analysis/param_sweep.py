@@ -90,27 +90,22 @@ EXTENDED_GRID = {
     "momentum_gate_threshold": [-10.0, -5.0, -2.0],
     "correlation_block_threshold": [0.70, 0.75, 0.80, 0.85],
     "momentum_exit_threshold": [-20.0, -15.0, -10.0],
-    # Stance taxonomy arc PR 4 (2026-05-11) — backtester-tunable gates.
-    # Activation gated on ≥4 weeks of stance-tagged history (predictor
-    # started emitting stance on 2026-05-11). Until then, sweep results
-    # for these params will be insufficient_data per ``MIN_SAMPLES``.
-    # Ranges are bracketed around the cold-start defaults (-0.05 and
-    # -15.0) with one tighter and one looser candidate so the optimizer
-    # can move them in either direction once attribution data exists.
-    "value_stance_drawdown_min": [-0.10, -0.05, -0.03],
-    "quality_stance_momentum_threshold": [-20.0, -15.0, -10.0],
-    # L300 (2026-06-01): stance_size_{momentum,value,quality,catalyst} REMOVED
-    # from the sweep. They scale position size by per-ticker ``stance``, but the
-    # backtester sim runs with ``predictions_by_ticker={}`` → stance is always
-    # None → the sizer's stance_adj resolves to 1.0 → sweeping these was a
-    # SILENT NO-OP. They are now tuned OFFLINE against realized per-stance alpha
-    # by ``optimizer/stance_sizing_optimizer.py`` (mirrors the predictor_sizing /
-    # barrier_sizing institutional rank-IC gate). The executor falls back to its
-    # FACTORY_DEFAULTS for stance_size_* (unchanged). NOTE: the stance GATE
-    # thresholds above (value_stance_drawdown_min, quality_stance_momentum_
-    # threshold) are also stance-conditioned and likely equally inert in the
-    # predictionless sim — a sibling L300 follow-up, left in place pending a
-    # consumption-path audit. See [[feedback_no_silent_fails]].
+    # L300 / L300-a (2026-06-01): ALL stance-conditioned params REMOVED from the
+    # sweep. The backtester sim runs with ``predictions_by_ticker={}`` and
+    # ``stance`` is sourced ONLY from predictions (executor/deciders.py:534,
+    # ``pred_data_for_veto.get("stance")``) → stance is always None in the sim, so:
+    #   • stance_size_{momentum,value,quality,catalyst} (SIZING multipliers) →
+    #     stance_adj resolves to 1.0 (L300);
+    #   • value_stance_drawdown_min / quality_stance_momentum_threshold (entry
+    #     GATE thresholds) → the ``if stance == "value"`` / ``elif stance ==
+    #     "quality"`` branches in deciders.py never execute (L300-a, audit
+    #     confirmed 2026-06-01).
+    # Sweeping any of them was a SILENT NO-OP reading as "tuned." The sizing
+    # multipliers are tuned OFFLINE by optimizer/stance_sizing_optimizer.py
+    # (realized per-stance rank-IC gate); the gate thresholds need a
+    # (stance × momentum)-conditioned offline read — deferred (L300-a follow-up).
+    # The executor falls back to its FACTORY_DEFAULTS for all of them (unchanged).
+    # See [[feedback_no_silent_fails]].
 }
 
 # ── Defaults for sweep mode (override via param_sweep_settings in config.yaml) ──
