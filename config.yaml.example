@@ -158,6 +158,20 @@ executor_optimizer:
   min_sharpe_improvement: 0.10   # best must exceed baseline by 10%+
   drawdown_penalty_weight: 0.50  # penalize max_drawdown in combined ranking score
 
+# ── Stance-sizing optimizer (L300) ───────────────────────────────────────────
+# Offline-IC gate for the stance_size_* multipliers (replaces the inert
+# predictionless param sweep). Tunes against realized per-stance alpha from
+# score_performance; dormant (stance_column_absent) until that migration lands.
+# Omit the block to use the institutional defaults below.
+stance_sizing_optimizer:
+  min_samples_per_stance: 30     # resolved rows per stance before it can move
+  min_stance_spread: 0.005       # max−min per-stance alpha must exceed this to act
+  min_positive_weeks: 6          # rolling sign-consistency gate
+  rolling_weeks: 8
+  sensitivity: 2.0               # nudge gain on realized alpha relative to the book
+  size_floor: 0.4                # multiplier bounds (match executor stance defaults)
+  size_cap: 1.1
+
 # ── Regression monitor / auto-rollback ──────────────────────────────────────
 # Post-run gate that auto-rolls-back optimizer config promotions if metrics
 # regress vs the saved promotion baseline. Primary risk-adjusted trigger is
