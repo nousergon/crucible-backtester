@@ -51,7 +51,11 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "analysis/regime_stratified_sortino_runner.py": 2,
     "analysis/retrain_alert.py": 2,
     "analysis/veto_analysis.py": 5,
-    "backtest.py": 8,
+    # +1 (8→9) 2026-06-01: W3.4 horizon_net_alpha.json — an OBSERVE diagnostic
+    # under backtest/{date}/ (sibling of cov_sweep/gamma_sweep), not a
+    # freshness-SLA artifact; grandfathered here like the other per-run
+    # diagnostics rather than added to the freshness registry.
+    "backtest.py": 9,
     "health_status.py": 1,
     "optimizer/assembler.py": 5,
     "optimizer/barrier_sizing_optimizer.py": 1,

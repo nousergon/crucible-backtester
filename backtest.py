@@ -2687,8 +2687,11 @@ def run_predictor_backtest(config: dict) -> dict:
     import sys
     from synthetic.predictor_backtest import run as run_predictor_pipeline
 
-    # Prepare data: load cache, compute features, run GBM, generate signals
-    result = run_predictor_pipeline(config)
+    # Prepare data: load cache, compute features, run GBM, generate signals.
+    # keep_predictions=True retains the (cheap) continuous alpha panel + ADV so
+    # the W3.4 horizon net-alpha study below reuses them — no second 10y
+    # inference.
+    result = run_predictor_pipeline(config, keep_predictions=True)
 
     if result.get("status") != "ok":
         return result
@@ -2726,6 +2729,46 @@ def run_predictor_backtest(config: dict) -> dict:
 
     # Merge metadata into stats for reporting
     stats["predictor_metadata"] = metadata
+
+    # ── W3.4 (L4469, OBSERVE): turnover-adjusted net alpha per horizon ───────
+    # Reuses the predictions/prices/ADV already computed above (no second 10y
+    # inference). NET-of-cost is the horizon-cutover judge; gross IC (the
+    # predictor manifest's leak-free curve) is not. Gates nothing; the canonical
+    # 21d target is unchanged. Self-contained S3 write mirrors the cov/gamma
+    # sweep stages.
+    try:
+        from analysis.horizon_net_alpha import compute_horizon_net_alpha
+        from analysis.transaction_cost import TransactionCostModel
+
+        hna_cfg = config.get("horizon_net_alpha", {}) or {}
+        if hna_cfg.get("enabled", True) and result.get("predictions_by_date"):
+            pb_cfg = config.get("predictor_backtest", {}) or {}
+            hna = compute_horizon_net_alpha(
+                result["predictions_by_date"],
+                result["price_matrix"],
+                result.get("spy_prices"),
+                cost_model=TransactionCostModel.from_config(config),
+                horizons=hna_cfg.get("horizons"),
+                top_n=int(hna_cfg.get("top_n", pb_cfg.get("top_n_signals_per_day", 20))),
+                init_cash=float(config.get("init_cash", 1_000_000.0)),
+                adv_dollar_by_ticker=result.get("adv_dollar_by_ticker"),
+            )
+            stats["horizon_net_alpha"] = hna
+            _run_date = config.get("_run_date")
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            if _run_date:
+                import boto3
+                s3 = boto3.client("s3")
+                key = f"backtest/{_run_date}/horizon_net_alpha.json"
+                body = json.dumps({"run_date": _run_date, **hna}, default=str, indent=2).encode("utf-8")
+                try:
+                    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+                    logger.info("horizon_net_alpha: persisted s3://%s/%s", bucket, key)
+                except Exception as exc:
+                    logger.warning("horizon_net_alpha S3 persist failed (non-fatal): %s", exc)
+    except Exception as exc:
+        logger.warning("horizon_net_alpha stage failed (OBSERVE, non-fatal): %s", exc)
+
     return stats
 
 

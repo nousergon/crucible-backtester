@@ -682,6 +682,30 @@ def build_ohlcv_df_by_ticker(
     return out
 
 
+def _compute_adv_dollar(price_data: dict[str, pd.DataFrame]) -> dict[str, float]:
+    """Per-ticker average daily DOLLAR volume (median of close×volume over the
+    full loaded history) — the ADV input to the W3.4 transaction-cost model's
+    √-impact term (``analysis.horizon_net_alpha``). A single per-ticker liquidity
+    scalar is sufficient: at our book size the impact term is near-negligible, so
+    a representative median beats threading a full ADV series. Names without a
+    Volume column are omitted (the cost model degrades to half-spread +
+    commission for them — the conservative fallback, not a silent zero)."""
+    out: dict[str, float] = {}
+    for t, df in price_data.items():
+        if df is None or getattr(df, "empty", True):
+            continue
+        close_col = "Close" if "Close" in df.columns else ("close" if "close" in df.columns else None)
+        vol_col = "Volume" if "Volume" in df.columns else ("volume" if "volume" in df.columns else None)
+        if not close_col or not vol_col:
+            continue
+        dv = (df[close_col].astype(float) * df[vol_col].astype(float)).dropna()
+        if len(dv) > 0:
+            v = float(dv.median())
+            if np.isfinite(v) and v > 0:
+                out[t] = v
+    return out
+
+
 def _extract_close(price_data: dict[str, pd.DataFrame], ticker: str | None) -> pd.Series | None:
     """Extract Close price series for a given ticker, or None if not found."""
     if ticker is None or ticker not in price_data:
@@ -1214,5 +1238,11 @@ def run(
         result["predictions_by_date"] = predictions_by_date
         result["sector_map"] = sector_map
         result["trading_dates"] = trading_dates
+
+    # W3.4 (L4469): per-ticker ADV-dollar for the horizon net-alpha cost model.
+    # Cheap (~one float per ticker); surfaced alongside predictions so the
+    # consumer doesn't re-load price data. price_data carries OHLCV Volume.
+    if keep_predictions or keep_features:
+        result["adv_dollar_by_ticker"] = _compute_adv_dollar(price_data)
 
     return result
