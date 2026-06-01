@@ -64,7 +64,10 @@ from analysis import shadow_book as shadow_book_analysis
 from analysis import exit_timing, macro_eval
 from analysis import regime_stratified_sortino_runner
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
-from optimizer import trigger_optimizer, predictor_sizing_optimizer, barrier_sizing_optimizer
+from optimizer import (
+    trigger_optimizer, predictor_sizing_optimizer, barrier_sizing_optimizer,
+    stance_sizing_optimizer,
+)
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
 from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_report_email
@@ -769,6 +772,18 @@ def _run_optimizers(
         skip_if_missing=["research_db"],
     )
 
+    # Stance-conditional sizing optimizer (L300). Offline-IC gate replacing the
+    # inert predictionless param sweep over stance_size_*; tunes the multipliers
+    # against realized per-stance alpha. Reports stance_column_absent until the
+    # score_performance stance migration lands (mirrors barrier).
+    stance_sizing_optimizer.init_config(config)
+    results["stance_sizing"] = tracker.run_module(
+        "stance_sizing",
+        lambda: _run_stance_sizing(db_path, freeze, bucket),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
     # Scanner optimizer
     results["scanner_opt"] = tracker.run_module(
         "scanner_optimizer",
@@ -897,6 +912,18 @@ def _run_barrier_sizing(db_path: str, freeze: bool, bucket: str) -> dict:
             result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         elif result.get("recommendation") == "enable":
             result["apply_result"] = barrier_sizing_optimizer.apply(result, bucket)
+    return result
+
+
+def _run_stance_sizing(db_path: str, freeze: bool, bucket: str) -> dict:
+    """L300: offline-IC stance-sizing optimizer. Reports stance_column_absent
+    until the score_performance stance migration lands (mirrors barrier)."""
+    result = stance_sizing_optimizer.analyze(db_path)
+    if result.get("status") == "ok":
+        if freeze:
+            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+        elif result.get("recommendation") == "enable":
+            result["apply_result"] = stance_sizing_optimizer.apply(result, bucket)
     return result
 
 

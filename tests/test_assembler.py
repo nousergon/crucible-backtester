@@ -533,6 +533,7 @@ class TestDefaultPrecedence:
         assert cfg["precedence"] == [
             "executor_optimizer",
             "predictor_sizing_optimizer",
+            "stance_sizing_optimizer",  # L300 (2026-06-01): offline stance sizing
             "trigger_optimizer",
         ]
         assert cfg["freeze_keys"] == []

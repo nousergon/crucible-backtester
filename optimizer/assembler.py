@@ -84,6 +84,10 @@ DEFAULT_PRECEDENCE = {
             # add their narrow fields on top.
             "executor_optimizer",
             "predictor_sizing_optimizer",
+            # L300 (2026-06-01): stance_size_* multipliers, tuned offline against
+            # realized per-stance alpha (field_overlay), replacing the inert
+            # predictionless sweep.
+            "stance_sizing_optimizer",
             "trigger_optimizer",
         ],
         "freeze_keys": [],

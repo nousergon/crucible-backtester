@@ -80,8 +80,11 @@ SAFE_PARAMS = [
     "max_position_pct",
     "reduce_fraction",
     "atr_sizing_target_risk",
-    "confidence_sizing_min",
-    "confidence_sizing_range",
+    # L300 (2026-06-01): confidence_sizing_min/range removed — the param sweep
+    # over them was a silent no-op (predictionless sim → prediction_confidence
+    # None → confidence_adj 1.0). Confidence sizing is tuned offline via p_up
+    # (predictor_sizing_optimizer). FACTORY_DEFAULTS below keep them for drift
+    # monitoring + executor fallback.
     "staleness_decay_per_day",
     "earnings_sizing_reduction",
     "earnings_proximity_days",
@@ -89,23 +92,16 @@ SAFE_PARAMS = [
     "correlation_block_threshold",
     "profit_take_pct",
     "momentum_exit_threshold",
-    # Stance taxonomy arc PR 4 (2026-05-11) — executor stance gates
-    # consume these from config/executor_params.json. Search-space
-    # ranges live in analysis/param_sweep.py EXTENDED_GRID. Until 4+
-    # weeks of stance-tagged history exists, the sweep ranges are
-    # ad hoc cold-start values; auto-tuned weekly once data lands.
+    # Stance taxonomy arc PR 4 (2026-05-11) — executor stance gates consume
+    # these from config/executor_params.json. (These are entry/exit GATE
+    # thresholds, not the inert sizing multipliers L300 removed.)
     "value_stance_drawdown_min",
     "quality_stance_momentum_threshold",
-    # Stance-conditional position sizing multipliers (2026-05-11 PR
-    # alpha-engine#NNN). Executor's compute_position_size folds these
-    # into raw_weight as ``stance_adj``. Defaults: momentum 1.0×,
-    # value 0.7×, quality 0.8×, catalyst 0.6×. Auto-tuned weekly via
-    # per-stance Sharpe / alpha attribution once ≥4 weeks of stance-
-    # tagged history accumulates.
-    "stance_size_momentum",
-    "stance_size_value",
-    "stance_size_quality",
-    "stance_size_catalyst",
+    # L300 (2026-06-01): stance_size_{momentum,value,quality,catalyst} removed —
+    # the sweep over them was a silent no-op (predictionless sim → stance None →
+    # stance_adj 1.0). They are tuned offline against realized per-stance alpha
+    # by optimizer/stance_sizing_optimizer.py (rank-IC gate, field_overlay).
+    # FACTORY_DEFAULTS below keep them for drift monitoring + executor fallback.
 ]
 
 # Factory defaults — the values the executor uses when no S3 config exists.
