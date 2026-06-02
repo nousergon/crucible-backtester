@@ -101,6 +101,69 @@ def _log_rss(label: str) -> None:
         logger.debug("MEM %s: failed to sample RSS: %s", label, exc)
 
 
+# Default minimum free RAM (GB) the full predictor pipeline needs before
+# it starts. Peak RSS measured ~2768 MB on the 2026-06-01 off-cycle run
+# (post_build_signals checkpoint); with ArcticDB + OS base the working
+# set needs ≥8 GB total / ≥~6 GB available. A 4 GB c5.large has ~3.5 GB
+# available at this point and OOM-killed predictor_pipeline ~60 min in
+# with an opaque SIGKILL (no stdout, no exit code — L4485). This floor
+# converts that into a fast, legible startup failure. Override via the
+# predictor_backtest.min_ram_gb config key.
+_DEFAULT_MIN_RAM_GB = 6.0
+
+
+def _available_ram_gb() -> "float | None":
+    """Return MemAvailable in GB from /proc/meminfo, or None off-Linux."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) / (1024 * 1024)  # kB → GB
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return None
+
+
+def _assert_ram_headroom(min_gb: float, label: str = "predictor_pipeline") -> None:
+    """Fail loud + legible at phase start if free RAM is below the floor.
+
+    The full 10y × ~900-ticker predictor backtest's peak RSS (~2.8 GB,
+    2026-06-01) does not fit a 4 GB c5.large; previously this surfaced as
+    an opaque SIGKILL ~60 min into the run with no stdout / exit code
+    (L4485 Run 1). Checking MemAvailable up front turns the OOM into an
+    actionable startup error that names the instance-size remedy.
+
+    Skipped (logged, not raised) when /proc/meminfo is unreadable
+    (non-Linux / local tests) — the production target is Linux spot
+    instances. On Linux at full scale this raises, not warns, per
+    [[feedback_no_silent_fails]]: a too-small instance is a contract
+    violation the caller must see, not degrade past.
+    """
+    avail = _available_ram_gb()
+    if avail is None:
+        logger.info(
+            "MEM headroom check skipped for %s (MemAvailable unreadable — "
+            "non-Linux host or /proc absent)", label,
+        )
+        return
+    logger.info(
+        "MEM headroom %s: %.1f GB available, floor %.1f GB", label, avail, min_gb
+    )
+    if avail < min_gb:
+        raise RuntimeError(
+            f"Pre-pipeline RAM headroom check FAILED for {label}: "
+            f"{avail:.1f} GB available < {min_gb:.1f} GB required. The full "
+            f"10y × ~900-ticker predictor backtest peaks at ~2.8 GB RSS and "
+            f"OOM-kills on a 4 GB instance (L4485, 2026-06-01). Launch this "
+            f"phase on an ≥8 GB instance (m5.large / m6i.large / c5.xlarge) — "
+            f"the mode-aware instance floor in spot_backtest.sh selects one "
+            f"automatically for predictor-bearing modes. Override the floor "
+            f"via the predictor_backtest.min_ram_gb config key."
+        )
+
+
 def load_sector_map(predictor_path: str) -> dict[str, str]:
     """Load sector_map.json mapping tickers to sector ETF symbols."""
     map_path = Path(predictor_path) / "data" / "cache" / "sector_map.json"
@@ -1068,6 +1131,12 @@ def run(
     # stock-symbol read; macro/ETF symbols (SPY etc.) always load.
     _smoke_tickers = config.get("smoke_tickers")
     _allowlist = set(_smoke_tickers) if _smoke_tickers else None
+    # RAM-headroom guard (L4485): full-universe runs only. Smoke fixtures
+    # (_allowlist set) load a handful of tickers and must never trip the
+    # floor. Fires before the first large allocation so a too-small
+    # instance fails in seconds, not 60 min into an OOM SIGKILL.
+    if _allowlist is None:
+        _assert_ram_headroom(pb_config.get("min_ram_gb", _DEFAULT_MIN_RAM_GB))
     price_data, features_by_ticker = load_universe_from_arctic(
         bucket=bucket, tickers_allowlist=_allowlist,
     )
