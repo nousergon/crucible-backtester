@@ -1186,6 +1186,22 @@ def run(
     _log_rss("post_spy_extract")
 
     ohlcv_by_ticker = build_ohlcv_df_by_ticker(price_data)
+    # W3.4 (L4485-c fix): compute per-ticker ADV-dollar from price_data
+    # HERE, while it is still alive. The original #270 code computed this
+    # at result-assembly time (below) — AFTER ``del price_data`` — so every
+    # keep_predictions / keep_features run raised
+    # ``UnboundLocalError: ... 'price_data' ...`` at that line. The error
+    # was swallowed by the pit_parity stage's observational/non-fatal
+    # handler, so it surfaced only as a silently-missing
+    # horizon_net_alpha.json (and would crash --mode=portfolio-optimizer-
+    # backtest, another keep_predictions=True caller). ADV is one float per
+    # ticker (~900 floats) — negligible, so it does not reintroduce the
+    # memory peak the del below is guarding against.
+    adv_dollar_by_ticker = (
+        _compute_adv_dollar(price_data)
+        if (keep_predictions or keep_features)
+        else None
+    )
     # Release price_data: its entries now live as normalized DataFrames
     # inside ohlcv_by_ticker. Holding both would re-introduce the
     # concurrent-peak the pandas refactor is designed to kill.
@@ -1309,9 +1325,9 @@ def run(
         result["trading_dates"] = trading_dates
 
     # W3.4 (L4469): per-ticker ADV-dollar for the horizon net-alpha cost model.
-    # Cheap (~one float per ticker); surfaced alongside predictions so the
-    # consumer doesn't re-load price data. price_data carries OHLCV Volume.
-    if keep_predictions or keep_features:
-        result["adv_dollar_by_ticker"] = _compute_adv_dollar(price_data)
+    # Computed above from price_data BEFORE the memory-drop (L4485-c fix);
+    # surfaced alongside predictions so the consumer doesn't re-load prices.
+    if adv_dollar_by_ticker is not None:
+        result["adv_dollar_by_ticker"] = adv_dollar_by_ticker
 
     return result
