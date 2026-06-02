@@ -422,15 +422,22 @@ pre_launch_preflight() {
     py="$LIB_PYTHON"
     [ -x "$py" ] || py="$(command -v python3 || echo python3)"
 
-    # (1) Byte-compile the load-bearing entrypoints (catches SyntaxError fast).
-    if ! "$py" -m py_compile \
+    # (1) Syntax-check the load-bearing entrypoints via ast.parse — a PURE
+    #     parse with ZERO filesystem writes. py_compile writes .pyc into
+    #     __pycache__, which fails with EACCES on this shared dispatcher
+    #     where the cache dir is owned by another uid (root, from a prior
+    #     SF run) — a FALSE failure that wrongly blocked a clean launch
+    #     (caught live 2026-06-02). ast.parse raises SyntaxError on the same
+    #     bug class without touching disk, so it can never false-fail on a
+    #     read-only / mixed-ownership tree.
+    if ! "$py" -c 'import ast,sys; [ast.parse(open(f).read(), filename=f) for f in sys.argv[1:]]' \
         "$REPO_ROOT/backtest.py" \
         "$REPO_ROOT/evaluate.py" \
         "$REPO_ROOT/preflight.py" \
         "$REPO_ROOT/pipeline_common.py" \
-        "$REPO_ROOT/synthetic/predictor_backtest.py" 2>/tmp/prelaunch_pycompile.err; then
-        echo "ERROR: pre-launch py_compile FAILED — a syntax error would crash the spot ~15 min into boot+deps. Fix before launching:" >&2
-        cat /tmp/prelaunch_pycompile.err >&2
+        "$REPO_ROOT/synthetic/predictor_backtest.py" 2>/tmp/prelaunch_syntax.err; then
+        echo "ERROR: pre-launch syntax check FAILED — a SyntaxError would crash the spot ~15 min into boot+deps. Fix before launching:" >&2
+        cat /tmp/prelaunch_syntax.err >&2
         exit 1
     fi
 
