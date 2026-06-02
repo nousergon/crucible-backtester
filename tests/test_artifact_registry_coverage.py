@@ -55,7 +55,9 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # under backtest/{date}/ (sibling of cov_sweep/gamma_sweep), not a
     # freshness-SLA artifact; grandfathered here like the other per-run
     # diagnostics rather than added to the freshness registry.
-    "backtest.py": 9,
+    # +1 (9→10) 2026-06-02: L4488b model_version_net_alpha.json — per-version
+    # net-of-cost OBSERVE diagnostic (same grandfather rationale).
+    "backtest.py": 10,
     "health_status.py": 1,
     "optimizer/assembler.py": 5,
     "optimizer/barrier_sizing_optimizer.py": 1,
