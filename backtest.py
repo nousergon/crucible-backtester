@@ -2769,6 +2769,49 @@ def run_predictor_backtest(config: dict) -> dict:
     except Exception as exc:
         logger.warning("horizon_net_alpha stage failed (OBSERVE, non-fatal): %s", exc)
 
+    # ── L4488b (OBSERVE): per-model-version net-of-cost alpha under a FIXED ──
+    # policy. Champion/challenger Phase-2 completion: score each registered
+    # version's predictions (from research.db predictor_outcomes[_shadow]) through
+    # the SAME top-N fixed policy + cost model as horizon_net_alpha, so the
+    # leaderboard's decision metric measures the MODEL, not model×execution.
+    # Reuses the prices/ADV already loaded above. Gates nothing.
+    try:
+        from analysis.model_version_net_alpha import (
+            compute_model_version_net_alpha,
+            load_version_predictions,
+        )
+        from analysis.transaction_cost import TransactionCostModel
+
+        mvna_cfg = config.get("model_version_net_alpha", {}) or {}
+        version_preds = load_version_predictions(config.get("research_db"))
+        if mvna_cfg.get("enabled", True) and version_preds and result.get("price_matrix") is not None:
+            pb_cfg = config.get("predictor_backtest", {}) or {}
+            mvna = compute_model_version_net_alpha(
+                version_preds,
+                result["price_matrix"],
+                result.get("spy_prices"),
+                cost_model=TransactionCostModel.from_config(config),
+                horizon=int(mvna_cfg.get("horizon", pb_cfg.get("forward_days", 21))),
+                top_n=int(mvna_cfg.get("top_n", pb_cfg.get("top_n_signals_per_day", 20))),
+                init_cash=float(config.get("init_cash", 1_000_000.0)),
+                adv_dollar_by_ticker=result.get("adv_dollar_by_ticker"),
+            )
+            stats["model_version_net_alpha"] = mvna
+            _run_date = config.get("_run_date")
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            if _run_date:
+                import boto3
+                s3 = boto3.client("s3")
+                key = f"backtest/{_run_date}/model_version_net_alpha.json"
+                body = json.dumps({"run_date": _run_date, **mvna}, default=str, indent=2).encode("utf-8")
+                try:
+                    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+                    logger.info("model_version_net_alpha: persisted s3://%s/%s", bucket, key)
+                except Exception as exc:
+                    logger.warning("model_version_net_alpha S3 persist failed (non-fatal): %s", exc)
+    except Exception as exc:
+        logger.warning("model_version_net_alpha stage failed (OBSERVE, non-fatal): %s", exc)
+
     return stats
 
 
