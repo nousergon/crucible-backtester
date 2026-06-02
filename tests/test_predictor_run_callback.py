@@ -97,6 +97,61 @@ class TestPersistFeaturesCallbackContract:
         assert result["status"] == "ok"
         assert "features_by_ticker" not in result
 
+    def test_keep_predictions_includes_adv_dollar_no_unbound_error(self):
+        """Regression (L4485-c / #270): the W3.4 adv_dollar computation must
+        not reference ``price_data`` after it's ``del``'d.
+
+        The original code called ``_compute_adv_dollar(price_data)`` at
+        result-assembly time — AFTER ``del price_data`` — so every
+        ``keep_predictions=True`` run (pit_parity's run_predictor_backtest,
+        --mode=portfolio-optimizer-backtest) raised
+        ``UnboundLocalError: ... 'price_data' ...``. The pit_parity stage
+        swallowed it as observational, so it surfaced only as a silently
+        missing ``horizon_net_alpha.json``. This drives run() with
+        keep_predictions=True and asserts the result carries
+        ``adv_dollar_by_ticker`` with no UnboundLocalError.
+        """
+        fake_features = {"AAPL": object()}
+        fake_predictions = {"2026-01-01": {"AAPL": 0.01}}
+
+        with (
+            patch("synthetic.predictor_backtest.os.path.isdir", return_value=True),
+            patch("synthetic.predictor_backtest.load_sector_map", return_value={}),
+            patch("synthetic.predictor_backtest._assert_ram_headroom"),
+            patch(
+                "store.arctic_reader.load_universe_from_arctic",
+                return_value=({"AAPL": None}, fake_features),
+            ),
+            patch("synthetic.predictor_backtest._resolve_trading_dates",
+                  return_value=["2026-01-01"]),
+            patch("synthetic.predictor_backtest.build_price_matrix",
+                  return_value=__import__("pandas").DataFrame()),
+            patch("synthetic.predictor_backtest._extract_close",
+                  return_value=None),
+            patch("synthetic.predictor_backtest.build_ohlcv_df_by_ticker",
+                  return_value={}),
+            patch("synthetic.predictor_backtest.download_gbm_model",
+                  return_value="/tmp/_test_gbm.txt"),
+            patch("synthetic.predictor_backtest.run_inference",
+                  return_value=fake_predictions),
+            patch("synthetic.predictor_backtest.build_signals_by_date",
+                  return_value={"2026-01-01": {"buy_candidates": []}}),
+            # _compute_adv_dollar is exercised for arg-evaluation (the bug
+            # was the unbound ``price_data`` arg); stub its body so we don't
+            # need real OHLCV volume frames.
+            patch("synthetic.predictor_backtest._compute_adv_dollar",
+                  return_value={"AAPL": 1.0e6}),
+            patch("os.unlink"),
+        ):
+            result = predictor_run(
+                config={"predictor_paths": ["/tmp"]},
+                keep_predictions=True,
+            )
+
+        assert result["status"] == "ok"
+        assert result.get("predictions_by_date") == fake_predictions
+        assert result.get("adv_dollar_by_ticker") == {"AAPL": 1.0e6}
+
     def test_callback_exception_propagates_not_swallowed(self):
         """If the persist callback raises (e.g. S3 IAM denied), the
         spot must HardFail — features can't reach Phase 4 lazy-load
