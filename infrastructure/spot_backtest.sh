@@ -312,6 +312,30 @@ fi
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Backtester Spot Run — $(date +%Y-%m-%d)"
 echo "═══════════════════════════════════════════════════════════════"
+
+# ── Phase-aware instance-type floor (L4485) ──────────────────────────────────
+# Modes that run predictor_pipeline (10y GBM inference over ~900 tickers;
+# peak RSS ~2.8 GB measured 2026-06-01) need ≥8 GB RAM. The 4 GB c5.large —
+# FIRST in the default rotation — OOM-killed predictor_pipeline on the
+# 2026-06-01 off-cycle run. CRITICAL: the Saturday SF's PredictorBacktest +
+# PortfolioOptimizerBacktest states invoke this script with NO --instance-type,
+# so without this floor they inherit the c5.large-first default and OOM
+# identically on the next weekly cycle (the operator's "why would Saturday
+# succeed?" — it wouldn't). Setting the floor HERE fixes both the off-cycle
+# --mode=all path and the SF split-states with zero edits to the Step Function.
+# param-sweep / simulate / signal-quality don't load the predictor tensor and
+# stay on the cheap 4 GB-first rotation. Skipped when the operator passes an
+# explicit --instance-type (their choice wins, incl. deliberate small debug).
+_PREDICTOR_RAM_FLOOR_TYPES="m5.large,m6i.large,m5a.large,c5.xlarge,c6i.xlarge"
+case "$BACKTEST_MODE" in
+    all|predictor-backtest|portfolio-optimizer-backtest)
+        if [ -z "$INSTANCE_TYPE" ]; then
+            echo "  Mode '$BACKTEST_MODE' runs predictor_pipeline → applying ≥8 GB instance floor"
+            INSTANCE_TYPES="$_PREDICTOR_RAM_FLOOR_TYPES"
+        fi
+        ;;
+esac
+
 if [ -n "$INSTANCE_TYPE" ]; then
     INSTANCE_TYPES="$INSTANCE_TYPE"  # --instance-type X collapses to single value
 fi
@@ -378,6 +402,74 @@ for candidate in \
 done
 # PREDICTOR_CONFIG may be empty — predictor backtest is skipped if so.
 
+# ── Dispatcher-side pre-launch preflight (L4485) ─────────────────────────────
+# Fail fast on the DISPATCHER, before provisioning a spot, per the standing
+# rule "every preflight fails fast before expensive work"
+# ([[feedback_preflight_fast_fail_before_expensive_work]]). The existing
+# BacktesterPreflight + smoke harness run ON the spot — only AFTER ~10-15 min
+# of boot + 3 clones + dep install — so a syntax error or a lib-pin drift
+# burns that whole window before surfacing. These checks cost <2 s locally
+# and catch the two cheapest-to-miss classes at second zero:
+#   (1) py_compile — a SyntaxError anywhere in the load-bearing entrypoints
+#       would crash the spot deep in the run. Byte-compile needs no deps.
+#   (2) lib-pin drift — requirements.txt's alpha-engine-lib pin must be ≥ the
+#       MIN_LIB_VERSION the in-process preflight asserts, or the spot's pip
+#       install pulls a version the code rejects (the 2026-04-21 80-min burn).
+# Plus a SOFT warning when local tracked .py/.sh edits aren't on origin/$BRANCH
+# (the spot clones --branch $BRANCH from GitHub — local-only commits won't run).
+pre_launch_preflight() {
+    local py
+    py="$LIB_PYTHON"
+    [ -x "$py" ] || py="$(command -v python3 || echo python3)"
+
+    # (1) Byte-compile the load-bearing entrypoints (catches SyntaxError fast).
+    if ! "$py" -m py_compile \
+        "$REPO_ROOT/backtest.py" \
+        "$REPO_ROOT/evaluate.py" \
+        "$REPO_ROOT/preflight.py" \
+        "$REPO_ROOT/pipeline_common.py" \
+        "$REPO_ROOT/synthetic/predictor_backtest.py" 2>/tmp/prelaunch_pycompile.err; then
+        echo "ERROR: pre-launch py_compile FAILED — a syntax error would crash the spot ~15 min into boot+deps. Fix before launching:" >&2
+        cat /tmp/prelaunch_pycompile.err >&2
+        exit 1
+    fi
+
+    # (2) Cross-check the requirements.txt lib pin against preflight.py's floor.
+    local pin floor lowest
+    pin=$(grep -oE '@v[0-9]+\.[0-9]+\.[0-9]+' "$REPO_ROOT/requirements.txt" | head -1 | tr -d '@v')
+    floor=$(grep -oE 'MIN_LIB_VERSION[[:space:]]*=[[:space:]]*"[0-9.]+"' "$REPO_ROOT/preflight.py" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$pin" ] && [ -n "$floor" ]; then
+        lowest=$(printf '%s\n%s\n' "$floor" "$pin" | sort -V | head -1)
+        if [ "$lowest" != "$floor" ]; then
+            echo "ERROR: requirements.txt alpha-engine-lib pin v$pin < preflight.py MIN_LIB_VERSION $floor." >&2
+            echo "       The spot's pip install would pull a version the code rejects. Bump the pin or the floor." >&2
+            exit 1
+        fi
+        echo "  pre-launch: lib pin v$pin ≥ MIN_LIB_VERSION $floor ✓"
+    else
+        echo "  pre-launch: WARNING — could not parse lib pin (pin='$pin' floor='$floor'); skipping pin cross-check" >&2
+    fi
+
+    # (3) SOFT: warn on local tracked .py/.sh edits not on origin/$BRANCH.
+    local dirty
+    dirty=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | grep -E '\.(py|sh)$' || true)
+    if [ -n "$dirty" ]; then
+        echo "  pre-launch: WARNING — uncommitted tracked .py/.sh changes; the spot clones --branch $BRANCH and will NOT see these:" >&2
+        echo "$dirty" | sed 's/^/      /' >&2
+    fi
+    git -C "$REPO_ROOT" fetch --quiet origin "$BRANCH" 2>/dev/null || true
+    local lhead rhead
+    lhead=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+    rhead=$(git -C "$REPO_ROOT" rev-parse "origin/$BRANCH" 2>/dev/null || true)
+    if [ -n "$lhead" ] && [ -n "$rhead" ] && ! git -C "$REPO_ROOT" merge-base --is-ancestor "$lhead" "$rhead" 2>/dev/null; then
+        echo "  pre-launch: WARNING — local HEAD ($lhead) is not in origin/$BRANCH; the spot clones origin/$BRANCH and will run WITHOUT your local commits. Push first." >&2
+    fi
+
+    echo "  pre-launch preflight OK."
+}
+echo "==> Dispatcher pre-launch preflight (fail-fast before provisioning spot)..."
+pre_launch_preflight
+
 # ── Launch spot instance ──────────────────────────────────────────────────────
 # Capacity-resilient launch via alpha_engine_lib.ec2_spot (lib v0.26.0+).
 # Rotates (instance_type × subnet) on InsufficientInstanceCapacity etc.
@@ -423,10 +515,24 @@ cleanup() {
     if [ "$exit_code" -ne 0 ]; then
         local last_desc="${LAST_SSM_DESC:-<none — failed before any SSM call>}"
         echo "    last run_ssm: $last_desc"
-        local state="<not yet provisioned>"
+        local state="<not yet provisioned>" state_reason="<none>"
         if [ -n "${INSTANCE_ID:-}" ]; then
-            state=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "<lookup-failed>")
+            # Capture State.Name + StateTransitionReason BEFORE terminating so
+            # the L4485 rc=-1 / empty-output failure class (SSM Failed with no
+            # stdout/stderr) is classifiable post-hoc: a spot interruption
+            # shows "Server.SpotInstanceTermination" here, a delivery-timeout /
+            # genuine crash shows something else. Without this the instance is
+            # gone by the time anyone looks and the diagnostics JSON carries
+            # empty tails — exactly the 2026-06-01 dead-end. One describe call,
+            # flattened to "State.Name<TAB>StateTransitionReason".
+            local _desc
+            _desc=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].[State.Name,StateTransitionReason]' --output text 2>/dev/null || true)
+            state=$(printf '%s' "$_desc" | awk '{print $1}')
+            state_reason=$(printf '%s' "$_desc" | cut -f2-)
+            [ -z "$state" ] && state="<lookup-failed>"
+            [ -z "$state_reason" ] && state_reason="<none>"
             echo "    spot state: $state"
+            echo "    spot state-reason: $state_reason"
         fi
         # Independent-channel surveillance: fan out the diagnostic via
         # alpha_engine_lib.alerts (SNS + Telegram). Mirrors the L117
@@ -445,7 +551,7 @@ cleanup() {
             _alert_python="$(command -v python3 || command -v python || echo python)"
         fi
         "$_alert_python" -m alpha_engine_lib.alerts publish \
-            --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state instance_id=${INSTANCE_ID:-<none>}" \
+            --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_state_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>}" \
             --severity error \
             --source alpha-engine-backtester/spot_backtest.sh \
             > /dev/null 2>&1 || echo "    (alerts.publish fan-out failed; primary stdout diagnostic above is the surface)"
@@ -454,6 +560,15 @@ cleanup() {
     aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
     aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
     echo "  Instance terminated; S3 staging cleaned."
+    # CRITICAL (L4485): re-exit with the captured status. A bash EXIT trap
+    # that ends on a successful command (the echo above, or the `|| true`
+    # cleanup steps) otherwise leaves the script exiting 0 — which is
+    # exactly how a Failed SSM `backtest` step (run_ssm correctly returned
+    # 1) was masked as rc=0 to the orchestration wrapper on 2026-06-01,
+    # letting a failed run read as success. The cleanup path must never
+    # override the primary exit status (inverse of the acceptable EXIT-trap
+    # carve-out in [[feedback_no_silent_fails]]).
+    exit "$exit_code"
 }
 trap cleanup EXIT
 
