@@ -374,19 +374,14 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.42.0" in text, (
-            "alpha-engine-lib should pin to v0.42.0 (the latest stable "
-            "tag at 2026-05-28, retiring the legacy 4-class "
-            "``RegimeLiteral`` 'caution' tier per "
-            "caution-regime-retirement-260528.md). Activated for "
-            "ae-backtester via this PR's caution-regime retirement Phase 2C. "
-            "Earlier version history retained per the changelog scan up to v0.33 "
-            "(``record_anthropic_call`` capture chokepoint); v0.34 "
-            "(LLMJudgeReranker deletion), v0.35 (ssm_dispatcher lift), "
-            "v0.36 (Option-D execution-picker), v0.37 (anthropic_payload "
-            "chokepoint), v0.38 (universe_writer_lock + PyPI summary "
-            "guard), v0.39 (ssm_dispatcher diagnostics-write), v0.40 "
-            "(artifact_freshness), v0.41 (build_batches_request_params), "
-            "v0.42 (RegimeLiteral 3-class). Update this test if the pin "
-            "moves further forward."
+        assert "@v0.49.0" in text, (
+            "alpha-engine-lib should pin to v0.49.0 — bumped from v0.42.0 for "
+            "the LV2-AE leverage arc (2026-06-03): the backtester's "
+            "analysis/{dsr,information_coefficient,expectancy,stats_utils,"
+            "risk_matched_benchmark}.py are now re-export shims over "
+            "``alpha_engine_lib.quant.stats`` (the ``[quant-stats]`` extra). "
+            "Intervening tags: v0.43-v0.45 (cross-cutting), v0.46 (quant "
+            "Option-B factor risk), v0.47 (quant Option-A factor_risk_xs), "
+            "v0.48 (http_retry), v0.49 (quant.stats). Update this test if the "
+            "pin moves further forward."
         )
