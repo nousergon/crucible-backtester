@@ -978,6 +978,11 @@ def save(
     quant_rank_quality: dict | None = None,
     agent_justification: dict | None = None,
     barrier_coherence: dict | None = None,
+    score_calibration: dict | None = None,
+    macro_eval: dict | None = None,
+    team_metrics: dict | None = None,
+    calibration_diagnostics: dict | None = None,
+    excursion_summary: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -1037,6 +1042,9 @@ def save(
     for filename, data in [
         ("decision_capture_coverage.json", decision_capture_coverage),
         ("executor_decision_capture_coverage.json", executor_decision_capture_coverage),
+        # team_metrics carries no status field; emit whenever populated (the
+        # evaluator passes `team_metrics or None`, so empty {} reaches here as None).
+        ("team_metrics.json", team_metrics),
     ]:
         if data is not None:
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
@@ -1057,6 +1065,13 @@ def save(
         ("quant_rank_quality.json", quant_rank_quality),
         ("agent_justification.json", agent_justification),
         ("barrier_coherence.json", barrier_coherence),
+        # Computed in evaluate.py but previously unpersisted — the evaluator
+        # (Report Card v2, Option B) reads these tiles over S3. (Director plan
+        # Phase B1a.)
+        ("score_calibration.json", score_calibration),
+        ("macro_eval.json", macro_eval),
+        ("portfolio_calibration.json", calibration_diagnostics),
+        ("portfolio_excursion.json", excursion_summary),
     ]:
         if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))

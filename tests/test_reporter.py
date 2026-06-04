@@ -711,3 +711,57 @@ class TestAlwaysEmitDecisionCapture:
             barrier_coherence={"status": "error", "error": "boom"},
         )
         assert not (out / "barrier_coherence.json").exists()
+
+
+# ── save() — Phase B1a artifact persistence ──────────────────────────────────
+
+
+class TestSavePersistence:
+    """The 6 computed-but-previously-unpersisted diagnostic dicts now land in
+    results/{date}/ for the evaluator (Report Card v2, Option B) to read over S3."""
+
+    def _save(self, tmp_path, **kw):
+        from reporter import save
+        return save(
+            report_md="# r",
+            signal_quality={},
+            score_analysis=[],
+            run_date="2026-06-04",
+            results_dir=str(tmp_path),
+            **kw,
+        )
+
+    def test_ok_artifacts_persisted(self, tmp_path):
+        import json
+        out = self._save(
+            tmp_path,
+            score_calibration={"status": "ok", "ece": 0.04},
+            macro_eval={"status": "ok", "accuracy": 0.6},
+            team_metrics={"tech": {"grade": 80}},
+            calibration_diagnostics={"status": "ok", "x": 1},
+            excursion_summary={"status": "ok", "mfe_mae": 1.2},
+        )
+        for fn in (
+            "score_calibration.json",
+            "macro_eval.json",
+            "team_metrics.json",
+            "portfolio_calibration.json",
+            "portfolio_excursion.json",
+        ):
+            assert (out / fn).exists(), f"{fn} not written"
+        assert json.loads((out / "score_calibration.json").read_text())["ece"] == 0.04
+        assert json.loads((out / "team_metrics.json").read_text())["tech"]["grade"] == 80
+
+    def test_na_status_not_persisted(self, tmp_path):
+        out = self._save(
+            tmp_path,
+            score_calibration={"status": "insufficient_data"},
+            calibration_diagnostics={"status": "insufficient_data"},
+        )
+        assert not (out / "score_calibration.json").exists()
+        assert not (out / "portfolio_calibration.json").exists()
+
+    def test_empty_team_metrics_not_persisted(self, tmp_path):
+        # evaluate.py passes `team_metrics or None`, so empty {} arrives as None.
+        out = self._save(tmp_path, team_metrics=None)
+        assert not (out / "team_metrics.json").exists()
