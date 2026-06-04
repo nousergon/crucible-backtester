@@ -753,7 +753,19 @@ def init_research_db(db_arg: str | None, config: dict) -> None:
 
 
 def find_trades_db(config: dict) -> str | None:
-    """Find trades.db from executor_paths config."""
+    """Resolve trades.db: local ``executor_paths`` first, else pull from S3.
+
+    On the trading box the DB is local; on the backtester spot (where grading
+    runs) it is not — but ``eod_reconcile`` backs it up to
+    ``s3://{signals_bucket}/trades/trades_latest.db`` after every close
+    (``executor/trade_logger.py::backup_to_s3``). Pulling that lets the
+    executor-tile analyses (trigger scorecard / shadow book / exit timing) grade
+    real production trades instead of skipping. (Director plan Phase B1b.)
+
+    Returns None if neither a local DB nor the S3 backup is available — the
+    dependent analyses then surface ``N/A-MISSING-INPUT`` (never silently),
+    logged at WARN here.
+    """
     executor_paths = config.get("executor_paths", [])
     if isinstance(executor_paths, str):
         executor_paths = [executor_paths]
@@ -761,7 +773,26 @@ def find_trades_db(config: dict) -> str | None:
         db_path = Path(p) / "trades.db"
         if db_path.exists():
             return str(db_path)
-    return None
+
+    # S3 fallback — the backtester spot has no local trades.db.
+    bucket = config.get("signals_bucket")
+    if not bucket:
+        return None
+    local = Path(tempfile.gettempdir()) / "ae_trades_latest.db"
+    try:
+        boto3.client("s3").download_file(bucket, "trades/trades_latest.db", str(local))
+        logger.info(
+            "Pulled trades_latest.db from s3://%s/trades/trades_latest.db", bucket
+        )
+        return str(local)
+    except ClientError as e:
+        logger.warning(
+            "find_trades_db: no local trades.db and S3 pull of "
+            "trades/trades_latest.db failed (%s) — executor tiles will surface "
+            "N/A-MISSING-INPUT this cycle",
+            e,
+        )
+        return None
 
 
 # ── Predictor metrics (evaluation output) ─────────────────────────────────────
