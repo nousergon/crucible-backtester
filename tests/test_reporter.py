@@ -765,3 +765,51 @@ class TestSavePersistence:
         # evaluate.py passes `team_metrics or None`, so empty {} arrives as None.
         out = self._save(tmp_path, team_metrics=None)
         assert not (out / "team_metrics.json").exists()
+
+
+# ── save() — Phase B1d optimizer/diagnostic artifact persistence ─────────────
+
+
+class TestSaveB1dOptimizerArtifacts:
+    """The 4 optimizer/diagnostic inputs the evaluator report card reads but the
+    backtester previously did not persist (veto_value / predictor_sizing /
+    scanner_opt / cio_opt). Always-emit: written whenever non-None (even error /
+    skipped status) so the evaluator can tell "didn't persist" from "no data"."""
+
+    def _save(self, tmp_path, **kw):
+        from reporter import save
+        return save(
+            report_md="# r",
+            signal_quality={},
+            score_analysis=[],
+            run_date="2026-06-04",
+            results_dir=str(tmp_path),
+            **kw,
+        )
+
+    def test_all_four_persisted_when_present(self, tmp_path):
+        import json
+        out = self._save(
+            tmp_path,
+            veto_value={"status": "ok", "net_value": 420.0},
+            predictor_sizing={"status": "ok", "overall_rank_ic": 0.06},
+            scanner_opt={"leakage_pct": 0.1},
+            cio_opt={"status": "ok", "recommendation": {}},
+        )
+        for fn in ("veto_value.json", "predictor_sizing.json", "scanner_opt.json", "cio_opt.json"):
+            assert (out / fn).exists(), f"{fn} not written"
+        assert json.loads((out / "veto_value.json").read_text())["net_value"] == 420.0
+        assert json.loads((out / "predictor_sizing.json").read_text())["overall_rank_ic"] == 0.06
+        # scanner_opt has no "status" field — always-emit still writes it.
+        assert json.loads((out / "scanner_opt.json").read_text())["leakage_pct"] == 0.1
+
+    def test_error_status_still_written(self, tmp_path):
+        # Always-emit: even a non-ok status persists (informative absence-vs-error).
+        out = self._save(tmp_path, predictor_sizing={"status": "skipped"})
+        assert (out / "predictor_sizing.json").exists()
+
+    def test_none_not_written(self, tmp_path):
+        out = self._save(tmp_path, veto_value=None, predictor_sizing=None,
+                         scanner_opt=None, cio_opt=None)
+        for fn in ("veto_value.json", "predictor_sizing.json", "scanner_opt.json", "cio_opt.json"):
+            assert not (out / fn).exists()

@@ -983,6 +983,10 @@ def save(
     team_metrics: dict | None = None,
     calibration_diagnostics: dict | None = None,
     excursion_summary: dict | None = None,
+    veto_value: dict | None = None,
+    predictor_sizing: dict | None = None,
+    scanner_opt: dict | None = None,
+    cio_opt: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -1045,6 +1049,15 @@ def save(
         # team_metrics carries no status field; emit whenever populated (the
         # evaluator passes `team_metrics or None`, so empty {} reaches here as None).
         ("team_metrics.json", team_metrics),
+        # Optimizer / diagnostic inputs the evaluator's report card reads over S3
+        # (Director plan B1d). Computed in evaluate.py but previously unpersisted,
+        # so the evaluator graded them N/A. Always-emit (not OK-only) so the
+        # evaluator's gaps-manifest can distinguish "didn't persist" from "ran,
+        # no data" — same rationale as the freshness-monitored artifacts above.
+        ("veto_value.json", veto_value),
+        ("predictor_sizing.json", predictor_sizing),
+        ("scanner_opt.json", scanner_opt),
+        ("cio_opt.json", cio_opt),
     ]:
         if data is not None:
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
