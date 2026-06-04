@@ -1512,6 +1512,12 @@ def main() -> None:
             team_metrics=team_metrics or None,
             calibration_diagnostics=portfolio_calibration,
             excursion_summary=portfolio_excursion,
+            # B1d — persist the optimizer/diagnostic inputs the evaluator report
+            # card reads over S3 (previously computed-but-unpersisted → graded N/A).
+            veto_value=diagnostics.get("veto_value"),
+            predictor_sizing=opt_results.get("predictor_sizing"),
+            scanner_opt=opt_results.get("scanner_opt"),
+            cio_opt=opt_results.get("cio_opt"),
         )
 
         # Save completeness manifest
