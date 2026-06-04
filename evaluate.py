@@ -1507,6 +1507,11 @@ def main() -> None:
             quant_rank_quality=diagnostics.get("quant_rank_quality"),
             agent_justification=diagnostics.get("agent_justification"),
             barrier_coherence=diagnostics.get("barrier_coherence"),
+            score_calibration=diagnostics.get("score_calibration"),
+            macro_eval=diagnostics.get("macro_eval"),
+            team_metrics=team_metrics or None,
+            calibration_diagnostics=portfolio_calibration,
+            excursion_summary=portfolio_excursion,
         )
 
         # Save completeness manifest
