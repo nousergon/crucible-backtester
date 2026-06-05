@@ -34,26 +34,40 @@ logger = logging.getLogger(__name__)
 SCHEMA = "pit_parity-1.0.0"
 
 
-def _release_memory_to_os(context: str) -> None:
-    """Best-effort: return freed heap memory to the OS (L4486).
+def _predictor_pass_worker(cfg: dict) -> dict:
+    """Module-level worker run in a spawned child process — must be importable
+    by qualified name for ``spawn`` pickling. Returns the predictor-backtest
+    stats dict back to the parent."""
+    from backtest import run_predictor_backtest
 
-    CPython/numpy free large arrays on dereference, but glibc keeps the
-    arena mapped, so RSS stays high. Between pit_parity's two back-to-back
-    predictor pipelines that left pass-2's pre-pipeline RAM-headroom guard
-    short (~3.9 GB free < 6 GB) on the 8 GB Parity spot. ``gc.collect()``
-    drops any cycles, then glibc ``malloc_trim(0)`` unmaps the freed arena.
-    Best-effort by design — non-glibc / non-Linux just skips, never raises.
+    return run_predictor_backtest(cfg)
+
+
+def _run_predictor_pass_isolated(cfg: dict) -> dict:
+    """Run ONE predictor-backtest pass in a fresh subprocess so the OS reclaims
+    100% of its RSS on exit before the next pass starts (L4486).
+
+    pit_parity runs TWO full predictor pipelines back-to-back (look-ahead +
+    walk-forward). In a single process CPython retains pass-1's ~3 GB RSS
+    (glibc keeps the arena mapped), so pass-2's pre-pipeline RAM-headroom guard
+    saw only ~3.9 GB free < 6 GB on the 8 GB Parity spot and aborted (2026-06-05
+    scoped validation). The earlier ``malloc_trim`` (#284) was best-effort and
+    not guaranteed to release pandas/Arctic/lightgbm pools; process isolation is
+    the guaranteed fix — pass-1's child fully exits, the OS reclaims everything,
+    pass-2's child starts clean at ~320 MB. No bigger instance.
+
+    Uses ``spawn`` (NOT ``fork``): a forked child would inherit the parent's
+    boto3 / ArcticDB sockets and HTTP pools and corrupt them mid-flight. The
+    child inherits stdout/stderr so its per-pass MEM logs still reach the
+    SSM-captured log. A separate single-worker pool per call guarantees the
+    child is torn down before the next pass.
     """
-    import gc
+    import concurrent.futures as _cf
+    import multiprocessing as _mp
 
-    gc.collect()
-    try:
-        import ctypes
-
-        freed = ctypes.CDLL("libc.so.6").malloc_trim(0)
-        logger.info("[pit_parity] released memory to OS (%s); malloc_trim=%s", context, freed)
-    except Exception as exc:  # noqa: BLE001 — best-effort; non-glibc env skips
-        logger.info("[pit_parity] malloc_trim unavailable (%s): %s", context, exc)
+    ctx = _mp.get_context("spawn")
+    with _cf.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex:
+        return ex.submit(_predictor_pass_worker, cfg).result()
 
 # Runtime handles that live on ``config`` but cannot be deep-copied. The
 # PhaseRegistry's ``.s3_client`` carries botocore service-model references
@@ -309,8 +323,8 @@ def run_pit_parity(config: dict) -> dict:
     sweep pair; in this single-pass mode it is reported ``null`` with a
     method note (no fabricated distribution).
     """
-    from backtest import run_predictor_backtest
-
+    # NB: run_predictor_backtest is imported INSIDE the subprocess worker
+    # (_predictor_pass_worker), not here — each pass runs in its own process.
     bucket = config.get("signals_bucket", "alpha-engine-research")
     run_date = config.get("_run_date") or _dt.date.today().isoformat()
 
@@ -318,24 +332,18 @@ def run_pit_parity(config: dict) -> dict:
     # ``_RUNTIME_HANDLE_KEYS`` comment for the failure-mode history.
     safe_config = _config_without_runtime_handles(config)
 
+    # L4486: each pass runs in its OWN subprocess so the OS reclaims pass-1's
+    # full RSS before pass-2 starts (guaranteed; supersedes the #284 malloc_trim
+    # best-effort). See _run_predictor_pass_isolated for the why.
     cur_cfg = copy.deepcopy(safe_config)
     cur_cfg["walk_forward"] = False
-    logger.info("[pit_parity] pass 1/2 — legacy single-pass (look-ahead)")
-    cur_stats = run_predictor_backtest(cur_cfg)
-
-    # L4486: pit_parity runs TWO full predictor pipelines back-to-back. CPython
-    # frees pass-1's numpy/lightgbm arrays on return, but glibc retains the
-    # arena, so pass-2's pre-pipeline RAM-headroom guard saw only ~3.9 GB free
-    # on the 8 GB Parity spot and aborted (2026-06-05 scoped validation). Run
-    # the passes sequentially-not-stacked (no bigger instance): reclaim pass-1's
-    # freed memory to the OS before pass 2 starts. Best-effort — malloc_trim is
-    # glibc-only; a non-Linux/non-glibc env just skips it.
-    _release_memory_to_os("between pit_parity passes")
+    logger.info("[pit_parity] pass 1/2 — legacy single-pass (look-ahead) [isolated subprocess]")
+    cur_stats = _run_predictor_pass_isolated(cur_cfg)
 
     pit_cfg = copy.deepcopy(safe_config)
     pit_cfg["walk_forward"] = True
-    logger.info("[pit_parity] pass 2/2 — walk-forward PIT")
-    pit_stats = run_predictor_backtest(pit_cfg)
+    logger.info("[pit_parity] pass 2/2 — walk-forward PIT [isolated subprocess]")
+    pit_stats = _run_predictor_pass_isolated(pit_cfg)
 
     if cur_stats.get("status") not in (None, "ok") or \
             pit_stats.get("status") not in (None, "ok"):
