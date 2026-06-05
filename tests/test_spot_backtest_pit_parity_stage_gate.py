@@ -69,3 +69,32 @@ def test_parity_state_skipset_does_not_skip_pit_parity():
     (Mirror of the SF-side contract; documents the cross-repo dependency.)"""
     skipset = {"backtest", "evaluator"}
     assert "pit_parity" not in skipset
+
+
+def test_no_raw_backticks_in_unquoted_heredocs():
+    """Regression (L4486b, 2026-06-05): a comment with raw backticks was added
+    inside the unquoted `<<BACKTEST` heredoc, so bash command-substituted the
+    backtick contents at heredoc construction → 'pit_parity: command not found'
+    noise. Inside an UNQUOTED heredoc, backticks (and $(...)) must be escaped or
+    avoided. Quoted heredocs (<<'CACHE') and dispatcher-side # comments are fine.
+    This guards the BACKTEST/BOOTSTRAP/DEPS unquoted heredoc bodies."""
+    import re
+    lines = _read_script().splitlines()
+    in_heredoc = None  # delimiter when inside an UNQUOTED heredoc
+    offenders = []
+    for i, ln in enumerate(lines, 1):
+        if in_heredoc is None:
+            m = re.search(r'<<(?!\s*[\'"])([A-Z_]+)\s*$', ln)  # unquoted heredoc start
+            if m:
+                in_heredoc = m.group(1)
+            continue
+        if ln.strip() == in_heredoc:  # heredoc end
+            in_heredoc = None
+            continue
+        # inside an unquoted heredoc: any UNESCAPED backtick is a bug
+        if re.search(r'(?<!\\)`', ln):
+            offenders.append(f"{i}: {ln.strip()[:70]}")
+    assert not offenders, (
+        "raw backticks inside unquoted heredoc(s) get command-substituted:\n"
+        + "\n".join(offenders)
+    )
