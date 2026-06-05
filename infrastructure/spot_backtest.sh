@@ -267,7 +267,7 @@ done
 # Hard-fail on unknown names per no-silent-fails: a typo like
 # --skip-stages=evaulator would silently run evaluator (no match) and mislead
 # the operator into thinking the pipeline respected their request.
-_KNOWN_STAGES="backtest parity evaluator"
+_KNOWN_STAGES="backtest pit_parity parity evaluator"
 if [ -n "$SKIP_STAGES" ]; then
     IFS=',' read -ra _SKIP_ARR <<< "$SKIP_STAGES"
     for _s in "${_SKIP_ARR[@]}"; do
@@ -1204,7 +1204,14 @@ fi
 # the separate post-review L2371 step). Opt out per run: --no-pit-parity
 # or PIT_PARITY_ENABLED=0. Runtime fallback stays :-0 (belt-and-suspenders
 # if the dispatcher bake is ever bypassed).
-if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ] && ! _stage_skipped backtest; then
+# L4486 (2026-06-05): gate is on the dedicated `pit_parity` stage token, NOT
+# `backtest`, so pit_parity runs in the standalone Parity SF state (which
+# passes --skip-stages=backtest,evaluator → backtest skipped but pit_parity
+# NOT skipped) in a FRESH process with full RAM headroom — instead of stacked
+# inside PredictorBacktest after the main predictor_pipeline already held
+# ~3.5 GB (4.5 GB free < 6 GB guard → OOM-guard fail). The SF turns it OFF in
+# PredictorBacktest via --no-pit-parity so it still fires EXACTLY ONCE.
+if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ] && ! _stage_skipped pit_parity; then
     echo "▶ stage=pit_parity START at \$(date -u +%H:%M:%S) (observational, non-blocking)"
     # Swallow on non-zero exit per feedback_no_silent_fails secondary-
     # observability carve-out: (a) failure mode swallowed = pit_parity
@@ -1222,7 +1229,7 @@ if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ] && ! _stage_skipped backtest; then
         || echo "WARNING: pit_parity stage failed (observational — spot run continues; failure-artifact + Telegram alert published by the inner Python)"
     echo "▶ stage=pit_parity END at \$(date -u +%H:%M:%S)"
 else
-    echo "⊘ stage=pit_parity SKIPPED (PIT_PARITY_ENABLED!=1 — opt-in observational)"
+    echo "⊘ stage=pit_parity SKIPPED (PIT_PARITY_ENABLED!=1 or --skip-stages contains pit_parity — runs ONCE in the standalone Parity state per L4486)"
 fi
 
 # ── Stage: parity ───────────────────────────────────────────────────────────
