@@ -1204,13 +1204,16 @@ fi
 # the separate post-review L2371 step). Opt out per run: --no-pit-parity
 # or PIT_PARITY_ENABLED=0. Runtime fallback stays :-0 (belt-and-suspenders
 # if the dispatcher bake is ever bypassed).
-# L4486 (2026-06-05): gate is on the dedicated `pit_parity` stage token, NOT
-# `backtest`, so pit_parity runs in the standalone Parity SF state (which
-# passes --skip-stages=backtest,evaluator → backtest skipped but pit_parity
-# NOT skipped) in a FRESH process with full RAM headroom — instead of stacked
-# inside PredictorBacktest after the main predictor_pipeline already held
-# ~3.5 GB (4.5 GB free < 6 GB guard → OOM-guard fail). The SF turns it OFF in
-# PredictorBacktest via --no-pit-parity so it still fires EXACTLY ONCE.
+# L4486 (2026-06-05): gate is on the dedicated pit_parity stage token, NOT
+# the backtest token, so pit_parity runs in the standalone Parity SF state
+# (which passes --skip-stages=backtest,evaluator: backtest skipped but
+# pit_parity NOT skipped) in a FRESH process with full RAM headroom -- instead
+# of stacked inside PredictorBacktest after the main predictor pipeline already
+# held ~3.5 GB. The SF turns it OFF in PredictorBacktest via --no-pit-parity so
+# it still fires EXACTLY ONCE.
+# NOTE: this comment lives inside the unquoted heredoc, so it must contain NO
+# backticks or dollar-paren -- they would be command-substituted at heredoc
+# construction (the 2026-06-05 "pit_parity: command not found" noise).
 if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ] && ! _stage_skipped pit_parity; then
     echo "▶ stage=pit_parity START at \$(date -u +%H:%M:%S) (observational, non-blocking)"
     # Swallow on non-zero exit per feedback_no_silent_fails secondary-

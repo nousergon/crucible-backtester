@@ -33,6 +33,28 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = "pit_parity-1.0.0"
 
+
+def _release_memory_to_os(context: str) -> None:
+    """Best-effort: return freed heap memory to the OS (L4486).
+
+    CPython/numpy free large arrays on dereference, but glibc keeps the
+    arena mapped, so RSS stays high. Between pit_parity's two back-to-back
+    predictor pipelines that left pass-2's pre-pipeline RAM-headroom guard
+    short (~3.9 GB free < 6 GB) on the 8 GB Parity spot. ``gc.collect()``
+    drops any cycles, then glibc ``malloc_trim(0)`` unmaps the freed arena.
+    Best-effort by design — non-glibc / non-Linux just skips, never raises.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import ctypes
+
+        freed = ctypes.CDLL("libc.so.6").malloc_trim(0)
+        logger.info("[pit_parity] released memory to OS (%s); malloc_trim=%s", context, freed)
+    except Exception as exc:  # noqa: BLE001 — best-effort; non-glibc env skips
+        logger.info("[pit_parity] malloc_trim unavailable (%s): %s", context, exc)
+
 # Runtime handles that live on ``config`` but cannot be deep-copied. The
 # PhaseRegistry's ``.s3_client`` carries botocore service-model references
 # that recurse past the Python stack limit (caught 2026-04-27 spot smoke v2
@@ -300,6 +322,15 @@ def run_pit_parity(config: dict) -> dict:
     cur_cfg["walk_forward"] = False
     logger.info("[pit_parity] pass 1/2 — legacy single-pass (look-ahead)")
     cur_stats = run_predictor_backtest(cur_cfg)
+
+    # L4486: pit_parity runs TWO full predictor pipelines back-to-back. CPython
+    # frees pass-1's numpy/lightgbm arrays on return, but glibc retains the
+    # arena, so pass-2's pre-pipeline RAM-headroom guard saw only ~3.9 GB free
+    # on the 8 GB Parity spot and aborted (2026-06-05 scoped validation). Run
+    # the passes sequentially-not-stacked (no bigger instance): reclaim pass-1's
+    # freed memory to the OS before pass 2 starts. Best-effort — malloc_trim is
+    # glibc-only; a non-Linux/non-glibc env just skips it.
+    _release_memory_to_os("between pit_parity passes")
 
     pit_cfg = copy.deepcopy(safe_config)
     pit_cfg["walk_forward"] = True
