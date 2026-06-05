@@ -123,11 +123,9 @@ def test_run_pit_parity_runs_both_passes_and_survives_upload_failure(monkeypatch
                                                         "n_cold_start_excluded": 2}}
         return s
 
-    # L4486: each pass runs in its own subprocess (spawn) for RAM isolation, so
-    # patching backtest.run_predictor_backtest in this process would be bypassed
-    # by the child's fresh import. Mock at the isolation seam instead — the test
-    # exercises pit_parity's orchestration, not the subprocess mechanism.
-    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", fake_run_predictor_backtest)
+    fake_bt = types.ModuleType("backtest")
+    fake_bt.run_predictor_backtest = fake_run_predictor_backtest
+    monkeypatch.setitem(sys.modules, "backtest", fake_bt)
 
     # S3 upload must be best-effort: a boto failure cannot raise.
     class _BoomS3:
@@ -149,11 +147,9 @@ def test_run_pit_parity_runs_both_passes_and_survives_upload_failure(monkeypatch
 
 
 def test_run_pit_parity_incomplete_pass_yields_status_report(monkeypatch):
-    # L4486: mock at the subprocess-isolation seam (see note in the
-    # both-passes test).
-    monkeypatch.setattr(
-        pp, "_run_predictor_pass_isolated", lambda cfg: {"status": "insufficient_data"}
-    )
+    fake_bt = types.ModuleType("backtest")
+    fake_bt.run_predictor_backtest = lambda cfg: {"status": "insufficient_data"}
+    monkeypatch.setitem(sys.modules, "backtest", fake_bt)
 
     # Always-emit-artifact contract: the incomplete-status path must also
     # upload, not just return a dict. Prior to 2026-05-27 this path was
@@ -211,10 +207,9 @@ def test_run_pit_parity_survives_cyclic_runtime_handle(monkeypatch):
             s["predictor_metadata"] = {"walk_forward": {"n_folds": 8}}
         return s
 
-    # L4486: mock at the subprocess-isolation seam. The strip+deepcopy still
-    # happens in the parent before the seam is called, so the cyclic-handle
-    # assertion above still exercises the regression.
-    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", fake_run_predictor_backtest)
+    fake_bt = types.ModuleType("backtest")
+    fake_bt.run_predictor_backtest = fake_run_predictor_backtest
+    monkeypatch.setitem(sys.modules, "backtest", fake_bt)
 
     fake_boto3 = types.ModuleType("boto3")
     fake_boto3.client = lambda *a, **k: type(
@@ -295,25 +290,3 @@ def test_write_failure_artifact_swallows_upload_error(monkeypatch):
     )
     assert rep["status"] == "failed"
     assert "_s3_key" not in rep  # upload failed but write_failure_artifact returned
-
-
-def test_passes_run_in_isolated_spawn_subprocesses():
-    """L4486: both pit_parity passes must run via _run_predictor_pass_isolated
-    (separate spawn subprocesses) so the OS reclaims pass-1's RSS before pass-2 —
-    NOT in-process run_predictor_backtest (which left pass-2 starved). Source
-    assertion: the real spawn/pickle path is validated by the scoped SF run."""
-    import inspect
-    import analysis.pit_parity as ppmod
-
-    runner_src = inspect.getsource(ppmod._run_predictor_pass_isolated)
-    assert 'get_context("spawn")' in runner_src, "must use spawn, not fork (inherited boto3/Arctic sockets)"
-    assert "ProcessPoolExecutor" in runner_src
-
-    orch_src = inspect.getsource(ppmod.run_pit_parity)
-    assert orch_src.count("_run_predictor_pass_isolated(") == 2, (
-        "both passes must go through the isolation seam"
-    )
-    # the parent orchestrator must NOT call run_predictor_backtest in-process
-    assert "run_predictor_backtest(" not in orch_src, (
-        "in-process run_predictor_backtest reintroduces the 2-pass RAM stacking"
-    )

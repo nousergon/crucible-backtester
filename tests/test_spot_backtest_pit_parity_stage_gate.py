@@ -98,3 +98,24 @@ def test_no_raw_backticks_in_unquoted_heredocs():
         "raw backticks inside unquoted heredoc(s) get command-substituted:\n"
         + "\n".join(offenders)
     )
+
+
+def test_pit_parity_gets_16gb_instance_floor():
+    """L4486d: pit_parity runs TWO predictor pipelines back-to-back, so the
+    Parity spot needs >=16 GB (the 8 GB floor only fits one). The 16 GB floor is
+    gated on PIT_PARITY_ENABLED so the single-pipeline stages stay on 8 GB."""
+    s = _read_script()
+    assert "_PIT_PARITY_RAM_FLOOR_TYPES=" in s, "no dedicated >=16 GB pit_parity floor list"
+    # the 16 GB list must be xlarge/r5-class (>=16 GB), not the 8 GB large-class
+    import re
+    m = re.search(r'_PIT_PARITY_RAM_FLOOR_TYPES="([^"]+)"', s)
+    assert m
+    types = m.group(1).split(",")
+    assert all((".xlarge" in t) or t.startswith(("r5.", "r6")) for t in types), (
+        f"pit_parity floor must be >=16 GB instances, got {types}"
+    )
+    # selection must be gated on PIT_PARITY_ENABLED (so 8 GB stages are unaffected)
+    assert re.search(
+        r'PIT_PARITY_ENABLED[^\n]*"1".*?INSTANCE_TYPES="\$_PIT_PARITY_RAM_FLOOR_TYPES"',
+        s, re.DOTALL,
+    ), "16 GB floor must be selected inside a PIT_PARITY_ENABLED==1 branch"
