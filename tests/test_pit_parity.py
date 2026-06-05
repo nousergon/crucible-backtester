@@ -113,19 +113,20 @@ def test_build_report_shape_and_materiality():
 def test_run_pit_parity_runs_both_passes_and_survives_upload_failure(monkeypatch):
     seen: list[bool] = []
 
-    def fake_run_predictor_backtest(cfg):
-        seen.append(cfg["walk_forward"])
-        # PIT pass carries wf metadata through predictor_metadata.
-        s = _stats(1.0 if not cfg["walk_forward"] else 0.6,
+    # L4487: each pass runs in its own subprocess (backtest.py --pit-parity-pass),
+    # so the in-process backtest mock is bypassed by the child. Mock at the
+    # isolation seam — the test exercises run_pit_parity's orchestration.
+    def fake_pass(safe_config, which, run_date):
+        wf = (which == "walkforward")
+        seen.append(wf)
+        s = _stats(1.0 if not wf else 0.6,
                    0.9, -0.03, -0.15, [0.01, 0.0], 0.03)
-        if cfg["walk_forward"]:
+        if wf:
             s["predictor_metadata"] = {"walk_forward": {"n_folds": 12,
                                                         "n_cold_start_excluded": 2}}
         return s
 
-    fake_bt = types.ModuleType("backtest")
-    fake_bt.run_predictor_backtest = fake_run_predictor_backtest
-    monkeypatch.setitem(sys.modules, "backtest", fake_bt)
+    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", fake_pass)
 
     # S3 upload must be best-effort: a boto failure cannot raise.
     class _BoomS3:
@@ -147,9 +148,11 @@ def test_run_pit_parity_runs_both_passes_and_survives_upload_failure(monkeypatch
 
 
 def test_run_pit_parity_incomplete_pass_yields_status_report(monkeypatch):
-    fake_bt = types.ModuleType("backtest")
-    fake_bt.run_predictor_backtest = lambda cfg: {"status": "insufficient_data"}
-    monkeypatch.setitem(sys.modules, "backtest", fake_bt)
+    # L4487: mock at the subprocess-isolation seam (see both-passes test).
+    monkeypatch.setattr(
+        pp, "_run_predictor_pass_isolated",
+        lambda safe_config, which, run_date: {"status": "insufficient_data"},
+    )
 
     # Always-emit-artifact contract: the incomplete-status path must also
     # upload, not just return a dict. Prior to 2026-05-27 this path was
@@ -196,20 +199,20 @@ def test_run_pit_parity_survives_cyclic_runtime_handle(monkeypatch):
 
     seen: list[bool] = []
 
-    def fake_run_predictor_backtest(cfg):
-        # Whatever escapes the strip+deepcopy must NOT carry the cyclic
-        # runtime handle into the per-pass cfg.
-        assert "_phase_registry" not in cfg
-        seen.append(cfg["walk_forward"])
-        s = _stats(1.0 if not cfg["walk_forward"] else 0.7,
+    def fake_pass(safe_config, which, run_date):
+        # run_pit_parity must strip the cyclic runtime handle BEFORE handing
+        # safe_config to the isolation seam (it is also what gets JSON-dumped
+        # to the child — a cyclic/unstrippable handle would break that too).
+        assert "_phase_registry" not in safe_config
+        wf = (which == "walkforward")
+        seen.append(wf)
+        s = _stats(1.0 if not wf else 0.7,
                    0.9, -0.03, -0.15, [0.01, 0.0], 0.03)
-        if cfg["walk_forward"]:
+        if wf:
             s["predictor_metadata"] = {"walk_forward": {"n_folds": 8}}
         return s
 
-    fake_bt = types.ModuleType("backtest")
-    fake_bt.run_predictor_backtest = fake_run_predictor_backtest
-    monkeypatch.setitem(sys.modules, "backtest", fake_bt)
+    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", fake_pass)
 
     fake_boto3 = types.ModuleType("boto3")
     fake_boto3.client = lambda *a, **k: type(
@@ -290,3 +293,41 @@ def test_write_failure_artifact_swallows_upload_error(monkeypatch):
     )
     assert rep["status"] == "failed"
     assert "_s3_key" not in rep  # upload failed but write_failure_artifact returned
+
+
+def test_passes_run_via_subprocess_run_not_multiprocessing():
+    """L4487: both passes go through _run_predictor_pass_isolated, which uses
+    subprocess.run (a fresh `backtest.py --pit-parity-pass`, cwd=backtester) —
+    NOT multiprocessing (whose spawn __main__ re-import collided on the `analysis`
+    package, #285). Source assertion; the real path is validated by a scoped SF run."""
+    import inspect
+    import analysis.pit_parity as ppmod
+
+    runner = inspect.getsource(ppmod._run_predictor_pass_isolated)
+    assert "subprocess.run" in runner, "must use subprocess.run for true process isolation"
+    # No multiprocessing USAGE (the docstring may mention it to explain why not).
+    assert "import multiprocessing" not in runner and "ProcessPoolExecutor(" not in runner, (
+        "must NOT use multiprocessing (spawn __main__ re-import collision, #285)"
+    )
+    assert "--pit-parity-pass" in runner and "cwd=" in runner, (
+        "must invoke backtest.py --pit-parity-pass with cwd=backtester repo"
+    )
+
+    orch = inspect.getsource(ppmod.run_pit_parity)
+    assert orch.count("_run_predictor_pass_isolated(") == 2, "both passes via the seam"
+    assert '"lookahead"' in orch and '"walkforward"' in orch
+    assert "run_predictor_backtest(" not in orch, "parent must not run a pass in-process"
+
+
+def test_backtest_has_pit_parity_pass_child_submode_with_rss_guard():
+    """L4487: the child sub-mode + the anti-degradation RSS-budget guard exist."""
+    import re
+    bt = (_SCRIPT.parent.parent / "backtest.py").read_text() if False else None  # noqa
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "backtest.py").read_text()
+    assert 'if args.pit_parity_pass:' in src, "child sub-mode handler missing"
+    assert "--pit-parity-pass" in src and "--stats-out" in src and "--config-json" in src
+    # anti-degradation guard: per-pass peak RSS checked against a budget + alert
+    assert "ru_maxrss" in src and "PIT_PARITY_PASS_RSS_BUDGET_MB" in src, (
+        "per-pass RSS-budget guard (the 'these always degrade' fix) missing"
+    )

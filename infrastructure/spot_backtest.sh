@@ -343,28 +343,18 @@ echo "════════════════════════�
 # stay on the cheap 4 GB-first rotation. Skipped when the operator passes an
 # explicit --instance-type (their choice wins, incl. deliberate small debug).
 _PREDICTOR_RAM_FLOOR_TYPES="m5.large,m6i.large,m5a.large,c5.xlarge,c6i.xlarge"
-# L4486d (2026-06-05): pit_parity runs TWO predictor pipelines back-to-back
-# (look-ahead + walk-forward); CPython/glibc retain pass-1's ~3 GB RSS, so on an
-# 8 GB box pass-2's headroom guard sees only ~3.9 GB free and aborts. Relocating
-# it to the Parity state (un-stacking from the main pipeline) wasn't enough, and
-# subprocess isolation hit a spawn __main__ re-import collision (the backtester
-# vs predictor repos both ship an `analysis` package on sys.path). Operator call:
-# right-size the Parity spot to ≥16 GB — the 2 stacked passes fit with margin.
-# Gated on PIT_PARITY_ENABLED (only the Parity state sets it), so the single-
-# pipeline stages (PredictorBacktest / PortfolioOptimizerBacktest, which pass
-# --no-pit-parity) stay on the cheaper ≥8 GB floor. A list (not one type) keeps
-# the L4485 capacity rotation. Cost delta ≈ $0.01/run.
-_PIT_PARITY_RAM_FLOOR_TYPES="m5.xlarge,m6i.xlarge,m5a.xlarge,r5.large,r6i.large"
+# L4487 (2026-06-05): the ≥16 GB pit_parity floor (L4486d) is REVERTED to ≥8 GB.
+# pit_parity now runs its two passes in separate subprocesses
+# (analysis/pit_parity.py::_run_predictor_pass_isolated → backtest.py
+# --pit-parity-pass), so the OS reclaims each pass's RSS between passes — the
+# Parity spot's footprint is bounded to ONE pass (~2.8 GB), which fits the 8 GB
+# floor with margin. No PIT_PARITY_ENABLED special-case: all predictor-bearing
+# modes (incl. the Parity state's --mode=all) share the cheap 8 GB floor again.
 case "$BACKTEST_MODE" in
     all|predictor-backtest|portfolio-optimizer-backtest)
         if [ -z "$INSTANCE_TYPE" ]; then
-            if [ "${PIT_PARITY_ENABLED:-0}" = "1" ]; then
-                echo "  pit_parity enabled (2 stacked predictor passes) → applying ≥16 GB instance floor"
-                INSTANCE_TYPES="$_PIT_PARITY_RAM_FLOOR_TYPES"
-            else
-                echo "  Mode '$BACKTEST_MODE' runs predictor_pipeline → applying ≥8 GB instance floor"
-                INSTANCE_TYPES="$_PREDICTOR_RAM_FLOOR_TYPES"
-            fi
+            echo "  Mode '$BACKTEST_MODE' runs predictor_pipeline → applying ≥8 GB instance floor"
+            INSTANCE_TYPES="$_PREDICTOR_RAM_FLOOR_TYPES"
         fi
         ;;
 esac
