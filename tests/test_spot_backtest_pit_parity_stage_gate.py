@@ -100,22 +100,15 @@ def test_no_raw_backticks_in_unquoted_heredocs():
     )
 
 
-def test_pit_parity_gets_16gb_instance_floor():
-    """L4486d: pit_parity runs TWO predictor pipelines back-to-back, so the
-    Parity spot needs >=16 GB (the 8 GB floor only fits one). The 16 GB floor is
-    gated on PIT_PARITY_ENABLED so the single-pipeline stages stay on 8 GB."""
+def test_pit_parity_floor_reverted_to_8gb_after_subprocess_isolation():
+    """L4487: the L4486d ≥16 GB pit_parity floor is REVERTED — pit_parity now runs
+    each pass in its own subprocess (footprint bounded to one pass ~2.8 GB), so the
+    Parity stage shares the cheap ≥8 GB floor again. No 16 GB special-case remains."""
     s = _read_script()
-    assert "_PIT_PARITY_RAM_FLOOR_TYPES=" in s, "no dedicated >=16 GB pit_parity floor list"
-    # the 16 GB list must be xlarge/r5-class (>=16 GB), not the 8 GB large-class
-    import re
-    m = re.search(r'_PIT_PARITY_RAM_FLOOR_TYPES="([^"]+)"', s)
-    assert m
-    types = m.group(1).split(",")
-    assert all((".xlarge" in t) or t.startswith(("r5.", "r6")) for t in types), (
-        f"pit_parity floor must be >=16 GB instances, got {types}"
+    assert "_PIT_PARITY_RAM_FLOOR_TYPES" not in s, (
+        "the dedicated ≥16 GB pit_parity floor should be gone (L4487 subprocess isolation)"
     )
-    # selection must be gated on PIT_PARITY_ENABLED (so 8 GB stages are unaffected)
-    assert re.search(
-        r'PIT_PARITY_ENABLED[^\n]*"1".*?INSTANCE_TYPES="\$_PIT_PARITY_RAM_FLOOR_TYPES"',
-        s, re.DOTALL,
-    ), "16 GB floor must be selected inside a PIT_PARITY_ENABLED==1 branch"
+    # predictor-bearing modes all share the single ≥8 GB floor list
+    assert '_PREDICTOR_RAM_FLOOR_TYPES="m5.large' in s
+    # and there is no longer a PIT_PARITY_ENABLED-gated 16 GB branch
+    assert "≥16 GB instance floor" not in s

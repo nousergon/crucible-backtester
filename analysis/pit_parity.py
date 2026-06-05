@@ -22,10 +22,11 @@ Brian-gated decision made *after* reading this report (plan §5).
 
 from __future__ import annotations
 
-import copy
 import datetime as _dt
 import json
 import logging
+import os
+from pathlib import Path
 
 import numpy as np
 
@@ -34,26 +35,54 @@ logger = logging.getLogger(__name__)
 SCHEMA = "pit_parity-1.0.0"
 
 
-def _release_memory_to_os(context: str) -> None:
-    """Best-effort: return freed heap memory to the OS (L4486).
+def _run_predictor_pass_isolated(safe_config: dict, which: str, run_date: str) -> dict:
+    """Run ONE pit_parity predictor pass in a fresh `backtest.py` subprocess and
+    return its stats dict (L4487).
 
-    CPython/numpy free large arrays on dereference, but glibc keeps the
-    arena mapped, so RSS stays high. Between pit_parity's two back-to-back
-    predictor pipelines that left pass-2's pre-pipeline RAM-headroom guard
-    short (~3.9 GB free < 6 GB) on the 8 GB Parity spot. ``gc.collect()``
-    drops any cycles, then glibc ``malloc_trim(0)`` unmaps the freed arena.
-    Best-effort by design — non-glibc / non-Linux just skips, never raises.
+    pit_parity runs TWO full predictor pipelines back-to-back (look-ahead +
+    walk-forward). In one process CPython/glibc retain pass-1's ~3 GB RSS, so
+    pass-2's pre-pipeline headroom guard saw only ~3.9 GB free on an 8 GB box and
+    aborted (2026-06-05). Running each pass as a separate OS process bounds the
+    footprint to one pass (O(max), not O(sum)) — so the Parity stage runs on the
+    cheap 8 GB floor again.
+
+    ``subprocess.run`` (NOT ``multiprocessing``) is deliberate: spawn re-imports
+    the parent's ``__main__`` in the child, and with both the backtester and
+    predictor repos shipping an ``analysis`` package on ``sys.path`` the child
+    resolved the wrong one → ImportError → BrokenProcessPool (#285). A fresh
+    ``python backtest.py`` with ``cwd`` = the backtester repo has no such
+    re-import and resolves ``analysis`` correctly.
+
+    Config crosses to the child as JSON (it is a plain deepcopy-safe dict); the
+    stats dict comes back as pickle (numpy/pandas-safe). Raises on a non-zero
+    child exit — the caller's observational handler records it.
     """
-    import gc
+    import json
+    import pickle
+    import subprocess
+    import sys
+    import tempfile
 
-    gc.collect()
-    try:
-        import ctypes
-
-        freed = ctypes.CDLL("libc.so.6").malloc_trim(0)
-        logger.info("[pit_parity] released memory to OS (%s); malloc_trim=%s", context, freed)
-    except Exception as exc:  # noqa: BLE001 — best-effort; non-glibc env skips
-        logger.info("[pit_parity] malloc_trim unavailable (%s): %s", context, exc)
+    repo_root = Path(__file__).resolve().parents[1]
+    pass_flag = "walkforward" if which == "walkforward" else "lookahead"
+    with tempfile.TemporaryDirectory(prefix="pit_parity_") as td:
+        cfg_path = os.path.join(td, "config.json")
+        stats_path = os.path.join(td, "stats.pkl")
+        with open(cfg_path, "w") as f:
+            json.dump(safe_config, f)
+        cmd = [
+            sys.executable, str(repo_root / "backtest.py"),
+            "--pit-parity-pass", pass_flag,
+            "--config-json", cfg_path,
+            "--stats-out", stats_path,
+            "--date", run_date,
+            "--log-level", "INFO",
+        ]
+        # check=True: a crashed pass must surface (caught by run_pit_parity's
+        # observational handler), never silently yield empty stats.
+        subprocess.run(cmd, cwd=str(repo_root), check=True)
+        with open(stats_path, "rb") as f:
+            return pickle.load(f)
 
 # Runtime handles that live on ``config`` but cannot be deep-copied. The
 # PhaseRegistry's ``.s3_client`` carries botocore service-model references
@@ -309,8 +338,8 @@ def run_pit_parity(config: dict) -> dict:
     sweep pair; in this single-pass mode it is reported ``null`` with a
     method note (no fabricated distribution).
     """
-    from backtest import run_predictor_backtest
-
+    # NB: each pass runs run_predictor_backtest in its own subprocess
+    # (_run_predictor_pass_isolated) — not imported/called in this process.
     bucket = config.get("signals_bucket", "alpha-engine-research")
     run_date = config.get("_run_date") or _dt.date.today().isoformat()
 
@@ -318,24 +347,18 @@ def run_pit_parity(config: dict) -> dict:
     # ``_RUNTIME_HANDLE_KEYS`` comment for the failure-mode history.
     safe_config = _config_without_runtime_handles(config)
 
-    cur_cfg = copy.deepcopy(safe_config)
-    cur_cfg["walk_forward"] = False
-    logger.info("[pit_parity] pass 1/2 — legacy single-pass (look-ahead)")
-    cur_stats = run_predictor_backtest(cur_cfg)
+    # L4487: each pass runs in its OWN subprocess (a fresh `python backtest.py
+    # --pit-parity-pass …`), so the OS reclaims pass-1's full RSS before pass-2
+    # starts — bounded O(max single pass), not O(sum) which had needed a 16 GB
+    # box. subprocess.run (not multiprocessing) is deliberate: a fresh process
+    # with cwd=backtester resolves the `analysis` package correctly, sidestepping
+    # the spawn __main__ re-import collision that broke the multiprocessing
+    # attempt (#285).
+    logger.info("[pit_parity] pass 1/2 — legacy single-pass (look-ahead) [isolated subprocess]")
+    cur_stats = _run_predictor_pass_isolated(safe_config, "lookahead", run_date)
 
-    # L4486: pit_parity runs TWO full predictor pipelines back-to-back. CPython
-    # frees pass-1's numpy/lightgbm arrays on return, but glibc retains the
-    # arena, so pass-2's pre-pipeline RAM-headroom guard saw only ~3.9 GB free
-    # on the 8 GB Parity spot and aborted (2026-06-05 scoped validation). Run
-    # the passes sequentially-not-stacked (no bigger instance): reclaim pass-1's
-    # freed memory to the OS before pass 2 starts. Best-effort — malloc_trim is
-    # glibc-only; a non-Linux/non-glibc env just skips it.
-    _release_memory_to_os("between pit_parity passes")
-
-    pit_cfg = copy.deepcopy(safe_config)
-    pit_cfg["walk_forward"] = True
-    logger.info("[pit_parity] pass 2/2 — walk-forward PIT")
-    pit_stats = run_predictor_backtest(pit_cfg)
+    logger.info("[pit_parity] pass 2/2 — walk-forward PIT [isolated subprocess]")
+    pit_stats = _run_predictor_pass_isolated(safe_config, "walkforward", run_date)
 
     if cur_stats.get("status") not in (None, "ok") or \
             pit_stats.get("status") not in (None, "ok"):

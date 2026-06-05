@@ -4127,6 +4127,25 @@ def _parse_args() -> argparse.Namespace:
              "human reading this report (plan §5).",
     )
     parser.add_argument(
+        "--pit-parity-pass", choices=["lookahead", "walkforward"], default=None,
+        help="INTERNAL (L4487): run ONE pit_parity predictor pass in an isolated "
+             "subprocess and pickle its stats to --stats-out. run_pit_parity "
+             "invokes this twice (lookahead, walkforward) so each pass's RSS is "
+             "reclaimed by the OS between passes — bounded-footprint O(max single "
+             "pass) instead of the O(sum) that needed a 16 GB instance. Not for "
+             "manual use.",
+    )
+    parser.add_argument(
+        "--config-json", default=None,
+        help="INTERNAL (L4487): path to the JSON-serialized config the "
+             "--pit-parity-pass child should run with.",
+    )
+    parser.add_argument(
+        "--stats-out", default=None,
+        help="INTERNAL (L4487): path the --pit-parity-pass child pickles its "
+             "predictor-backtest stats dict to.",
+    )
+    parser.add_argument(
         "--walk-forward", action="store_true",
         help="Point-in-time-honest predictor backtest: resolve archived "
              "momentum weights whose knowledge-time ≤ each fold's decision "
@@ -4694,6 +4713,50 @@ def main() -> None:
                 print(f"  Rolled back: {r['config_type']} → {r['key']}")
             else:
                 print(f"  Skipped: {r.get('reason', 'unknown')}")
+        return
+
+    # --pit-parity-pass: INTERNAL child sub-mode (L4487). Runs exactly ONE
+    # predictor-backtest pass (lookahead | walkforward) in this fresh process
+    # and pickles its stats to --stats-out, then exits — so run_pit_parity can
+    # invoke it once per pass via subprocess.run and let the OS reclaim each
+    # pass's RSS between passes (bounded O(max single pass), not O(sum) which
+    # needed a 16 GB box). Runs BEFORE _init_pipeline so it can never write a
+    # config. A fresh `python backtest.py` (cwd=backtester) resolves the
+    # `analysis` package correctly — sidesteps the multiprocessing-spawn
+    # __main__ re-import collision that killed the earlier attempt (#285).
+    if args.pit_parity_pass:
+        import pickle
+        import resource
+        if not args.config_json or not args.stats_out:
+            raise SystemExit("--pit-parity-pass requires --config-json and --stats-out")
+        with open(args.config_json) as _f:
+            pass_cfg = json.load(_f)
+        pass_cfg["walk_forward"] = (args.pit_parity_pass == "walkforward")
+        stats = run_predictor_backtest(pass_cfg)
+        with open(args.stats_out, "wb") as _f:
+            pickle.dump(stats, _f)
+        # Anti-degradation guard (L4487): each pass is its own process, so
+        # ru_maxrss IS this pass's peak RSS. Alert LOUD if it exceeds the sized
+        # envelope — converts silent OOM / right-size-drift (the "these always
+        # degrade" pattern) into an explicit signal. ru_maxrss is KiB on Linux.
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        budget_mb = float(os.environ.get("PIT_PARITY_PASS_RSS_BUDGET_MB", "4500"))
+        logger.info("[pit_parity] pass=%s peak RSS=%.0f MB (budget %.0f MB)",
+                    args.pit_parity_pass, peak_mb, budget_mb)
+        if peak_mb > budget_mb:
+            try:
+                from alpha_engine_lib.alerts import publish as _alerts_publish
+                _alerts_publish(
+                    f"pit_parity pass={args.pit_parity_pass} peak RSS {peak_mb:.0f} MB "
+                    f"exceeded budget {budget_mb:.0f} MB on {args.date} — the per-pass "
+                    f"footprint has grown; re-check the Parity instance sizing (L4487).",
+                    severity="warning",
+                    source="alpha-engine-backtester/pit_parity",
+                    dedup_key=f"pit_parity_rss_budget_{args.date}",
+                    dedup_window_min=720,
+                )
+            except Exception as _alert_err:  # best-effort; log line is the primary surface
+                logger.warning("[pit_parity] RSS-budget alert publish failed: %s", _alert_err)
         return
 
     # --pit-parity: dedicated observational run (plan §D4). Runs BEFORE
