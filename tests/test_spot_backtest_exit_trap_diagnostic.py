@@ -128,9 +128,16 @@ def test_cleanup_fans_out_via_lib_alerts_cli():
         "L117 'Lambda CI canary rollback should Telegram/email the "
         "operator on rollback' pattern via the canonical primitive."
     )
-    assert "--severity error" in body, (
-        "alerts.publish call must tag severity=error so Telegram pushes "
-        "(rather than silent in-channel)."
+    # L4485-b: severity is now variable — defaults to "error" (Telegram push),
+    # downgraded to "warning" only on a recoverable spot reclaim about to relaunch.
+    assert 'local _will_relaunch=0 _alert_sev="error"' in body, (
+        "alerts.publish severity must default to error (Telegram push) — "
+        "L4485-b made it a variable that only downgrades to warning on a "
+        "recoverable spot reclaim."
+    )
+    assert '--severity "$_alert_sev"' in body, (
+        "alerts.publish call must tag severity via $_alert_sev (error default, "
+        "warning on a will-relaunch reclaim)."
     )
     assert "--source alpha-engine-backtester/spot_backtest.sh" in body, (
         "alerts.publish call must identify itself via --source so the "

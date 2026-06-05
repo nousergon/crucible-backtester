@@ -215,6 +215,22 @@ USE_VECTORIZED_SWEEP="${USE_VECTORIZED_SWEEP:-false}"
 # support — each value flag gets a companion `--foo=*` case that splits on
 # `=`. Boolean flags (--smoke-only, --force, --dry-run, etc.) accept no
 # value and don't need the companion case.
+
+# L4485-b (2026-06-05): bounded self-relaunch on a mid-run AWS spot RECLAIM.
+# The Saturday SF's per-state Retry is on the `ssm:sendCommand` Task, which
+# only SENDS the command and returns — the actual run is polled by a separate
+# Choice loop, so a worker spot reclaimed mid-run (Server.SpotInstanceTermination
+# / instance-terminated-no-capacity) surfaces in the poll as a generic Failed,
+# NOT a sendCommand TaskFailed → the SF Retry never fires (its "handles spot
+# interruption" comment is structurally wrong). This dispatcher (which OWNS the
+# worker-spot lifecycle) is the only layer that can see the reclaim reason — it
+# already classifies it in cleanup(). On a classified reclaim, cleanup() re-execs
+# this script on a FRESH spot, bounded by RECLAIM_RELAUNCH_MAX. Gated STRICTLY on
+# the reclaim reason — any non-reclaim failure exits immediately (no blind retry
+# that could mask a real bug, per feedback_no_silent_fails). Happy path unchanged.
+RECLAIM_RELAUNCH_MAX="${RECLAIM_RELAUNCH_MAX:-1}"
+_ORIG_ARGS=("$@")  # captured pre-parse for the relaunch exec
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke-only) RUN_MODE="smoke-only"; shift ;;
@@ -517,6 +533,7 @@ LAST_SSM_DESC=""
 # with diagnostics on failure.
 cleanup() {
     local exit_code=$?
+    local _will_relaunch=0 _alert_sev="error"
     echo ""
     echo "==> Dispatcher EXIT (code=$exit_code)"
     if [ "$exit_code" -ne 0 ]; then
@@ -541,6 +558,19 @@ cleanup() {
             echo "    spot state: $state"
             echo "    spot state-reason: $state_reason"
         fi
+        # L4485-b: classify a genuine AWS spot reclaim. ONLY
+        # Server.SpotInstanceTermination triggers a bounded relaunch — every
+        # other failure (real crash, delivery timeout, OOM) exits as-is so a
+        # blind retry never masks a real bug. Downgrade the alert to warning
+        # when we will relaunch, so a recovered run does not page as an error.
+        case "$state_reason" in
+            *Server.SpotInstanceTermination*)
+                if [ "${RECLAIM_RELAUNCH_MAX:-0}" -gt 0 ]; then
+                    _will_relaunch=1
+                    _alert_sev="warning"
+                fi
+                ;;
+        esac
         # Independent-channel surveillance: fan out the diagnostic via
         # alpha_engine_lib.alerts (SNS + Telegram). Mirrors the L117
         # "Lambda CI canary rollback should Telegram/email the operator
@@ -558,8 +588,8 @@ cleanup() {
             _alert_python="$(command -v python3 || command -v python || echo python)"
         fi
         "$_alert_python" -m alpha_engine_lib.alerts publish \
-            --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_state_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>}" \
-            --severity error \
+            --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_state_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>} will_relaunch=$_will_relaunch" \
+            --severity "$_alert_sev" \
             --source alpha-engine-backtester/spot_backtest.sh \
             > /dev/null 2>&1 || echo "    (alerts.publish fan-out failed; primary stdout diagnostic above is the surface)"
     fi
@@ -567,6 +597,15 @@ cleanup() {
     aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
     aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
     echo "  Instance terminated; S3 staging cleaned."
+    # L4485-b: on a classified spot reclaim, relaunch on a FRESH spot (bounded).
+    # The dead worker + its S3 staging are already cleaned above, so re-exec is
+    # clean. exec replaces this process, decrementing the budget so the relaunch
+    # is bounded; the pending `exit` below is moot. Any non-reclaim failure falls
+    # through to the status-preserving exit.
+    if [ "$_will_relaunch" = "1" ]; then
+        echo "==> Spot RECLAIMED by AWS (Server.SpotInstanceTermination) — relaunching on a fresh spot (budget remaining after this: $((RECLAIM_RELAUNCH_MAX - 1)))"
+        exec env RECLAIM_RELAUNCH_MAX="$((RECLAIM_RELAUNCH_MAX - 1))" bash "$0" "${_ORIG_ARGS[@]}"
+    fi
     # CRITICAL (L4485): re-exit with the captured status. A bash EXIT trap
     # that ends on a successful command (the echo above, or the `|| true`
     # cleanup steps) otherwise leaves the script exiting 0 — which is
