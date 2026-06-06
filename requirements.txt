@@ -45,4 +45,4 @@ cvxpy>=1.4,<1.8
 # integration tests); cross-repo lockstep — bumping in sync with
 # alpha-engine's lib pin to avoid the silent-downgrade pattern flagged
 # in feedback_lib_pin_lockstep_cross_repo_composition.
-alpha-engine-lib[arcticdb,flow_doctor,quant-stats] @ git+https://github.com/cipher813/alpha-engine-lib@v0.50.0
+alpha-engine-lib[arcticdb,flow_doctor,quant-stats] @ git+https://github.com/cipher813/alpha-engine-lib@v0.53.0
