@@ -820,11 +820,25 @@ command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m p
 \$PIP install --upgrade pip -q
 \$PIP install -q -r requirements.txt
 
-# Also install predictor deps (needed for GBM inference + feature computation)
+# Also install predictor deps (needed for GBM inference + feature computation).
+# CAUTION: the predictor's requirements.txt pins its OWN (older) alpha-engine-lib
+# (v0.47.0 as of 2026-06-06). Installing it here SECOND silently DOWNGRADES the
+# lib from the backtester's pinned version — which is exactly how the Evaluator
+# broke: v0.47.0 predates alpha_engine_lib.quant.stats (first shipped v0.49.0),
+# so evaluate.py -> analysis.stats_utils -> quant.stats.multiple_testing raised
+# ModuleNotFoundError every run (the 2>/dev/null swallowed pip's downgrade note).
 cd /home/ec2-user/alpha-engine-predictor
 if [ -f requirements.txt ]; then
     \$PIP install -q -r requirements.txt 2>/dev/null || true
 fi
+
+# RE-ASSERT the backtester's alpha-engine-lib pin as the FINAL word, so a
+# sibling repo's older pin can never leave the env on a quant.stats-less lib.
+# Idempotent + cached when already correct; loud (no 2>/dev/null) so a genuine
+# resolution failure surfaces instead of silently shipping the wrong version.
+cd /home/ec2-user/alpha-engine-backtester
+\$PIP install -q -r requirements.txt
+\$PIP show alpha-engine-lib 2>/dev/null | grep -E '^Version:' || true
 
 # Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)
 \$PIP install -q 'numpy<2'
