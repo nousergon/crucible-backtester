@@ -821,24 +821,30 @@ command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m p
 \$PIP install -q -r requirements.txt
 
 # Also install predictor deps (needed for GBM inference + feature computation).
-# CAUTION: the predictor's requirements.txt pins its OWN (older) alpha-engine-lib
-# (v0.47.0 as of 2026-06-06). Installing it here SECOND silently DOWNGRADES the
-# lib from the backtester's pinned version — which is exactly how the Evaluator
-# broke: v0.47.0 predates alpha_engine_lib.quant.stats (first shipped v0.49.0),
-# so evaluate.py -> analysis.stats_utils -> quant.stats.multiple_testing raised
-# ModuleNotFoundError every run (the 2>/dev/null swallowed pip's downgrade note).
+# The predictor + backtester alpha-engine-lib pins are now ALIGNED at v0.53.0
+# (fleet lockstep — predictor #238 / L4513), so this co-install no longer
+# downgrades the lib. Background: when the predictor lagged at v0.47.0, installing
+# it here SECOND silently downgraded the lib below quant.stats (first shipped
+# v0.49.0), breaking evaluate.py's import every run (the 2>/dev/null hid pip's
+# downgrade note). Alignment fixes the instance; the GUARD below fixes the CLASS.
 cd /home/ec2-user/alpha-engine-predictor
 if [ -f requirements.txt ]; then
     \$PIP install -q -r requirements.txt 2>/dev/null || true
 fi
 
-# RE-ASSERT the backtester's alpha-engine-lib pin as the FINAL word, so a
-# sibling repo's older pin can never leave the env on a quant.stats-less lib.
-# Idempotent + cached when already correct; loud (no 2>/dev/null) so a genuine
-# resolution failure surfaces instead of silently shipping the wrong version.
+# Fail-loud dependency GUARD (L4513 class fix). Assert the alpha-engine-lib
+# modules the Evaluator imports are actually present AFTER all installs — so if a
+# future sibling-repo pin drift ever downgrades the lib below quant.stats, this
+# breaks LOUD at deps time instead of silently at evaluate.py's import weeks
+# later. Per feedback_no_silent_fails. PYBIN derives from PIP ("py -m pip" -> py).
 cd /home/ec2-user/alpha-engine-backtester
-\$PIP install -q -r requirements.txt
-\$PIP show alpha-engine-lib 2>/dev/null | grep -E '^Version:' || true
+PYBIN="\${PIP% -m pip}"
+\$PYBIN -c "import alpha_engine_lib.quant.stats.multiple_testing, alpha_engine_lib.quant" || {
+    echo "FATAL: alpha-engine-lib is missing quant.stats — a co-installed sibling repo's pin likely downgraded it below v0.49.0. Resolved version:" >&2
+    \$PIP show alpha-engine-lib | grep -E '^Version:' >&2 || true
+    exit 1
+}
+\$PIP show alpha-engine-lib | grep -E '^Version:'
 
 # Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)
 \$PIP install -q 'numpy<2'

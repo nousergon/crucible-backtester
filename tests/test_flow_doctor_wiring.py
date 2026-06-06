@@ -374,12 +374,11 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.50.0" in text, (
-            "alpha-engine-lib should pin to v0.50.0 — the LV2-AE leverage arc "
-            "(2026-06-03). v0.49 lifted analysis/{dsr,information_coefficient,"
-            "expectancy,stats_utils,risk_matched_benchmark}.py to "
-            "``alpha_engine_lib.quant.stats`` (re-export shims); v0.50 (LV2-AE.b) "
-            "lifts the regime-stratified Sortino pure core to "
-            "``quant.stats.regime_sortino`` (this module keeps the SQLite loader + "
-            "re-exports the core). Update this test if the pin moves further forward."
+        assert "@v0.53.0" in text, (
+            "alpha-engine-lib should pin to v0.53.0 — fleet pin alignment "
+            "(2026-06-06, L4513). The predictor lagged at v0.47.0 and silently "
+            "downgraded the lib below quant.stats (first shipped v0.49.0) in the "
+            "backtester spot co-install, breaking the Evaluator; aligning the "
+            "fleet at v0.53.0 (predictor #238 + backtester #291) closes that. "
+            "Update this test if the pin moves further forward."
         )
