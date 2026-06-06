@@ -47,17 +47,49 @@ def test_orig_args_captured_pre_parse():
     )
 
 
-def test_relaunch_gated_strictly_on_reclaim_reason():
-    """The relaunch must be gated on Server.SpotInstanceTermination ONLY —
-    a generic failure must NOT trigger a relaunch (no blind retry)."""
+def test_describe_captures_statereason_code():
+    """The reclaim classifier's input bug (fixed 2026-06-06): the authoritative
+    spot-reclaim signal is StateReason.Code == Server.SpotInstanceTermination.
+    cleanup() previously queried StateTransitionReason ALONE (which only shows
+    'Service initiated (<ts>)') and classified against Server.SpotInstanceTermination
+    — a field/value mismatch that could never match, so two real reclaims on
+    2026-06-06 hard-failed. The describe-instances query MUST capture
+    StateReason.Code."""
     s = _read()
-    # the classifier sets _will_relaunch=1 only inside the reclaim case
-    assert "Server.SpotInstanceTermination" in s
-    m = re.search(
-        r'\*Server\.SpotInstanceTermination\*\)(.*?)_will_relaunch=1',
-        s, re.DOTALL,
+    assert "StateReason.Code" in s, (
+        "cleanup() must query StateReason.Code — the authoritative reclaim signal "
+        "(without it the classifier can never match a real reclaim)"
     )
-    assert m, "relaunch flag not set inside the Server.SpotInstanceTermination case"
+
+
+def test_relaunch_gated_strictly_on_reclaim_reason():
+    """The relaunch must be gated on a CLASSIFIED reclaim only — a generic
+    failure must NOT trigger a relaunch (no blind retry). The reclaim is
+    classified via _is_reclaim, set by the authoritative StateReason.Code case."""
+    s = _read()
+    # _is_reclaim is set inside the Server.SpotInstanceTermination (reason_code) case
+    m = re.search(
+        r'\*Server\.SpotInstanceTermination\*\)\s*_is_reclaim=1',
+        s,
+    )
+    assert m, "_is_reclaim not set inside the Server.SpotInstanceTermination case"
+    # _will_relaunch is gated on BOTH _is_reclaim AND a positive budget
+    assert re.search(
+        r'\[ "\$_is_reclaim" = "1" \] && \[ "\$\{RECLAIM_RELAUNCH_MAX:-0\}" -gt 0 \]',
+        s,
+    ), "relaunch must be gated on _is_reclaim AND a positive budget"
+
+
+def test_service_initiated_shutting_down_classified_as_reclaim():
+    """Belt-and-suspenders: a worker already shutting-down/terminated with
+    StateTransitionReason 'Service initiated' (AWS reclaimed it out from under a
+    still-failing dispatcher) must also classify as a reclaim — this is the exact
+    2026-06-06 signature that the old classifier missed."""
+    s = _read()
+    assert re.search(
+        r'shutting-down:\*Service\\? initiated\* \| terminated:\*Service\\? initiated\*\)\s*_is_reclaim=1',
+        s,
+    ), "the shutting-down/terminated + 'Service initiated' reclaim path is missing"
 
 
 def test_relaunch_exec_decrements_budget():

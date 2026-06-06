@@ -228,7 +228,12 @@ USE_VECTORIZED_SWEEP="${USE_VECTORIZED_SWEEP:-false}"
 # this script on a FRESH spot, bounded by RECLAIM_RELAUNCH_MAX. Gated STRICTLY on
 # the reclaim reason — any non-reclaim failure exits immediately (no blind retry
 # that could mask a real bug, per feedback_no_silent_fails). Happy path unchanged.
-RECLAIM_RELAUNCH_MAX="${RECLAIM_RELAUNCH_MAX:-1}"
+# Default budget 3 (was 1): 2026-06-06 saw TWO consecutive reclaims during a
+# capacity-volatile window; a budget of 1 exhausts on such a streak. Each
+# relaunch resumes cheaply via the S3 phase auto-skip markers (completed phases
+# are skipped on the fresh spot), so a higher bound is low-cost and only ever
+# burns on a CLASSIFIED reclaim — a real crash/OOM/timeout still exits at once.
+RECLAIM_RELAUNCH_MAX="${RECLAIM_RELAUNCH_MAX:-3}"
 _ORIG_ARGS=("$@")  # captured pre-parse for the relaunch exec
 
 while [[ $# -gt 0 ]]; do
@@ -540,7 +545,7 @@ LAST_SSM_DESC=""
 # with diagnostics on failure.
 cleanup() {
     local exit_code=$?
-    local _will_relaunch=0 _alert_sev="error"
+    local _will_relaunch=0 _alert_sev="error" _is_reclaim=0
     echo ""
     echo "==> Dispatcher EXIT (code=$exit_code)"
     if [ "$exit_code" -ne 0 ]; then
@@ -556,28 +561,46 @@ cleanup() {
             # gone by the time anyone looks and the diagnostics JSON carries
             # empty tails — exactly the 2026-06-01 dead-end. One describe call,
             # flattened to "State.Name<TAB>StateTransitionReason".
-            local _desc
-            _desc=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].[State.Name,StateTransitionReason]' --output text 2>/dev/null || true)
-            state=$(printf '%s' "$_desc" | awk '{print $1}')
-            state_reason=$(printf '%s' "$_desc" | cut -f2-)
+            # Capture State.Name + StateReason.Code + StateTransitionReason.
+            # The AUTHORITATIVE spot-reclaim signal is StateReason.Code ==
+            # Server.SpotInstanceTermination; StateTransitionReason only shows
+            # the human "Service initiated (<ts>)" form. Earlier this queried
+            # StateTransitionReason ALONE and classified against
+            # Server.SpotInstanceTermination — a field/value mismatch that could
+            # never match, so two real reclaims on 2026-06-06 hard-failed instead
+            # of relaunching. Now both are captured (3 tab-separated fields).
+            local _desc reason_code
+            _desc=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].[State.Name,StateReason.Code,StateTransitionReason]' --output text 2>/dev/null || true)
+            state=$(printf '%s' "$_desc" | cut -f1)
+            reason_code=$(printf '%s' "$_desc" | cut -f2)
+            state_reason=$(printf '%s' "$_desc" | cut -f3-)
             [ -z "$state" ] && state="<lookup-failed>"
+            [ -z "$reason_code" ] && reason_code="<none>"
             [ -z "$state_reason" ] && state_reason="<none>"
             echo "    spot state: $state"
-            echo "    spot state-reason: $state_reason"
+            echo "    spot state-reason-code: $reason_code"
+            echo "    spot state-transition-reason: $state_reason"
         fi
-        # L4485-b: classify a genuine AWS spot reclaim. ONLY
-        # Server.SpotInstanceTermination triggers a bounded relaunch — every
-        # other failure (real crash, delivery timeout, OOM) exits as-is so a
-        # blind retry never masks a real bug. Downgrade the alert to warning
-        # when we will relaunch, so a recovered run does not page as an error.
-        case "$state_reason" in
-            *Server.SpotInstanceTermination*)
-                if [ "${RECLAIM_RELAUNCH_MAX:-0}" -gt 0 ]; then
-                    _will_relaunch=1
-                    _alert_sev="warning"
-                fi
-                ;;
+        # L4485-b (classifier fixed 2026-06-06): classify a genuine AWS spot
+        # reclaim. Authoritative signal = StateReason.Code ==
+        # Server.SpotInstanceTermination. Belt-and-suspenders: also treat a
+        # worker already in shutting-down/terminated whose StateTransitionReason
+        # is "Service initiated" as a reclaim — AWS tore it down out from under a
+        # still-running (exit_code!=0) dispatcher (a real crash/OOM leaves the
+        # worker state=running until we terminate it below, so this can't
+        # mis-fire on a genuine bug). Every other failure exits as-is so a blind
+        # retry never masks a real bug. Downgrade the alert to warning when we
+        # will relaunch, so a recovered run does not page as an error.
+        case "$reason_code" in
+            *Server.SpotInstanceTermination*) _is_reclaim=1 ;;
         esac
+        case "$state:$state_reason" in
+            shutting-down:*Service\ initiated* | terminated:*Service\ initiated*) _is_reclaim=1 ;;
+        esac
+        if [ "$_is_reclaim" = "1" ] && [ "${RECLAIM_RELAUNCH_MAX:-0}" -gt 0 ]; then
+            _will_relaunch=1
+            _alert_sev="warning"
+        fi
         # Independent-channel surveillance: fan out the diagnostic via
         # alpha_engine_lib.alerts (SNS + Telegram). Mirrors the L117
         # "Lambda CI canary rollback should Telegram/email the operator
@@ -595,7 +618,7 @@ cleanup() {
             _alert_python="$(command -v python3 || command -v python || echo python)"
         fi
         "$_alert_python" -m alpha_engine_lib.alerts publish \
-            --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_state_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>} will_relaunch=$_will_relaunch" \
+            --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_reason_code='$reason_code' spot_transition_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>} will_relaunch=$_will_relaunch" \
             --severity "$_alert_sev" \
             --source alpha-engine-backtester/spot_backtest.sh \
             > /dev/null 2>&1 || echo "    (alerts.publish fan-out failed; primary stdout diagnostic above is the surface)"
@@ -610,7 +633,7 @@ cleanup() {
     # is bounded; the pending `exit` below is moot. Any non-reclaim failure falls
     # through to the status-preserving exit.
     if [ "$_will_relaunch" = "1" ]; then
-        echo "==> Spot RECLAIMED by AWS (Server.SpotInstanceTermination) — relaunching on a fresh spot (budget remaining after this: $((RECLAIM_RELAUNCH_MAX - 1)))"
+        echo "==> Spot RECLAIMED by AWS (reason_code='$reason_code' state='$state' transition='$state_reason') — relaunching on a fresh spot (budget remaining after this: $((RECLAIM_RELAUNCH_MAX - 1)))"
         exec env RECLAIM_RELAUNCH_MAX="$((RECLAIM_RELAUNCH_MAX - 1))" bash "$0" "${_ORIG_ARGS[@]}"
     fi
     # CRITICAL (L4485): re-exit with the captured status. A bash EXIT trap
