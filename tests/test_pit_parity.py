@@ -331,3 +331,18 @@ def test_backtest_has_pit_parity_pass_child_submode_with_rss_guard():
     assert "ru_maxrss" in src and "PIT_PARITY_PASS_RSS_BUDGET_MB" in src, (
         "per-pass RSS-budget guard (the 'these always degrade' fix) missing"
     )
+
+
+def test_isolated_pass_surfaces_child_stderr_on_failure():
+    """L4487b: a non-zero child exit must surface the child's stderr (the actual
+    cause), not a bare 'exit 1'. The earlier design used check=True with inherited
+    fds, so the SSM-relayed stream dropped the traceback -> opaque failures
+    (no-silent-fails violation in our own code)."""
+    import inspect
+    import analysis.pit_parity as ppmod
+    src = inspect.getsource(ppmod._run_predictor_pass_isolated)
+    assert "stderr=subprocess.PIPE" in src, "child stderr must be captured"
+    assert "returncode" in src and "raise RuntimeError" in src, (
+        "non-zero child exit must raise with the captured stderr tail"
+    )
+    assert "proc.stderr" in src, "the raised error/log must include the child's stderr"

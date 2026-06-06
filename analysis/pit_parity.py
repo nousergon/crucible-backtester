@@ -78,9 +78,24 @@ def _run_predictor_pass_isolated(safe_config: dict, which: str, run_date: str) -
             "--date", run_date,
             "--log-level", "INFO",
         ]
-        # check=True: a crashed pass must surface (caught by run_pit_parity's
-        # observational handler), never silently yield empty stats.
-        subprocess.run(cmd, cwd=str(repo_root), check=True)
+        # L4487b: capture the child's stderr so a non-zero exit surfaces the
+        # ACTUAL cause, not a bare "exit 1". The child's stdout still inherits
+        # (live MEM logs reach the captured spot log); only stderr is piped so
+        # the traceback is preserved even when the SSM-relayed stream drops it.
+        # A crashed pass must surface loud (caught by run_pit_parity's
+        # observational handler) — never silently yield empty stats.
+        proc = subprocess.run(
+            cmd, cwd=str(repo_root), stderr=subprocess.PIPE, text=True,
+        )
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip()[-2000:]
+            logger.error(
+                "[pit_parity] %s pass subprocess failed (rc=%s); child stderr tail:\n%s",
+                which, proc.returncode, tail,
+            )
+            raise RuntimeError(
+                f"pit_parity {which} pass failed (rc={proc.returncode}): {tail[-500:]}"
+            )
         with open(stats_path, "rb") as f:
             return pickle.load(f)
 
