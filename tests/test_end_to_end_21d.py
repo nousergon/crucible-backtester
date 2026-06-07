@@ -9,6 +9,8 @@ outcome cleanly rewards the selected names, and assert the additive
 
 import sqlite3
 
+import pytest
+
 from analysis.end_to_end import compute_lift_metrics
 
 DATE = "2026-05-01"
@@ -26,7 +28,7 @@ def _build_research_db(tmp_path):
     )
     conn.execute("CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT, quant_filter_pass INTEGER)")
     conn.execute("CREATE TABLE team_candidates (ticker TEXT, eval_date TEXT, team_id TEXT, team_recommended INTEGER)")
-    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, cio_decision TEXT, final_score REAL)")
+    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, cio_decision TEXT, final_score REAL, cio_conviction REAL)")
     # Empty — _predictor_lift queries it; the read must not error on a missing table.
     conn.execute("CREATE TABLE predictor_outcomes (symbol TEXT, prediction_date TEXT, "
                  "predicted_direction TEXT, prediction_confidence REAL)")
@@ -47,8 +49,9 @@ def _build_research_db(tmp_path):
         conn.execute("INSERT INTO scanner_evaluations VALUES (?,?,?)", (t, DATE, 1 if selected else 0))
         conn.execute("INSERT INTO team_candidates VALUES (?,?,?,?)", (t, DATE, "tech", 1 if selected else 0))
         conn.execute(
-            "INSERT INTO cio_evaluations VALUES (?,?,?,?)",
-            (t, DATE, "ADVANCE" if selected else "REJECT", 70.0 if selected else 40.0),
+            "INSERT INTO cio_evaluations VALUES (?,?,?,?,?)",
+            (t, DATE, "ADVANCE" if selected else "REJECT", 70.0 if selected else 40.0,
+             75.0 if selected else 45.0),
         )
     conn.commit()
     conn.close()
@@ -73,6 +76,19 @@ def test_cio_21d_block_present(tmp_path):
     assert cl["classification_21d"]["precision"] == 1.0
 
 
+def test_cio_selection_skill_block(tmp_path):
+    # Fixture: ADVANCE names have +0.05 21d log-alpha, REJECT -0.02 → positive
+    # selection gap; conviction (75 vs 45) tracks alpha → positive IC. (L4561)
+    out = compute_lift_metrics(_build_research_db(tmp_path))
+    sel = out["cio_lift"]["selection_skill_21d"]
+    assert sel is not None
+    assert sel["advance_alpha_21d"] == pytest.approx(0.05)
+    assert sel["reject_alpha_21d"] == pytest.approx(-0.02)
+    assert sel["selection_gap_21d"] == pytest.approx(0.07)
+    assert sel["n_advance"] == 10 and sel["n_reject"] == 10
+    assert sel["conviction_ic_21d"] is not None and sel["conviction_ic_21d"] > 0
+
+
 def test_team_21d_block_present(tmp_path):
     out = compute_lift_metrics(_build_research_db(tmp_path))
     team = out["team_lift"][0]
@@ -90,7 +106,7 @@ def test_21d_absent_when_columns_missing(tmp_path):
     )
     conn.execute("CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT, quant_filter_pass INTEGER)")
     conn.execute("CREATE TABLE team_candidates (ticker TEXT, eval_date TEXT, team_id TEXT, team_recommended INTEGER)")
-    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, cio_decision TEXT, final_score REAL)")
+    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, cio_decision TEXT, final_score REAL, cio_conviction REAL)")
     conn.execute("CREATE TABLE predictor_outcomes (symbol TEXT, prediction_date TEXT, "
                  "predicted_direction TEXT, prediction_confidence REAL)")
     for i in range(20):
