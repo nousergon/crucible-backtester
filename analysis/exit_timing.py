@@ -141,6 +141,38 @@ def compute_exit_timing(
 
     rdf = pd.DataFrame(results)
 
+    # Capture ratio (realized / MFE) is a WINNER concept — "of the favorable
+    # move that was available, how much did we keep?". Averaging it over ALL
+    # trades is a defective metric (ROADMAP L4554): a stopped-out loser has a
+    # tiny/near-zero MFE denominator and a negative numerator, so its per-trade
+    # ratio explodes negative and a handful of stops drag the unbounded MEAN
+    # below zero even when most exits capture their winners well. The graded
+    # signal is therefore the MEDIAN capture over WINNERS (realized>0 & MFE>0);
+    # the legacy all-trade mean is retained as a (misleading) diagnostic only,
+    # and loser exit-quality is summarized separately via stop_efficiency
+    # (|realized| / |MAE| — how much of the adverse move we absorbed before
+    # cutting; lower = cut sooner).
+    winners = rdf[(rdf["realized_return_pct"] > 0) & (rdf["mfe_pct"] > 0.01)
+                  & rdf["capture_ratio"].notna()]
+    losers = rdf[rdf["realized_return_pct"] < 0]
+    capture_winners_median = (round(float(winners["capture_ratio"].median()), 2)
+                              if not winners.empty else None)
+    # Winsorize the all-trade capture to [-1, 1.5] before meaning, so the
+    # outlier-driven legacy number has a bounded companion.
+    _wins_cap = rdf["capture_ratio"].dropna().clip(lower=-1.0, upper=1.5)
+    winsorized_capture = (round(float(_wins_cap.mean()), 2) if not _wins_cap.empty else None)
+
+    # Stop efficiency on losers: |realized| / |MAE| (both negative). Near 1 means
+    # we rode the loss most of the way to its worst point; small means we cut
+    # early. Only meaningful when MAE < 0.
+    loser_stop = losers[losers["mae_pct"] < -0.01]
+    if not loser_stop.empty:
+        stop_eff = (loser_stop["realized_return_pct"].abs()
+                    / loser_stop["mae_pct"].abs())
+        stop_efficiency_median = round(float(stop_eff.median()), 2)
+    else:
+        stop_efficiency_median = None
+
     summary = {
         "n_roundtrips": len(rdf),
         "avg_mfe": round(float(rdf["mfe_pct"].mean()), 2),
@@ -148,20 +180,27 @@ def compute_exit_timing(
         "avg_realized_return": round(float(rdf["realized_return_pct"].mean()), 2),
         "avg_capture_ratio": round(float(rdf["capture_ratio"].dropna().mean()), 2)
         if rdf["capture_ratio"].notna().any() else None,
+        # Robust replacements (L4554) — graded in preference to avg_capture_ratio:
+        "capture_winners_median": capture_winners_median,
+        "n_winners": int(len(winners)),
+        "winsorized_capture_ratio": winsorized_capture,
+        "stop_efficiency_median": stop_efficiency_median,
+        "n_losers": int(len(losers)),
+        "win_rate": round(float((rdf["realized_return_pct"] > 0).mean()), 3),
         "median_mfe": round(float(rdf["mfe_pct"].median()), 2),
         "median_mae": round(float(rdf["mae_pct"].median()), 2),
     }
 
-    # Diagnosis
-    avg_mfe = summary["avg_mfe"]
-    avg_realized = summary["avg_realized_return"]
-    capture = summary.get("avg_capture_ratio")
-
-    if capture is not None and capture < 0.3:
-        diagnosis = "exits_too_early"
-    elif avg_realized > avg_mfe * 0.6:
-        diagnosis = "exits_well_timed"
-    elif capture is not None and capture > 0.8:
+    # Diagnosis — robust, off WINNER capture (exit-timing quality on the trades
+    # where there was a move to capture), not the outlier-polluted all-trade mean.
+    # Cutpoints align with the report-card grading bands (red_line 0.40 / target
+    # 0.70) so the diagnosis label and the graded status never disagree.
+    cap_w = capture_winners_median
+    if cap_w is None:
+        diagnosis = "insufficient_winners"
+    elif cap_w < 0.40:
+        diagnosis = "exits_too_early"  # winners systematically under-captured
+    elif cap_w >= 0.70:
         diagnosis = "exits_well_timed"
     else:
         diagnosis = "exits_could_improve"
