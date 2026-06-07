@@ -239,6 +239,21 @@ def _run_combos(
             config = _deepcopy_safe_config(base_config)
             config.update(params)
             stats = run_simulation_fn(config)
+            # Strip nested per-combo time-series before the row enters the
+            # DataFrame (L4529). `vectorbt_bridge.run_vectorbt_simulation`
+            # returns `daily_returns` / `daily_log_returns` as full pandas
+            # Series (a ~2500-row path per combo). They are NOT scalar sweep
+            # metrics; left in the row they make the column dtype `object` and
+            # `sweep_df.to_parquet` dies with `ArrowInvalid: Could not convert
+            # … with type Series` — which the L4518 fail-loud export guard then
+            # escalates to a backtest-stage kill (→ no sweep_df.parquet /
+            # portfolio_stats.json → Evaluator critical-artifact gate fails →
+            # whole Saturday SF FAILED). Mirrors the existing `stats.pop(...)`
+            # pattern in analysis/portfolio_optimizer_backtest.py. The sweep
+            # only needs scalar metrics per combo; nothing reads these Series
+            # back from the parquet. See [[feedback_no_silent_fails]].
+            stats.pop("daily_returns", None)
+            stats.pop("daily_log_returns", None)
             rows.append({**params, **stats})
         except Exception as e:
             logger.warning("Simulation failed for params %s: %s", params, e)
