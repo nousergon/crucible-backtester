@@ -78,6 +78,26 @@ def test_empty_sweep_is_exported_present_not_skipped():
     )
 
 
+def test_param_sweep_except_captures_traceback_failloud():
+    """L4525: the param_sweep except must capture the stack (exc_info=True) AND
+    persist the full traceback to S3. A message-only log is unrecoverable under
+    the 24KB spot-log cap + staging cleanup — exactly why recovery8's raise
+    could not be diagnosed. See [[feedback_no_silent_fails]]."""
+    s = _src()
+    assert 'logger.error("Param sweep failed: %s", e, exc_info=True)' in s, (
+        "param_sweep except must log with exc_info=True (mirror the simulate "
+        "except) — a message-only log loses the traceback (recovery8 symptom)"
+    )
+    # durably persisted to S3 under a _diagnostics namespace (no marker collision)
+    assert '"_diagnostics", "param_sweep_traceback"' in s, (
+        "param_sweep except must persist the traceback to S3 so it survives the "
+        "24KB log cap + spot staging cleanup"
+    )
+    assert "traceback.format_exc()" in s, (
+        "must persist the full formatted traceback, not just the exception str"
+    )
+
+
 def test_predictor_backtest_exempt_from_guard():
     """predictor-backtest legitimately produces neither portfolio_stats nor
     sweep_df — the guard must not require them for that mode."""
