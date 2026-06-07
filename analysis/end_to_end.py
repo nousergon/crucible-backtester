@@ -156,6 +156,44 @@ def _cio_selection_skill(merged: pd.DataFrame) -> dict | None:
     return out
 
 
+def _cio_layer_attribution(merged: pd.DataFrame) -> dict | None:
+    """Attribute realized 21d alpha to each layer the CIO orchestrates (L4561/L4562).
+
+    The CIO synthesizes several inputs — the sector-team stock score
+    (``combined_score``, pre-macro), the macro/sector tilt (``macro_shift``), the
+    blended ``final_score`` it currently ranks on, and its own ``cio_conviction``.
+    This emits the Spearman rank-IC (+p) of EACH vs realized 21d alpha across all
+    CIO-evaluated names, so the harness can see which layer carries forward signal
+    and which is noise/anti-signal — the precondition for de-blending the
+    orchestration. Diagnostic; ``None`` when canonical 21d cols / closed outcomes
+    are absent.
+    """
+    if "log_return_21d" not in merged.columns or "log_spy_return_21d" not in merged.columns:
+        return None
+    df = merged.copy()
+    df["alpha21"] = df["log_return_21d"] - df["log_spy_return_21d"]
+    df = df.dropna(subset=["alpha21"])
+    if df.shape[0] < 5:
+        return None
+    from scipy.stats import spearmanr
+
+    out: dict = {"n": int(df.shape[0])}
+    for layer in ("combined_score", "macro_shift", "final_score", "cio_conviction"):
+        if layer not in df.columns:
+            out[f"{layer}_ic"] = None
+            out[f"{layer}_ic_p"] = None
+            continue
+        sub = df.dropna(subset=[layer])
+        if sub.shape[0] >= 5 and sub[layer].nunique() >= 2 and sub["alpha21"].nunique() >= 2:
+            rho, p = spearmanr(sub[layer], sub["alpha21"])
+            out[f"{layer}_ic"] = round(float(rho), 4) if rho == rho else None
+            out[f"{layer}_ic_p"] = round(float(p), 4) if p == p else None
+        else:
+            out[f"{layer}_ic"] = None
+            out[f"{layer}_ic_p"] = None
+    return out
+
+
 def compute_lift_metrics(
     research_db_path: str,
     trades_db_path: str | None = None,
@@ -695,7 +733,8 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
     try:
         ce_filter = date_filter.replace("eval_date", "ce.eval_date") if date_filter else ""
         ce = pd.read_sql_query(
-            f"SELECT ticker, eval_date, cio_decision, final_score, cio_conviction "
+            f"SELECT ticker, eval_date, cio_decision, final_score, cio_conviction, "
+            f"combined_score, macro_shift "
             f"FROM cio_evaluations ce{ce_filter}",
             conn, params=params,
         )
@@ -744,6 +783,8 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
         lift_21d = _alpha_21d_log_lift(merged, adv_mask)
         # CIO entrant-gate selection skill (L4561): does ADVANCE beat REJECT at 21d?
         selection_skill = _cio_selection_skill(merged)
+        # Layer attribution (L4561): which orchestrated input carries 21d signal?
+        layer_attribution = _cio_layer_attribution(merged)
 
         return {
             "all_recs_avg": round(all_recs_avg, 4),
@@ -760,6 +801,7 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
             "classification_21d": clf_21d,
             "lift_21d_log": lift_21d,
             "selection_skill_21d": selection_skill,
+            "layer_attribution_21d": layer_attribution,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "cio_evaluations table not found"}

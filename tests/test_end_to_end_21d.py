@@ -28,7 +28,7 @@ def _build_research_db(tmp_path):
     )
     conn.execute("CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT, quant_filter_pass INTEGER)")
     conn.execute("CREATE TABLE team_candidates (ticker TEXT, eval_date TEXT, team_id TEXT, team_recommended INTEGER)")
-    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, cio_decision TEXT, final_score REAL, cio_conviction REAL)")
+    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, cio_decision TEXT, final_score REAL, cio_conviction REAL, combined_score REAL, macro_shift REAL)")
     # Empty — _predictor_lift queries it; the read must not error on a missing table.
     conn.execute("CREATE TABLE predictor_outcomes (symbol TEXT, prediction_date TEXT, "
                  "predicted_direction TEXT, prediction_confidence REAL)")
@@ -49,9 +49,9 @@ def _build_research_db(tmp_path):
         conn.execute("INSERT INTO scanner_evaluations VALUES (?,?,?)", (t, DATE, 1 if selected else 0))
         conn.execute("INSERT INTO team_candidates VALUES (?,?,?,?)", (t, DATE, "tech", 1 if selected else 0))
         conn.execute(
-            "INSERT INTO cio_evaluations VALUES (?,?,?,?,?)",
+            "INSERT INTO cio_evaluations VALUES (?,?,?,?,?,?,?)",
             (t, DATE, "ADVANCE" if selected else "REJECT", 70.0 if selected else 40.0,
-             75.0 if selected else 45.0),
+             75.0 if selected else 45.0, 68.0 if selected else 42.0, 2.0 if selected else -2.0),
         )
     conn.commit()
     conn.close()
@@ -89,6 +89,17 @@ def test_cio_selection_skill_block(tmp_path):
     assert sel["conviction_ic_21d"] is not None and sel["conviction_ic_21d"] > 0
 
 
+def test_cio_layer_attribution_block(tmp_path):
+    # Each orchestrated layer (combined_score, macro_shift, final_score,
+    # cio_conviction) gets a rank-IC vs realized 21d alpha. In the fixture all
+    # track the selected/+alpha split, so each IC is present (and positive). (L4561)
+    out = compute_lift_metrics(_build_research_db(tmp_path))
+    attr = out["cio_lift"]["layer_attribution_21d"]
+    assert attr is not None and attr["n"] == 20
+    for layer in ("combined_score", "macro_shift", "final_score", "cio_conviction"):
+        assert attr[f"{layer}_ic"] is not None
+
+
 def test_team_21d_block_present(tmp_path):
     out = compute_lift_metrics(_build_research_db(tmp_path))
     team = out["team_lift"][0]
@@ -106,7 +117,7 @@ def test_21d_absent_when_columns_missing(tmp_path):
     )
     conn.execute("CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT, quant_filter_pass INTEGER)")
     conn.execute("CREATE TABLE team_candidates (ticker TEXT, eval_date TEXT, team_id TEXT, team_recommended INTEGER)")
-    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, cio_decision TEXT, final_score REAL, cio_conviction REAL)")
+    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, cio_decision TEXT, final_score REAL, cio_conviction REAL, combined_score REAL, macro_shift REAL)")
     conn.execute("CREATE TABLE predictor_outcomes (symbol TEXT, prediction_date TEXT, "
                  "predicted_direction TEXT, prediction_confidence REAL)")
     for i in range(20):
