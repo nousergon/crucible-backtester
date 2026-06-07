@@ -220,9 +220,6 @@ def _run_combos(
     n = len(combinations)
     t_sweep_start = _time.monotonic()
     for i, params in enumerate(combinations, 1):
-        config = _deepcopy_safe_config(base_config)
-        config.update(params)
-
         # Per-combo progress at INFO so the sweep never goes silent. Each
         # combo is a full simulation (~30-90s); without this, 60 combos
         # run in complete silence at default INFO level and look like a
@@ -231,6 +228,16 @@ def _run_combos(
         t_combo = _time.monotonic()
         logger.info("Sweep combo %d/%d: %s", i, n, params)
         try:
+            # _deepcopy_safe_config is INSIDE the per-combo try (L4525): a
+            # deepcopy / recursion failure on one combo's config must degrade
+            # to an error-row, NOT escape the whole sweep and return
+            # sweep_df=None — which the export guard then treats as a fatal
+            # ABSENT sweep (recovery8 symptom). The docstring records a prior
+            # recursion failure here from a boto3 client in config. Per the
+            # L4523 outcome taxonomy + [[feedback_no_silent_fails]]: a single
+            # bad combo is a logged warning, never a process kill.
+            config = _deepcopy_safe_config(base_config)
+            config.update(params)
             stats = run_simulation_fn(config)
             rows.append({**params, **stats})
         except Exception as e:

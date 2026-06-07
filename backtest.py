@@ -42,6 +42,7 @@ import logging
 import tempfile
 import os
 import time as _time
+import traceback
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -4355,7 +4356,35 @@ def _run_simulation_pipeline(
                             preserve_index=False, s3_client=s3,
                         ))
         except Exception as e:
-            logger.error("Param sweep failed: %s", e)
+            # Fail-loud diagnostics (L4525): mirror the simulate except's
+            # exc_info=True so the stack frame survives, AND persist the full
+            # traceback to S3. The spot log is 24KB-capped and the staging dir
+            # is cleaned on exit, so a log-only stack is unrecoverable — this is
+            # exactly why recovery8's param_sweep raise could not be diagnosed.
+            # See [[feedback_no_silent_fails]].
+            logger.error("Param sweep failed: %s", e, exc_info=True)
+            # Best-effort secondary observability hung off the primary record
+            # above (logger exc_info + fd.report below) — a persist failure must
+            # not mask the original; it is itself logged loud. The diagnostic is
+            # written under a `_diagnostics` phase namespace so it never collides
+            # with the param_sweep phase marker / auto-skip artifact_keys.
+            try:
+                from phase_artifacts import save_json as _save_json
+                _save_json(
+                    bucket, args.date, "_diagnostics", "param_sweep_traceback",
+                    {
+                        "error": str(e),
+                        "type": type(e).__name__,
+                        "traceback": traceback.format_exc(),
+                        "mode": args.mode,
+                    },
+                    s3_client=s3,
+                )
+            except Exception as persist_err:  # noqa: BLE001 — best-effort diag
+                logger.error(
+                    "Failed to persist param_sweep traceback to S3: %s",
+                    persist_err, exc_info=True,
+                )
             if fd:
                 fd.report(e, severity="error", context={
                     "site": "param_sweep", "mode": args.mode})
