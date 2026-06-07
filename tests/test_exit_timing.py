@@ -149,7 +149,8 @@ def test_compute_exit_timing_diagnoses_exits_too_early(tmp_path):
         result = compute_exit_timing(str(db))
 
     assert result["status"] == "ok"
-    # avg_mfe=10, avg_realized=1 → capture 0.1 < 0.3
+    # MFE=10, realized=1 → winner-capture 0.1 < 0.40 → exits_too_early
+    assert result["summary"]["capture_winners_median"] == pytest.approx(0.10)
     assert result["diagnosis"] == "exits_too_early"
 
 
@@ -225,7 +226,7 @@ def test_compute_exit_timing_falls_back_to_computed_realized_return(tmp_path):
 
 
 def test_compute_exit_timing_diagnoses_exits_could_improve(tmp_path):
-    """MFE high but realized only ~40% of MFE → falls into 'exits_could_improve' branch."""
+    """Winner-capture median in [0.40, 0.70) → 'exits_could_improve' band."""
     db = tmp_path / "trades.db"
     roundtrips = []
     for i in range(6):
@@ -234,13 +235,13 @@ def test_compute_exit_timing_diagnoses_exits_could_improve(tmp_path):
             "entry_date": "2026-04-01",
             "exit_date": "2026-04-05",
             "entry_price": 100.0,
-            "exit_price": 103.5,
-            "realized_return_pct": 3.5,  # ~35% of 10% MFE → above 0.3 but below 0.8 and below 0.6 of MFE
+            "exit_price": 105.0,
+            "realized_return_pct": 5.0,  # 50% of 10% MFE → in [0.40, 0.70)
             "exit_type": "atr_stop",
         })
     _build_trades_db(db, roundtrips)
 
-    # MFE 10%, MAE -2% → capture 0.35; avg_realized (3.5) < avg_mfe (10) * 0.6 (6.0)
+    # MFE 10%, MAE -2% → winner-capture 0.50 → exits_could_improve
     price_cache = {f"T{i}": _price_df([102, 105, 110, 108, 103], [100, 99, 100, 98, 99])
                    for i in range(6)}
 
@@ -248,13 +249,14 @@ def test_compute_exit_timing_diagnoses_exits_could_improve(tmp_path):
         result = compute_exit_timing(str(db))
 
     assert result["status"] == "ok"
+    assert result["summary"]["capture_winners_median"] == pytest.approx(0.50)
     assert result["diagnosis"] == "exits_could_improve"
 
 
 def test_compute_exit_timing_diagnoses_exits_well_timed_high_capture(tmp_path):
-    """capture > 0.8 AND avg_realized < avg_mfe * 0.6 → still 'exits_well_timed' (high-capture branch)."""
+    """Winner-capture median >= 0.70 → 'exits_well_timed'."""
     db = tmp_path / "trades.db"
-    # MFE tiny but realized close to MFE → capture > 0.8
+    # MFE tiny but realized close to MFE → capture ~0.83
     roundtrips = []
     for i in range(6):
         roundtrips.append({
@@ -268,14 +270,7 @@ def test_compute_exit_timing_diagnoses_exits_well_timed_high_capture(tmp_path):
         })
     _build_trades_db(db, roundtrips)
 
-    # MFE = 0.6% (60 bps), realized 0.5 → capture 0.83; avg_realized 0.5 vs avg_mfe*0.6 = 0.36 →
-    # avg_realized > avg_mfe * 0.6 short-circuits to first well_timed branch.
-    # To force the high-capture-only branch, need realized < mfe*0.6 AND capture>0.8.
-    # Use MFE big enough that realized is just barely under 0.6*MFE but capture is still 0.83.
-    # mfe=1.0, realized=0.83 → capture=0.83 AND realized < 0.6*mfe (0.6) → FALSE (0.83 > 0.6).
-    # Need realized < 0.6*MFE AND capture > 0.8 — impossible mathematically since capture = realized/mfe,
-    # capture > 0.8 implies realized > 0.8*mfe > 0.6*mfe. So the high-capture branch is unreachable
-    # — pinned here as documentation of the dead branch.
+    # MFE = 0.6% (60 bps), realized 0.5 → winner-capture 0.83 >= 0.70
     price_cache = {f"T{i}": _price_df([100.6, 100.7, 100.5, 100.6], [99.5, 99.8, 99.9, 99.8])
                    for i in range(6)}
 
@@ -283,6 +278,47 @@ def test_compute_exit_timing_diagnoses_exits_well_timed_high_capture(tmp_path):
         result = compute_exit_timing(str(db))
 
     assert result["status"] == "ok"
+    assert result["diagnosis"] == "exits_well_timed"
+
+
+def test_capture_robust_to_stopped_out_losers(tmp_path):
+    """THE L4554 regression: a few stopped-out losers tank the legacy all-trade
+    avg_capture_ratio negative, but the robust winner-capture median stays
+    healthy and the diagnosis is NOT a false 'exits_too_early'."""
+    db = tmp_path / "trades.db"
+    roundtrips = []
+    # 8 well-captured winners: MFE ~6%, realized 5% → capture ~0.83.
+    for i in range(8):
+        roundtrips.append({
+            "ticker": f"W{i}", "entry_date": "2026-04-01", "exit_date": "2026-04-05",
+            "entry_price": 100.0, "exit_price": 105.0, "realized_return_pct": 5.0,
+            "exit_type": "intraday_profit_take",
+        })
+    # 4 stopped-out losers: briefly up ~0.3% (tiny MFE) then exit at -4%.
+    for i in range(4):
+        roundtrips.append({
+            "ticker": f"L{i}", "entry_date": "2026-04-01", "exit_date": "2026-04-05",
+            "entry_price": 100.0, "exit_price": 96.0, "realized_return_pct": -4.0,
+            "exit_type": "intraday_trailing_stop",
+        })
+    _build_trades_db(db, roundtrips)
+
+    cache = {}
+    for i in range(8):
+        cache[f"W{i}"] = _price_df([103, 105, 106, 105, 104], [100, 99, 102, 98, 103])  # MFE ~6
+    for i in range(4):
+        cache[f"L{i}"] = _price_df([100.3, 99, 97, 96, 95], [100, 96, 94, 93, 95])  # MFE ~0.3, MAE ~-7
+
+    with patch("analysis.exit_timing._load_price_cache", return_value=cache):
+        result = compute_exit_timing(str(db))
+
+    s = result["summary"]
+    # Legacy mean is dragged negative by the loser ratios (-4 / 0.3 ≈ -13 each)...
+    assert s["avg_capture_ratio"] < 0
+    # ...but the robust winner-capture median is healthy and the diagnosis holds.
+    assert s["capture_winners_median"] >= 0.70
+    assert s["n_winners"] == 8
+    assert s["n_losers"] == 4
     assert result["diagnosis"] == "exits_well_timed"
 
 

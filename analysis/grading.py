@@ -198,7 +198,8 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     lift = _safe_get(sl, "lift")
     n_passing = _safe_get(sl, "n_passing", default=0)
     n_universe = _safe_get(sl, "n_universe", default=1)
-    clf = _safe_get(sl, "classification")
+    # Canonical 21d horizon first; legacy 5d fallback (ROADMAP L4551).
+    clf = _safe_get(sl, "classification_21d") or _safe_get(sl, "classification")
 
     # Precision/recall from classification metrics (if available)
     precision = _safe_get(clf, "precision")
@@ -282,7 +283,8 @@ def _grade_sector_team(team: dict, team_metrics: dict | None = None) -> dict:
     # ── Legacy path: lift + classification ──────────────────────────────
     lift_vs_sector = team.get("lift")
     lift_vs_quant = team.get("lift_vs_quant")
-    clf = team.get("classification")
+    # Canonical 21d horizon first; legacy 5d fallback (ROADMAP L4551).
+    clf = team.get("classification_21d") or team.get("classification")
 
     # Classification metrics (if available)
     precision = _safe_get(clf, "precision")
@@ -462,7 +464,8 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
     if not cio_lift or _safe_get(cio_lift, "n_advance", default=0) < 3:
         return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
 
-    clf = _safe_get(cio_lift, "classification")
+    # Canonical 21d horizon first; legacy 5d fallback (ROADMAP L4551).
+    clf = _safe_get(cio_lift, "classification_21d") or _safe_get(cio_lift, "classification")
     precision = _safe_get(clf, "precision")
     recall = _safe_get(clf, "recall")
     f1 = _safe_get(clf, "f1")
@@ -835,7 +838,11 @@ def _grade_exit_rules(exit_timing: dict | None) -> dict:
     summary = exit_timing.get("summary", {})
     diagnosis = exit_timing.get("diagnosis", "unknown")
 
-    capture = summary.get("avg_capture_ratio")
+    # Grade the robust WINNER-capture median (L4554); the legacy all-trade
+    # avg_capture_ratio is an outlier-polluted mean kept only as a diagnostic.
+    capture = summary.get("capture_winners_median")
+    if capture is None:
+        capture = summary.get("avg_capture_ratio")  # legacy fallback
     capture_g = _ratio_to_grade(capture, target=0.70)
 
     avg_return = summary.get("avg_realized_return")
@@ -846,6 +853,7 @@ def _grade_exit_rules(exit_timing: dict | None) -> dict:
         "exits_well_timed": 85.0,
         "exits_could_improve": 55.0,
         "exits_too_early": 35.0,
+        "insufficient_winners": None,
     }
     diag_g = diag_scores.get(diagnosis)
 
@@ -857,7 +865,9 @@ def _grade_exit_rules(exit_timing: dict | None) -> dict:
 
     detail = {"diagnosis": diagnosis}
     if capture is not None:
-        detail["capture_ratio"] = f"{capture:.2f}"
+        detail["capture_winners_median"] = f"{capture:.2f}"
+    if summary.get("avg_capture_ratio") is not None:
+        detail["avg_capture_ratio_legacy"] = f"{summary['avg_capture_ratio']:.2f}"
     if avg_return is not None:
         detail["avg_return"] = f"{avg_return:+.2f}%"
     detail["n_roundtrips"] = exit_timing.get("n_roundtrips", 0)
