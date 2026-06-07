@@ -191,6 +191,21 @@ def _cio_layer_attribution(merged: pd.DataFrame) -> dict | None:
         else:
             out[f"{layer}_ic"] = None
             out[f"{layer}_ic_p"] = None
+
+    # De-blending substrate (L4563): does CROSS-SECTIONALLY rank-normalizing the
+    # stock-quality score within each cycle recover forward signal the raw score
+    # lacks? (The apples-to-apples hypothesis — a 70 from Tech ≠ a 70 from
+    # Defensives.) Rank combined_score within each eval_date (pct), then IC vs
+    # 21d alpha — tracked every cycle so the Phase-3 de-blended cutover has a
+    # measured before/after, not a hunch.
+    if "combined_score" in df.columns and "eval_date" in df.columns:
+        cs = df.dropna(subset=["combined_score"]).copy()
+        if cs.shape[0] >= 5:
+            cs["cs_xs_rank"] = cs.groupby("eval_date")["combined_score"].rank(pct=True)
+            if cs["cs_xs_rank"].nunique() >= 2 and cs["alpha21"].nunique() >= 2:
+                rho, p = spearmanr(cs["cs_xs_rank"], cs["alpha21"])
+                out["combined_score_xs_rank_ic"] = round(float(rho), 4) if rho == rho else None
+                out["combined_score_xs_rank_ic_p"] = round(float(p), 4) if p == p else None
     return out
 
 
