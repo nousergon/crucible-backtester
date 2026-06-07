@@ -49,17 +49,32 @@ def test_simulate_phase_gate_includes_param_sweep():
 
 
 def test_export_failloud_guard_present():
-    """A mode-aware fail-loud guard must raise when a mode expected to produce
-    the Evaluator's critical artifacts didn't (L4518) — no silent starve."""
+    """Outcome taxonomy (L4523): the guard must FAIL LOUD on ABSENT critical
+    artifacts (portfolio_stats absent, sweep_df None) but treat an EMPTY sweep
+    as a valid no-op (not a crash) — a risk/score gate must never kill the
+    process."""
     s = _src()
-    # the guard checks portfolio_stats + sweep_df and raises in sim modes
-    m = re.search(
-        r'if args\.mode in \("simulate", "param-sweep", "all"\):\s*\n\s*_missing',
-        s,
+    # absent portfolio_stats → raise
+    assert "did not produce portfolio_stats" in s and "raise RuntimeError(" in s, (
+        "guard must raise on ABSENT portfolio_stats"
     )
-    assert m, "the post-export fail-loud guard (mode-aware _missing check) is absent"
-    assert "did not produce required" in s and "raise RuntimeError(" in s, (
-        "the guard must raise RuntimeError naming the missing critical artifacts"
+    # sweep_df None (phase didn't run) → raise; distinct from empty
+    assert "sweep_df is ABSENT" in s, "guard must raise on sweep_df is None (absent)"
+    # EMPTY sweep_df → no-op (WARN + alert), NOT raise
+    assert 'getattr(sweep_df, "empty", True)' in s, "empty-sweep branch missing"
+    assert "valid no-op" in s and "[outcome] sweep_df is EMPTY" in s, (
+        "an empty sweep must be a logged valid no-op, not a fatal error "
+        "(the 'risk gate killed the process' symptom — L4523)"
+    )
+
+
+def test_empty_sweep_is_exported_present_not_skipped():
+    """An empty sweep_df must still be written (present-but-empty) so the
+    Evaluator finds the artifact and no-ops, rather than seeing it absent."""
+    s = _src()
+    assert "if sweep_df is not None:" in s, (
+        "export must write sweep_df whenever the frame exists (incl. empty), "
+        "skipping only a None frame"
     )
 
 
@@ -67,9 +82,8 @@ def test_predictor_backtest_exempt_from_guard():
     """predictor-backtest legitimately produces neither portfolio_stats nor
     sweep_df — the guard must not require them for that mode."""
     s = _src()
-    # the guard's mode set must NOT include predictor-backtest
-    guard_block = s[s.index("FAIL-LOUD guard (L4518)"):]
-    guard_block = guard_block[: guard_block.index("raise RuntimeError(") + 50]
+    guard_block = s[s.index("Outcome taxonomy (L4523)"):]
+    guard_block = guard_block[: guard_block.index("logger.warning")]
     assert '"predictor-backtest"' not in guard_block, (
         "predictor-backtest must be exempt from the critical-artifact guard"
     )

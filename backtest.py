@@ -4536,11 +4536,15 @@ def _export_simulation_artifacts(
     s3 = boto3.client("s3")
     exported = []
 
-    if sweep_df is not None and not sweep_df.empty:
+    # Write sweep_df.parquet whenever the frame EXISTS (incl. empty) — an empty
+    # sweep is a valid no-op (no admissible combo), and the Evaluator must find
+    # the artifact PRESENT to proceed + no-op its optimizer (L4523). Only a None
+    # frame (phase didn't run) is skipped — the guard catches that as fatal.
+    if sweep_df is not None:
         buf = io.BytesIO()
         sweep_df.to_parquet(buf, index=False)
         s3.put_object(Bucket=bucket, Key=f"{prefix}/sweep_df.parquet", Body=buf.getvalue())
-        exported.append("sweep_df.parquet")
+        exported.append("sweep_df.parquet" + (" (empty)" if sweep_df.empty else ""))
 
     if predictor_sweep_df is not None and not predictor_sweep_df.empty:
         buf = io.BytesIO()
@@ -4986,20 +4990,55 @@ def main() -> None:
         # silently skipped by the conditional uploads above, marking the phase
         # ok and starving the Evaluator weeks later (the L4513 failure mode).
         # predictor-backtest legitimately produces neither, so it's exempt.
+        # Outcome taxonomy (L4523): distinguish ABSENT (phase didn't run /
+        # errored → FAILURE, fail loud) from EMPTY (ran, produced no admissible
+        # result → valid no-op, WARN+alert, do NOT crash). A risk/score gate
+        # legitimately gating out all entries must NOT kill the process — that
+        # was the 2026-06-06 symptom. portfolio_stats ABSENT stays fatal
+        # (#292 made param-sweep produce it). predictor-backtest exempt.
         if args.mode in ("simulate", "param-sweep", "all"):
-            _missing = []
             if not portfolio_stats:
-                _missing.append("portfolio_stats")
-            if sweep_df is None or getattr(sweep_df, "empty", True):
-                _missing.append("sweep_df")
-            if _missing:
                 raise RuntimeError(
-                    f"Backtester mode={args.mode} did not produce required "
-                    f"Evaluator artifact(s): {_missing}. These are CRITICAL "
-                    f"(evaluate.py hard-requires portfolio_stats.json + "
-                    f"sweep_df.parquet). Failing loud instead of leaving the "
-                    f"Evaluator to starve silently (L4513/L4518)."
+                    f"Backtester mode={args.mode} did not produce portfolio_stats "
+                    f"(absent, not empty) — evaluate.py hard-requires it. Failing "
+                    f"loud (L4513/L4518); this is an infra/contract break, not a "
+                    f"degenerate market result."
                 )
+            if sweep_df is None:
+                raise RuntimeError(
+                    f"Backtester mode={args.mode}: sweep_df is ABSENT (param_sweep "
+                    f"phase did not run / errored — None, not an empty frame). "
+                    f"Failing loud (L4513/L4524) — distinct from an empty sweep."
+                )
+            if getattr(sweep_df, "empty", True):
+                # EMPTY sweep = ran, no admissible combo (all entries gated by
+                # score/risk in this window). VALID no-op: the empty parquet is
+                # written by _export_simulation_artifacts so the Evaluator finds
+                # it present + no-ops the optimizer. Surface LOUDLY (never
+                # silent) so a suspicious degeneracy (e.g. zero-score inputs) is
+                # visible. The input-quality HARD gate (L4525) is the follow-up
+                # that classifies legit-empty vs garbage-input-empty.
+                logger.warning(
+                    "[outcome] sweep_df is EMPTY (mode=%s) — no admissible param "
+                    "combo this run (all entries gated by score/risk). Treating as "
+                    "a valid no-op: configs HELD, executor-optimizer skipped. "
+                    "L4525 input-quality gate will classify legit-vs-garbage.",
+                    args.mode,
+                )
+                try:
+                    import alpha_engine_lib.alerts as _alerts
+                    _alerts.publish(
+                        message=(
+                            f"Backtester empty param-sweep (mode={args.mode}, "
+                            f"date={args.date}): no admissible combo; configs held, "
+                            f"optimizer skipped. Verify not a zero-score-input issue "
+                            f"(L4525)."
+                        ),
+                        severity="warning",
+                        source="alpha-engine-backtester/backtest.py",
+                    )
+                except Exception:  # noqa: BLE001 — alert is best-effort observability
+                    pass
 
     # ── Report, upload, email, and instance stop ──────────────────────────
     # Wrapped in try/finally so --stop-instance ALWAYS runs.
