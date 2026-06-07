@@ -98,6 +98,8 @@ def test_cio_layer_attribution_block(tmp_path):
     assert attr is not None and attr["n"] == 20
     for layer in ("combined_score", "macro_shift", "final_score", "cio_conviction"):
         assert attr[f"{layer}_ic"] is not None
+    # L4563 de-blending substrate: cross-sectional rank-normalized stock-score IC.
+    assert attr["combined_score_xs_rank_ic"] is not None
 
 
 def test_team_21d_block_present(tmp_path):
