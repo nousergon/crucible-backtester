@@ -535,14 +535,20 @@ def _grade_composite_scoring(signal_quality: dict | None,
     high_acc = _safe_get(high_bucket, "accuracy_10d") if high_bucket else None
     high_g = _pct_to_grade(high_acc, baseline=0.50, ceiling=0.80)
 
-    # Monotonicity from calibration
-    monotonic = _safe_get(score_cal, "monotonic")
-    mono_g = 90.0 if monotonic else (40.0 if monotonic is not None else None)
+    # Calibration: prefer the robust row-level Spearman rank correlation of
+    # score vs realized alpha. Fall back to the legacy binary monotonic flag
+    # only for pre-2026-06-07 artifacts that predate the Spearman fields.
+    # The legacy binary flips False on a single noisy quantile bucket; the
+    # Spearman measure grades the monotonic association continuously and reads
+    # a flat/insignificant calibration as neutral rather than RED. See
+    # ROADMAP L4550 (the composite formula is provably monotonic in its inputs;
+    # this is a metric-quality fix, not a scoring-formula bug).
+    cal_g, cal_detail = _grade_calibration(score_cal)
 
     grade = _weighted_avg([
         (0.40, acc_g),
         (0.30, high_g),
-        (0.30, mono_g),
+        (0.30, cal_g),
     ])
 
     detail = {}
@@ -550,10 +556,40 @@ def _grade_composite_scoring(signal_quality: dict | None,
         detail["accuracy_10d"] = f"{acc_10d:.1%}"
     if high_acc is not None:
         detail["90+_accuracy"] = f"{high_acc:.1%}"
-    if monotonic is not None:
-        detail["monotonic"] = "YES" if monotonic else "NO"
+    detail.update(cal_detail)
 
     return {"grade": grade, "letter": _letter(grade), "detail": detail}
+
+
+def _grade_calibration(score_cal: dict | None) -> tuple[float | None, dict]:
+    """Grade score→alpha calibration, robust-measure-first.
+
+    Returns ``(grade_or_None, detail_dict)``. Uses the row-level Spearman rank
+    correlation when present; a statistically flat/insignificant calibration
+    (p >= 0.10) grades neutral (no measurable signal, not a miscalibration);
+    a significant correlation maps rho in [-1, 1] linearly to [0, 100]
+    (rho=+1 -> 100, 0 -> 50, -1 -> 0). Falls back to the legacy binary
+    monotonic flag for older artifacts.
+    """
+    rho = _safe_get(score_cal, "spearman_rho")
+    if rho is not None:
+        assessment = _safe_get(score_cal, "calibration_assessment")
+        pval = _safe_get(score_cal, "spearman_p")
+        detail = {"calibration_rho": round(float(rho), 3)}
+        if pval is not None:
+            detail["calibration_p"] = round(float(pval), 3)
+        if assessment:
+            detail["calibration"] = str(assessment)
+        if assessment == "flat":
+            return 60.0, detail  # not distinguishable from zero — neutral
+        grade = max(0.0, min(100.0, 50.0 + 50.0 * float(rho)))
+        return grade, detail
+
+    # Legacy fallback (pre-Spearman artifacts)
+    monotonic = _safe_get(score_cal, "monotonic")
+    if monotonic is None:
+        return None, {}
+    return (90.0 if monotonic else 40.0), {"monotonic": "YES" if monotonic else "NO"}
 
 
 def _grade_meta_model(predictor_sizing: dict | None,
