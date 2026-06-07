@@ -4253,9 +4253,17 @@ def _run_simulation_pipeline(
             )
 
     # ── Simulate mode ─────────────────────────────────────────────────────
+    # Includes "param-sweep": the baseline single-policy simulation produces
+    # portfolio_stats, which the Evaluator REQUIRES (alongside sweep_df from the
+    # param-sweep block below). The 2026-05-16 SF backtester split (#249/#250)
+    # set the main Backtester state to --mode=param-sweep and moved predictor /
+    # portfolio-optimizer to their own states — but no SF state runs
+    # simulate/all, so portfolio_stats.json silently stopped being produced and
+    # the Evaluator hard-failed on missing critical artifacts from ~2026-05-20
+    # (L4513). Running the simulate phase in param-sweep mode restores it.
     bucket = config.get("signals_bucket", "alpha-engine-research")
     s3 = registry.s3_client
-    if args.mode in ("simulate", "all"):
+    if args.mode in ("simulate", "param-sweep", "all"):
         from phase_artifacts import save_json, load_json
         try:
             with registry.phase(
@@ -4971,6 +4979,27 @@ def main() -> None:
                 _export_simulation_artifacts(config, args.date, sweep_df=sweep_df, predictor_sweep_df=predictor_sweep_df, portfolio_stats=portfolio_stats, predictor_stats=predictor_stats)
         except Exception as e:
             logger.warning("Simulation artifact export failed (non-fatal): %s", e)
+
+        # FAIL-LOUD guard (L4518). The Evaluator treats portfolio_stats.json +
+        # sweep_df.parquet as CRITICAL. When a mode is EXPECTED to produce them
+        # (simulate / param-sweep / all), their absence must raise here — not be
+        # silently skipped by the conditional uploads above, marking the phase
+        # ok and starving the Evaluator weeks later (the L4513 failure mode).
+        # predictor-backtest legitimately produces neither, so it's exempt.
+        if args.mode in ("simulate", "param-sweep", "all"):
+            _missing = []
+            if not portfolio_stats:
+                _missing.append("portfolio_stats")
+            if sweep_df is None or getattr(sweep_df, "empty", True):
+                _missing.append("sweep_df")
+            if _missing:
+                raise RuntimeError(
+                    f"Backtester mode={args.mode} did not produce required "
+                    f"Evaluator artifact(s): {_missing}. These are CRITICAL "
+                    f"(evaluate.py hard-requires portfolio_stats.json + "
+                    f"sweep_df.parquet). Failing loud instead of leaving the "
+                    f"Evaluator to starve silently (L4513/L4518)."
+                )
 
     # ── Report, upload, email, and instance stop ──────────────────────────
     # Wrapped in try/finally so --stop-instance ALWAYS runs.
