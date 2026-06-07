@@ -32,6 +32,70 @@ from analysis.classification_metrics import compute_binary_metrics
 logger = logging.getLogger(__name__)
 
 
+# ── Canonical-horizon research-edge helpers (ROADMAP L4551) ─────────────────
+#
+# The system targets 21-day log-domain market-relative alpha (canonical-alpha
+# cutover 2026-05-09). The legacy lift metrics below measure selection skill on
+# `return_5d` / `beat_spy_5d` only — a 5-trading-day window mismatched to the
+# 21-day thesis horizon the research picks are constructed for, which collapses
+# every selector's precision toward the base rate regardless of real 21d edge.
+# These helpers emit the canonical 21d classification + log-domain alpha lift
+# ADDITIVELY (5d retained as a short-horizon diagnostic); the report-card tiles
+# grade the 21d block, falling back to 5d for pre-2026-06-07 artifacts.
+
+
+def _classification_for(merged: pd.DataFrame, selected_mask, beat_col: str) -> dict | None:
+    """Binary selection metrics for a given realized-outcome column.
+
+    ``selected_mask`` is a boolean Series aligned to ``merged`` (True = the
+    selector chose this row). Returns ``None`` when ``beat_col`` is absent or has
+    no closed outcomes yet (e.g. the 21d forward window hasn't closed) so the
+    caller emits ``None`` and the grader reads N/A rather than a phantom zero.
+    """
+    if beat_col not in merged.columns:
+        return None
+    has = merged[beat_col].notna()
+    if not has.any():
+        return None
+    m = merged[has]
+    sel = selected_mask[has].tolist()
+    pos = (m[beat_col] == 1).tolist()
+    return compute_binary_metrics(
+        tp=sum(s and p for s, p in zip(sel, pos)),
+        fp=sum(s and not p for s, p in zip(sel, pos)),
+        fn=sum(not s and p for s, p in zip(sel, pos)),
+        tn=sum(not s and not p for s, p in zip(sel, pos)),
+    )
+
+
+def _alpha_21d_log_lift(merged: pd.DataFrame, selected_mask) -> dict | None:
+    """Selected-vs-baseline 21d log-domain market-relative alpha lift.
+
+    Uses ``log_return_21d - log_spy_return_21d`` — the exact unit the system
+    trades toward. Baseline is the full ``merged`` frame mean. Diagnostic
+    (surfaced in the grade reason); the graded signal is the precision-edge of
+    ``classification_21d``. Returns ``None`` when the canonical columns are
+    absent or no 21d outcomes have closed.
+    """
+    if "log_return_21d" not in merged.columns or "log_spy_return_21d" not in merged.columns:
+        return None
+    alpha = merged["log_return_21d"] - merged["log_spy_return_21d"]
+    base = alpha.dropna()
+    if base.empty:
+        return None
+    sel_alpha = alpha[selected_mask].dropna()
+    sel_avg = float(sel_alpha.mean()) if not sel_alpha.empty else None
+    base_avg = float(base.mean())
+    lift = (sel_avg - base_avg) if sel_avg is not None else None
+    return {
+        "selected_avg": round(sel_avg, 5) if sel_avg is not None else None,
+        "baseline_avg": round(base_avg, 5),
+        "lift": round(lift, 5) if lift is not None else None,
+        "n_selected": int(sel_alpha.shape[0]),
+        "n_baseline": int(base.shape[0]),
+    }
+
+
 def compute_lift_metrics(
     research_db_path: str,
     trades_db_path: str | None = None,
@@ -421,6 +485,12 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
                     tn=sum(not s and not p for s, p in zip(selected, positive)),
                 )
 
+        # Canonical 21d horizon (L4551): classification on beat_spy_21d + the
+        # log-domain alpha lift, additive alongside the 5d diagnostic above.
+        sel_mask = merged["quant_filter_pass"] == 1
+        clf_21d = _classification_for(merged, sel_mask, "beat_spy_21d")
+        lift_21d = _alpha_21d_log_lift(merged, sel_mask)
+
         return {
             "universe_avg": round(universe_avg, 4),
             "passing_avg": round(passing_avg, 4) if passing_avg is not None else None,
@@ -428,6 +498,8 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
             "n_universe": len(merged),
             "n_passing": len(passing),
             "classification": clf,
+            "classification_21d": clf_21d,
+            "lift_21d_log": lift_21d,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "scanner_evaluations table not found"}
@@ -500,6 +572,14 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
                         tn=sum(not s and not p for s, p in zip(selected, positive)),
                     )
 
+            # Canonical 21d horizon (L4551): the system's objective is alpha
+            # vs SPY, so the 21d classification uses beat_spy_21d (market-
+            # relative) uniformly across selectors — not a sector-relative
+            # baseline. Additive alongside the 5d/sector classification above.
+            rec_mask = team_data["team_recommended"] == 1
+            clf_21d = _classification_for(team_data, rec_mask, "beat_spy_21d")
+            lift_21d = _alpha_21d_log_lift(team_data, rec_mask)
+
             # Emit the per-pick records so downstream metric modules
             # (information_coefficient, expectancy, excursion, the
             # team-daily-returns sleeve simulator) can consume the
@@ -533,6 +613,8 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
                 "n_candidates": len(team_data),
                 "n_sector_universe": n_sector_universe,
                 "classification": clf,
+                "classification_21d": clf_21d,
+                "lift_21d_log": lift_21d,
                 "picks": picks_records,
             })
 
@@ -594,6 +676,12 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
                     tn=sum(not s and not p for s, p in zip(selected, positive)),
                 )
 
+        # Canonical 21d horizon (L4551): ADVANCE-gate classification on
+        # beat_spy_21d + log-domain alpha lift, additive alongside 5d.
+        adv_mask = merged["cio_decision"] == "ADVANCE"
+        clf_21d = _classification_for(merged, adv_mask, "beat_spy_21d")
+        lift_21d = _alpha_21d_log_lift(merged, adv_mask)
+
         return {
             "all_recs_avg": round(all_recs_avg, 4),
             "advance_avg": round(advance_avg, 4) if advance_avg is not None else None,
@@ -606,6 +694,8 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
             "advance_std_5d": round(advance_std, 4) if advance_std is not None else None,
             "reject_std_5d": round(reject_std, 4) if reject_std is not None else None,
             "classification": clf,
+            "classification_21d": clf_21d,
+            "lift_21d_log": lift_21d,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "cio_evaluations table not found"}
