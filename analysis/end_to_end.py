@@ -96,6 +96,66 @@ def _alpha_21d_log_lift(merged: pd.DataFrame, selected_mask) -> dict | None:
     }
 
 
+def _cio_selection_skill(merged: pd.DataFrame) -> dict | None:
+    """CIO entrant-gate SELECTION skill at the canonical 21d horizon (L4561).
+
+    The CIO gate's job is to ADVANCE the team-recommended names that will realize
+    HIGHER forward alpha than the ones it REJECTs. This measures whether it does:
+
+      * ``selection_gap_21d`` = mean(ADVANCE 21d log-alpha) − mean(REJECT 21d
+        log-alpha). POSITIVE = the gate adds selection value; NEGATIVE = it is
+        anti-selecting (advancing the worse names). With a Mann-Whitney p so a
+        small-sample gap is not mistaken for a real one.
+      * ``conviction_ic_21d`` = Spearman rank-IC of ``cio_conviction`` vs realized
+        21d alpha across all evaluated names — does conviction order outcomes?
+
+    Returns ``None`` when the canonical 21d columns or any closed-21d outcomes
+    are absent (no phantom zeros). This is a measurement instrument: it makes the
+    gate's skill visible every cycle rather than silently inferred — it does NOT
+    itself change any selection. Graded under the L4562 reliability contract: a
+    statistically-insignificant gap reads WATCH + reliability=low, not a
+    confident RED.
+    """
+    if "log_return_21d" not in merged.columns or "log_spy_return_21d" not in merged.columns:
+        return None
+    df = merged.copy()
+    df["alpha21"] = df["log_return_21d"] - df["log_spy_return_21d"]
+    df = df.dropna(subset=["alpha21"])
+    if df.empty:
+        return None
+    adv = df[df["cio_decision"].isin(("ADVANCE", "ADVANCE_FORCED"))]["alpha21"]
+    rej = df[df["cio_decision"] == "REJECT"]["alpha21"]
+    out: dict = {
+        "n_advance": int(adv.shape[0]),
+        "n_reject": int(rej.shape[0]),
+        "advance_alpha_21d": round(float(adv.mean()), 5) if not adv.empty else None,
+        "reject_alpha_21d": round(float(rej.mean()), 5) if not rej.empty else None,
+        "selection_gap_21d": None,
+        "selection_gap_p": None,
+        "conviction_ic_21d": None,
+        "conviction_ic_p": None,
+    }
+    if not adv.empty and not rej.empty:
+        out["selection_gap_21d"] = round(float(adv.mean() - rej.mean()), 5)
+        if adv.shape[0] >= 3 and rej.shape[0] >= 3:
+            from scipy.stats import mannwhitneyu
+            try:
+                _, p = mannwhitneyu(adv, rej, alternative="two-sided")
+                out["selection_gap_p"] = round(float(p), 4)
+            except ValueError:
+                pass
+    if "cio_conviction" in df.columns:
+        cc = df.dropna(subset=["cio_conviction"])
+        if cc.shape[0] >= 5 and cc["cio_conviction"].nunique() >= 2 and cc["alpha21"].nunique() >= 2:
+            from scipy.stats import spearmanr
+            rho, p = spearmanr(cc["cio_conviction"], cc["alpha21"])
+            if rho == rho:
+                out["conviction_ic_21d"] = round(float(rho), 4)
+            if p == p:
+                out["conviction_ic_p"] = round(float(p), 4)
+    return out
+
+
 def compute_lift_metrics(
     research_db_path: str,
     trades_db_path: str | None = None,
@@ -635,7 +695,8 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
     try:
         ce_filter = date_filter.replace("eval_date", "ce.eval_date") if date_filter else ""
         ce = pd.read_sql_query(
-            f"SELECT ticker, eval_date, cio_decision, final_score FROM cio_evaluations ce{ce_filter}",
+            f"SELECT ticker, eval_date, cio_decision, final_score, cio_conviction "
+            f"FROM cio_evaluations ce{ce_filter}",
             conn, params=params,
         )
         if ce.empty:
@@ -681,6 +742,8 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
         adv_mask = merged["cio_decision"] == "ADVANCE"
         clf_21d = _classification_for(merged, adv_mask, "beat_spy_21d")
         lift_21d = _alpha_21d_log_lift(merged, adv_mask)
+        # CIO entrant-gate selection skill (L4561): does ADVANCE beat REJECT at 21d?
+        selection_skill = _cio_selection_skill(merged)
 
         return {
             "all_recs_avg": round(all_recs_avg, 4),
@@ -696,6 +759,7 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
             "classification": clf,
             "classification_21d": clf_21d,
             "lift_21d_log": lift_21d,
+            "selection_skill_21d": selection_skill,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "cio_evaluations table not found"}
