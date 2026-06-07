@@ -198,7 +198,8 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     lift = _safe_get(sl, "lift")
     n_passing = _safe_get(sl, "n_passing", default=0)
     n_universe = _safe_get(sl, "n_universe", default=1)
-    clf = _safe_get(sl, "classification")
+    # Canonical 21d horizon first; legacy 5d fallback (ROADMAP L4551).
+    clf = _safe_get(sl, "classification_21d") or _safe_get(sl, "classification")
 
     # Precision/recall from classification metrics (if available)
     precision = _safe_get(clf, "precision")
@@ -282,7 +283,8 @@ def _grade_sector_team(team: dict, team_metrics: dict | None = None) -> dict:
     # ── Legacy path: lift + classification ──────────────────────────────
     lift_vs_sector = team.get("lift")
     lift_vs_quant = team.get("lift_vs_quant")
-    clf = team.get("classification")
+    # Canonical 21d horizon first; legacy 5d fallback (ROADMAP L4551).
+    clf = team.get("classification_21d") or team.get("classification")
 
     # Classification metrics (if available)
     precision = _safe_get(clf, "precision")
@@ -462,7 +464,8 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
     if not cio_lift or _safe_get(cio_lift, "n_advance", default=0) < 3:
         return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
 
-    clf = _safe_get(cio_lift, "classification")
+    # Canonical 21d horizon first; legacy 5d fallback (ROADMAP L4551).
+    clf = _safe_get(cio_lift, "classification_21d") or _safe_get(cio_lift, "classification")
     precision = _safe_get(clf, "precision")
     recall = _safe_get(clf, "recall")
     f1 = _safe_get(clf, "f1")
