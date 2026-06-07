@@ -247,11 +247,51 @@ def compute_score_calibration(
         return {"status": "insufficient_data", "error": "not enough buckets with data"}
 
     alphas = [c["avg_alpha"] for c in calibration]
+    # Legacy bucket-based binary: strict non-decreasing avg_alpha across quantile
+    # buckets. RETAINED for backward-compat + as a coarse diagnostic, but NO
+    # LONGER the graded metric — it flips False on a single noisy bucket and
+    # discards the per-bucket concentration diagnostics above. The graded signal
+    # is now the robust row-level Spearman rank correlation below.
     monotonic = all(alphas[i] <= alphas[i + 1] for i in range(len(alphas) - 1))
+
+    # Robust calibration: Spearman rank correlation of raw score vs realized
+    # alpha across ALL rows (not bucket means). Measures monotonic association
+    # continuously, is outlier-robust, and yields a significance test so a flat
+    # calibration at low N reads as "no measurable signal" rather than RED.
+    # Mirrors the rank-correlation + significance pattern already used in
+    # analysis/attribution.py (scipy.stats). See ROADMAP L4550 (metric-quality
+    # fix; the composite formula itself is provably monotonic in its inputs).
+    spearman_rho: float | None = None
+    spearman_p: float | None = None
+    spearman_n = int(len(sub))
+    if sub["score"].nunique() >= 2 and sub["alpha"].nunique() >= 2:
+        from scipy.stats import spearmanr
+
+        rho, pval = spearmanr(sub["score"], sub["alpha"])
+        # spearmanr returns nan when a column is constant despite the nunique
+        # guard (e.g. all-tied ranks); coerce to None so consumers see "unknown".
+        if rho == rho:  # not NaN
+            spearman_rho = round(float(rho), 4)
+        if pval == pval:  # not NaN
+            spearman_p = round(float(pval), 4)
+
+    # Plain-language assessment for observability + grading fallback.
+    if spearman_rho is None:
+        calibration_assessment = "insufficient_data"
+    elif spearman_p is not None and spearman_p >= 0.10:
+        calibration_assessment = "flat"  # not statistically distinguishable from zero
+    elif spearman_rho > 0:
+        calibration_assessment = "positive"
+    else:
+        calibration_assessment = "negative"
 
     return {
         "status": "ok",
         "horizon": horizon,
         "calibration": calibration,
         "monotonic": monotonic,
+        "spearman_rho": spearman_rho,
+        "spearman_p": spearman_p,
+        "spearman_n": spearman_n,
+        "calibration_assessment": calibration_assessment,
     }

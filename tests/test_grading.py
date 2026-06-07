@@ -7,6 +7,7 @@ from analysis.grading import (
     _clamp,
     _cvar_to_grade,
     _grade_action_entropy,
+    _grade_calibration,
     _grade_calibration_diagnostics,
     _grade_excursion,
     _ic_to_grade,
@@ -17,6 +18,35 @@ from analysis.grading import (
     _weighted_avg,
     compute_scorecard,
 )
+
+
+class TestGradeCalibration:
+    """Robust score→alpha calibration grade (Spearman-first, legacy fallback)."""
+
+    def test_positive_rho_high_grade(self):
+        g, d = _grade_calibration({"spearman_rho": 0.4, "spearman_p": 0.001,
+                                   "calibration_assessment": "positive"})
+        assert g == pytest.approx(70.0)  # 50 + 50*0.4
+        assert d["calibration"] == "positive"
+
+    def test_negative_rho_low_grade(self):
+        g, _ = _grade_calibration({"spearman_rho": -0.3, "spearman_p": 0.01,
+                                   "calibration_assessment": "negative"})
+        assert g == pytest.approx(35.0)  # 50 + 50*-0.3
+
+    def test_flat_is_neutral_not_punished(self):
+        # The fix: an insignificant calibration is neutral (60), not ~RED.
+        g, _ = _grade_calibration({"spearman_rho": -0.05, "spearman_p": 0.7,
+                                   "calibration_assessment": "flat"})
+        assert g == pytest.approx(60.0)
+
+    def test_legacy_monotonic_fallback(self):
+        assert _grade_calibration({"monotonic": True})[0] == pytest.approx(90.0)
+        assert _grade_calibration({"monotonic": False})[0] == pytest.approx(40.0)
+
+    def test_none_when_no_signal(self):
+        assert _grade_calibration(None) == (None, {})
+        assert _grade_calibration({})[0] is None
 
 
 # ---------------------------------------------------------------------------
