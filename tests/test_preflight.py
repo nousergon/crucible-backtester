@@ -37,6 +37,7 @@ class TestBacktesterPreflight:
         with patch.object(pf, "check_env_vars") as env, \
              patch.object(pf, "check_s3_bucket") as s3, \
              patch.object(pf, "check_arcticdb_fresh") as adb, \
+             patch.object(pf, "_check_artifact_contract") as contract, \
              patch.object(pf, "_check_executor_config") as exec_cfg, \
              patch.object(pf, "_check_lib_version") as lib_v, \
              patch.object(pf, "_check_imports") as imports, \
@@ -46,11 +47,28 @@ class TestBacktesterPreflight:
         env.assert_called_once_with("AWS_REGION")
         s3.assert_called_once()
         adb.assert_not_called()
+        contract.assert_called_once()
         exec_cfg.assert_called_once()
         lib_v.assert_called_once()
         imports.assert_called_once()
         vec.assert_called_once()
         pred_w.assert_called_once()
+
+    def test_artifact_contract_check_passes_on_real_manifest(self):
+        """The shipped manifest's contract holds for the SF mode → no raise."""
+        BacktesterPreflight(bucket="b", mode="backtest")._check_artifact_contract()
+
+    def test_artifact_contract_check_raises_on_violation(self, monkeypatch):
+        """A manifest contract violation must fail loud at preflight (L4513
+        guard), not 2h into the spot run."""
+        import pipeline_manifest
+        monkeypatch.setattr(
+            pipeline_manifest, "contract_violations",
+            lambda mode: [f"--mode={mode}: orphaned sweep_df.parquet (L4513)"],
+        )
+        pf = BacktesterPreflight(bucket="b", mode="backtest")
+        with pytest.raises(RuntimeError, match="artifact-contract violation"):
+            pf._check_artifact_contract()
 
     def test_evaluate_mode_runs_env_and_s3_only(self):
         pf = BacktesterPreflight(bucket="b", mode="evaluate")
