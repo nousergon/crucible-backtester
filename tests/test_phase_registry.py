@@ -32,6 +32,7 @@ class _FakeS3:
         self.store: dict[tuple[str, str], bytes] = {}
         self.put_calls: list[dict] = []
         self.get_calls: list[dict] = []
+        self.head_calls: list[dict] = []
 
     def get_object(self, *, Bucket, Key):
         self.get_calls.append({"Bucket": Bucket, "Key": Key})
@@ -47,6 +48,17 @@ class _FakeS3:
             def read(self): return self._b
 
         return {"Body": _Body(body)}
+
+    def head_object(self, *, Bucket, Key):
+        self.head_calls.append({"Bucket": Bucket, "Key": Key})
+        if (Bucket, Key) not in self.store:
+            # Real S3 head_object returns a 404 (Code "404"/"NotFound"),
+            # not the NoSuchKey body get_object returns.
+            raise ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}},
+                "HeadObject",
+            )
+        return {"ContentLength": len(self.store[(Bucket, Key)])}
 
     def put_object(self, *, Bucket, Key, Body, ContentType=None):
         self.put_calls.append({"Bucket": Bucket, "Key": Key, "Body": Body})
@@ -155,6 +167,123 @@ def test_error_marker_does_not_auto_skip(s3):
     run, reason = r.should_run("simulate", supports_auto_skip=True)
     assert run is True
     assert reason == "default_run"
+
+
+# ── L4524: artifact-validated checkpoints (markers can't lie) ───────────────
+
+
+def _seed_artifact(s3, key: str, body: bytes = b"x"):
+    s3.store[("test-bucket", key)] = body
+
+
+def test_auto_skip_honored_when_declared_artifact_present(s3):
+    """A status=ok marker whose declared artifact exists auto-skips."""
+    art = "backtest/2026-04-23/portfolio_stats.json"
+    _seed_artifact(s3, art)
+    s3.seed("test-bucket", "2026-04-23", "simulate", {
+        "phase": "simulate", "date": "2026-04-23", "status": "ok",
+        "artifact_keys": [art],
+    })
+    r = _make_registry(s3)
+    run, reason = r.should_run("simulate", supports_auto_skip=True)
+    assert run is False
+    assert reason == "auto_skip_marker_ok"
+    # The declared artifact was actually probed.
+    assert any(c["Key"] == art for c in s3.head_calls)
+
+
+def test_marker_invalid_when_declared_artifact_absent(s3, caplog):
+    """A status=ok marker whose declared artifact is GONE is a lie — the
+    phase must re-run (the L4518/L4521 trust-and-yield-empty failure)."""
+    import logging
+    s3.seed("test-bucket", "2026-04-23", "param_sweep", {
+        "phase": "param_sweep", "date": "2026-04-23", "status": "ok",
+        # Declares sweep_df.parquet but it was never written / was pruned.
+        "artifact_keys": ["backtest/2026-04-23/sweep_df.parquet"],
+    })
+    r = _make_registry(s3)
+    with caplog.at_level(logging.WARNING, logger="pipeline_common"):
+        run, reason = r.should_run("param_sweep", supports_auto_skip=True)
+    assert run is True
+    assert reason == "marker_artifact_missing"
+    assert any("INVALID" in rec.getMessage() for rec in caplog.records)
+
+
+def test_marker_invalid_when_any_one_declared_artifact_absent(s3):
+    """All declared artifacts must exist — one missing invalidates the marker."""
+    present = "backtest/2026-04-23/portfolio_stats.json"
+    _seed_artifact(s3, present)
+    s3.seed("test-bucket", "2026-04-23", "simulate", {
+        "phase": "simulate", "date": "2026-04-23", "status": "ok",
+        "artifact_keys": [present, "backtest/2026-04-23/sweep_df.parquet"],
+    })
+    r = _make_registry(s3)
+    run, reason = r.should_run("simulate", supports_auto_skip=True)
+    assert run is True
+    assert reason == "marker_artifact_missing"
+
+
+def test_marker_with_no_declared_artifacts_still_auto_skips(s3):
+    """Back-compat: a marker that declares no artifacts has nothing to
+    validate and is honored (existing markers / artifact-free phases)."""
+    s3.seed("test-bucket", "2026-04-23", "simulate", {
+        "phase": "simulate", "date": "2026-04-23", "status": "ok",
+    })
+    r = _make_registry(s3)
+    run, reason = r.should_run("simulate", supports_auto_skip=True)
+    assert run is False
+    assert reason == "auto_skip_marker_ok"
+    # Nothing declared → no head_object probes.
+    assert s3.head_calls == []
+
+
+def test_artifact_validation_cached_across_repeat_should_run(s3):
+    """The phase() context manager re-asks should_run; the head_object
+    probes must not be re-issued (mirrors the marker-read cache)."""
+    art = "backtest/2026-04-23/portfolio_stats.json"
+    _seed_artifact(s3, art)
+    s3.seed("test-bucket", "2026-04-23", "simulate", {
+        "phase": "simulate", "date": "2026-04-23", "status": "ok",
+        "artifact_keys": [art],
+    })
+    r = _make_registry(s3)
+    r.should_run("simulate", supports_auto_skip=True)
+    r.should_run("simulate", supports_auto_skip=True)
+    r.should_run("simulate", supports_auto_skip=True)
+    assert len(s3.head_calls) == 1
+
+
+def test_artifact_validation_raises_on_non_404_error(s3):
+    """A transient/permission S3 error during validation must fail loud,
+    not silently flip the skip decision (fail-loud rule)."""
+    art = "backtest/2026-04-23/portfolio_stats.json"
+    s3.seed("test-bucket", "2026-04-23", "simulate", {
+        "phase": "simulate", "date": "2026-04-23", "status": "ok",
+        "artifact_keys": [art],
+    })
+
+    def _boom(*, Bucket, Key):
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "nope"}}, "HeadObject"
+        )
+
+    s3.head_object = _boom
+    r = _make_registry(s3)
+    with pytest.raises(ClientError):
+        r.should_run("simulate", supports_auto_skip=True)
+
+
+def test_phase_context_reruns_when_declared_artifact_absent(s3):
+    """End-to-end through the context manager: a marker whose artifact is
+    gone yields a non-skipped phase (ctx.skipped is False)."""
+    s3.seed("test-bucket", "2026-04-23", "param_sweep", {
+        "phase": "param_sweep", "date": "2026-04-23", "status": "ok",
+        "artifact_keys": ["backtest/2026-04-23/sweep_df.parquet"],
+    })
+    r = _make_registry(s3)
+    with r.phase("param_sweep", supports_auto_skip=True) as ctx:
+        assert ctx.skipped is False
+        assert ctx.skip_reason == "marker_artifact_missing"
 
 
 def test_explicit_skip_trumps_force(s3):
