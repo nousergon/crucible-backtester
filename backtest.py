@@ -4803,6 +4803,44 @@ def main() -> None:
                 predictor_paths=config.get("predictor_paths") or [],
             ).run()
 
+        # Pre-spend input-quality gate (L4525, plan §6 Phase 3). For the modes
+        # that simulate over signals.json history, assert the inputs aren't
+        # degenerate (no usable signals / a wall of Score 0.0) BEFORE burning
+        # ~121 min on a param-sweep that would silently empty-out on garbage
+        # — the L4521/L4529 silent-starvation failure mode. Observe-first:
+        # the verdict is always computed + logged + alerted; it only RAISES
+        # when config.input_quality_gate.enforce is true (default false) so a
+        # first live run can't false-fail before the soak confirms the verdict
+        # is sane on real data. predictor-backtest uses synthetic signals, not
+        # signals.json, so it's exempt.
+        if args.mode in ("simulate", "param-sweep", "all"):
+            with registry.phase("input_quality_gate", mode=args.mode):
+                from analysis.input_quality import gate_signal_inputs
+                from loaders import signal_loader as _sig_loader
+                _iq_cfg = config.get("input_quality_gate") or {}
+                _bucket = config.get("signals_bucket", "alpha-engine-research")
+                try:
+                    from alpha_engine_lib.alerts import publish as _iq_alert
+                except Exception:  # noqa: BLE001 — alerts optional
+                    _iq_alert = None
+                gate_signal_inputs(
+                    _bucket,
+                    _sig_loader.list_dates(_bucket),
+                    signal_loader=_sig_loader,
+                    sample_recent=int(_iq_cfg.get("sample_recent", 20)),
+                    enforce=bool(_iq_cfg.get("enforce", False)),
+                    zero_score_garbage_fraction=float(
+                        _iq_cfg.get("zero_score_garbage_fraction", 0.99)
+                    ),
+                    elevated_zero_observe_fraction=float(
+                        _iq_cfg.get("elevated_zero_observe_fraction", 0.10)
+                    ),
+                    low_coverage_observe_fraction=float(
+                        _iq_cfg.get("low_coverage_observe_fraction", 0.25)
+                    ),
+                    alert_publisher=_iq_alert,
+                )
+
         # Runtime smoke: end-to-end sanity with minimal data (~30-60s).
         # Runs after preflight (so any preflight failure surfaces first,
         # in seconds) and before any full mode (so an environment bug

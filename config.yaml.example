@@ -205,6 +205,25 @@ regression_monitor:
   min_signals_for_rollback: 30        # skip rollback if resolved signal n < 30
   baseline_max_age_days: 21           # baseline older than this → skip + refresh
 
+# ── Pre-spend input-quality gate (L4525, plan §6 Phase 3) ────────────────────
+# Asserts the signal INPUTS are sane before the ~121-min param-sweep spend.
+# Catches a degenerate signals.json source (no usable signals / a wall of
+# Score 0.0) that would silently empty-out the sweep (the L4521/L4529
+# silent-starvation mode). Observe-first: the verdict is always computed +
+# logged + alerted; it only RAISES on unambiguous garbage when enforce: true.
+# Omit the block entirely to run observe-mode with the code defaults below.
+# Flip enforce to true (in the live alpha-engine-config repo) after a 1-2
+# Saturday soak confirms the verdict is sane on real data — the
+# unambiguous-garbage conditions can't fire on a healthy quiet week, so the
+# false-positive risk is ~zero. Only runs for the signals.json-consuming modes
+# (simulate / param-sweep / all); predictor-backtest uses synthetic signals.
+input_quality_gate:
+  enforce: false                       # raise InputQualityError on garbage (soak-gated → true)
+  sample_recent: 20                    # most-recent signal dates to assess
+  zero_score_garbage_fraction: 0.99    # >= this fraction of scores <= 0 ⇒ garbage (enforce)
+  elevated_zero_observe_fraction: 0.10 # >= this ⇒ observation (logged, not raised)
+  low_coverage_observe_fraction: 0.25  # mean coverage below this ⇒ observation
+
 # ── Veto threshold analysis ─────────────────────────────────────────────────
 veto_analysis:
   confidence_thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
