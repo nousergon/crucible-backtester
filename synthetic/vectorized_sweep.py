@@ -323,6 +323,17 @@ def build_combo_configs(
             _get_strategy_param(c, "sector_relative_outperform_threshold", 0.05)
             for c in combo_configs
         ], dtype=np.float64),
+        # MAE hard floor (L4549a #238) — default enabled at -0.15, mirroring
+        # the scalar ``check_position_loss_floor`` inline defaults so a combo
+        # that doesn't set it still carries the falling-knife backstop.
+        position_loss_floor_enabled=np.array([
+            _get_strategy_param(c, "position_loss_floor_enabled", True)
+            for c in combo_configs
+        ], dtype=bool),
+        position_loss_floor_pct=np.array([
+            _get_strategy_param(c, "position_loss_floor_pct", -0.15)
+            for c in combo_configs
+        ], dtype=np.float64),
         reduce_fraction=np.array([
             c.get("reduce_fraction", 0.50) for c in combo_configs
         ], dtype=np.float64),
