@@ -4595,6 +4595,60 @@ def _export_simulation_artifacts(
         logger.info("Exported simulation artifacts to s3://%s/%s/: %s", bucket, prefix, ", ".join(exported))
 
 
+def _load_predictor_artifacts(config: dict, run_date: str):
+    """Reload the predictor-backtest artifacts from S3 (L4527 skip/resume).
+
+    Mirrors ``_export_simulation_artifacts``'s predictor writes
+    (``predictor_stats.json`` + ``predictor_sweep_df.parquet`` under
+    ``backtest/{run_date}/``) so a targeted recovery can SKIP the ~121-min
+    predictor pipeline — ``--skip-phases=predictor_pipeline`` — and still feed
+    its outputs to the downstream export/report stages instead of redundantly
+    re-running it (supersedes L4519).
+
+    Returns ``(predictor_stats, predictor_sweep_df)``. A missing artifact
+    yields ``None`` for that slot with a loud WARN — non-fatal, because the
+    predictor artifacts are NOT in the Evaluator-critical set (see
+    ``pipeline_manifest``), so skipping without a prior run degrades gracefully
+    rather than starving the Evaluator. A non-404 S3 error fails loud.
+    """
+    import io
+    from botocore.exceptions import ClientError
+
+    bucket = config.get("output_bucket", config.get("signals_bucket", "alpha-engine-research"))
+    prefix = f"backtest/{run_date}"
+    s3 = boto3.client("s3")
+    predictor_stats = None
+    predictor_sweep_df = None
+
+    def _get(key: str):
+        try:
+            return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound"):
+                logger.warning(
+                    "predictor_pipeline skipped but s3://%s/%s is absent — "
+                    "downstream predictor output will be missing. Run the "
+                    "predictor pipeline first, or don't skip it.", bucket, key,
+                )
+                return None
+            raise  # transient / permission → fail loud, don't guess
+
+    stats_body = _get(f"{prefix}/predictor_stats.json")
+    if stats_body is not None:
+        predictor_stats = json.loads(stats_body)
+    sweep_body = _get(f"{prefix}/predictor_sweep_df.parquet")
+    if sweep_body is not None:
+        predictor_sweep_df = pd.read_parquet(io.BytesIO(sweep_body))
+
+    logger.info(
+        "Reloaded predictor artifacts from s3://%s/%s/ (stats=%s, sweep_df=%s rows) "
+        "— predictor pipeline skipped",
+        bucket, prefix, predictor_stats is not None,
+        len(predictor_sweep_df) if predictor_sweep_df is not None else 0,
+    )
+    return predictor_stats, predictor_sweep_df
+
+
 def classify_simulation_outcome(
     mode: str,
     portfolio_stats: dict | None,
@@ -5017,11 +5071,23 @@ def main() -> None:
             )
 
     # ── Predictor backtest ────────────────────────────────────────────────
+    # The ~121-min long pole. Honors an explicit skip (L4527 skip/resume): on
+    # `--skip-phases=predictor_pipeline` a targeted recovery RELOADS the
+    # predictor artifacts from S3 instead of redundantly re-running the whole
+    # pipeline to reach a downstream stage (supersedes L4519). A normal run
+    # (ctx not skipped) is unchanged. executor_rec is left intact on skip — the
+    # skipped pipeline's recommendation isn't recomputed; the existing value
+    # (from the simulate path / prior) carries forward.
     if args.mode in ("predictor-backtest", "all"):
-        with registry.phase("predictor_pipeline", mode=args.mode):
-            predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
-                args, config, executor_rec, current_executor_params, fd,
-            )
+        with registry.phase("predictor_pipeline", mode=args.mode) as pp_ctx:
+            if pp_ctx.skipped:
+                predictor_stats, predictor_sweep_df = _load_predictor_artifacts(
+                    config, args.date,
+                )
+            else:
+                predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
+                    args, config, executor_rec, current_executor_params, fd,
+                )
 
     # ── Portfolio-optimizer cutover gate ──────────────────────────────────
     # ROADMAP L2222 PR 4.5. Runs the constrained MVO optimizer over synthetic
