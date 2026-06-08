@@ -72,6 +72,7 @@ REASON_PROFIT = 3
 REASON_MOMENTUM = 4
 REASON_TIME_EXIT = 5
 REASON_TIME_REDUCE = 6
+REASON_LOSS_FLOOR = 7  # MAE hard floor (L4549a #238) — stance-agnostic full EXIT
 
 # Research action codes — caller translates string signals to these.
 RA_HOLD = 0
@@ -100,6 +101,12 @@ class VectorizedExitConfig:
     momentum_exit_enabled: np.ndarray
     time_decay_enabled: np.ndarray
     sector_relative_veto_enabled: np.ndarray
+    position_loss_floor_enabled: np.ndarray  # MAE floor (L4549a)
+
+    # MAE hard floor: full EXIT when price/avg_cost - 1 <= pct (a NEGATIVE
+    # decimal, e.g. -0.15). Stance-agnostic, highest precedence (the
+    # falling-knife backstop — see the override block in compute_*).
+    position_loss_floor_pct: np.ndarray
 
     # ATR trailing stop multiplier (price - highest_high - ATR × mult)
     atr_multiplier: np.ndarray  # float64[n_combos]
@@ -143,6 +150,8 @@ class VectorizedExitConfig:
             "momentum_exit_enabled": True,
             "time_decay_enabled": True,
             "sector_relative_veto_enabled": True,
+            "position_loss_floor_enabled": True,
+            "position_loss_floor_pct": -0.15,
             "atr_multiplier": 3.0,
             "fallback_stop_pct": 0.10,
             "profit_take_pct": 0.25,
@@ -159,6 +168,7 @@ class VectorizedExitConfig:
             "atr_trailing_enabled", "fallback_stop_enabled",
             "profit_take_enabled", "momentum_exit_enabled",
             "time_decay_enabled", "sector_relative_veto_enabled",
+            "position_loss_floor_enabled",
         }
         int_fields = {"time_decay_reduce_days", "time_decay_exit_days"}
 
@@ -389,6 +399,30 @@ def compute_vectorized_exits(
     exit_reason = np.where(time_exit, REASON_TIME_EXIT, exit_reason).astype(np.int8)
     exit_action = np.where(time_reduce, ACTION_REDUCE, exit_action).astype(np.int8)
     exit_reason = np.where(time_reduce, REASON_TIME_REDUCE, exit_reason).astype(np.int8)
+
+    # ── 0. Position loss floor (MAE) — HARD, stance-agnostic, HIGHEST ───
+    # precedence. Scalar ``evaluate_exits`` runs this FIRST (step 0 of
+    # ``_evaluate_single_position``): a held position whose loss from avg cost
+    # breaches ``position_loss_floor_pct`` is a full EXIT regardless of
+    # stance / catalyst / sector-veto / any price-based gate — the
+    # falling-knife backstop (L4549a #238). Applied here as an UNCONDITIONAL
+    # override (not gated on ``exit_action == NONE``) so it STOMPS whatever
+    # ATR/fallback/profit/momentum/time decided for the cell — matching the
+    # scalar precedence (floor wins) and reason. Gated on ``eligible`` (NOT
+    # raw ``held``) for parity: scalar skips strategy checks, the floor
+    # included, for research-EXIT/REDUCE names (``exit_manager.py`` L818).
+    floor_cost_ok = sim.avg_costs > 0
+    safe_cost_floor = np.where(floor_cost_ok, sim.avg_costs, 1.0)
+    loss_frac = prices[None, :] / safe_cost_floor - 1.0  # [n_combos, n_tickers]
+    loss_floor_triggered = (
+        eligible
+        & config.position_loss_floor_enabled[:, None]
+        & floor_cost_ok
+        & ~np.isnan(prices)[None, :]
+        & (loss_frac <= config.position_loss_floor_pct[:, None])
+    )
+    exit_action = np.where(loss_floor_triggered, ACTION_EXIT, exit_action).astype(np.int8)
+    exit_reason = np.where(loss_floor_triggered, REASON_LOSS_FLOOR, exit_reason).astype(np.int8)
 
     # ── Compute share counts ────────────────────────────────────────
     # EXIT: full position. REDUCE: floor(shares * reduce_frac[c]).

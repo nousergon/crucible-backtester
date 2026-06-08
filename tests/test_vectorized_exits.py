@@ -54,6 +54,7 @@ from synthetic.vectorized_exits import (
     RA_REDUCE,
     REASON_ATR,
     REASON_FALLBACK,
+    REASON_LOSS_FLOOR,
     REASON_MOMENTUM,
     REASON_NONE,
     REASON_PROFIT,
@@ -73,6 +74,7 @@ _REASON_BY_NAME = {
     "momentum_exit": REASON_MOMENTUM,
     "time_decay_exit": REASON_TIME_EXIT,
     "time_decay_reduce": REASON_TIME_REDUCE,
+    "position_loss_floor": REASON_LOSS_FLOOR,
 }
 
 _ACTION_BY_NAME = {"EXIT": ACTION_EXIT, "REDUCE": ACTION_REDUCE}
@@ -129,6 +131,7 @@ class TestATRTrailingStopParity:
             n_combos=1,
             atr_multiplier=3.0,
             sector_relative_veto_enabled=False,  # disable veto for this test
+            position_loss_floor_enabled=False,   # isolate ATR from the MAE floor
         )
         prices = np.array([current_price])
         atr = np.array([atr_dollar])
@@ -190,6 +193,7 @@ class TestSectorVetoBlocksATR:
             atr_multiplier=3.0,
             sector_relative_veto_enabled=True,
             sector_relative_outperform_threshold=0.05,  # 5%
+            position_loss_floor_enabled=False,  # isolate the veto from the MAE floor
         )
 
         # Stock returns 15%, sector ETF returns 5%. Outperformance = 10% > 5%.
@@ -227,6 +231,7 @@ class TestSectorVetoBlocksATR:
             atr_multiplier=3.0,
             sector_relative_veto_enabled=True,
             sector_relative_outperform_threshold=0.05,
+            position_loss_floor_enabled=False,  # isolate the veto from the MAE floor
         )
         # Stock -15%, ETF +5% → outperformance -20% < 5% threshold → no veto
         prices = np.array([85.0, 50.0])
@@ -262,6 +267,7 @@ class TestFallbackStop:
 
         config = VectorizedExitConfig.from_uniform(
             n_combos=1, fallback_stop_pct=0.10,
+            position_loss_floor_enabled=False,  # isolate fallback from the MAE floor
         )
         # ATR data missing (NaN), price 85 ≤ entry 100 * 0.90 = 90 → fallback fires
         prices = np.array([85.0])
@@ -297,6 +303,7 @@ class TestFallbackStop:
             sector_relative_outperform_threshold=0.05,
             fallback_stop_enabled=True,
             fallback_stop_pct=0.05,  # tight fallback that WOULD fire
+            position_loss_floor_enabled=False,  # isolate fallback/veto from the MAE floor
         )
         # ATR raw triggered (price below stop) but vetoed → fallback skipped
         prices = np.array([85.0, 50.0])
@@ -314,6 +321,121 @@ class TestFallbackStop:
         # Vetoed ATR + skipped fallback + no other check fires (-15% loss but
         # not enough for momentum and not enough days for time decay)
         assert decisions.exit_action[0, 0] == ACTION_NONE
+
+
+class TestPositionLossFloor:
+    """MAE hard floor (L4549a #238) — stance-agnostic full EXIT at the highest
+    precedence. Mirrors scalar ``check_position_loss_floor`` / step-0 ordering
+    in ``executor.strategies.exit_manager._evaluate_single_position``."""
+
+    def _held(self, n_combos=1, n_tickers=1):
+        ti = _ticker_index(*[f"T{i}" for i in range(n_tickers)])
+        sim = VectorizedSimulator(n_combos=n_combos, ticker_index=ti)
+        sim.positions[:, 0] = 100
+        sim.avg_costs[:, 0] = 100.0
+        sim.entry_dates[:, 0] = 0
+        sim.highest_high[:, 0] = 110.0
+        return sim
+
+    def _run(self, sim, config, price, n_tickers=1):
+        nan = np.full(n_tickers, np.nan)
+        prices = np.array([price] + [50.0] * (n_tickers - 1))
+        return compute_vectorized_exits(
+            sim, prices=prices,
+            atr_dollar_at_date=nan, rsi_at_date=nan, momentum_at_date=nan,
+            sector_lookback_return=np.zeros(n_tickers),
+            research_action_per_ticker=np.full(n_tickers, RA_HOLD, dtype=np.int8),
+            sector_idx_per_ticker=np.full(n_tickers, -1, dtype=np.int32),
+            sector_etf_ticker_idx=np.array([-1], dtype=np.int32),
+            date_idx=1, config=config,
+        )
+
+    def test_floor_fires_full_exit_at_breach(self):
+        sim = self._held()
+        cfg = VectorizedExitConfig.from_uniform(n_combos=1)  # floor default -0.15
+        d = self._run(sim, cfg, price=85.0)  # 85/100 - 1 = -0.15 ≤ -0.15
+        assert d.exit_action[0, 0] == ACTION_EXIT
+        assert d.exit_reason[0, 0] == REASON_LOSS_FLOOR
+        assert d.exit_shares[0, 0] == 100.0  # full position
+
+    def test_floor_skips_above_breach(self):
+        sim = self._held()
+        cfg = VectorizedExitConfig.from_uniform(
+            n_combos=1, atr_trailing_enabled=False, fallback_stop_enabled=False,
+        )
+        d = self._run(sim, cfg, price=86.0)  # -14% > -15% floor → no floor exit
+        assert d.exit_action[0, 0] == ACTION_NONE
+
+    def test_floor_disabled_does_not_fire(self):
+        sim = self._held()
+        cfg = VectorizedExitConfig.from_uniform(
+            n_combos=1, position_loss_floor_enabled=False,
+            atr_trailing_enabled=False, fallback_stop_enabled=False,
+        )
+        d = self._run(sim, cfg, price=50.0)  # -50% but floor disabled
+        assert d.exit_action[0, 0] == ACTION_NONE
+
+    def test_floor_custom_pct(self):
+        sim = self._held()
+        cfg = VectorizedExitConfig.from_uniform(
+            n_combos=1, position_loss_floor_pct=-0.08,
+            atr_trailing_enabled=False, fallback_stop_enabled=False,
+        )
+        d = self._run(sim, cfg, price=90.0)  # -10% ≤ -8% → fires
+        assert d.exit_action[0, 0] == ACTION_EXIT
+        assert d.exit_reason[0, 0] == REASON_LOSS_FLOOR
+
+    def test_floor_overrides_sector_veto(self):
+        # The #238 invariant: the floor is stance/veto-AGNOSTIC. A position the
+        # sector-relative veto would protect from an ATR exit is STILL cut by the
+        # floor when it breaches — the veto suppresses the alpha exit, never the
+        # hard risk floor.
+        ti = _ticker_index("AAPL", "XLK")
+        sim = VectorizedSimulator(n_combos=1, ticker_index=ti)
+        sim.positions[0, 0] = 100
+        sim.avg_costs[0, 0] = 100.0
+        sim.entry_dates[0, 0] = 0
+        sim.highest_high[0, 0] = 110.0
+        cfg = VectorizedExitConfig.from_uniform(
+            n_combos=1, atr_multiplier=3.0,
+            sector_relative_veto_enabled=True,
+            sector_relative_outperform_threshold=0.05,
+            # floor default-on at -0.15
+        )
+        # AAPL -15% (breaches floor) AND outperforms its ETF (+15% vs +5% → veto
+        # would block the ATR exit). Floor must win regardless.
+        d = compute_vectorized_exits(
+            sim, prices=np.array([85.0, 50.0]),
+            atr_dollar_at_date=np.array([5.0, np.nan]),
+            rsi_at_date=np.array([50.0, np.nan]),
+            momentum_at_date=np.array([0.0, np.nan]),
+            sector_lookback_return=np.array([0.15, 0.05]),
+            research_action_per_ticker=np.array([RA_HOLD, RA_HOLD], dtype=np.int8),
+            sector_idx_per_ticker=np.array([0, 0], dtype=np.int32),
+            sector_etf_ticker_idx=np.array([1], dtype=np.int32),
+            date_idx=1, config=cfg,
+        )
+        assert d.exit_action[0, 0] == ACTION_EXIT
+        assert d.exit_reason[0, 0] == REASON_LOSS_FLOOR
+
+    def test_floor_skips_research_blocked(self):
+        # Parity: scalar ``evaluate_exits`` skips strategy checks (floor included)
+        # for research EXIT/REDUCE names (exit_manager.py L818) — research is
+        # already exiting. Vectorized gates the floor on ``eligible`` likewise.
+        sim = self._held()
+        cfg = VectorizedExitConfig.from_uniform(n_combos=1)
+        d = compute_vectorized_exits(
+            sim, prices=np.array([85.0]),
+            atr_dollar_at_date=np.array([np.nan]),
+            rsi_at_date=np.array([np.nan]),
+            momentum_at_date=np.array([np.nan]),
+            sector_lookback_return=np.array([0.0]),
+            research_action_per_ticker=np.array([RA_EXIT], dtype=np.int8),
+            sector_idx_per_ticker=np.array([-1], dtype=np.int32),
+            sector_etf_ticker_idx=np.array([-1], dtype=np.int32),
+            date_idx=1, config=cfg,
+        )
+        assert d.exit_action[0, 0] == ACTION_NONE
 
 
 class TestProfitTake:
@@ -533,6 +655,10 @@ class TestMultiCombo:
             momentum_exit_enabled=np.array([False, False, False]),
             time_decay_enabled=np.array([False, False, False]),
             sector_relative_veto_enabled=np.array([False, False, False]),
+            # Floor enabled at -0.15; price 95 vs cost 100 is only -5%, so it
+            # never fires here — this case stays a pure ATR-multiplier test.
+            position_loss_floor_enabled=np.array([True, True, True]),
+            position_loss_floor_pct=np.full(3, -0.15),
             atr_multiplier=np.array([2.0, 3.0, 4.0]),
             fallback_stop_pct=np.full(3, 0.10),
             profit_take_pct=np.full(3, 0.25),
