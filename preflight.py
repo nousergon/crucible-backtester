@@ -122,8 +122,17 @@ class BacktesterPreflight(BasePreflight):
         self.check_s3_bucket()
 
         if self.mode == "backtest":
-            # Environment checks first — cheapest, and catch the class
-            # of failure where the spot's pip install didn't pull the
+            # Cross-stage artifact contract FIRST — pure + instant (no I/O):
+            # the declarative pipeline_manifest asserts that the mode the SF
+            # Backtester state runs produces every Evaluator-critical artifact.
+            # Enforced at CI by test_evaluator_artifact_contract, but a
+            # topology/mode drift that reaches a live host (e.g. a hand-edited
+            # SF mode) must also fail HERE, in microseconds, before any spend —
+            # not 2h in when the Evaluator starves (the L4513 class). L4526
+            # plan §6 Phase 4 (compose the preflight on the manifest).
+            self._check_artifact_contract()
+            # Environment checks next — cheapest I/O-free-ish, and catch the
+            # class of failure where the spot's pip install didn't pull the
             # pin we expected. ~2 seconds total. All three would have
             # caught the 2026-04-21 80-minute burn.
             self._check_lib_version()
@@ -152,6 +161,30 @@ class BacktesterPreflight(BasePreflight):
             # the executor-sim call chain. Caught at preflight so the
             # operator sees the real cause in <1s. Hit 2026-04-20.
             self._check_executor_config()
+
+    # ── Pipeline-contract preflight (L4526, plan §6 Phase 4) ─────────────
+
+    def _check_artifact_contract(self) -> None:
+        """Fail if the SF Backtester mode wouldn't produce an Evaluator-critical
+        artifact, per the declarative ``pipeline_manifest``.
+
+        Pure + instant (no I/O). The same contract the CI test
+        (``test_evaluator_artifact_contract``) locks — re-checked at runtime so
+        a drift that reached this host (a hand-edited SF mode, a phase-gate edit
+        deployed without the test) fails in microseconds at the gate instead of
+        2h in when the Evaluator starves (the L4513 silent-starvation class).
+        """
+        import pipeline_manifest as manifest
+
+        violations = manifest.contract_violations(manifest.SF_BACKTESTER_MODE)
+        if violations:
+            raise RuntimeError(
+                "Pre-flight: pipeline artifact-contract violation for "
+                f"--mode={manifest.SF_BACKTESTER_MODE} — the SF Backtester state "
+                "would not produce an Evaluator-critical artifact, starving the "
+                "Evaluator (L4513 class). Fix pipeline_manifest.py / the SF mode "
+                "/ the producer mode-gate:\n  - " + "\n  - ".join(violations)
+            )
 
     # ── Environment primitives (added 2026-04-21 post-80min-burn) ────────
 
