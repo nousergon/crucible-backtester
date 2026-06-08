@@ -156,6 +156,63 @@ def _cio_selection_skill(merged: pd.DataFrame) -> dict | None:
     return out
 
 
+def _trailing_sector_neutral(
+    df: pd.DataFrame,
+    *,
+    score_col: str = "combined_score",
+    date_col: str = "eval_date",
+    sector_col: str = "sector",
+    k_min: int = 6,
+) -> tuple[pd.Series, float]:
+    """Leak-free sector-neutral transform of ``score_col`` (L4564).
+
+    The six sector teams share one rubric, so raw scores carry a persistent
+    per-sector level/scale bias (a 70 from Tech ≠ a 70 from Defensives). This
+    strips that bias deterministically, so the residual is comparable across
+    sectors — the precondition for the CIO ranking on stock quality and
+    applying the sector tilt SEPARATELY (rather than letting the rubric's
+    sector bias double-count with the explicit sector ratings).
+
+    For each row at eval_date ``d`` in sector ``s``::
+
+        q = (score − μ_s) / σ_s
+
+    where μ_s, σ_s are the mean/std of that sector's scores over STRICTLY
+    PRIOR eval_dates (``< d``) — no look-ahead, exactly what is reconstructable
+    live from ``research.db`` at decision time (the CIO candidate pool is only
+    ~2–3 names/sector/cycle, far too thin for a within-cycle within-sector
+    z-score, so the baseline MUST come from history). Sectors with < ``k_min``
+    prior samples (cold start / thin) fall back to the within-cycle pool-wide
+    percentile rank, so every row gets a comparable value rather than a NaN.
+
+    Returns ``(series_aligned_to_df_index, frac_neutralized)`` — the second
+    element is the share of valued rows that used the true trailing-sector
+    transform vs the pool-wide fallback (transparency for the L4564 gate).
+    """
+    import numpy as np
+
+    out = pd.Series(np.nan, index=df.index, dtype="float64")
+    if not {score_col, date_col, sector_col}.issubset(df.columns):
+        return out, 0.0
+    # Pool-wide within-cycle percentile rank — the cold-start / thin fallback.
+    pool_rank = df.groupby(date_col)[score_col].rank(pct=True)
+    n_neutral = 0
+    # eval_date is a YYYY-MM-DD string — lexical order is chronological order.
+    for d in sorted(df[date_col].dropna().unique()):
+        cur = df[df[date_col] == d]
+        prior = df[df[date_col] < d]
+        for s, idx in cur.groupby(sector_col).groups.items():
+            prior_s = prior[prior[sector_col] == s][score_col].dropna()
+            sd = prior_s.std(ddof=1) if len(prior_s) >= k_min else None
+            if sd is not None and sd == sd and sd > 1e-9:
+                out.loc[idx] = (df.loc[idx, score_col] - prior_s.mean()) / sd
+                n_neutral += int(df.loc[idx, score_col].notna().sum())
+            else:
+                out.loc[idx] = pool_rank.loc[idx]
+    valid = int(out.notna().sum())
+    return out, (n_neutral / valid if valid else 0.0)
+
+
 def _cio_layer_attribution(merged: pd.DataFrame) -> dict | None:
     """Attribute realized 21d alpha to each layer the CIO orchestrates (L4561/L4562).
 
@@ -206,6 +263,27 @@ def _cio_layer_attribution(merged: pd.DataFrame) -> dict | None:
                 rho, p = spearmanr(cs["cs_xs_rank"], cs["alpha21"])
                 out["combined_score_xs_rank_ic"] = round(float(rho), 4) if rho == rho else None
                 out["combined_score_xs_rank_ic_p"] = round(float(p), 4) if p == p else None
+
+    # Sector-neutral stock quality (L4564): strip the rubric's persistent
+    # per-sector bias via a LEAK-FREE trailing-sector z-score (μ,σ from
+    # strictly prior eval_dates), with a pool-wide-rank fallback for cold-start
+    # sectors. This is the de-blended quality signal the CIO will rank on once
+    # the Phase-B flag flips — measured here FIRST so the cutover has a real
+    # before/after, not a hunch. The 3-way A/B is: raw ``combined_score_ic``
+    # (no normalization) vs ``combined_score_xs_rank_ic`` (pool-wide rank —
+    # removes scale only, NOT the sector-mean bias) vs this (sector-neutral).
+    if {"combined_score", "eval_date", "sector"}.issubset(df.columns):
+        sn = df.dropna(subset=["combined_score"]).copy()
+        if sn.shape[0] >= 5:
+            q_neutral, frac = _trailing_sector_neutral(sn)
+            sn = sn.assign(q_neutral=q_neutral).dropna(subset=["q_neutral"])
+            if (sn.shape[0] >= 5 and sn["q_neutral"].nunique() >= 2
+                    and sn["alpha21"].nunique() >= 2):
+                rho, p = spearmanr(sn["q_neutral"], sn["alpha21"])
+                out["combined_score_sector_neutral_ic"] = round(float(rho), 4) if rho == rho else None
+                out["combined_score_sector_neutral_ic_p"] = round(float(p), 4) if p == p else None
+                out["combined_score_sector_neutral_n"] = int(sn.shape[0])
+                out["combined_score_sector_neutral_frac"] = round(float(frac), 3)
     return out
 
 

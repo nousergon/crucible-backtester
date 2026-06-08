@@ -100,6 +100,49 @@ def test_cio_layer_attribution_block(tmp_path):
         assert attr[f"{layer}_ic"] is not None
     # L4563 de-blending substrate: cross-sectional rank-normalized stock-score IC.
     assert attr["combined_score_xs_rank_ic"] is not None
+    # L4564 de-blending substrate: sector-neutral (trailing-baseline) stock-score
+    # IC. Single-date fixture has no PRIOR cycle, so every row cold-starts to the
+    # pool-wide fallback → key present, frac neutralized == 0.0.
+    assert attr["combined_score_sector_neutral_ic"] is not None
+    assert attr["combined_score_sector_neutral_frac"] == 0.0
+    assert attr["combined_score_sector_neutral_n"] == 20
+
+
+def test_trailing_sector_neutral_leakfree_and_fallback():
+    # L4564: leak-free trailing-sector z-score with pool-wide cold-start fallback.
+    import math
+
+    import pandas as pd
+
+    from analysis.end_to_end import _trailing_sector_neutral
+
+    # Sector A across 3 dates (chronological string order), sector B once.
+    df = pd.DataFrame(
+        [
+            ("d1", "A", 10.0),
+            ("d1", "A", 20.0),   # d1: no prior → both fall back to pool rank
+            ("d2", "A", 30.0),
+            ("d2", "A", 40.0),   # d2: prior A=[10,20] (n=2≥k_min) → z-scored
+            ("d2", "B", 5.0),    # d2: no prior B → fall back
+            ("d3", "A", 100.0),  # d3: prior A=[10,20,30,40] → z-scored, leak-free
+        ],
+        columns=["eval_date", "sector", "combined_score"],
+    )
+    q, frac = _trailing_sector_neutral(df, k_min=2)
+
+    # d2 sector A is z-scored on the STRICTLY-PRIOR baseline mean=15, sd=√50.
+    sd2 = math.sqrt(50.0)
+    assert q.iloc[2] == pytest.approx((30.0 - 15.0) / sd2)  # not a 0–1 pool rank
+    assert q.iloc[3] == pytest.approx((40.0 - 15.0) / sd2)
+    # d3 sector A uses prior [10,20,30,40] (mean=25, sd ddof=1) — the current 100
+    # does NOT enter its own baseline (leak-free).
+    sd3 = pd.Series([10.0, 20.0, 30.0, 40.0]).std(ddof=1)
+    assert q.iloc[5] == pytest.approx((100.0 - 25.0) / sd3)
+    # Cold-start rows fell back to within-date pool-wide percentile rank ∈ (0, 1].
+    assert 0.0 < q.iloc[0] <= 1.0 and 0.0 < q.iloc[1] <= 1.0
+    assert 0.0 < q.iloc[4] <= 1.0
+    # 3 of 6 valued rows used the true trailing transform.
+    assert frac == pytest.approx(0.5)
 
 
 def test_team_21d_block_present(tmp_path):
