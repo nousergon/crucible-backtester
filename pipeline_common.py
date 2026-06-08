@@ -473,6 +473,11 @@ class PhaseRegistry:
         # pre-watchdog code).
         self._hard_caps = dict(hard_caps or {})
         self._markers: dict[str, dict | None] = {}
+        # L4524: per-phase cache of artifact-validation results so a marker
+        # whose declared artifacts were head_object'd once isn't re-checked
+        # on the second should_run call (the phase() context manager re-asks).
+        # Value is the first-missing artifact key, or None if all present.
+        self._artifact_checks: dict[str, str | None] = {}
         self._s3 = s3_client  # lazy-init if None
         # Names of phases that wrote a marker with status=error during
         # THIS invocation. Used by the smoke-harness budget check to
@@ -549,6 +554,51 @@ class PhaseRegistry:
         if marker.get("status") == "error":
             self.phase_errors.append(marker["phase"])
 
+    def _first_missing_artifact(self, artifact_keys: Iterable[str]) -> str | None:
+        """Return the first declared artifact key that is absent on S3, or
+        None if every key is present (or none were declared).
+
+        L4524 — artifact-validated checkpoints. A `status=ok` marker only
+        earns an auto-skip if the outputs it *claims* to have produced are
+        actually on S3. A marker whose declared artifact has gone missing is
+        LYING (the L4518/L4521 "trust-and-yield-empty" failure: a phase marked
+        ok while its critical artifact was never written / was pruned),
+        so the marker must be treated as INVALID → re-run rather than skipped.
+
+        Existence is probed with `head_object` (metadata only — never download
+        a multi-MB parquet just to confirm it exists). Error posture mirrors
+        `_read_marker`: a 404/NotFound means absent (→ invalidate the marker);
+        any other S3 error (network blip, permission) RAISES rather than
+        silently flipping a skip/re-run decision on incomplete information,
+        per the fail-loud rule.
+        """
+        client = self._client()
+        for key in artifact_keys:
+            if not key:
+                continue
+            try:
+                client.head_object(Bucket=self.bucket, Key=key)
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in ("NoSuchKey", "NoSuchBucket", "NotFound", "404"):
+                    return key
+                # Transient / permission error: fail loud, don't guess.
+                raise
+        return None
+
+    def _marker_artifact_missing(self, phase_name: str, marker: dict) -> str | None:
+        """Validate a phase's marker against its declared artifacts (cached).
+
+        Returns the first-missing artifact key (marker invalid) or None
+        (marker honored). Cached per phase so the phase() context manager's
+        repeat should_run call doesn't re-issue the head_object probes.
+        """
+        if phase_name not in self._artifact_checks:
+            self._artifact_checks[phase_name] = self._first_missing_artifact(
+                marker.get("artifact_keys") or []
+            )
+        return self._artifact_checks[phase_name]
+
     # ── Decision logic ───────────────────────────────────────────────────
 
     def should_run(self, phase_name: str, supports_auto_skip: bool = False) -> tuple[bool, str]:
@@ -559,12 +609,15 @@ class PhaseRegistry:
           2. --skip-phases / --force-phases take precedence (explicit wins).
           3. --force overrides any auto-skip.
           4. Auto-skip if phase is auto-skippable AND a prior-run marker
-             is present with status=ok.
+             is present with status=ok AND every artifact the marker
+             declares still exists on S3 (L4524 — a marker whose declared
+             artifact has gone missing is invalid → re-run).
           5. Default: run.
 
         Reason strings are structured so downstream INFO logs are grep-able:
           "only_phases_filter" | "explicit_skip" | "auto_skip_marker_ok"
-          | "force_rerun" | "force_phase_rerun" | "default_run" | "not_auto_skippable"
+          | "force_rerun" | "force_phase_rerun" | "default_run"
+          | "not_auto_skippable" | "marker_artifact_missing"
         """
         if self._only is not None and phase_name not in self._only:
             return False, "only_phases_filter"
@@ -578,6 +631,19 @@ class PhaseRegistry:
             return True, "not_auto_skippable"
         marker = self._read_marker(phase_name)
         if marker is not None and marker.get("status") == "ok":
+            # L4524: the marker says ok — but does what it claims to have
+            # produced actually exist? A missing declared artifact means the
+            # marker is lying; invalidate it and re-run rather than skip into
+            # a downstream phase that will starve on the absent output.
+            missing = self._marker_artifact_missing(phase_name, marker)
+            if missing is not None:
+                logger.warning(
+                    "phase_registry: phase %s (date %s) has a status=ok marker but "
+                    "its declared artifact s3://%s/%s is absent — marker INVALID, "
+                    "re-running the phase (L4524 artifact-validated checkpoint).",
+                    phase_name, self.date, self.bucket, missing,
+                )
+                return True, "marker_artifact_missing"
             return False, "auto_skip_marker_ok"
         return True, "default_run"
 
