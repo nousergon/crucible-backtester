@@ -78,7 +78,9 @@ from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 from pipeline_common import (
+    PhaseOutcome,
     PhaseRegistry,
+    PhaseStatus,
     PhaseTimeoutError,
     init_research_db,
     load_config,
@@ -4593,6 +4595,78 @@ def _export_simulation_artifacts(
         logger.info("Exported simulation artifacts to s3://%s/%s/: %s", bucket, prefix, ", ".join(exported))
 
 
+def classify_simulation_outcome(
+    mode: str,
+    portfolio_stats: dict | None,
+    sweep_df,
+) -> PhaseOutcome:
+    """Map the simulate/param-sweep critical artifacts to a 3-way PhaseOutcome.
+
+    The single decision point for the simulate-phase outcome, encoding
+    ARCHITECTURE.md §22 (the backtester's 0-result policy). Pure + side-effect
+    free so it unit-tests directly (callers act on ``.status``). Replaces the
+    inline if-ladder #294 shipped — the taxonomy is now a first-class,
+    structured record (L4523) the rest of the arc (L4524/L4526) builds on.
+
+    FAILURE (fail loud, infra/contract break):
+      - ``portfolio_stats`` absent — the Evaluator hard-requires it; param-sweep
+        was made to produce it (#292). Absence = the phase didn't run / errored,
+        NOT a degenerate market result. ("did not produce portfolio_stats")
+      - ``sweep_df is None`` — the param_sweep phase didn't run / errored (None,
+        not an empty frame). ("sweep_df is ABSENT")
+    EMPTY (valid no-op, WARN+alert — see §22):
+      - ``sweep_df`` is an EMPTY frame — ran, no admissible combo (all entries
+        gated by score/risk this window). Configs HELD, executor-optimizer
+        skipped; the empty parquet is still written so the Evaluator finds it
+        present + no-ops. Surfaced loudly so a suspicious degeneracy (e.g.
+        zero-score inputs) is visible; the L4525 input-quality gate later
+        classifies legit-empty vs garbage-input-empty.
+    SUCCESS:
+      - a non-empty sweep + present portfolio_stats.
+    """
+    phase_name = "export_artifacts"
+    if not portfolio_stats:
+        return PhaseOutcome(
+            status=PhaseStatus.FAILURE,
+            phase=phase_name,
+            reason=(
+                f"Backtester mode={mode} did not produce portfolio_stats "
+                f"(absent, not empty) — evaluate.py hard-requires it. Failing "
+                f"loud (L4513/L4518); this is an infra/contract break, not a "
+                f"degenerate market result."
+            ),
+        )
+    if sweep_df is None:
+        return PhaseOutcome(
+            status=PhaseStatus.FAILURE,
+            phase=phase_name,
+            reason=(
+                f"Backtester mode={mode}: sweep_df is ABSENT (param_sweep "
+                f"phase did not run / errored — None, not an empty frame). "
+                f"Failing loud (L4513/L4524) — distinct from an empty sweep."
+            ),
+        )
+    if getattr(sweep_df, "empty", True):
+        return PhaseOutcome(
+            status=PhaseStatus.EMPTY,
+            phase=phase_name,
+            n_admissible=0,
+            degeneracy_reason="no admissible param combo (all entries gated by score/risk)",
+            reason=(
+                f"[outcome] sweep_df is EMPTY (mode={mode}) — no admissible param "
+                f"combo this run (all entries gated by score/risk). Treating as "
+                f"a valid no-op: configs HELD, executor-optimizer skipped. "
+                f"L4525 input-quality gate will classify legit-vs-garbage."
+            ),
+        )
+    return PhaseOutcome(
+        status=PhaseStatus.SUCCESS,
+        phase=phase_name,
+        n_admissible=int(len(sweep_df)),
+        reason=f"sweep produced {len(sweep_df)} admissible combo(s) (mode={mode}).",
+    )
+
+
 # ── Main entry point ────────────────────────────────────────────────────────
 
 
@@ -5013,47 +5087,28 @@ def main() -> None:
         except Exception as e:
             logger.warning("Simulation artifact export failed (non-fatal): %s", e)
 
-        # FAIL-LOUD guard (L4518). The Evaluator treats portfolio_stats.json +
-        # sweep_df.parquet as CRITICAL. When a mode is EXPECTED to produce them
-        # (simulate / param-sweep / all), their absence must raise here — not be
-        # silently skipped by the conditional uploads above, marking the phase
-        # ok and starving the Evaluator weeks later (the L4513 failure mode).
-        # predictor-backtest legitimately produces neither, so it's exempt.
-        # Outcome taxonomy (L4523): distinguish ABSENT (phase didn't run /
-        # errored → FAILURE, fail loud) from EMPTY (ran, produced no admissible
-        # result → valid no-op, WARN+alert, do NOT crash). A risk/score gate
-        # legitimately gating out all entries must NOT kill the process — that
-        # was the 2026-06-06 symptom. portfolio_stats ABSENT stays fatal
-        # (#292 made param-sweep produce it). predictor-backtest exempt.
+        # Outcome taxonomy guard (L4523 — encodes ARCHITECTURE.md §22). The
+        # Evaluator treats portfolio_stats.json + sweep_df.parquet as CRITICAL.
+        # When a mode is EXPECTED to produce them (simulate / param-sweep / all),
+        # classify_simulation_outcome() resolves the 3-way outcome and we act on
+        # it: FAILURE (ABSENT — phase didn't run / errored) → raise (the L4513
+        # silent-starvation failure mode); EMPTY (ran, no admissible combo) →
+        # valid no-op WARN+alert, do NOT crash (a risk/score gate gating out all
+        # entries must NOT kill the process — the 2026-06-06 symptom); SUCCESS →
+        # proceed. predictor-backtest legitimately produces neither → exempt.
         if args.mode in ("simulate", "param-sweep", "all"):
-            if not portfolio_stats:
-                raise RuntimeError(
-                    f"Backtester mode={args.mode} did not produce portfolio_stats "
-                    f"(absent, not empty) — evaluate.py hard-requires it. Failing "
-                    f"loud (L4513/L4518); this is an infra/contract break, not a "
-                    f"degenerate market result."
-                )
-            if sweep_df is None:
-                raise RuntimeError(
-                    f"Backtester mode={args.mode}: sweep_df is ABSENT (param_sweep "
-                    f"phase did not run / errored — None, not an empty frame). "
-                    f"Failing loud (L4513/L4524) — distinct from an empty sweep."
-                )
-            if getattr(sweep_df, "empty", True):
-                # EMPTY sweep = ran, no admissible combo (all entries gated by
-                # score/risk in this window). VALID no-op: the empty parquet is
-                # written by _export_simulation_artifacts so the Evaluator finds
-                # it present + no-ops the optimizer. Surface LOUDLY (never
-                # silent) so a suspicious degeneracy (e.g. zero-score inputs) is
-                # visible. The input-quality HARD gate (L4525) is the follow-up
-                # that classifies legit-empty vs garbage-input-empty.
-                logger.warning(
-                    "[outcome] sweep_df is EMPTY (mode=%s) — no admissible param "
-                    "combo this run (all entries gated by score/risk). Treating as "
-                    "a valid no-op: configs HELD, executor-optimizer skipped. "
-                    "L4525 input-quality gate will classify legit-vs-garbage.",
-                    args.mode,
-                )
+            outcome = classify_simulation_outcome(args.mode, portfolio_stats, sweep_df)
+            logger.info("[outcome] simulate-phase outcome: %s", outcome.to_dict())
+            if outcome.is_failure:
+                raise RuntimeError(outcome.reason)
+            if outcome.is_empty:
+                # EMPTY sweep = ran, no admissible combo. VALID no-op: the empty
+                # parquet is written by _export_simulation_artifacts so the
+                # Evaluator finds it present + no-ops the optimizer. Surface
+                # LOUDLY (never silent) so a suspicious degeneracy (e.g.
+                # zero-score inputs) is visible; the L4525 input-quality HARD
+                # gate is the follow-up that classifies legit-vs-garbage.
+                logger.warning("%s", outcome.reason)
                 try:
                     import alpha_engine_lib.alerts as _alerts
                     _alerts.publish(
