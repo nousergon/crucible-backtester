@@ -93,6 +93,24 @@ STAGES: tuple[Stage, ...] = (
         auto_skippable=True,
         gate_pattern=r"# ── Param sweep[^\n]*\n\s*if args\.mode in \(([^)]*)\):",
     ),
+    # ── Resumable-stage inventory (L4526 P7 — skip/resume SoT) ──────────────
+    # The remaining auto-skippable (resumable) phases. Their `produces`/
+    # `requires` are intentionally left empty (the two Evaluator-critical
+    # producers above are the only verified artifact contract); these entries
+    # exist so the manifest is the COMPLETE inventory of resumable stages —
+    # the single source of truth for what `--skip-phases=<name>` can target
+    # (the phase NAME is the skip token). The AST enumeration test
+    # (test_manifest_covers_every_auto_skippable_phase) binds this set to the
+    # actual `supports_auto_skip=True` phases in backtest.py so it can't drift.
+    Stage(name="simulation_setup", modes=("simulate", "param-sweep", "all"), auto_skippable=True),
+    Stage(name="executor_optimizer", modes=("param-sweep", "all"), auto_skippable=True),
+    Stage(name="predictor_data_prep", modes=("predictor-backtest", "all"), auto_skippable=True),
+    Stage(name="predictor_feature_maps_bulk_load", modes=("predictor-backtest", "all"), auto_skippable=True),
+    Stage(name="predictor_single_run", modes=("predictor-backtest", "all"), auto_skippable=True),
+    Stage(name="phase4a_ensemble_modes", modes=("predictor-backtest", "all"), auto_skippable=True),
+    Stage(name="phase4b_signal_thresholds", modes=("predictor-backtest", "all"), auto_skippable=True),
+    Stage(name="phase4c_feature_pruning", modes=("predictor-backtest", "all"), auto_skippable=True),
+    Stage(name="predictor_param_sweep", modes=("predictor-backtest", "all"), auto_skippable=True),
     Stage(
         name="evaluator",
         requires=("sweep_df.parquet", "portfolio_stats.json"),
@@ -121,6 +139,19 @@ def producers_of(artifact: str) -> list[Stage]:
 def stages_for_mode(mode: str) -> list[Stage]:
     """Producer stages that run in ``mode`` (its mode-gate includes ``mode``)."""
     return [s for s in producer_stages() if mode in s.modes]
+
+
+def auto_skippable_stages() -> list[Stage]:
+    """Every resumable stage — i.e. one declared with ``supports_auto_skip=True``
+    in backtest.py. The phase NAME is the ``--skip-phases`` / ``--force-phases``
+    token for targeted skip/resume (L4527)."""
+    return [s for s in STAGES if s.auto_skippable]
+
+
+def resumable_phase_names() -> frozenset[str]:
+    """The skip/resume token set — bound to the code by the AST enumeration
+    test so the manifest stays the complete, drift-free inventory."""
+    return frozenset(s.name for s in auto_skippable_stages())
 
 
 def evaluator_critical() -> frozenset[str]:
