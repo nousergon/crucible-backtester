@@ -166,6 +166,92 @@ CANONICAL_CUTOVER_DATE = "2026-05-09"
 POST_CUTOVER_FILTER_SQL = f"prediction_date >= '{CANONICAL_CUTOVER_DATE}'"
 
 
+# ── Phase outcome taxonomy (3-way: SUCCESS | EMPTY | FAILURE) ────────────────
+#
+# The durable encoding of ARCHITECTURE.md §22 ("The backtester delivers config
+# ACTIONS and a report card; a 0-result is legitimate only when the inputs were
+# validated first"). Every backtester stage resolves to exactly one of three
+# outcomes — binary ok/fail is WRONG because it forces the EMPTY case into one
+# of two harmful answers (treat-as-success silently drops the config action and
+# mis-tunes the live book; treat-as-failure kills the whole Saturday SF when a
+# risk/score gate merely did its job — the 2026-06-06 symptom, L4506–L4521).
+#
+#   SUCCESS — produced its declared admissible result.
+#   EMPTY   — ran correctly, produced NO admissible result (e.g. all combos
+#             gated out). A first-class analytical FINDING, not an error:
+#             downstream no-ops gracefully (configs held), but it is surfaced
+#             LOUDLY (WARN + alert) so a *suspicious* degeneracy (e.g. a
+#             zero-score-input feed defect) is never silent. The input-quality
+#             HARD gate (L4525) is what later promotes garbage-input-EMPTY to
+#             FAILURE; until it lands, EMPTY is "valid-but-alarmed".
+#   FAILURE — an infra/contract break (absent input, exception, contract
+#             violation). Fatal, fail-loud.
+#
+# This is the analytical-outcome sibling of §12's deliverable-presence
+# three-state (present-valid / present-invalid / absent). PhaseOutcome is the
+# structured record (P8 observability) that L4524 (artifact-validated
+# checkpoints) and L4526 (pipeline manifest) build on.
+
+
+import enum
+from dataclasses import dataclass, field
+
+
+class PhaseStatus(enum.Enum):
+    """3-way phase outcome. See module section header + ARCHITECTURE.md §22."""
+
+    SUCCESS = "success"
+    EMPTY = "empty"
+    FAILURE = "failure"
+
+
+@dataclass
+class PhaseOutcome:
+    """Structured result of running (or classifying) a pipeline stage.
+
+    ``status`` is the load-bearing field; the rest are observability so a
+    degenerate week is legible at a glance instead of a forensic dig (plan
+    §2 P8). ``reason`` is the human/log message; ``degeneracy_reason`` names
+    *why* an EMPTY produced nothing; ``n_inputs``/``n_admissible`` quantify
+    the gating. ``artifacts_written`` records what hit S3 (foundation for the
+    L4524 artifact-validated marker).
+    """
+
+    status: PhaseStatus
+    phase: str
+    reason: str = ""
+    n_inputs: int | None = None
+    n_admissible: int | None = None
+    degeneracy_reason: str | None = None
+    artifacts_written: list[str] = field(default_factory=list)
+    detail: dict = field(default_factory=dict)
+
+    @property
+    def is_success(self) -> bool:
+        return self.status is PhaseStatus.SUCCESS
+
+    @property
+    def is_empty(self) -> bool:
+        return self.status is PhaseStatus.EMPTY
+
+    @property
+    def is_failure(self) -> bool:
+        return self.status is PhaseStatus.FAILURE
+
+    def to_dict(self) -> dict:
+        """JSON-serializable record for structured logging / markers."""
+        return {
+            "status": self.status.value,
+            "phase": self.phase,
+            "reason": self.reason,
+            "n_inputs": self.n_inputs,
+            "n_admissible": self.n_admissible,
+            "degeneracy_reason": self.degeneracy_reason,
+            "artifacts_written": list(self.artifacts_written),
+            "detail": dict(self.detail),
+        }
+
+
 # ── Phase markers ────────────────────────────────────────────────────────────
 #
 # Structured begin/end log lines around each pipeline phase so any timeout

@@ -102,8 +102,17 @@ def test_predictor_backtest_exempt_from_guard():
     """predictor-backtest legitimately produces neither portfolio_stats nor
     sweep_df — the guard must not require them for that mode."""
     s = _src()
-    guard_block = s[s.index("Outcome taxonomy (L4523)"):]
-    guard_block = guard_block[: guard_block.index("logger.warning")]
+    # The guard runs classify_simulation_outcome() under the simulate-phase
+    # mode gate; isolate that gate line + the classify call and assert the
+    # gate is the 3-tuple (predictor-backtest excluded).
+    guard_block = s[s.index("outcome = classify_simulation_outcome(args.mode"):]
+    guard_block = guard_block[: guard_block.index("logger.info")]
+    # walk back to the enclosing gate line
+    gate_anchor = 'if args.mode in ("simulate", "param-sweep", "all"):\n            outcome = classify_simulation_outcome'
+    assert gate_anchor in s, (
+        "the outcome guard must be gated on the 3-tuple (simulate/param-sweep/"
+        "all); predictor-backtest must NOT trigger the critical-artifact guard"
+    )
     assert '"predictor-backtest"' not in guard_block, (
         "predictor-backtest must be exempt from the critical-artifact guard"
     )
