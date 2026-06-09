@@ -20,13 +20,20 @@ def fd_instance(tmp_path):
 
     db_path = str(tmp_path / "flow_doctor_test.db")
 
-    fd = flow_doctor.init(
-        flow_name="backtester-test",
-        repo="cipher813/alpha-engine-backtester",
-        store={"type": "sqlite", "path": db_path},
-        notify=[],  # no notifiers — pure capture
-        dependencies=["predictor-training", "data-phase1"],
-        rate_limits={"max_alerts_per_day": 50, "dedup_cooldown_minutes": 1},
+    # flow-doctor 0.6.0rc3 replaced the top-level `flow_doctor.init(...)`
+    # constructor with the fluent FlowDoctorBuilder. Same SQLite-only,
+    # no-notifier capture config as before.
+    from flow_doctor.core.config import RateLimitConfig
+
+    fd = (
+        flow_doctor.FlowDoctorBuilder("backtester-test")
+        .with_repo("cipher813/alpha-engine-backtester")
+        .with_store(type="sqlite", path=db_path)
+        .with_dependencies(["predictor-training", "data-phase1"])
+        .with_rate_limits(
+            RateLimitConfig(max_alerts_per_day=50, dedup_cooldown_minutes=1)
+        )
+        .build()
     )
     return fd, db_path
 

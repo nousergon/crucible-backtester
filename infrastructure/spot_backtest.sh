@@ -903,7 +903,7 @@ CACHE
 # ${AWS_REGION:-us-east-1} defaults). Origin: 2026-05-16 Saturday SF
 # PredictorTraining failure (spot_train.sh sibling) — audited forward to
 # prevent the identical Backtester/Parity/Evaluator failure.
-ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1; command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3; export PYTHON_BIN;'
+ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1; command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3; export PYTHON_BIN;'
 
 # Spot-side python is resolved inline per SSM step via PYTHON_BIN in the
 # ENV_SOURCE above. The pre-2026-05-27 SSH transport captured this on the

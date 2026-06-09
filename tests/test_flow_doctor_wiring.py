@@ -374,11 +374,11 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.53.0" in text, (
-            "alpha-engine-lib should pin to v0.53.0 — fleet pin alignment "
-            "(2026-06-06, L4513). The predictor lagged at v0.47.0 and silently "
-            "downgraded the lib below quant.stats (first shipped v0.49.0) in the "
-            "backtester spot co-install, breaking the Evaluator; aligning the "
-            "fleet at v0.53.0 (predictor #238 + backtester #291) closes that. "
+        assert "@v0.58.0" in text, (
+            "alpha-engine-lib should pin to v0.58.0 — flow-doctor default-on "
+            "roll (lib v0.58.0 makes flow-doctor activate when setup_logging is "
+            "called with a flow_doctor_yaml; adds guard_entrypoint/monitor_handler "
+            "crash-capture helpers). Bumped from the prior v0.53.0 fleet-alignment "
+            "pin (2026-06-06, L4513). "
             "Update this test if the pin moves further forward."
         )

@@ -39,7 +39,7 @@ from pathlib import Path
 # simple repo-root path resolution works.
 #
 # exclude_patterns starts empty by deliberate convention.
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, guard_entrypoint
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
 setup_logging(
@@ -1135,6 +1135,14 @@ def _run_regression(
 
 
 def main() -> None:
+    # flow-doctor default-on (lib v0.58.0): the outer guard catches the
+    # uncaught raise from anywhere in the body and reports it before
+    # re-raising. No-op when flow-doctor is inactive (dev/CI/pytest).
+    with guard_entrypoint():
+        _main_impl()
+
+
+def _main_impl() -> None:
     args = _parse_args()
 
     # DATE_CONVENTIONS: normalize the run-date label to the NYSE trading day so

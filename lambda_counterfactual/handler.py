@@ -54,7 +54,7 @@ from datetime import datetime
 # lambda_concordance pattern.
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, monitor_handler
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -89,6 +89,7 @@ def _ensure_init() -> None:
     _init_done = True
 
 
+@monitor_handler
 def handler(event: dict, context) -> dict:
     """Compute + emit per-agent counterfactual rule fit.
 
