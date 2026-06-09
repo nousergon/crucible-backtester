@@ -64,7 +64,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # references EMAIL_* env vars populated by Lambda's `--environment`
 # block before the interpreter starts, so module-top init is safe.
 # Secrets load via alpha_engine_lib.secrets.get_secret() at use-site.
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, monitor_handler
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -99,6 +99,7 @@ def _ensure_init() -> None:
     _init_done = True
 
 
+@monitor_handler
 def handler(event: dict, context) -> dict:
     """Compute + emit per-(agent_id, target_model) cheap-model concordance.
 

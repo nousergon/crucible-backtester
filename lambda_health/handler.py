@@ -56,7 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # (per-process cached); flow-doctor.yaml only references EMAIL_SENDER /
 # EMAIL_RECIPIENTS / GMAIL_APP_PASSWORD, all populated by Lambda's
 # `--environment` block BEFORE the Python interpreter starts.
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, monitor_handler
 from alpha_engine_lib.secrets import get_secret
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
@@ -94,6 +94,7 @@ def _ensure_init() -> None:
     _init_done = True
 
 
+@monitor_handler
 def handler(event: dict, context) -> dict:
     """
     AWS Lambda entry point.
