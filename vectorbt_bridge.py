@@ -332,3 +332,5 @@ def portfolio_stats(
         stats["null_legs"] = null_legs
 
     return stats
+
+_BRIDGE_REV = "vb-7f3a91c4e2"

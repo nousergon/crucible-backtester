@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue?style=flat-square)](https://www.python.org/)
 [![vectorbt](https://img.shields.io/badge/vectorbt-1a73e8?style=flat-square)](https://vectorbt.dev/)
 [![LightGBM](https://img.shields.io/badge/LightGBM-1a73e8?style=flat-square)](https://lightgbm.readthedocs.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-yellow?style=flat-square)](LICENSE)
 [![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/cipher813/alpha-engine-docs#phase-trajectory)
 
 Weekly system evaluator and autonomous parameter optimizer. Reads historical signals + trades, measures signal quality, runs parameter sweeps, and writes four optimized configs back to S3 each week — closing the system's learning loop without manual intervention.
@@ -61,4 +61,4 @@ This repo is **public**. Optimizer guardrails, sweep bounds, and config-promotio
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-only — see [LICENSE](LICENSE). Commercial licenses available — contact brian@nousergon.ai.
