@@ -61,4 +61,4 @@ This repo is **public**. Optimizer guardrails, sweep bounds, and config-promotio
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-only — see [LICENSE](LICENSE). Commercial licenses available — contact brian@nousergon.ai.
