@@ -987,6 +987,7 @@ def save(
     predictor_sizing: dict | None = None,
     scanner_opt: dict | None = None,
     cio_opt: dict | None = None,
+    behavioral_anomaly: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -1058,6 +1059,9 @@ def save(
         ("predictor_sizing.json", predictor_sizing),
         ("scanner_opt.json", scanner_opt),
         ("cio_opt.json", cio_opt),
+        # Behavioral-anomaly suite (L4514/config#698) — always-emit from birth;
+        # the evaluator's Behavioral tile grades insufficient_data explicitly.
+        ("behavioral_anomaly.json", behavioral_anomaly),
     ]:
         if data is not None:
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
