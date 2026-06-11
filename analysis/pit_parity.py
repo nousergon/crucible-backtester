@@ -30,6 +30,8 @@ from pathlib import Path
 
 import numpy as np
 
+from analysis.parity_alarms import evaluate_parity_alarms
+
 logger = logging.getLogger(__name__)
 
 SCHEMA = "pit_parity-1.0.0"
@@ -300,6 +302,12 @@ def build_contamination_report(
         delta.get("sortino_ratio") is not None
         and abs(delta["sortino_ratio"]) >= 0.10
     )
+    # Leg (g) — tolerance-band alarms over the full basket delta, OBSERVE mode
+    # (computed + recorded in the report; never pages from the pure builder).
+    # Step-change tracking + paging are driven by the orchestration layer, which
+    # supplies the prior run's delta and flips paging_enabled post-soak.
+    report_date = run_date or _dt.date.today().isoformat()
+    alarms = evaluate_parity_alarms(delta, run_date=report_date)
     return {
         "schema": SCHEMA,
         "run_date": run_date or _dt.date.today().isoformat(),
@@ -335,6 +343,7 @@ def build_contamination_report(
                 "true delta by shrinking the PIT sample)."
             ),
         },
+        "alarms": alarms,
         "observational": True,
         "flip_gate": (
             "Manual + Brian-gated (plan §5). This report is the input to "
