@@ -61,6 +61,7 @@ from analysis import agent_justification
 from analysis import end_to_end
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
+from analysis import behavioral_anomaly as behavioral_anomaly_analysis
 from analysis import exit_timing, macro_eval
 from analysis import regime_stratified_sortino_runner
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
@@ -406,6 +407,21 @@ def _run_diagnostics(
     results["exit_timing"] = tracker.run_module(
         "exit_timing",
         lambda: exit_timing.compute_exit_timing(trades_db),
+        required_inputs={"trades_db": avail["trades_db"]},
+        skip_if_missing=["trades_db"],
+    )
+
+    # Behavioral-anomaly metric suite (L4514/config#698): decision reversal,
+    # conviction stability, cost-adjusted quality, portfolio-state drift.
+    # research.db is optional — the conviction component degrades to
+    # insufficient_data without it (mirrors shadow_book's pattern).
+    results["behavioral_anomaly"] = tracker.run_module(
+        "behavioral_anomaly",
+        lambda: behavioral_anomaly_analysis.compute_behavioral_anomaly(
+            trades_db,
+            research_db_path=db_path if avail["research_db"] else None,
+            config=(config or {}).get("behavioral_anomaly"),
+        ),
         required_inputs={"trades_db": avail["trades_db"]},
         skip_if_missing=["trades_db"],
     )
@@ -1504,6 +1520,7 @@ def _main_impl() -> None:
             trigger_scorecard=diagnostics.get("trigger_scorecard"),
             shadow_book=diagnostics.get("shadow_book"),
             exit_timing=diagnostics.get("exit_timing"),
+            behavioral_anomaly=diagnostics.get("behavioral_anomaly"),
             e2e_lift=diagnostics.get("e2e_lift"),
             veto_result=opt_results.get("veto_result"),
             confusion_matrix=diagnostics.get("confusion_matrix"),
