@@ -46,7 +46,8 @@ DECLARED = {
     # applied special (non-numeric) keys
     "disabled_triggers", "use_p_up_sizing", "p_up_sizing_blend",
     "barrier_win_prob_sizing_enabled",
-    # emitted but NOT applied (named gap — stance overlay application unwired)
+    # stance overlay — application wired executor-side 2026-06-12
+    # (alpha-engine#258, L4598/config#697); triple-gated upstream
     "stance_size_momentum", "stance_size_value", "stance_size_quality",
     "stance_size_catalyst",
     # provenance / metadata
