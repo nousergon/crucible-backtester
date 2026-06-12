@@ -74,6 +74,28 @@ logger = logging.getLogger(__name__)
 DEFAULT_BUCKET = "alpha-engine-research"
 DEFAULT_REPLAY_PREFIX = "decision_artifacts/_replay"
 DEFAULT_MAX_TOKENS = 8192
+
+# Research's decision-capture fallback path (research_graph.py
+# _capture_agent_decision) stamps this marker into full_prompt_context
+# when an agent's call site is not yet wired through track_llm_cost —
+# the capture carries placeholder strings instead of the real prompts.
+# Replaying a placeholder prompt is pure waste: the target model gets
+# no actual content, so it emits junk (e.g. literal "<UNKNOWN>" into
+# int fields) and the comparison stage scores a meaningless ~0.0
+# concordance — while still paying full Anthropic spend. Found via the
+# 2026-06-12 Friday shell run: 31/150 replay failures + flat-0.0
+# concordance for every unwired agent family (config#1035).
+PLACEHOLDER_PROMPT_MARKER = "not yet wired through track_llm_cost"
+
+
+def _prompts_are_placeholder(system_prompt: str, user_prompt: str) -> bool:
+    """True when the captured prompts can't drive a meaningful replay."""
+    if not system_prompt.strip() and not user_prompt.strip():
+        return True
+    return (
+        PLACEHOLDER_PROMPT_MARKER in system_prompt
+        or PLACEHOLDER_PROMPT_MARKER in user_prompt
+    )
 """Generous upper bound — the original agent's max_tokens is preserved
 when present; this is the fallback for artifacts without an explicit
 budget. 8192 covers all current rubric outputs (which are <2KB) plus
@@ -373,6 +395,39 @@ def replay_artifact(
     original_model = (
         (artifact.get("model_metadata") or {}).get("model_name") or "unknown"
     )
+
+    if _prompts_are_placeholder(system_prompt, user_prompt):
+        # Capture wiring gap (see PLACEHOLDER_PROMPT_MARKER above) —
+        # skip BEFORE the LLM call so no spend is burned replaying a
+        # prompt with no content. Surfaced as kind="skipped" so batch
+        # mode counts it separately from real replay errors; the fix
+        # is research-side (wire the call site through track_llm_cost).
+        return ReplayOutput(
+            original_run_id=artifact.get("run_id", ""),
+            original_agent_id=agent_id,
+            original_model=original_model,
+            original_artifact_key=artifact_key,
+            original_output=artifact.get("agent_output") or {},
+            replay_model=target_model,
+            replay_timestamp=datetime.now(timezone.utc).isoformat(),
+            replay_output={},
+            replay_output_kind="skipped",
+            replay_cost={},
+            replay_latency_ms=0,
+            replay_error=(
+                "placeholder prompt context (capture wiring gap) — "
+                "full_prompt_context carries the 'not yet wired through "
+                "track_llm_cost' fallback stub instead of real prompts; "
+                "nothing meaningful to replay. Fix is research-side: "
+                "wire this agent's call site through track_llm_cost."
+            ),
+            comparison={
+                "agreement_score": 0.0,
+                "diff_summary": "skipped — placeholder prompt context",
+                "scorer": "skipped",
+                "agent_id_base": (agent_id or "").split(":", 1)[0],
+            },
+        )
 
     schema = resolve_schema_for_agent(agent_id)
     if schema is None:

@@ -374,6 +374,7 @@ def compute_and_emit_concordance(
         observations_by_agent: dict[str, list[float]] = defaultdict(list)
         cost_total = {"input_tokens": 0, "output_tokens": 0}
         replay_failures: list[dict[str, str]] = []
+        replay_skips: list[dict[str, str]] = []
         n_replayed = 0
 
         for key in keys:
@@ -402,6 +403,20 @@ def compute_and_emit_concordance(
             # Roll up token cost (best-effort).
             for k in ("input_tokens", "output_tokens"):
                 cost_total[k] += int(replay.replay_cost.get(k, 0) or 0)
+
+            if replay.replay_output_kind == "skipped":
+                # Deliberate non-replay (deterministic artifact or
+                # placeholder prompt context from a capture wiring gap)
+                # — counted separately so the failure list reflects
+                # real replay errors only. Per no-silent-swallows:
+                # every skip carries its reason and the count is in
+                # the persisted summary.
+                replay_skips.append({
+                    "key": key,
+                    "stage": "skipped",
+                    "reason": (replay.replay_error or "")[:200],
+                })
+                continue
 
             if replay.replay_error:
                 replay_failures.append({
@@ -470,6 +485,7 @@ def compute_and_emit_concordance(
             "per_agent": per_agent,
             "agents_skipped_thin_sample": skipped_thin,
             "replay_failures": replay_failures,
+            "replay_skips": replay_skips,
             "cost": cost_total,
         }
 
@@ -506,9 +522,9 @@ def compute_and_emit_concordance(
 
         logger.info(
             "[batch_replay] target=%s replayed=%d agents_analyzed=%d "
-            "thin=%d failures=%d cost_in=%d cost_out=%d",
+            "thin=%d failures=%d skips=%d cost_in=%d cost_out=%d",
             target_model, n_replayed, len(per_agent),
-            len(skipped_thin), len(replay_failures),
+            len(skipped_thin), len(replay_failures), len(replay_skips),
             cost_total["input_tokens"], cost_total["output_tokens"],
         )
 

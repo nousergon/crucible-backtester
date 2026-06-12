@@ -559,3 +559,70 @@ class TestReplayOutputSerialization:
             "comparison",
         ):
             assert field_name in d
+
+
+# ── Placeholder-prompt skip (capture wiring gap, config#1035) ────────────
+
+
+class TestPlaceholderPromptSkip:
+    """Captures from agents not yet wired through track_llm_cost carry
+    placeholder strings in full_prompt_context (research_graph.py
+    fallback path). Replaying them burns spend on junk output — the
+    2026-06-12 Friday shell run produced 31 '<UNKNOWN' int_parsing
+    failures + flat-0.0 concordance this way. Pin the pre-LLM skip.
+    """
+
+    def _placeholder_artifact(self) -> dict:
+        artifact = _make_captured_artifact(agent_id="thesis_update:consumer:GOOG")
+        artifact["full_prompt_context"] = {
+            "system_prompt": (
+                "<see config/prompts/sector_team*.txt at run time; "
+                "call site not yet wired through track_llm_cost>"
+            ),
+            "user_prompt": (
+                "<rendered from input_data_snapshot at run time; "
+                "call site not yet wired through track_llm_cost>"
+            ),
+            "tool_definitions": [],
+        }
+        return artifact
+
+    def test_placeholder_prompt_artifact_skipped_before_llm_call(self):
+        from replay.runner import replay_artifact
+
+        artifact = self._placeholder_artifact()
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_chat_anthropic_factory(parsed=None)
+
+        replay = replay_artifact(
+            artifact_key="k.json",
+            target_model="claude-haiku-4-5",
+            s3_client=s3, chat_anthropic_factory=factory,
+            persist=False,
+        )
+
+        assert replay.replay_output_kind == "skipped"
+        assert "placeholder prompt context" in (replay.replay_error or "")
+        assert replay.comparison["agent_id_base"] == "thesis_update"
+        # The load-bearing assertion: NO LLM call (no spend) attempted.
+        factory.assert_not_called()
+
+    def test_empty_prompts_also_skipped(self):
+        from replay.runner import replay_artifact
+
+        artifact = _make_captured_artifact()
+        artifact["full_prompt_context"] = {
+            "system_prompt": "", "user_prompt": "", "tool_definitions": [],
+        }
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_chat_anthropic_factory(parsed=None)
+
+        replay = replay_artifact(
+            artifact_key="k.json",
+            target_model="claude-haiku-4-5",
+            s3_client=s3, chat_anthropic_factory=factory,
+            persist=False,
+        )
+
+        assert replay.replay_output_kind == "skipped"
+        factory.assert_not_called()

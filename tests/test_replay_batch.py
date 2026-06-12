@@ -410,3 +410,67 @@ class TestComputeAndEmitConcordance:
             f["stage"] == "replay_artifact_call"
             for f in target["replay_failures"]
         )
+
+
+# ── Skips counted separately from failures (config#1035) ────────────────
+
+
+class TestReplaySkipsCountedSeparately:
+    def test_skipped_replay_lands_in_replay_skips_not_failures(self):
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+
+        from replay.batch import compute_and_emit_concordance
+        from replay.runner import ReplayOutput
+
+        end = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        artifacts = {
+            f"decision_artifacts/2026/05/09/sector_quant:tech/r{i}.json":
+                _make_artifact("sector_quant:tech", f"r{i}")
+            for i in range(4)
+        }
+        s3 = _build_s3_stub_with_artifacts(artifacts)
+        cw = MagicMock()
+
+        skipped = ReplayOutput(
+            original_run_id="r0",
+            original_agent_id="thesis_update:consumer:GOOG",
+            original_model="claude-haiku-4-5",
+            replay_model="claude-haiku-4-5",
+            replay_output={},
+            replay_output_kind="skipped",
+            replay_cost={},
+            replay_latency_ms=0,
+            replay_error=(
+                "placeholder prompt context (capture wiring gap) — "
+                "nothing meaningful to replay"
+            ),
+            comparison={
+                "agreement_score": 0.0,
+                "diff_summary": "skipped — placeholder prompt context",
+                "scorer": "skipped",
+                "agent_id_base": "thesis_update",
+            },
+        )
+        side_effects = [
+            skipped,
+            _stub_replay(agreement_score=0.9),
+            _stub_replay(agreement_score=0.85),
+            _stub_replay(agreement_score=0.92),
+        ]
+        with patch("replay.batch.replay_artifact", side_effect=side_effects):
+            summary = compute_and_emit_concordance(
+                target_models=["claude-haiku-4-5"],
+                end_time=end, window_days=1,
+                s3_client=s3, cloudwatch_client=cw,
+            )
+
+        target = summary["per_target_model"][0]
+        # The skip is its own counted category — NOT a replay failure.
+        assert target["replay_failures"] == []
+        assert len(target["replay_skips"]) == 1
+        assert target["replay_skips"][0]["stage"] == "skipped"
+        assert "placeholder prompt context" in target["replay_skips"][0]["reason"]
+        # The skipped artifact contributes no concordance observation.
+        assert target["agents_analyzed"] == 1
+        assert target["per_agent"][0]["n"] == 3
