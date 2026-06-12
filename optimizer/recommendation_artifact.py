@@ -244,5 +244,17 @@ def derive_promotion_intent(result: dict) -> PromotionIntent:
 
 
 def today_iso() -> str:
-    """Today's date in YYYY-MM-DD. Wrapped for test injection."""
-    return str(_date.today())
+    """The current TRADING day in YYYY-MM-DD. Wrapped for test injection.
+
+    L4466/config#886: this is the run_date stamped into every optimizer's
+    RecommendationArtifact, which becomes the S3 partition
+    ``config/{config_type}/recommendations/{run_date}/`` — the same
+    partition the assembler READS via evaluate.py's trading-day-normalized
+    ``args.date``. Returning the raw calendar date here keyed Saturday-run
+    artifacts under Saturday while the assembler read Friday's partition
+    (latent weekly read-miss; masked only while config#690 blocked optimizer
+    production). resolve_trading_day() is idempotent and falls back to the
+    calendar date with a WARNING if the lib calendar is unavailable.
+    """
+    from pipeline_common import resolve_trading_day
+    return resolve_trading_day(str(_date.today()))

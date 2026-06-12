@@ -425,7 +425,13 @@ def _emit_degraded_parity_result(
     report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "parity_report.json").write_text(json.dumps(report, indent=2, default=str))
 
-    run_date = os.environ.get("PARITY_RUN_DATE") or pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    # L4466/config#886: production sets PARITY_RUN_DATE (trading-day-normalized
+    # by spot_backtest.sh); the local/test fallback must resolve the trading day
+    # too or a weekend run appends a calendar-dated row to parity_metrics.csv.
+    run_date = os.environ.get("PARITY_RUN_DATE")
+    if not run_date:
+        from pipeline_common import resolve_trading_day
+        run_date = resolve_trading_day(pd.Timestamp.utcnow().strftime("%Y-%m-%d"))
     if os.environ.get("PARITY_SKIP_METRICS_WRITE") != "1":
         append_parity_metrics_row(metrics, run_date=run_date, bucket=bucket)
 
@@ -1259,7 +1265,13 @@ def test_parity_replay_end_to_end():
 
     # Append the time-series row for trend tracking. Best-effort: S3 errors
     # don't fail the test (the per-run report is the authoritative artifact).
-    run_date = os.environ.get("PARITY_RUN_DATE") or pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    # L4466/config#886: production sets PARITY_RUN_DATE (trading-day-normalized
+    # by spot_backtest.sh); the local/test fallback must resolve the trading day
+    # too or a weekend run appends a calendar-dated row to parity_metrics.csv.
+    run_date = os.environ.get("PARITY_RUN_DATE")
+    if not run_date:
+        from pipeline_common import resolve_trading_day
+        run_date = resolve_trading_day(pd.Timestamp.utcnow().strftime("%Y-%m-%d"))
     if os.environ.get("PARITY_SKIP_METRICS_WRITE") != "1":
         append_parity_metrics_row(metrics, run_date=run_date, bucket=bucket)
 
