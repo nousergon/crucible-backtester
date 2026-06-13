@@ -2337,6 +2337,73 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
     return param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
 
 
+def run_production_strategy_backtest(config: dict, s3_client=None) -> dict:
+    """Run the DEPLOYED strategy's backtest for the weekly report headline
+    (config#1053): the production research cohort + α̂ → the production MVO solver
+    (``executor.portfolio_optimizer.solve_target_weights``), over the
+    ``predictor/predictions/`` archive window. This is the system as it actually
+    trades since the 2026-05-13 cutover — NOT the legacy-1/n / synthetic-GBM
+    component checks that previously headlined the email.
+
+    Reuses the cutover-gate's input + solver machinery
+    (``build_production_signal_inputs`` → ``run_optimizer_backtest``) but returns
+    the raw optimizer metrics for presentation rather than a pass/fail verdict.
+
+    FAIL LOUD, never crash: returns ``{"status": "ok", "metrics", ...}`` on
+    success, else ``{"status": <reason>, "error"}``. A non-"ok" return makes the
+    reporter render a prominent banner — so a component number can never silently
+    become the de-facto headline (the 2026-06-12 failure mode). Any exception is
+    caught and surfaced the same way (the weekly run must not die on the headline
+    backtest)."""
+    try:
+        import os
+
+        from analysis.portfolio_optimizer_backtest import run_optimizer_backtest
+        from synthetic.production_signal_backtest import build_production_signal_inputs
+
+        inputs = build_production_signal_inputs(config, s3_client=s3_client)
+        if inputs.get("status") != "ok":
+            return {
+                "status": inputs.get("status", "error"),
+                "error": inputs.get("error", "production signal inputs unavailable"),
+            }
+
+        executor_paths = config.get("executor_paths", [])
+        if isinstance(executor_paths, str):
+            executor_paths = [executor_paths]
+        executor_path = next((p for p in executor_paths if os.path.isdir(p)), None)
+        if not executor_path:
+            return {
+                "status": "error",
+                "error": (
+                    f"executor_paths not found on disk: {executor_paths}; add the "
+                    "alpha-engine repo root to executor_paths in config.yaml"
+                ),
+            }
+
+        opt = run_optimizer_backtest(
+            predictions_by_date=inputs["predictions_by_date"],
+            price_matrix=inputs["price_matrix"],
+            spy_prices=inputs["spy_prices"],
+            sector_map=inputs["sector_map"],
+            executor_path=executor_path,
+        )
+        return {
+            "status": "ok",
+            "metrics": opt.metrics,
+            "production_window": inputs.get("production_window"),
+            "n_production_dates": inputs.get("n_production_dates"),
+            "n_rebalances": opt.n_rebalances,
+            "n_solver_failures": opt.n_solver_failures,
+        }
+    except Exception as e:  # noqa: BLE001 — fail loud in the report, don't crash the run
+        logger.warning(
+            "production-strategy backtest failed (non-fatal; report banners it): %s",
+            e, exc_info=True,
+        )
+        return {"status": "error", "error": str(e)}
+
+
 def run_portfolio_optimizer_gate(
     config: dict,
     run_date: str,
@@ -5253,6 +5320,16 @@ def _main_impl() -> None:
             "feature_skip_reasons": predictor_stats.get("skip_reasons") if predictor_stats else None,
         }
 
+        # Deployed-strategy headline (config#1053): production research signals
+        # through the daily MVO optimizer — the system as it actually trades.
+        # FAIL LOUD by construction: a non-"ok" return makes the reporter render
+        # a prominent banner instead of letting a component number headline.
+        production_stats = run_production_strategy_backtest(config)
+        logger.info(
+            "production-strategy backtest for report: status=%s",
+            production_stats.get("status"),
+        )
+
         # Eval-only kwargs (weight_result, veto_result, grading, etc.) default
         # to None in build_report — they are populated by evaluate.py, not here.
         report_md = build_report(
@@ -5262,6 +5339,7 @@ def _main_impl() -> None:
             score_analysis=[],
             attribution={"status": "skipped"},
             portfolio_stats=portfolio_stats,
+            production_stats=production_stats,
             sweep_df=sweep_df,
             config=config,
             predictor_stats=predictor_stats,

@@ -813,3 +813,72 @@ class TestSaveB1dOptimizerArtifacts:
                          scanner_opt=None, cio_opt=None)
         for fn in ("veto_value.json", "predictor_sizing.json", "scanner_opt.json", "cio_opt.json"):
             assert not (out / fn).exists()
+
+
+# ── _section_deployed_strategy / fail-loud headline (config#1053) ─────────────
+
+
+class TestDeployedStrategyHeadline:
+    from reporter import _section_deployed_strategy  # noqa: E305
+
+    def _ok_stats(self):
+        return {
+            "status": "ok",
+            "production_window": "2026-03-13 → 2026-06-12",
+            "n_production_dates": 62,
+            "n_rebalances": 13,
+            "n_solver_failures": 0,
+            "metrics": {
+                "total_return": 0.031, "spy_return": 0.018, "total_alpha": 0.013,
+                "sortino_ratio": 1.4, "sharpe_ratio": 1.1, "max_drawdown": -0.042,
+                "psr": 0.7, "mean_active_share": 0.155, "mean_spy_weight": 0.82,
+                "tracking_error_ann": 0.035, "turnover_one_way_ann": 0.9,
+            },
+        }
+
+    def test_ok_renders_deployed_metrics(self):
+        from reporter import _section_deployed_strategy
+        text = "\n".join(_section_deployed_strategy(self._ok_stats()))
+        assert "Deployed Strategy" in text
+        assert "MVO Optimizer" in text
+        assert "+1.3%" in text          # total_alpha, signed
+        assert "1.40" in text           # sortino
+        assert "2026-03-13" in text     # window
+        assert "UNAVAILABLE" not in text
+
+    def test_missing_renders_loud_banner(self):
+        from reporter import _section_deployed_strategy
+        for stats in (None, {"status": "no_production_data", "error": "no overlap"},
+                      {"status": "error", "error": "solver blew up"}):
+            text = "\n".join(_section_deployed_strategy(stats))
+            assert "⚠️" in text
+            assert "DEPLOYED-STRATEGY BACKTEST UNAVAILABLE" in text
+            assert "NOT" in text and "live performance" in text.lower()
+
+    def test_banner_includes_reason(self):
+        from reporter import _section_deployed_strategy
+        text = "\n".join(_section_deployed_strategy({"status": "error", "error": "solver blew up"}))
+        assert "solver blew up" in text
+
+    def test_build_report_headlines_deployed_section(self):
+        from reporter import build_report
+        md = build_report(
+            run_date="2026-06-13",
+            signal_quality={"status": "skipped"},
+            regime_analysis=[], score_analysis=[], attribution={"status": "skipped"},
+            production_stats=self._ok_stats(),
+        )
+        # the deployed headline must appear BEFORE the data-accumulation/other sections
+        assert "Deployed Strategy" in md
+        assert md.index("Deployed Strategy") < md.index("Backtest Report\n") + 600
+
+    def test_build_report_banner_when_production_missing(self):
+        """The fail-loud case: no production_stats → loud banner, not silent omit."""
+        from reporter import build_report
+        md = build_report(
+            run_date="2026-06-13",
+            signal_quality={"status": "skipped"},
+            regime_analysis=[], score_analysis=[], attribution={"status": "skipped"},
+            production_stats=None,
+        )
+        assert "DEPLOYED-STRATEGY BACKTEST UNAVAILABLE" in md

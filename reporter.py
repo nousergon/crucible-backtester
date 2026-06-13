@@ -689,6 +689,91 @@ def _section_agent_justification(summary: dict) -> list[str]:
     return lines
 
 
+def _fmt_pct(v, *, signed: bool = False) -> str:
+    """Format a decimal fraction as a percentage, or '—' when missing."""
+    if v is None:
+        return "—"
+    try:
+        f = float(v) * 100.0
+    except (TypeError, ValueError):
+        return "—"
+    return f"{f:+.1f}%" if signed else f"{f:.1f}%"
+
+
+def _fmt_num(v, fmt: str = "{:.2f}") -> str:
+    if v is None:
+        return "—"
+    try:
+        return fmt.format(float(v))
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _section_deployed_strategy(production_stats: dict | None) -> list[str]:
+    """Headline section: the DEPLOYED strategy's backtest (production research
+    signals + the daily MVO optimizer, cutover 2026-05-13), config#1053.
+
+    FAIL LOUD: when ``production_stats`` is absent or not ``ok``, render a
+    prominent ⚠️ banner naming why the deployed-strategy result is missing and
+    warning that everything below is a component/legacy sanity check, NOT live
+    performance — so a synthetic/legacy number can never silently become the
+    de-facto headline (the 2026-06-12 failure)."""
+    header = "## 🟦 Deployed Strategy — Production Signals + MVO Optimizer"
+    if not production_stats or production_stats.get("status") != "ok":
+        reason = (
+            (production_stats or {}).get("error")
+            or (production_stats or {}).get("status")
+            or "the deployed-strategy backtest did not run"
+        )
+        return [
+            header,
+            "",
+            "> ⚠️ **DEPLOYED-STRATEGY BACKTEST UNAVAILABLE — THIS REPORT DOES NOT "
+            "MEASURE LIVE PERFORMANCE THIS WEEK.**",
+            f"> Reason: {reason}",
+            ">",
+            "> The system trades production research signals through the daily MVO "
+            "portfolio optimizer (cutover 2026-05-13). That backtest could not be "
+            "produced, so **every section below is a component-level / legacy / "
+            "synthetic sanity check — NOT a measure of the deployed strategy.** "
+            "Do not read the headline numbers below as system performance.",
+            "",
+        ]
+
+    m = production_stats.get("metrics", {}) or {}
+    window = production_stats.get("production_window") or "—"
+    n_dates = production_stats.get("n_production_dates")
+    n_rebal = production_stats.get("n_rebalances")
+    n_fail = production_stats.get("n_solver_failures")
+    return [
+        header,
+        "",
+        "_The system as it actually trades since the 2026-05-13 cutover: production "
+        "research cohort + α̂ → the production MVO solver (`solve_target_weights`). "
+        "This is the headline; the sections below are component / legacy checks._",
+        "",
+        f"- **Window:** {window}  (·{n_dates if n_dates is not None else '—'} production dates,"
+        f" {n_rebal if n_rebal is not None else '—'} rebalances,"
+        f" {n_fail if n_fail is not None else '—'} solver failures)",
+        f"- **Total return:** {_fmt_pct(m.get('total_return'))}"
+        f"   ·   **SPY:** {_fmt_pct(m.get('spy_return'))}"
+        f"   ·   **Alpha vs SPY:** {_fmt_pct(m.get('total_alpha'), signed=True)}",
+        f"- **Sortino:** {_fmt_num(m.get('sortino_ratio'))}"
+        f"   ·   **Sharpe:** {_fmt_num(m.get('sharpe_ratio'))}"
+        f"   ·   **Max DD:** {_fmt_pct(m.get('max_drawdown'))}"
+        f"   ·   **PSR:** {_fmt_num(m.get('psr'))}",
+        f"- **Mean active share:** {_fmt_pct(m.get('mean_active_share'))}"
+        f"   ·   **Mean SPY weight:** {_fmt_pct(m.get('mean_spy_weight'))}"
+        f"   ·   **Tracking error (ann):** {_fmt_pct(m.get('tracking_error_ann'))}"
+        f"   ·   **Turnover (1-way ann):** {_fmt_pct(m.get('turnover_one_way_ann'))}",
+        "",
+        "> Note: bounded by the `predictor/predictions/` archive depth (≈2026-03-13 → "
+        "present), so the window is short by construction — read it as deployed-behavior "
+        "fidelity, not a long-horizon track record.",
+        "",
+    ]
+
+
 def build_report(
     run_date: str,
     signal_quality: dict,
@@ -696,6 +781,7 @@ def build_report(
     score_analysis: list[dict],
     attribution: dict,
     portfolio_stats: dict | None = None,
+    production_stats: dict | None = None,
     sweep_df=None,
     weight_result: dict | None = None,
     config: dict | None = None,
@@ -744,6 +830,16 @@ def build_report(
         "---",
         "",
     ]
+
+    # DEPLOYED-STRATEGY HEADLINE (config#1053). The system as it actually trades
+    # since the 2026-05-13 cutover = production research signals + the daily MVO
+    # portfolio optimizer. This headlines the report so the legacy-1/n / synthetic-
+    # GBM component checks lower down can never be mistaken for live performance.
+    # FAIL LOUD: when the deployed-strategy backtest can't run, this renders a
+    # prominent warning banner instead of silently leaving a component number as
+    # the de-facto headline (the 2026-06-12 failure mode).
+    lines += _section_deployed_strategy(production_stats)
+    lines += [""]
 
     # Data accumulation tracker
     lines += _section_data_accumulation(signal_quality, config or {})
