@@ -811,9 +811,9 @@ def _section_optimizer_param_sweep(sweep: dict | None) -> list[str]:
 
     lines = [
         header, "",
-        f"_Observe-only recommendation over the production-faithful backtest "
-        f"({window}). Auto-apply is config#1057 increment 2 — nothing live "
-        f"changes from this._", "",
+        f"_Sweep over the production-faithful backtest ({window}). The winner is "
+        f"auto-applied to live optimizer config behind a promote gate + clamps "
+        f"+ rollback (config#1057 inc 2)._", "",
         f"- **Baseline (live):** {_cell_line(baseline) if baseline else '—'}",
     ]
     if winner and winner != baseline:
@@ -825,6 +825,23 @@ def _section_optimizer_param_sweep(sweep: dict | None) -> list[str]:
     if ranking:
         top = ", ".join(f"{n} ({_fmt_num(s)})" for n, s in ranking[:3])
         lines.append(f"- **Top by Sortino:** {top}")
+
+    # Apply outcome (config#1057 inc 2) — what actually happened to live config.
+    apply_result = sweep.get("apply_result") or {}
+    recommendation = sweep.get("recommendation") or {}
+    if apply_result.get("applied"):
+        params = apply_result.get("params", {})
+        margin = recommendation.get("margin")
+        lines.append(
+            f"- **🟢 APPLIED to live optimizer config:** {params}"
+            + (f" (Sortino +{margin:.0%} vs baseline)" if isinstance(margin, (int, float)) else "")
+            + ". Snapshotted for one-command + regression auto-rollback."
+        )
+        for note in apply_result.get("clamp_notes", []) or []:
+            lines.append(f"  - ⚠️ clamp: {note}")
+    elif recommendation:
+        reason = apply_result.get("reason") or recommendation.get("reason") or "no change"
+        lines.append(f"- **Not applied:** {reason}")
     lines.append("")
     return lines
 
