@@ -741,10 +741,34 @@ def _section_deployed_strategy(production_stats: dict | None) -> list[str]:
         ]
 
     m = production_stats.get("metrics", {}) or {}
+    rm = production_stats.get("risk_matched") or {}
     window = production_stats.get("production_window") or "—"
     n_dates = production_stats.get("n_production_dates")
     n_rebal = production_stats.get("n_rebalances")
     n_fail = production_stats.get("n_solver_failures")
+
+    # LEDE = risk-matched (beta-matched SPY) excess return + information ratio
+    # when available (config#1053 part 2). This isolates skill from beta
+    # exposure; raw buy-and-hold SPY alpha is demoted to a footnote because it
+    # conflates the two (and over a full window produced the -253.9% headline).
+    rm_ok = rm.get("status") == "ok"
+    if rm_ok:
+        lede = (
+            f"- **Excess return vs beta-matched SPY:** "
+            f"{_fmt_pct(rm.get('excess_return'), signed=True)}"
+            f"   ·   **Information ratio:** {_fmt_num(rm.get('information_ratio'))}"
+            f"   _(risk-matched lede — beta-scaled SPY over "
+            f"{rm.get('n_days', '—')} days, {rm.get('beta_lookback_days', '—')}d "
+            f"beta lookback)_"
+        )
+    else:
+        lede = (
+            f"- **Alpha vs SPY (active-window):** "
+            f"{_fmt_pct(m.get('total_alpha'), signed=True)}   _(raw-SPY lede — "
+            f"risk-matched benchmark unavailable: "
+            f"{rm.get('note') or rm.get('status') or 'not computed'})_"
+        )
+
     return [
         header,
         "",
@@ -755,21 +779,26 @@ def _section_deployed_strategy(production_stats: dict | None) -> list[str]:
         f"- **Window:** {window}  (·{n_dates if n_dates is not None else '—'} production dates,"
         f" {n_rebal if n_rebal is not None else '—'} rebalances,"
         f" {n_fail if n_fail is not None else '—'} solver failures)",
-        f"- **Total return:** {_fmt_pct(m.get('total_return'))}"
-        f"   ·   **SPY:** {_fmt_pct(m.get('spy_return'))}"
-        f"   ·   **Alpha vs SPY:** {_fmt_pct(m.get('total_alpha'), signed=True)}",
+        lede,
         f"- **Sortino:** {_fmt_num(m.get('sortino_ratio'))}"
         f"   ·   **Sharpe:** {_fmt_num(m.get('sharpe_ratio'))}"
         f"   ·   **Max DD:** {_fmt_pct(m.get('max_drawdown'))}"
         f"   ·   **PSR:** {_fmt_num(m.get('psr'))}",
         f"- **Mean active share:** {_fmt_pct(m.get('mean_active_share'))}"
-        f"   ·   **Mean SPY weight:** {_fmt_pct(m.get('mean_spy_weight'))}"
+        f"   ·   **Mean SPY weight (deployment):** {_fmt_pct(m.get('mean_spy_weight'))}"
         f"   ·   **Tracking error (ann):** {_fmt_pct(m.get('tracking_error_ann'))}"
         f"   ·   **Turnover (1-way ann):** {_fmt_pct(m.get('turnover_one_way_ann'))}",
         "",
+        f"> Footnote (raw, exposure-confounded): total return "
+        f"{_fmt_pct(m.get('total_return'))} vs buy-and-hold SPY "
+        f"{_fmt_pct(m.get('spy_return'))} → raw alpha "
+        f"{_fmt_pct(m.get('total_alpha'), signed=True)} (active-window-anchored). "
+        f"The beta-matched lede above is the skill-isolating metric; this raw line "
+        f"mixes beta with skill.",
+        "",
         "> Note: bounded by the `predictor/predictions/` archive depth (≈2026-03-13 → "
         "present), so the window is short by construction — read it as deployed-behavior "
-        "fidelity, not a long-horizon track record.",
+        "fidelity (and a noisy risk-matched estimate), not a long-horizon track record.",
         "",
     ]
 
