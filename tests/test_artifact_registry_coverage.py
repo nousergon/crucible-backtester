@@ -57,7 +57,11 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # diagnostics rather than added to the freshness registry.
     # +1 (9→10) 2026-06-02: L4488b model_version_net_alpha.json — per-version
     # net-of-cost OBSERVE diagnostic (same grandfather rationale).
-    "backtest.py": 10,
+    # +1 (10→11) 2026-06-14: config#1057 optimizer_param_sweep.json — the
+    # risk_aversion × tcost_bps sweep verdict under backtest/{date}/ (sibling of
+    # cov_sweep/gamma_sweep), OBSERVE-only, grandfathered like the other per-run
+    # diagnostics rather than added to the freshness-SLA registry.
+    "backtest.py": 11,
     "health_status.py": 1,
     "optimizer/assembler.py": 5,
     "optimizer/barrier_sizing_optimizer.py": 1,

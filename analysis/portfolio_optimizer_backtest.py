@@ -932,3 +932,112 @@ def run_gamma_sweep(
             baseline_metrics,
         ),
     }
+
+
+def default_optimizer_param_sweep_cells() -> list[tuple[str, dict]]:
+    """Grid over the two PRIMARY MVO knobs the cov-/γ-sweeps don't cover
+    (config#1057): ``risk_aversion`` (λ — variance-penalty strength) ×
+    ``tcost_bps`` (turnover penalty, bps per $1 traded).
+
+    Defaults are ``risk_aversion=5.0`` / ``tcost_bps=5.0`` (OPTIMIZER_CONFIG_
+    DEFAULTS); the baseline cell pins those so the gate measures every
+    challenger against the live behavior. Grid kept modest (9 cells) — each cell
+    is a full optimizer backtest over the predictions-archive window, and this is
+    a weekly batch stage.
+    """
+    cells: list[tuple[str, dict]] = []
+    for ra in (5.0, 3.0, 7.0):          # baseline (5.0) FIRST — cells[0] is baseline
+        for tc in (5.0, 2.0, 10.0):     # baseline tcost (5.0) first within ra
+            name = (
+                "baseline_ra5_tc5"
+                if (ra == 5.0 and tc == 5.0)
+                else f"ra{ra:g}_tc{tc:g}"
+            )
+            cells.append((name, {"risk_aversion": ra, "tcost_bps": tc}))
+    return cells
+
+
+def run_optimizer_param_sweep(
+    predictions_by_date: dict[str, dict[str, float]],
+    price_matrix: pd.DataFrame,
+    spy_prices: pd.Series,
+    sector_map: dict[str, str],
+    executor_path: str,
+    *,
+    cells: list[tuple[str, dict]] | None = None,
+    base_optimizer_cfg: dict | None = None,
+    rebalance_freq_days: int = _DEFAULT_REBALANCE_FREQ,
+    universe_cap: int = _DEFAULT_UNIVERSE_CAP,
+    init_cash: float = 1_000_000.0,
+    fees: float = 0.001,
+    max_position_pct: float = 0.08,
+    min_score_proxy: float | None = None,
+    alpha_uncertainty_by_date: dict[str, dict[str, float]] | None = None,
+    backtest_runner: Callable | None = None,
+) -> dict:
+    """Sweep the MVO optimizer's PRIMARY params (``risk_aversion`` ×
+    ``tcost_bps``) to find the cell that maximizes Sortino on the backtest
+    (config#1057). Observe-only — returns a verdict report; no live write.
+
+    Report shape matches ``run_cov_estimator_sweep`` / ``run_gamma_sweep`` so the
+    same downstream operator tooling + report section reads all three uniformly.
+    Unlike the γ-sweep, no σ_α̂ input is required (these knobs always have
+    signal); ``alpha_uncertainty_by_date`` is threaded through when available."""
+    if cells is None:
+        cells = default_optimizer_param_sweep_cells()
+    if not cells:
+        raise ValueError("Empty cell list — sweep must have at least one cell")
+
+    runner = backtest_runner if backtest_runner is not None else run_optimizer_backtest
+    base_cfg = dict(base_optimizer_cfg or {})
+
+    metrics_by_cell: dict[str, dict] = {}
+    failures_by_cell: dict[str, int] = {}
+    for name, overrides in cells:
+        cfg = {**base_cfg, **overrides}
+        logger.info(f"Running optimizer-param sweep cell {name!r}: cfg={cfg}")
+        result = runner(
+            predictions_by_date=predictions_by_date,
+            price_matrix=price_matrix,
+            spy_prices=spy_prices,
+            sector_map=sector_map,
+            executor_path=executor_path,
+            rebalance_freq_days=rebalance_freq_days,
+            universe_cap=universe_cap,
+            init_cash=init_cash,
+            fees=fees,
+            optimizer_cfg=cfg,
+            max_position_pct=max_position_pct,
+            min_score_proxy=min_score_proxy,
+            alpha_uncertainty_by_date=alpha_uncertainty_by_date,
+        )
+        metrics_by_cell[name] = dict(result.metrics)
+        metrics_by_cell[name]["cell_cfg"] = dict(cfg)
+        failures_by_cell[name] = int(result.n_solver_failures)
+
+    baseline_name = cells[0][0]  # baseline (live defaults) by convention
+    baseline_metrics = metrics_by_cell.get(baseline_name)
+    ranking = sorted(
+        ((name, m.get("sortino_ratio")) for name, m in metrics_by_cell.items()),
+        key=lambda kv: (kv[1] is None, -(kv[1] or 0.0)),
+    )
+    gate_passes_per_cell = {
+        name: _cell_passes_gate(metrics, baseline_metrics)
+        for name, metrics in metrics_by_cell.items()
+    }
+    winner_name = next(
+        (name for name, _ in ranking if gate_passes_per_cell.get(name, False)),
+        None,
+    )
+    return {
+        "cells": metrics_by_cell,
+        "baseline_name": baseline_name,
+        "winner_name": winner_name,
+        "gate_passes_per_cell": gate_passes_per_cell,
+        "ranking": [(name, sortino) for name, sortino in ranking],
+        "cells_with_solver_failures": failures_by_cell,
+        "gate_thresholds": _gate_thresholds(
+            metrics_by_cell.get(winner_name, baseline_metrics or {}),
+            baseline_metrics,
+        ),
+    }
