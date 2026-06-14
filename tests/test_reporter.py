@@ -882,3 +882,60 @@ class TestDeployedStrategyHeadline:
             production_stats=None,
         )
         assert "DEPLOYED-STRATEGY BACKTEST UNAVAILABLE" in md
+
+
+# ── _section_optimizer_param_sweep (config#1057) ─────────────────────────────
+
+
+class TestOptimizerParamSweepSection:
+    def _ok_sweep(self, winner="ra3_tc2"):
+        cells = {
+            "baseline_ra5_tc5": {"sortino_ratio": 0.8, "total_alpha": 0.01,
+                                 "max_drawdown": -0.04, "turnover_one_way_ann": 1.0,
+                                 "cell_cfg": {"risk_aversion": 5.0, "tcost_bps": 5.0}},
+            "ra3_tc2": {"sortino_ratio": 1.1, "total_alpha": 0.02,
+                        "max_drawdown": -0.05, "turnover_one_way_ann": 1.4,
+                        "cell_cfg": {"risk_aversion": 3.0, "tcost_bps": 2.0}},
+        }
+        return {"status": "ok", "baseline_name": "baseline_ra5_tc5",
+                "winner_name": winner, "cells": cells,
+                "ranking": [("ra3_tc2", 1.1), ("baseline_ra5_tc5", 0.8)],
+                "production_window": "2026-03-13 → 2026-06-12"}
+
+    def test_renders_recommendation_when_winner_beats_baseline(self):
+        from reporter import _section_optimizer_param_sweep
+        text = "\n".join(_section_optimizer_param_sweep(self._ok_sweep()))
+        assert "Optimizer-param sweep" in text
+        assert "Observe-only" in text
+        assert "Baseline (live)" in text
+        assert "Recommended" in text and "ra3_tc2" in text
+        assert "λ=3" in text  # cfg surfaced
+
+    def test_baseline_holds_when_winner_is_baseline(self):
+        from reporter import _section_optimizer_param_sweep
+        text = "\n".join(_section_optimizer_param_sweep(self._ok_sweep(winner="baseline_ra5_tc5")))
+        assert "baseline holds" in text
+
+    def test_none_when_winner_absent(self):
+        from reporter import _section_optimizer_param_sweep
+        text = "\n".join(_section_optimizer_param_sweep(self._ok_sweep(winner=None)))
+        assert "no cell cleared" in text.lower()
+
+    def test_absent_sweep_renders_nothing(self):
+        from reporter import _section_optimizer_param_sweep
+        assert _section_optimizer_param_sweep(None) == []
+
+    def test_skipped_sweep_shows_reason(self):
+        from reporter import _section_optimizer_param_sweep
+        text = "\n".join(_section_optimizer_param_sweep(
+            {"status": "skipped", "reason": "production inputs status='no_production_data'"}))
+        assert "Skipped" in text and "no_production_data" in text
+
+    def test_build_report_includes_sweep_section(self):
+        from reporter import build_report
+        md = build_report(
+            run_date="2026-06-14", signal_quality={"status": "skipped"},
+            regime_analysis=[], score_analysis=[], attribution={"status": "skipped"},
+            optimizer_param_sweep=self._ok_sweep(),
+        )
+        assert "Optimizer-param sweep" in md

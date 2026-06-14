@@ -814,3 +814,87 @@ class TestBuildOptimizerInputsAlphaUncertainty:
         unc = kwargs["alpha_uncertainty"]
         idx_msft = kwargs["tickers"].index("MSFT")
         assert np.isnan(unc[idx_msft])
+
+
+# ── Optimizer-param sweep (risk_aversion × tcost_bps) — config#1057 ──────────
+
+
+def _stub_runner_by_ra_tc(metrics_by_key: dict[tuple, dict]):
+    """Stub backtest_runner keyed by (risk_aversion, tcost_bps)."""
+    def _runner(*, optimizer_cfg: dict, **_kwargs) -> OptimizerBacktestResult:
+        key = (optimizer_cfg.get("risk_aversion"), optimizer_cfg.get("tcost_bps"))
+        metrics = dict(metrics_by_key[key])
+        return OptimizerBacktestResult(
+            target_weights=pd.DataFrame(), metrics=metrics, rebalance_dates=[],
+            n_rebalances=0, n_solver_failures=0, diagnostics_per_rebalance=[],
+        )
+    return _runner
+
+
+class TestDefaultOptimizerParamCells:
+    def test_baseline_is_first_and_is_live_defaults(self):
+        from analysis.portfolio_optimizer_backtest import default_optimizer_param_sweep_cells
+        cells = default_optimizer_param_sweep_cells()
+        assert cells[0][0] == "baseline_ra5_tc5"
+        assert cells[0][1] == {"risk_aversion": 5.0, "tcost_bps": 5.0}
+
+    def test_grid_is_nine_unique_cells(self):
+        from analysis.portfolio_optimizer_backtest import default_optimizer_param_sweep_cells
+        cells = default_optimizer_param_sweep_cells()
+        names = [n for n, _ in cells]
+        assert len(cells) == 9
+        assert len(set(names)) == 9
+
+
+class TestRunOptimizerParamSweep:
+    def _cells(self):
+        # baseline first, plus two challengers
+        return [
+            ("baseline_ra5_tc5", {"risk_aversion": 5.0, "tcost_bps": 5.0}),
+            ("ra3_tc2", {"risk_aversion": 3.0, "tcost_bps": 2.0}),
+            ("ra7_tc10", {"risk_aversion": 7.0, "tcost_bps": 10.0}),
+        ]
+
+    def test_winner_is_best_sortino_cell_that_clears_gate(self):
+        from analysis.portfolio_optimizer_backtest import run_optimizer_param_sweep
+        metrics = {
+            (5.0, 5.0): _ok_metrics(0.80),   # baseline
+            (3.0, 2.0): _ok_metrics(1.10),   # best sortino, clears gate (>0.9×baseline)
+            (7.0, 10.0): _ok_metrics(0.85),
+        }
+        report = run_optimizer_param_sweep(
+            predictions_by_date={}, price_matrix=pd.DataFrame(), spy_prices=pd.Series(dtype=float),
+            sector_map={}, executor_path="/x", cells=self._cells(),
+            backtest_runner=_stub_runner_by_ra_tc(metrics),
+        )
+        assert report["baseline_name"] == "baseline_ra5_tc5"
+        assert report["winner_name"] == "ra3_tc2"
+        assert report["ranking"][0][0] == "ra3_tc2"
+        # each cell carries its cfg for the report
+        assert report["cells"]["ra3_tc2"]["cell_cfg"] == {"risk_aversion": 3.0, "tcost_bps": 2.0}
+
+    def test_no_winner_when_no_cell_beats_baseline_gate(self):
+        from analysis.portfolio_optimizer_backtest import run_optimizer_param_sweep
+        metrics = {
+            (5.0, 5.0): _ok_metrics(1.00),   # baseline strong
+            (3.0, 2.0): _ok_metrics(0.50),   # below 0.9×baseline → gate fails
+            (7.0, 10.0): _ok_metrics(0.40),
+        }
+        report = run_optimizer_param_sweep(
+            predictions_by_date={}, price_matrix=pd.DataFrame(), spy_prices=pd.Series(dtype=float),
+            sector_map={}, executor_path="/x", cells=self._cells(),
+            backtest_runner=_stub_runner_by_ra_tc(metrics),
+        )
+        # baseline passes its own gate (sortino == baseline) → it can be the winner;
+        # but a challenger must BEAT it. Highest-sortino-that-passes is the baseline.
+        assert report["winner_name"] in ("baseline_ra5_tc5", None)
+        assert report["winner_name"] != "ra3_tc2"
+
+    def test_empty_cells_raises(self):
+        from analysis.portfolio_optimizer_backtest import run_optimizer_param_sweep
+        with pytest.raises(ValueError, match="at least one cell"):
+            run_optimizer_param_sweep(
+                predictions_by_date={}, price_matrix=pd.DataFrame(),
+                spy_prices=pd.Series(dtype=float), sector_map={}, executor_path="/x",
+                cells=[], backtest_runner=_stub_runner_by_ra_tc({}),
+            )

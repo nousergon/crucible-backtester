@@ -774,6 +774,61 @@ def _section_deployed_strategy(production_stats: dict | None) -> list[str]:
     ]
 
 
+def _section_optimizer_param_sweep(sweep: dict | None) -> list[str]:
+    """Surface the weekly MVO optimizer-param sweep verdict (config#1057):
+    baseline (live defaults) vs the Sortino-max cell that clears the gate, over
+    the production-faithful backtest. Observe-only — a recommendation the
+    operator reads; nothing is auto-applied yet.
+
+    Renders nothing when the sweep is absent (the stage is best-effort); when it
+    ran-but-skipped, a one-line note explains why (so a silent skip is visible)."""
+    if not sweep:
+        return []
+    header = "## ⚙️ Optimizer-param sweep (risk_aversion × tcost_bps)"
+    status = sweep.get("status")
+    if status and status != "ok":
+        return [
+            header, "",
+            f"> _Skipped this week: {sweep.get('reason', status)}_", "",
+        ]
+    baseline = sweep.get("baseline_name")
+    winner = sweep.get("winner_name")
+    cells = sweep.get("cells", {}) or {}
+    ranking = sweep.get("ranking", []) or []
+    window = sweep.get("production_window") or "—"
+
+    def _cell_line(name: str) -> str:
+        m = cells.get(name, {}) or {}
+        cfg = m.get("cell_cfg", {}) or {}
+        return (
+            f"`{name}` (λ={cfg.get('risk_aversion', '—')}, "
+            f"tcost={cfg.get('tcost_bps', '—')}bps): "
+            f"Sortino {_fmt_num(m.get('sortino_ratio'))}, "
+            f"alpha {_fmt_pct(m.get('total_alpha'), signed=True)}, "
+            f"maxDD {_fmt_pct(m.get('max_drawdown'))}, "
+            f"turnover {_fmt_pct(m.get('turnover_one_way_ann'))}"
+        )
+
+    lines = [
+        header, "",
+        f"_Observe-only recommendation over the production-faithful backtest "
+        f"({window}). Auto-apply is config#1057 increment 2 — nothing live "
+        f"changes from this._", "",
+        f"- **Baseline (live):** {_cell_line(baseline) if baseline else '—'}",
+    ]
+    if winner and winner != baseline:
+        lines.append(f"- **Recommended:** {_cell_line(winner)} ✅ beats baseline + clears gate")
+    elif winner == baseline:
+        lines.append("- **Recommended:** baseline holds — no challenger cleared the gate by enough")
+    else:
+        lines.append("- **Recommended:** none — no cell cleared the promote gate; keep baseline")
+    if ranking:
+        top = ", ".join(f"{n} ({_fmt_num(s)})" for n, s in ranking[:3])
+        lines.append(f"- **Top by Sortino:** {top}")
+    lines.append("")
+    return lines
+
+
 def build_report(
     run_date: str,
     signal_quality: dict,
@@ -782,6 +837,7 @@ def build_report(
     attribution: dict,
     portfolio_stats: dict | None = None,
     production_stats: dict | None = None,
+    optimizer_param_sweep: dict | None = None,
     sweep_df=None,
     weight_result: dict | None = None,
     config: dict | None = None,
@@ -840,6 +896,10 @@ def build_report(
     # the de-facto headline (the 2026-06-12 failure mode).
     lines += _section_deployed_strategy(production_stats)
     lines += [""]
+
+    # Optimizer-param sweep recommendation (config#1057) — sits under the
+    # deployed headline since it tunes the deployed optimizer. Observe-only.
+    lines += _section_optimizer_param_sweep(optimizer_param_sweep)
 
     # Data accumulation tracker
     lines += _section_data_accumulation(signal_quality, config or {})

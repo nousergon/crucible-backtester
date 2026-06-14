@@ -2744,6 +2744,88 @@ def run_gamma_sweep_stage(
     return payload
 
 
+def run_optimizer_param_sweep_stage(
+    config: dict,
+    run_date: str,
+    s3_client=None,
+) -> dict:
+    """Sweep the MVO optimizer's PRIMARY params (risk_aversion × tcost_bps)
+    against the PRODUCTION-faithful backtest (production cohort + α̂ → the live
+    solver) and persist the verdict to
+    ``s3://{bucket}/backtest/{run_date}/optimizer_param_sweep.json`` (config#1057
+    increment 1).
+
+    Observe-only + non-fatal, like the cov-/γ-sweeps — this is the recommendation
+    surface; the auto-apply to live optimizer config (a new
+    ``config/portfolio_optimizer.json`` key + executor-side merge, behind a
+    holdout gate) is increment 2. Skips cleanly when the production
+    predictions/signals archive isn't available yet."""
+    import os
+
+    import boto3
+
+    from analysis.portfolio_optimizer_backtest import run_optimizer_param_sweep
+    from synthetic.production_signal_backtest import build_production_signal_inputs
+
+    logger.info("optimizer_param_sweep: starting")
+
+    executor_paths = config.get("executor_paths", [])
+    if isinstance(executor_paths, str):
+        executor_paths = [executor_paths]
+    executor_path = next((p for p in executor_paths if os.path.isdir(p)), None)
+    if not executor_path:
+        raise ValueError(
+            f"executor_paths not found on disk: {executor_paths}. "
+            "Add the alpha-engine repo root to executor_paths in config.yaml."
+        )
+
+    inputs = build_production_signal_inputs(config, s3_client=s3_client)
+    if inputs.get("status") != "ok":
+        logger.warning(
+            "optimizer_param_sweep: production inputs status=%s — sweep skipped",
+            inputs.get("status"),
+        )
+        return {
+            "run_date": run_date,
+            "status": "skipped",
+            "reason": f"production inputs status={inputs.get('status')!r}",
+        }
+
+    sweep_report = run_optimizer_param_sweep(
+        predictions_by_date=inputs["predictions_by_date"],
+        price_matrix=inputs["price_matrix"],
+        spy_prices=inputs["spy_prices"],
+        sector_map=inputs["sector_map"],
+        executor_path=executor_path,
+    )
+
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    key = f"backtest/{run_date}/optimizer_param_sweep.json"
+    payload = {
+        "run_date": run_date,
+        "status": "ok",
+        "production_window": inputs.get("production_window"),
+        "n_production_dates": inputs.get("n_production_dates"),
+        **sweep_report,
+    }
+    body = json.dumps(payload, default=str, indent=2).encode("utf-8")
+
+    s3 = s3_client or boto3.client("s3")
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+        logger.info("optimizer_param_sweep: persisted s3://%s/%s", bucket, key)
+    except Exception as exc:
+        logger.warning("optimizer_param_sweep: S3 persist failed (non-fatal): %s", exc)
+
+    logger.info(
+        "optimizer_param_sweep: baseline=%s winner=%s ranking_top=%s",
+        sweep_report.get("baseline_name"),
+        sweep_report.get("winner_name"),
+        (sweep_report.get("ranking") or [(None, None)])[0],
+    )
+    return payload
+
+
 def run_predictor_backtest(config: dict) -> dict:
     """
     Run predictor-only historical backtest: generate synthetic signals from
@@ -5330,6 +5412,16 @@ def _main_impl() -> None:
             production_stats.get("status"),
         )
 
+        # Optimizer-param sweep recommendation (config#1057) — observe-only,
+        # best-effort: a failure must not break the report. Surfaced under the
+        # deployed headline so the operator sees the recommended risk_aversion ×
+        # tcost_bps cell. Auto-apply is increment 2.
+        try:
+            optimizer_param_sweep = run_optimizer_param_sweep_stage(config, args.date)
+        except Exception as e:  # noqa: BLE001 — advisory; report must still ship
+            logger.warning("optimizer_param_sweep stage failed (non-fatal): %s", e)
+            optimizer_param_sweep = {"status": "error", "reason": str(e)}
+
         # Eval-only kwargs (weight_result, veto_result, grading, etc.) default
         # to None in build_report — they are populated by evaluate.py, not here.
         report_md = build_report(
@@ -5340,6 +5432,7 @@ def _main_impl() -> None:
             attribution={"status": "skipped"},
             portfolio_stats=portfolio_stats,
             production_stats=production_stats,
+            optimizer_param_sweep=optimizer_param_sweep,
             sweep_df=sweep_df,
             config=config,
             predictor_stats=predictor_stats,
