@@ -346,8 +346,9 @@ class TestApplyShadowVsProduction:
         }
 
     @patch("optimizer.executor_optimizer.boto3")
-    def test_legacy_writes_to_production_key(self, mock_boto3):
-        _init_default_config()  # enforce_skill_composite default false
+    def test_legacy_writes_to_production_key_when_opted_in(self, mock_boto3):
+        # config#1053 Phase C: the legacy live write is now opt-in only.
+        _init_default_config({"legacy_executor_params_live_apply": True})
         s3 = MagicMock()
         mock_boto3.client.return_value = s3
         with patch("optimizer.rollback.save_previous"):
@@ -359,6 +360,23 @@ class TestApplyShadowVsProduction:
         assert any("executor_params_history" in k for k in keys_written)
         # Did NOT write to shadow archive.
         assert not any(S3_SHADOW_PREFIX in k for k in keys_written)
+
+    @patch("optimizer.executor_optimizer.boto3")
+    def test_legacy_default_writes_to_shadow_only(self, mock_boto3):
+        """config#1053 Phase C: by DEFAULT the legacy 1/n-path sweep no longer
+        overwrites live config — the MVO optimizer owns sizing. It routes to the
+        shadow archive instead, leaving config/executor_params.json untouched."""
+        _init_default_config()  # legacy_executor_params_live_apply default False
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        outcome = apply(self._ok_result("sharpe_legacy"), bucket="test-bucket")
+        assert outcome["applied"] is False
+        assert "shadow mode" in outcome["reason"].lower()
+        assert "live auto-apply" in outcome["reason"].lower()
+        keys_written = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        # Shadow archive written; live key NOT touched.
+        assert any(S3_SHADOW_PREFIX in k for k in keys_written)
+        assert S3_PARAMS_KEY not in keys_written
 
     @patch("optimizer.executor_optimizer.boto3")
     def test_skill_without_enforce_writes_to_shadow_only(self, mock_boto3):
@@ -543,7 +561,8 @@ class TestApplyWritesArtifactInDualWriteMode:
     @patch("optimizer.executor_optimizer.boto3")
     @patch("optimizer.recommendation_artifact.boto3")
     def test_legacy_apply_path_also_writes_artifact(self, mock_artifact_boto3, mock_apply_boto3):
-        _init_default_config()
+        # config#1053 Phase C: legacy live write is opt-in; flag on to exercise it.
+        _init_default_config({"legacy_executor_params_live_apply": True})
         legacy_s3 = MagicMock()
         artifact_s3 = MagicMock()
         mock_apply_boto3.client.return_value = legacy_s3
@@ -648,11 +667,12 @@ class TestApplyCutoverSkip:
     def test_cutover_disabled_default_keeps_legacy_write(
         self, mock_artifact_boto3, mock_apply_boto3,
     ):
-        # Belt-and-suspenders: confirms the autouse fixture's reset works
-        # AND that with the flag off, legacy still writes (PR 1 behavior
-        # preserved when assembler hasn't taken over yet).
-        _init_default_config()
-        # Flag is False by default per fixture; do not call set_cutover_enabled.
+        # Belt-and-suspenders: confirms the autouse fixture's reset works AND
+        # that with the CUTOVER flag off, the legacy write path runs (assembler
+        # hasn't taken over). config#1053 Phase C: the legacy live write is now
+        # opt-in, so enable it here to isolate the cutover-gate behavior under test.
+        _init_default_config({"legacy_executor_params_live_apply": True})
+        # Cutover flag is False by default per fixture; do not call set_cutover_enabled.
         legacy_s3 = MagicMock()
         artifact_s3 = MagicMock()
         mock_apply_boto3.client.return_value = legacy_s3

@@ -176,6 +176,13 @@ executor_optimizer:
   min_valid_combos: 5            # minimum sweep combos with sharpe_ratio
   min_sharpe_improvement: 0.10   # best must exceed baseline by 10%+
   drawdown_penalty_weight: 0.50  # penalize max_drawdown in combined ranking score
+  # config#1053 Phase C: the legacy 1/n-path executor-param sweep no longer
+  # auto-writes LIVE config by default — the daily MVO portfolio optimizer
+  # (cutover 2026-05-13) owns sizing + entry, so params tuned on the bypassed
+  # 1/n path are routed to the SHADOW archive (sweep still runs + reports).
+  # Set true ONLY to re-enable the legacy live write (not recommended; the real
+  # fix is sweeping the optimizer's own params — config#1053 Phase-2 follow-up).
+  legacy_executor_params_live_apply: false
 
 # ── Stance-sizing optimizer (L300) ───────────────────────────────────────────
 # Offline-IC gate for the stance_size_* multipliers (replaces the inert

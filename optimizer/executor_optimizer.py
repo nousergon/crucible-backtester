@@ -1086,7 +1086,31 @@ def apply(result: dict, bucket: str) -> dict:
 
     fit_target = result.get("fit_target", "sharpe_legacy")
     enforce_skill_composite = bool(_cfg.get("enforce_skill_composite", False))
-    shadow_only = fit_target == "skill_composite" and not enforce_skill_composite
+
+    # config#1053 Phase C: the legacy 1/n-path executor-param sweep no longer
+    # auto-writes LIVE config. The daily MVO portfolio optimizer (cutover
+    # 2026-05-13) owns sizing + entry, so sweep params tuned on the BYPASSED 1/n
+    # path (min_score, max_position_pct, ...) must not silently overwrite the
+    # live optimizer-era config. A non-skill_composite (legacy) recommendation is
+    # routed to the SHADOW archive by default — the sweep still runs, reports,
+    # and archives for observability, but live config is untouched. Re-enabling
+    # the legacy live write is an explicit opt-in (`legacy_executor_params_live_apply`,
+    # OFF by default). The real fix — sweeping the OPTIMIZER's own params (γ,
+    # turnover/ambiguity penalty, weight caps) against the production-faithful
+    # backtest — is the Phase-2 follow-up (config#1053 → its child issue).
+    legacy_live_apply = bool(_cfg.get("legacy_executor_params_live_apply", False))
+    if fit_target == "skill_composite":
+        shadow_only = not enforce_skill_composite
+        shadow_reason = (
+            "shadow mode — fit_target=skill_composite, enforce_skill_composite=False"
+        )
+    else:
+        shadow_only = not legacy_live_apply
+        shadow_reason = (
+            "shadow mode — legacy executor-param sweep retired from live auto-apply "
+            "(config#1053 Phase C; the MVO optimizer owns sizing). Set "
+            "legacy_executor_params_live_apply=true to re-enable the live write."
+        )
 
     payload = {
         **recommended,
@@ -1119,16 +1143,16 @@ def apply(result: dict, bucket: str) -> dict:
                 ContentType="application/json",
             )
             logger.info(
-                "Executor params written to shadow archive (enforce_skill_composite=False): "
+                "Executor params written to shadow archive (%s): "
                 "s3://%s/%s (+ latest.json sidecar)",
-                bucket, shadow_key,
+                shadow_reason, bucket, shadow_key,
             )
         except Exception as e:
             logger.error("Failed to write executor params shadow archive: %s", e)
             return {"applied": False, "reason": f"shadow S3 write failed: {e}"}
         return {
             "applied": False,
-            "reason": "shadow mode — fit_target=skill_composite, enforce_skill_composite=False",
+            "reason": shadow_reason,
             "shadow_key": shadow_key,
             "fit_target": fit_target,
             "params": recommended,

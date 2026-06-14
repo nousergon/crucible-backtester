@@ -198,6 +198,9 @@ class TestAssemblerArcEndToEnd:
         # Writes: artifact + legacy live key (atr 3.0) + history.
         executor_init_config({
             "executor_optimizer": {
+                # config#1053 Phase C: the legacy live write is now opt-in; enable
+                # it so this assembler-chain e2e exercises the live-write path.
+                "legacy_executor_params_live_apply": True,
                 "min_valid_combos": 0, "min_sharpe_improvement": 0.05,
                 "min_trades_to_promote": 0, "drawdown_penalty_weight": 0.5,
             },
@@ -351,6 +354,9 @@ class TestAssemblerArcEndToEnd:
 
         executor_init_config({
             "executor_optimizer": {
+                # config#1053 Phase C: the legacy live write is now opt-in; enable
+                # it so this assembler-chain e2e exercises the live-write path.
+                "legacy_executor_params_live_apply": True,
                 "min_valid_combos": 0, "min_sharpe_improvement": 0.05,
                 "min_trades_to_promote": 0, "drawdown_penalty_weight": 0.5,
             },
