@@ -19,6 +19,11 @@ CONFIG_KEYS = {
     "scoring_weights": "config/scoring_weights.json",
     "executor_params": "config/executor_params.json",
     "predictor_params": "config/predictor_params.json",
+    # config#1057 inc 2: MVO optimizer's own params (risk_aversion × tcost_bps),
+    # auto-tuned by optimizer/portfolio_optimizer_optimizer.py. Registered here
+    # so save_previous() snapshots it before overwrite AND the weekly regression
+    # monitor's rollback_all() auto-reverts it if next week's Sortino regresses.
+    "portfolio_optimizer": "config/portfolio_optimizer.json",
 }
 
 
