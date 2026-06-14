@@ -465,3 +465,60 @@ class TestPerformance:
             f"took >90 min on the same scale. If this hits 2s, "
             f"investigate before merging."
         )
+
+
+# ── active-window SPY anchoring (config#1053 Phase B) ────────────────────────
+
+
+class TestActiveWindowSpyAnchoring:
+    def test_flat_prefix_combo_uses_active_window_not_full_window(self):
+        """A combo that only trades the back half of a long window must be
+        measured against SPY over its ACTIVE window — not the full window where
+        SPY ran up during the flat prefix (the -253.9% exposure-bias artifact)."""
+        from synthetic.vectorized_stats import compute_active_window_spy_returns
+        dates = pd.date_range("2026-01-01", periods=10, freq="B")
+        # SPY ramps hard in the flat-prefix half, drifts in the active half.
+        spy = pd.Series(
+            [400, 500, 600, 700, 800, 805, 810, 815, 820, 825.0], index=dates,
+        )
+        # Combo holds cash for 5 days, then deploys (+5%) over the back half.
+        nav = np.array([[1_000_000.0] * 5 + [1_050_000.0] * 5])
+        out = compute_active_window_spy_returns(spy, dates, nav, 1_000_000.0)
+        # active window = dates[5:] → SPY 825/805 - 1 ≈ 0.0248, NOT 825/400-1≈1.06
+        assert out[0] == pytest.approx(825 / 805 - 1, rel=1e-6)
+        assert out[0] < 0.05  # nowhere near the +106% full-window figure
+
+    def test_never_trading_combo_gets_full_window_cashdrag(self):
+        from synthetic.vectorized_stats import compute_active_window_spy_returns
+        dates = pd.date_range("2026-01-01", periods=6, freq="B")
+        spy = pd.Series([400, 420, 440, 460, 480, 500.0], index=dates)
+        nav = np.full((1, 6), 1_000_000.0)  # never moves
+        out = compute_active_window_spy_returns(spy, dates, nav, 1_000_000.0)
+        # honest cash-drag: full-window SPY return
+        assert out[0] == pytest.approx(500 / 400 - 1)
+
+    def test_none_spy_is_all_nan(self):
+        from synthetic.vectorized_stats import compute_active_window_spy_returns
+        dates = pd.date_range("2026-01-01", periods=4, freq="B")
+        nav = np.linspace(1e6, 1.1e6, 4).reshape(1, 4)
+        out = compute_active_window_spy_returns(None, dates, nav, 1e6)
+        assert np.isnan(out).all()
+
+    def test_end_to_end_flat_prefix_alpha_not_exposure_biased(self):
+        """Through compute_vectorized_stats: the flat-prefix combo's total_alpha
+        reflects active-window skill, not the full-window exposure gap."""
+        dates = pd.date_range("2026-01-01", periods=10, freq="B")
+        spy = pd.Series(
+            [400, 500, 600, 700, 800, 805, 810, 815, 820, 825.0], index=dates,
+        )
+        nav = np.array([[1_000_000.0] * 5 + [1_050_000.0] * 5])  # +5% in back half
+        store = _build_store(1, dates, ["AAPL"])
+        store.add_entry(0, 5, 0, 100, 100.0, 1e6, 0.05)
+        store.add_exit(0, 9, 0, ACTION_EXIT, 100, 105.0, 1.05e6, REASON_ATR)
+        df = compute_vectorized_stats(
+            nav_history=nav, init_cash=1_000_000.0, spy_prices=spy,
+            dates=dates, orders_per_combo=store, combo_params=[{"k": 0}],
+        )
+        # active-window alpha ≈ 0.05 - 0.0248 ≈ +0.025, NOT 0.05 - 1.06 ≈ -1.01
+        assert df["total_alpha"].iloc[0] == pytest.approx(0.05 - (825 / 805 - 1), abs=1e-6)
+        assert df["total_alpha"].iloc[0] > 0

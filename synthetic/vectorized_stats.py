@@ -237,6 +237,54 @@ def compute_spy_return(
     return float((aligned.iloc[-1] / aligned.iloc[0]) - 1.0)
 
 
+def compute_active_window_spy_returns(
+    spy_prices: "pd.Series | None",
+    dates: pd.DatetimeIndex,
+    nav_history: np.ndarray,
+    init_cash: float,
+) -> np.ndarray:
+    """Per-combo SPY total return over each combo's ACTIVE window (first NAV
+    change → end), as a ``float`` array ``[n_combos]`` (NaN where unavailable).
+
+    Anchoring each combo's benchmark to when it actually started trading removes
+    the apples-to-oranges exposure bias (config#1053): a combo that only enters
+    positions in the final weeks of a 10y ``price_matrix`` was previously
+    compared to SPY's FULL-window compound return — the construction that
+    produced the ``-253.9% total_alpha`` headline (a long/flat cash-holding
+    strategy floors at ``-spy_return`` over a multi-year bull market, measuring
+    equity *exposure*, not skill). This mirrors ``vectorbt_bridge.
+    _compute_active_window`` (which the vbt path already uses; this ports it to
+    the vectorized sweep path).
+
+    A combo whose NAV never departs from its t0 value (never trades) has no
+    active window → it gets the FULL-window SPY return, since it genuinely held
+    cash the whole time (an honest cash-drag), matching the no-orders branch.
+
+    ``init_cash`` is accepted for signature symmetry with the other vectorized
+    stats; the per-combo t0 NAV is used as the flat-baseline so a combo that
+    starts already deployed is still handled correctly.
+    """
+    n_combos, n_dates = nav_history.shape
+    out = np.full(n_combos, np.nan, dtype=np.float64)
+    if spy_prices is None or n_dates < 2:
+        return out
+    spy_full = compute_spy_return(spy_prices, dates)
+    full_val = float(spy_full) if spy_full is not None else np.nan
+    base = nav_history[:, [0]]  # per-combo t0 NAV as the flat baseline
+    changed = ~np.isclose(nav_history, base, atol=1e-9)
+    for i in range(n_combos):
+        if not changed[i].any():
+            out[i] = full_val  # never trades → full-window cash-drag
+            continue
+        start = int(np.argmax(changed[i]))
+        if start <= 0:
+            out[i] = full_val
+            continue
+        r = compute_spy_return(spy_prices, dates[start:])
+        out[i] = float(r) if r is not None else full_val
+    return out
+
+
 # ── Trade counting (per-combo, columnar buffer walk) ────────────────────────
 
 
@@ -370,17 +418,24 @@ def compute_vectorized_stats(
     max_drawdown = compute_max_drawdown(nav_history)
     calmar = compute_calmar_ratio(total_return, max_drawdown, n_dates)
 
-    # SPY return over the portfolio's date range — single scalar shared
-    # across all combos (every combo runs the same simulation window).
-    spy_return = compute_spy_return(spy_prices, dates)
-    if spy_return is not None:
-        total_alpha_per_combo: list[float | None] = [
-            float(tr - spy_return) for tr in total_return
-        ]
-        spy_value: float | None = float(spy_return)
-    else:
-        total_alpha_per_combo = [None] * n_combos
-        spy_value = None
+    # SPY return anchored PER COMBO to each combo's ACTIVE window (first NAV
+    # change → end), config#1053. A combo that only trades a recent slice of a
+    # long price_matrix is measured against SPY over the SAME slice — not the
+    # full window (the exposure-bias that produced the -253.9% total_alpha).
+    # `spy_value` keeps the FULL-window SPY return for the no-orders branch
+    # below (a never-trading combo held cash the whole window — honest cash-drag).
+    spy_full = compute_spy_return(spy_prices, dates)
+    spy_value: float | None = float(spy_full) if spy_full is not None else None
+    spy_active = compute_active_window_spy_returns(
+        spy_prices, dates, nav_history, init_cash,
+    )
+    spy_active_per_combo: list[float | None] = [
+        (float(sa) if not np.isnan(sa) else None) for sa in spy_active
+    ]
+    total_alpha_per_combo: list[float | None] = [
+        (float(tr) - sa) if sa is not None else None
+        for tr, sa in zip(total_return, spy_active_per_combo)
+    ]
 
     # Per-combo trade counts + order counts. Walks columnar buffers
     # directly to avoid materializing dict-lists (60 combos × 26k orders
@@ -425,7 +480,7 @@ def compute_vectorized_stats(
                 "max_drawdown": float(max_drawdown[combo_idx]),
                 "calmar_ratio": float(calmar[combo_idx]),
                 "cvar_95": float(cvar_95[combo_idx]),
-                "spy_return": spy_value,
+                "spy_return": spy_active_per_combo[combo_idx],
                 "total_alpha": total_alpha_per_combo[combo_idx],
             }
         rows.append(row)
