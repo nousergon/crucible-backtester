@@ -68,6 +68,10 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "optimizer/config_archive.py": 1,
     "optimizer/executor_optimizer.py": 5,
     "optimizer/pipeline_optimizer.py": 2,
+    # config#1057 inc 2: MVO optimizer-param auto-apply — 5 PUTs (live + shadow×2
+    # + history×2), same config-write shape as optimizer/executor_optimizer.py;
+    # config writes, not freshness-SLA artifacts, so pinned here (grandfathered).
+    "optimizer/portfolio_optimizer_optimizer.py": 5,
     "optimizer/predictor_optimizer.py": 3,
     "optimizer/predictor_sizing_optimizer.py": 1,
     "optimizer/recommendation_artifact.py": 1,
