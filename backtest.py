@@ -2894,12 +2894,35 @@ def run_optimizer_param_sweep_stage(
     )
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
+
+    # config#1057 inc 2: recommend + (flag-gated, safeguarded) auto-apply the
+    # winning risk_aversion × tcost_bps to live optimizer config. Best-effort —
+    # a recommend/apply failure must not break the sweep artifact + report.
+    recommendation: dict = {}
+    apply_result: dict = {}
+    try:
+        from optimizer.portfolio_optimizer_optimizer import apply as opt_apply
+        from optimizer.portfolio_optimizer_optimizer import recommend as opt_recommend
+
+        recommendation = opt_recommend(sweep_report, config=config)
+        apply_result = opt_apply(recommendation, bucket, config=config)
+        logger.info(
+            "optimizer_param_sweep: recommend status=%s, applied=%s",
+            recommendation.get("status"), apply_result.get("applied"),
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory; sweep artifact already valid
+        logger.warning("optimizer_param_sweep: recommend/apply failed (non-fatal): %s", exc)
+        recommendation = {"status": "error", "reason": str(exc)}
+        apply_result = {"applied": False, "reason": str(exc)}
+
     key = f"backtest/{run_date}/optimizer_param_sweep.json"
     payload = {
         "run_date": run_date,
         "status": "ok",
         "production_window": inputs.get("production_window"),
         "n_production_dates": inputs.get("n_production_dates"),
+        "recommendation": recommendation,
+        "apply_result": apply_result,
         **sweep_report,
     }
     body = json.dumps(payload, default=str, indent=2).encode("utf-8")

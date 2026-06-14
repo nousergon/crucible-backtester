@@ -943,7 +943,7 @@ class TestOptimizerParamSweepSection:
         from reporter import _section_optimizer_param_sweep
         text = "\n".join(_section_optimizer_param_sweep(self._ok_sweep()))
         assert "Optimizer-param sweep" in text
-        assert "Observe-only" in text
+        assert "promote gate" in text  # inc 2: auto-applied behind a gate
         assert "Baseline (live)" in text
         assert "Recommended" in text and "ra3_tc2" in text
         assert "λ=3" in text  # cfg surfaced
@@ -976,3 +976,38 @@ class TestOptimizerParamSweepSection:
             optimizer_param_sweep=self._ok_sweep(),
         )
         assert "Optimizer-param sweep" in md
+
+
+def test_optimizer_sweep_section_shows_applied_status():
+    """config#1057 inc 2: the section reports what happened to LIVE config."""
+    from reporter import _section_optimizer_param_sweep
+    sweep = {
+        "status": "ok", "baseline_name": "baseline_ra5_tc5", "winner_name": "ra3_tc2",
+        "cells": {
+            "baseline_ra5_tc5": {"sortino_ratio": 0.8, "cell_cfg": {"risk_aversion": 5.0, "tcost_bps": 5.0}},
+            "ra3_tc2": {"sortino_ratio": 1.1, "cell_cfg": {"risk_aversion": 3.0, "tcost_bps": 2.0}},
+        },
+        "ranking": [("ra3_tc2", 1.1)],
+        "recommendation": {"margin": 0.375},
+        "apply_result": {"applied": True, "params": {"risk_aversion": 3.0, "tcost_bps": 2.0},
+                         "clamp_notes": []},
+    }
+    text = "\n".join(_section_optimizer_param_sweep(sweep))
+    assert "APPLIED to live optimizer config" in text
+    assert "rollback" in text.lower()
+
+
+def test_optimizer_sweep_section_shows_not_applied_reason():
+    from reporter import _section_optimizer_param_sweep
+    sweep = {
+        "status": "ok", "baseline_name": "baseline_ra5_tc5", "winner_name": "ra3_tc2",
+        "cells": {
+            "baseline_ra5_tc5": {"sortino_ratio": 0.8, "cell_cfg": {"risk_aversion": 5.0, "tcost_bps": 5.0}},
+            "ra3_tc2": {"sortino_ratio": 0.82, "cell_cfg": {"risk_aversion": 3.0, "tcost_bps": 2.0}},
+        },
+        "ranking": [("ra3_tc2", 0.82)],
+        "recommendation": {"status": "blocked", "reason": "insufficient margin: +2.5% < 15%"},
+        "apply_result": {"applied": False, "reason": "no promotable recommendation (status=blocked)"},
+    }
+    text = "\n".join(_section_optimizer_param_sweep(sweep))
+    assert "Not applied" in text

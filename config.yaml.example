@@ -184,6 +184,20 @@ executor_optimizer:
   # fix is sweeping the optimizer's own params — config#1053 Phase-2 follow-up).
   legacy_executor_params_live_apply: false
 
+# ── Portfolio-optimizer param tuner (config#1057) ─────────────────────────────
+# Auto-tunes the MVO optimizer's OWN params (risk_aversion × tcost_bps) from the
+# weekly production-faithful sweep and writes the winner to live
+# config/portfolio_optimizer.json (the executor merges it in optimizer_shadow).
+# SAFEGUARDS: only risk_aversion + tcost_bps are writable (clamped to sane
+# bands); the winner must beat baseline Sortino by promote_margin AND clear the
+# sweep's risk floors; every apply is rollback-snapshotted + regression-
+# auto-reverted; the turnover governor / drawdown circuit breaker / caps are
+# never auto-tuned. auto_apply_enabled=false → recommendation is shadow-archived
+# only, live config untouched.
+portfolio_optimizer_tuner:
+  auto_apply_enabled: true
+  promote_margin: 0.15           # winner must beat baseline Sortino by 15%+ to write live
+
 # ── Stance-sizing optimizer (L300) ───────────────────────────────────────────
 # Offline-IC gate for the stance_size_* multipliers (replaces the inert
 # predictionless param sweep). Tunes against realized per-stance alpha from
