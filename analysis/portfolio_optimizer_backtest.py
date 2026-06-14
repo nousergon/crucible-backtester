@@ -75,6 +75,15 @@ class OptimizerBacktestResult:
     n_rebalances: int
     n_solver_failures: int = 0
     diagnostics_per_rebalance: list[dict] = field(default_factory=list)
+    # Daily simple-return series of the simulated portfolio and the SPY
+    # benchmark, aligned. Kept OFF the ``metrics`` dict (which JSON/parquet
+    # round-trips through the sweep reports) so they never break
+    # serialization — populated only when the caller passes
+    # ``keep_daily_returns=True``. The weekly report's deployed-strategy
+    # section (config#1053) needs them to build the beta-matched SPY
+    # benchmark (the risk-matched headline metric). ``None`` otherwise.
+    portfolio_daily_returns: "pd.Series | None" = None
+    spy_daily_returns: "pd.Series | None" = None
 
 
 def run_optimizer_backtest(
@@ -91,6 +100,7 @@ def run_optimizer_backtest(
     max_position_pct: float = 0.08,
     min_score_proxy: float | None = None,
     alpha_uncertainty_by_date: dict[str, dict[str, float]] | None = None,
+    keep_daily_returns: bool = False,
 ) -> OptimizerBacktestResult:
     """
     Backtest the constrained MVO optimizer over historical synthetic predictions.
@@ -200,7 +210,7 @@ def run_optimizer_backtest(
             target_weights, rebal_date, kwargs["tickers"], result.weights,
         )
 
-    metrics = _simulate_and_measure(
+    metrics, daily_returns, spy_daily_returns = _simulate_and_measure(
         target_weights=target_weights,
         price_matrix=price_matrix,
         spy_prices=spy_prices,
@@ -219,6 +229,10 @@ def run_optimizer_backtest(
         n_rebalances=len(rebalance_dates),
         n_solver_failures=n_solver_failures,
         diagnostics_per_rebalance=diagnostics,
+        # Series are heavy + non-serializable, so only retain them when the
+        # caller (the deployed-strategy report headline) explicitly asks.
+        portfolio_daily_returns=daily_returns if keep_daily_returns else None,
+        spy_daily_returns=spy_daily_returns if keep_daily_returns else None,
     )
 
 
@@ -387,11 +401,18 @@ def _simulate_and_measure(
     spy_prices: pd.Series,
     init_cash: float,
     fees: float,
-) -> dict:
+) -> tuple[dict, "pd.Series | None", "pd.Series | None"]:
     """
     Simulate target-weight trajectory through vectorbt and emit the
     skilled-risk metric basket (Sortino / PSR / CVaR / max DD), with raw
     Sharpe + alpha-vs-SPY available for observability/presentation only.
+
+    Returns ``(metrics, portfolio_daily_returns, spy_daily_returns)`` where
+    the two return series are aligned on the portfolio's active window (or
+    ``None`` when fewer than 2 aligned days). The series feed the
+    beta-matched SPY benchmark used as the deployed-strategy headline
+    (config#1053); they are returned separately rather than stuffed into
+    ``metrics`` because ``metrics`` JSON/parquet round-trips downstream.
 
     Anchor follows the evaluator-revamp framework (workstream D of
     evaluator-revamp-260506.md): Sortino is the primary risk-adjusted
@@ -425,11 +446,19 @@ def _simulate_and_measure(
     daily_returns = stats.pop("daily_returns", None)
     stats.pop("daily_log_returns", None)
 
+    # Aligned (portfolio, SPY) daily simple returns over the overlap of the
+    # two series — the basis for both the tracking-error number and the
+    # beta-matched SPY benchmark (config#1053 risk-matched headline). None
+    # when fewer than 2 aligned days.
+    pf_returns_aligned: "pd.Series | None" = None
+    spy_returns_aligned: "pd.Series | None" = None
     if daily_returns is not None and len(daily_returns) > 1:
         spy_daily = spy_aligned.pct_change().dropna()
         spy_aligned_to_pf = spy_daily.reindex(daily_returns.index).dropna()
         pf_aligned_to_spy = daily_returns.reindex(spy_aligned_to_pf.index)
         if len(pf_aligned_to_spy) > 1:
+            pf_returns_aligned = pf_aligned_to_spy
+            spy_returns_aligned = spy_aligned_to_pf
             active_returns = pf_aligned_to_spy.values - spy_aligned_to_pf.values
             tracking_error_ann = float(np.std(active_returns, ddof=1) * np.sqrt(_TRADING_DAYS_PER_YEAR))
         else:
@@ -450,7 +479,7 @@ def _simulate_and_measure(
         mean_spy_weight = None
         turnover_one_way_ann = None
 
-    return {
+    metrics = {
         "sortino_ratio": stats.get("sortino_ratio"),
         "psr": stats.get("psr"),
         "cvar_95": stats.get("cvar_95"),
@@ -467,6 +496,7 @@ def _simulate_and_measure(
         "total_trades": stats.get("total_trades"),
         "win_rate": stats.get("win_rate"),
     }
+    return metrics, pf_returns_aligned, spy_returns_aligned
 
 
 _DEFAULT_MIN_PSR = 0.95

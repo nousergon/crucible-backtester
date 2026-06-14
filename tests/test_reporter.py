@@ -883,6 +883,43 @@ class TestDeployedStrategyHeadline:
         )
         assert "DEPLOYED-STRATEGY BACKTEST UNAVAILABLE" in md
 
+    def test_risk_matched_lede_when_available(self):
+        """config#1053 part 2: when the beta-matched SPY benchmark is present,
+        it is the LEDE (excess return + information ratio) and raw-SPY alpha is
+        demoted to an explicit footnote."""
+        from reporter import _section_deployed_strategy
+        stats = self._ok_stats()
+        stats["risk_matched"] = {
+            "status": "ok", "n_days": 40, "beta_lookback_days": 20,
+            "excess_return": 0.009, "information_ratio": 0.85,
+            "benchmark_total_return": 0.022, "portfolio_total_return": 0.031,
+        }
+        text = "\n".join(_section_deployed_strategy(stats))
+        # Risk-matched lede present.
+        assert "Excess return vs beta-matched SPY" in text
+        assert "+0.9%" in text          # excess_return signed
+        assert "Information ratio" in text
+        assert "0.85" in text
+        # Raw-SPY demoted to a footnote, not the lede.
+        assert "Footnote (raw, exposure-confounded)" in text
+        # Active-deployment / cash-drag line present.
+        assert "deployment" in text.lower()
+
+    def test_raw_spy_fallback_when_risk_matched_unavailable(self):
+        """When the risk-matched benchmark can't be built (short window), the
+        section falls back to the raw-SPY lede and names why — never silently
+        drops the headline."""
+        from reporter import _section_deployed_strategy
+        stats = self._ok_stats()
+        stats["risk_matched"] = {
+            "status": "insufficient_data",
+            "note": "only 12 portfolio return days",
+        }
+        text = "\n".join(_section_deployed_strategy(stats))
+        assert "raw-SPY lede" in text
+        assert "only 12 portfolio return days" in text
+        assert "Excess return vs beta-matched SPY" not in text
+
 
 # ── _section_optimizer_param_sweep (config#1057) ─────────────────────────────
 

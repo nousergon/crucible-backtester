@@ -2337,6 +2337,84 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
     return param_sweep.sweep(grid, sim_fn, config, sweep_settings=sweep_settings)
 
 
+# The deployed strategy is enhanced-index (SPY core + ~15% active tilt) and
+# the production window is short (≈3 months, bounded by predictor/predictions/
+# archive depth). The lib default beta lookback (60d) would consume nearly the
+# whole window before the benchmark even starts; 20d gives a usable risk-matched
+# series over the short window while still smoothing daily-beta noise.
+_RISK_MATCHED_BETA_LOOKBACK_DAYS = 20
+
+
+def _compute_risk_matched_headline(
+    portfolio_daily_returns, spy_daily_returns,
+) -> dict:
+    """Build the beta-matched-SPY risk-matched headline (config#1053 part 2).
+
+    Constructs a beta-matched SPY benchmark (a SPY position scaled to the
+    portfolio's trailing realized beta) and measures the portfolio's excess
+    return + information ratio against it. This isolates skill from beta
+    exposure — the institutional risk-matched lede the issue asks for — vs the
+    raw buy-and-hold SPY comparison (which conflates the two and, over the full
+    window, produced the exposure-biased -253.9% headline).
+
+    FAIL SOFT: returns ``{"status": "ok", ...}`` on success, else
+    ``{"status": <reason>, "note": ...}`` so the reporter can fall back to the
+    raw-SPY lede rather than crash the headline. The short production window
+    (≈3 months) makes this number inherently noisy — the section labels it as a
+    short-window risk-matched estimate, not a track record."""
+    if portfolio_daily_returns is None or spy_daily_returns is None:
+        return {
+            "status": "insufficient_data",
+            "note": "optimizer backtest returned no aligned daily-return series",
+        }
+    try:
+        from alpha_engine_lib.quant.stats.risk_matched_benchmark import (
+            compute_alpha_vs_benchmark,
+            construct_beta_matched_spy_benchmark,
+        )
+
+        n_pf = len(portfolio_daily_returns.dropna())
+        if n_pf <= _RISK_MATCHED_BETA_LOOKBACK_DAYS + 1:
+            return {
+                "status": "insufficient_data",
+                "note": (
+                    f"only {n_pf} portfolio return days — need "
+                    f">{_RISK_MATCHED_BETA_LOOKBACK_DAYS + 1} for a "
+                    f"{_RISK_MATCHED_BETA_LOOKBACK_DAYS}d beta lookback"
+                ),
+            }
+        bench = construct_beta_matched_spy_benchmark(
+            portfolio_daily_returns,
+            spy_daily_returns,
+            beta_lookback_days=_RISK_MATCHED_BETA_LOOKBACK_DAYS,
+        )
+        if bench is None or bench.dropna().empty:
+            return {
+                "status": "insufficient_data",
+                "note": "beta-matched benchmark empty after the lookback warm-up",
+            }
+        result = compute_alpha_vs_benchmark(
+            portfolio_daily_returns, bench, label="beta_matched_spy",
+        )
+        if result.get("status") not in (None, "ok"):
+            return {"status": result.get("status", "error"), "note": str(result)}
+        return {
+            "status": "ok",
+            "beta_lookback_days": _RISK_MATCHED_BETA_LOOKBACK_DAYS,
+            "n_days": result.get("n_days"),
+            "excess_return": result.get("excess_return"),
+            "information_ratio": result.get("information_ratio"),
+            "benchmark_total_return": result.get("benchmark_total_return"),
+            "portfolio_total_return": result.get("portfolio_total_return"),
+        }
+    except Exception as e:  # noqa: BLE001 — fail soft; raw-SPY lede is the fallback
+        logger.warning(
+            "risk-matched headline computation failed (non-fatal; "
+            "report falls back to raw-SPY lede): %s", e, exc_info=True,
+        )
+        return {"status": "error", "note": str(e)}
+
+
 def run_production_strategy_backtest(config: dict, s3_client=None) -> dict:
     """Run the DEPLOYED strategy's backtest for the weekly report headline
     (config#1053): the production research cohort + α̂ → the production MVO solver
@@ -2387,10 +2465,26 @@ def run_production_strategy_backtest(config: dict, s3_client=None) -> dict:
             spy_prices=inputs["spy_prices"],
             sector_map=inputs["sector_map"],
             executor_path=executor_path,
+            keep_daily_returns=True,
         )
+
+        # Risk-matched headline (config#1053 part 2): a beta-matched SPY
+        # benchmark is the lede, not raw buy-and-hold SPY. The optimizer
+        # backtest already active-window-anchors total_alpha (so it's not the
+        # exposure-biased full-window number that produced the -253.9%
+        # headline), but raw-SPY alpha still mixes beta exposure with skill.
+        # The beta-matched benchmark scales a SPY position to the portfolio's
+        # realized beta so the residual (information ratio + excess return) is
+        # the skill component. Best-effort: a failure here never sinks the
+        # headline — the section falls back to the raw-SPY lede + a footnote.
+        risk_matched = _compute_risk_matched_headline(
+            opt.portfolio_daily_returns, opt.spy_daily_returns,
+        )
+
         return {
             "status": "ok",
             "metrics": opt.metrics,
+            "risk_matched": risk_matched,
             "production_window": inputs.get("production_window"),
             "n_production_dates": inputs.get("n_production_dates"),
             "n_rebalances": opt.n_rebalances,
