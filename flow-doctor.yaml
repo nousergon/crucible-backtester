@@ -1,5 +1,5 @@
 flow_name: backtester
-repo: cipher813/alpha-engine-backtester
+repo: nousergon/crucible-backtester
 owner: "@brianmcmahon"
 notify:
   - type: email
@@ -9,7 +9,7 @@ notify:
     smtp_port: 587
     smtp_password: ${GMAIL_APP_PASSWORD}
   - type: github
-    repo: cipher813/alpha-engine-backtester
+    repo: nousergon/crucible-backtester
     token: ${FLOW_DOCTOR_GITHUB_TOKEN}
 store:
   type: sqlite

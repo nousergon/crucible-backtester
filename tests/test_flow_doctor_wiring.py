@@ -146,7 +146,7 @@ class TestFlowDoctorYamlSchema:
             cfg = yaml.safe_load(f)
         for key in ("flow_name", "repo", "notify", "store", "rate_limits"):
             assert key in cfg, f"missing top-level key: {key}"
-        assert cfg["repo"] == "cipher813/alpha-engine-backtester"
+        assert cfg["repo"] == "nousergon/crucible-backtester"
 
 
 @flow_doctor_required

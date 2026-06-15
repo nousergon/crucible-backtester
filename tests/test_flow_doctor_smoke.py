@@ -27,7 +27,7 @@ def fd_instance(tmp_path):
 
     fd = (
         flow_doctor.FlowDoctorBuilder("backtester-test")
-        .with_repo("cipher813/alpha-engine-backtester")
+        .with_repo("nousergon/crucible-backtester")
         .with_store(type="sqlite", path=db_path)
         .with_dependencies(["predictor-training", "data-phase1"])
         .with_rate_limits(
