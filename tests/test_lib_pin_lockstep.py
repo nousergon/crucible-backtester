@@ -27,10 +27,10 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _REQUIREMENTS_PIN_RE = re.compile(
-    r"alpha-engine-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/cipher813/alpha-engine-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
+    r"alpha-engine-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
 )
 _DOCKERFILE_PIN_RE = re.compile(
-    r'"alpha-engine-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/cipher813/alpha-engine-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"'
+    r'"alpha-engine-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"'
 )
 
 
