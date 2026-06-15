@@ -7,11 +7,11 @@
 [![vectorbt](https://img.shields.io/badge/vectorbt-1a73e8?style=flat-square)](https://vectorbt.dev/)
 [![LightGBM](https://img.shields.io/badge/LightGBM-1a73e8?style=flat-square)](https://lightgbm.readthedocs.io/)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-yellow?style=flat-square)](LICENSE)
-[![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/cipher813/alpha-engine-docs#phase-trajectory)
+[![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/nousergon/nousergon-docs#phase-trajectory)
 
 Weekly system evaluator and autonomous parameter optimizer. Reads historical signals + trades, measures signal quality, runs parameter sweeps, and writes four optimized configs back to S3 each week — closing the system's learning loop without manual intervention.
 
-> System overview, Step Function orchestration, and module relationships live in [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs). Code index lives in [`OVERVIEW.md`](OVERVIEW.md).
+> System overview, Step Function orchestration, and module relationships live in [`alpha-engine-docs`](https://github.com/nousergon/nousergon-docs). Code index lives in [`OVERVIEW.md`](OVERVIEW.md).
 
 ## What this does
 
@@ -45,19 +45,19 @@ Runs weekly after Predictor Training on a c5.large EC2 spot instance (~$0.01/wee
 
 ## Configuration
 
-This repo is **public**. Optimizer guardrails, sweep bounds, and config-promotion thresholds live in the private [`alpha-engine-config`](https://github.com/cipher813/alpha-engine-config) repo. Architecture and approach are public; specific values are private.
+This repo is **public**. Optimizer guardrails, sweep bounds, and config-promotion thresholds live in the private [`alpha-engine-config`](https://github.com/nousergon/alpha-engine-config) repo. Architecture and approach are public; specific values are private.
 
 ## Sister repos
 
 | Module | Repo |
 |---|---|
-| Executor | [`alpha-engine`](https://github.com/cipher813/alpha-engine) |
-| Data | [`alpha-engine-data`](https://github.com/cipher813/alpha-engine-data) |
-| Research | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) |
-| Predictor | [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) |
-| Dashboard | [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) |
+| Executor | [`alpha-engine`](https://github.com/nousergon/crucible-executor) |
+| Data | [`alpha-engine-data`](https://github.com/nousergon/nousergon-data) |
+| Research | [`alpha-engine-research`](https://github.com/nousergon/crucible-research) |
+| Predictor | [`alpha-engine-predictor`](https://github.com/nousergon/crucible-predictor) |
+| Dashboard | [`alpha-engine-dashboard`](https://github.com/nousergon/crucible-dashboard) |
 | Library | [`alpha-engine-lib`](https://github.com/nousergon/nousergon-lib) |
-| Docs | [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs) |
+| Docs | [`alpha-engine-docs`](https://github.com/nousergon/nousergon-docs) |
 
 ## License
 

@@ -34,7 +34,7 @@ jobs:
           aws-region: us-east-1
 
       - name: Append to system-wide deploy changelog
-        uses: cipher813/alpha-engine-docs/.github/actions/append-changelog@main
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
         with:
           deploy_status: merged
           deploy_workflow: changelog.yml

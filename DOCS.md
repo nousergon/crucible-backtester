@@ -25,14 +25,14 @@
 
 - Python 3.11+
 - AWS credentials with access to the research S3 bucket (see [§11 IAM policy](#11-iam-policy))
-- The [alpha-engine-research](https://github.com/cipher813/alpha-engine-research) pipeline running and writing to S3
-- The [alpha-engine](https://github.com/cipher813/alpha-engine) executor repo cloned locally (required for Mode 2 and param sweep)
-- The [alpha-engine-research](https://github.com/cipher813/alpha-engine-research) repo cloned locally (used to read current scoring weights)
+- The [alpha-engine-research](https://github.com/nousergon/crucible-research) pipeline running and writing to S3
+- The [alpha-engine](https://github.com/nousergon/crucible-executor) executor repo cloned locally (required for Mode 2 and param sweep)
+- The [alpha-engine-research](https://github.com/nousergon/crucible-research) repo cloned locally (used to read current scoring weights)
 
 ### Install
 
 ```bash
-git clone https://github.com/cipher813/alpha-engine-backtester.git
+git clone https://github.com/nousergon/crucible-backtester.git
 cd alpha-engine-backtester
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -488,7 +488,7 @@ EOF
 chmod 600 ~/.netrc
 
 # 2. Clone and set up
-git clone https://github.com/cipher813/alpha-engine-backtester.git
+git clone https://github.com/nousergon/crucible-backtester.git
 bash ~/alpha-engine-backtester/infrastructure/setup-ec2.sh
 ```
 
