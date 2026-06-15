@@ -54,7 +54,13 @@ logger = logging.getLogger(__name__)
 # circuit breaker, vol target) is operator-owned and never touched here.
 WRITABLE_PARAMS: tuple[str, ...] = ("risk_aversion", "tcost_bps")
 PARAM_BOUNDS: dict[str, tuple[float, float]] = {
-    "risk_aversion": (3.0, 10.0),   # λ — variance-penalty strength
+    # λ — variance-penalty strength. Floor lowered 3.0→1.0 (2026-06-15, Brian)
+    # to let the tuner explore a more aggressive (higher-risk) book; the real
+    # risk backstops at low λ are the position/sector caps + drawdown
+    # circuit-breaker, and the tuner only promotes a lower λ if Sortino-justified
+    # (≥promote_margin + holdout). MUST stay in lockstep with the executor's
+    # read-side re-clamp executor/optimizer_shadow.py::_AUTO_TUNED_BOUNDS.
+    "risk_aversion": (1.0, 10.0),
     "tcost_bps": (1.0, 20.0),       # turnover penalty (bps per $1 traded)
 }
 
