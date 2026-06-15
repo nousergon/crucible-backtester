@@ -80,17 +80,18 @@ def _get_json(s3, bucket: str, key: str) -> dict | None:
         return None
 
 
-def _list_cov_sweep_dates(s3, bucket: str) -> list[str]:
-    """Return trading-day folders under backtest/ that have a cov_sweep.json."""
+def _list_run_dates(s3, bucket: str) -> list[str]:
+    """Return trading days that have an optimizer-gate verdict — the source the
+    backtester writes every run (cov_sweep.json is enrichment, often absent)."""
     dates: list[str] = []
     paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix="backtest/"):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/cov_sweep.json"):
-                parts = key.split("/")
-                if len(parts) == 3:  # backtest/{date}/cov_sweep.json
-                    dates.append(parts[1])
+    for prefix in ("predictor/optimizer_gate/", "predictor/optimizer_gate/production/"):
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                fname = key.rsplit("/", 1)[-1]
+                if fname.endswith(".json") and fname != "latest.json":
+                    dates.append(fname[: -len(".json")])
     return sorted(set(dates))
 
 
@@ -103,17 +104,17 @@ def main() -> int:
 
     s3 = boto3.client("s3")
     defaults = _load_defaults(args.executor_path)
-    dates = _list_cov_sweep_dates(s3, args.bucket)
-    logger.info("found %d trading day(s) with cov_sweep.json", len(dates))
+    dates = _list_run_dates(s3, args.bucket)
+    logger.info("found %d trading day(s) with an optimizer-gate verdict", len(dates))
 
     seeded = skipped = 0
     for day in dates:
-        cov = _get_json(s3, args.bucket, f"backtest/{day}/cov_sweep.json")
-        gamma = _get_json(s3, args.bucket, f"backtest/{day}/gamma_sweep.json")
         gate = (
             _get_json(s3, args.bucket, f"predictor/optimizer_gate/{day}.json")
             or _get_json(s3, args.bucket, f"predictor/optimizer_gate/production/{day}.json")
         )
+        cov = _get_json(s3, args.bucket, f"backtest/{day}/cov_sweep.json")
+        gamma = _get_json(s3, args.bucket, f"backtest/{day}/gamma_sweep.json")
         run_id = day.replace("-", "")  # YYYYMMDD — deterministic, idempotent
         record = build_optimizer_risk_record(
             cov_payload=cov,
@@ -125,7 +126,7 @@ def main() -> int:
             run_id=run_id,
         )
         if record is None:
-            logger.warning("skip %s — no usable cov-sweep cells", day)
+            logger.warning("skip %s — neither gate nor cov-sweep metrics present", day)
             skipped += 1
             continue
         if args.dry_run:

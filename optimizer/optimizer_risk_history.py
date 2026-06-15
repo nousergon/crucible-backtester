@@ -41,7 +41,7 @@ HISTORY_PREFIX = "config/optimizer_risk_history"
 # Provenance / metadata.
 _META_KEYS = (
     "schema_version", "run_id", "trading_day", "updated_at", "signal_source",
-    "cov_baseline_name", "cov_winner_name", "cov_selected_name",
+    "metrics_source", "cov_baseline_name", "cov_winner_name", "cov_selected_name",
     "cov_selected_is_winner", "gamma_status", "gamma_winner_name", "gate_passed",
 )
 # Risk-tolerance levers (effective config of the selected cell).
@@ -86,6 +86,15 @@ def _selected_cell(sweep_payload: dict | None) -> tuple[str | None, dict, bool]:
     return selected, metrics, bool(winner)
 
 
+def _gate_metrics(gate_payload: dict | None) -> dict:
+    """Return the deployed optimizer's per-run metrics from an optimizer-gate
+    payload (``comparison.optimizer``). {} when absent."""
+    if not isinstance(gate_payload, dict):
+        return {}
+    opt = (gate_payload.get("comparison") or {}).get("optimizer")
+    return opt if isinstance(opt, dict) else {}
+
+
 def build_optimizer_risk_record(
     *,
     cov_payload: dict | None,
@@ -112,16 +121,32 @@ def build_optimizer_risk_record(
         gate_payload: the ``run_portfolio_optimizer_gate`` return (optional —
             supplies ``gate_passed``).
 
-    Returns the record dict, or None when no usable cov-sweep cells exist (the
-    caller skips the write cleanly — that is not an error)."""
+    Source priority: the cov-sweep SELECTED cell when the sweep produced cells
+    (its swept levers + metrics are coherent); otherwise the optimizer GATE's
+    deployed-config metrics (``comparison.optimizer``) — which the backtester
+    writes every run, so the record fires even before the cov-sweep is producing
+    in production. Returns None only when NEITHER source has metrics (the caller
+    skips the write cleanly — that is not an error)."""
     cov_name, cov_metrics, cov_is_winner = _selected_cell(cov_payload)
-    if not cov_metrics:
-        return None
-
-    # Effective config of the selected cov cell = optimizer defaults overlaid
-    # with the cell's swept overrides (covariance_shrinkage / sigma_horizon_days
-    # / risk_aversion / ewma_lambda_decay).
-    eff_cfg = {**(optimizer_defaults or {}), **dict(cov_metrics.get("cell_cfg") or {})}
+    if cov_metrics:
+        metrics = cov_metrics
+        # Effective config of the selected cov cell = optimizer defaults overlaid
+        # with the cell's swept overrides (covariance_shrinkage /
+        # sigma_horizon_days / risk_aversion / ewma_lambda_decay).
+        eff_cfg = {**(optimizer_defaults or {}), **dict(cov_metrics.get("cell_cfg") or {})}
+        metrics_source = "cov_sweep"
+        cov_selected_name = cov_name
+    else:
+        metrics = _gate_metrics(gate_payload)
+        if not metrics:
+            return None
+        # Gate metrics correspond to the DEPLOYED optimizer config — so the
+        # levers are the deployed defaults (no swept overrides). Metrics and
+        # levers stay coherent (never mix gate metrics with sweep-winner levers).
+        eff_cfg = dict(optimizer_defaults or {})
+        metrics_source = "optimizer_gate"
+        cov_selected_name = None
+        cov_is_winner = False
 
     # γ overlay: the gamma-sweep winner's penalty when the sweep ran with a
     # winner, else the deployed baseline (0.0). The cov sweep does not vary γ.
@@ -136,15 +161,21 @@ def build_optimizer_risk_record(
     else:
         alpha_unc_penalty = float(eff_cfg.get("alpha_uncertainty_penalty", 0.0) or 0.0)
 
+    _signal_source = (
+        (cov_payload or {}).get("signal_source")
+        or (gate_payload or {}).get("signal_source")
+        or "synthetic"
+    )
     record: dict = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "trading_day": trading_day,
         "updated_at": updated_at,
-        "signal_source": (cov_payload or {}).get("signal_source", "synthetic"),
+        "signal_source": _signal_source,
+        "metrics_source": metrics_source,
         "cov_baseline_name": (cov_payload or {}).get("baseline_name"),
         "cov_winner_name": (cov_payload or {}).get("winner_name"),
-        "cov_selected_name": cov_name,
+        "cov_selected_name": cov_selected_name,
         "cov_selected_is_winner": cov_is_winner,
         "gamma_status": gamma_status,
         "gamma_winner_name": gamma_name,
@@ -154,7 +185,7 @@ def build_optimizer_risk_record(
     for k in _LEVER_FROM_CFG:
         record[k] = eff_cfg.get(k)
     for k in _METRIC_KEYS:
-        record[k] = cov_metrics.get(k)
+        record[k] = metrics.get(k)
 
     # Defensive: never emit a key outside the declared vocabulary (keeps the
     # cross-repo contract honest — see test_optimizer_risk_history_producer_contract).

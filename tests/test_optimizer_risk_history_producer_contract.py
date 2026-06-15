@@ -32,6 +32,9 @@ _DEFAULTS = {
     "tcost_bps": 5.0,
     "cash_sleeve_pct": 0.03,
     "max_sector_pct": 0.25,
+    "covariance_shrinkage": "ledoit_wolf",
+    "sigma_horizon_days": 1,
+    "ewma_lambda_decay": 0.94,
     "max_daily_turnover": 0.20,
     "alpha_uncertainty_penalty": 0.0,
 }
@@ -62,6 +65,16 @@ def _cov_payload(winner: str | None = "oas_h21") -> dict:
                           "sigma_horizon_days": 1, "risk_aversion": 5.0}),
             "oas_h21": _cell_metrics(),
         },
+    }
+
+
+def _gate_payload(passed: bool = False) -> dict:
+    # Mirrors predictor/optimizer_gate/{date}.json: metrics live under
+    # comparison.optimizer; deployed config (no swept overrides).
+    opt = {k: v for k, v in _cell_metrics().items() if k != "cell_cfg"}
+    return {
+        "run_date": "2026-06-13", "signal_source": "synthetic", "passed": passed,
+        "comparison": {"optimizer": opt, "signal_source": "synthetic"},
     }
 
 
@@ -107,6 +120,24 @@ def test_metrics_come_from_selected_cell():
     assert record["max_drawdown"] == -0.18
     assert record["cov_selected_name"] == "oas_h21"
     assert record["cov_selected_is_winner"] is True
+    assert record["metrics_source"] == "cov_sweep"
+
+
+def test_falls_back_to_gate_metrics_when_cov_absent():
+    # Production reality today: cov_sweep not producing → record keys off the
+    # optimizer gate's deployed-config metrics, with deployed-default levers.
+    record = _build(cov_payload=None, gate_payload=_gate_payload(passed=True))
+    assert record is not None
+    assert record["metrics_source"] == "optimizer_gate"
+    assert record["sortino_ratio"] == 1.2          # from comparison.optimizer
+    assert record["max_drawdown"] == -0.18
+    assert record["cov_selected_name"] is None
+    assert record["cov_selected_is_winner"] is False
+    # Levers = deployed defaults (no swept overrides).
+    assert record["risk_aversion"] == 5.0
+    assert record["covariance_shrinkage"] == "ledoit_wolf"
+    assert record["sigma_horizon_days"] == 1
+    assert record["gate_passed"] is True
 
 
 def test_falls_back_to_baseline_when_no_winner():
@@ -148,11 +179,12 @@ def test_gate_passed_lifted_from_gate_payload():
     assert record2["gate_passed"] is None
 
 
-def test_returns_none_when_no_usable_cells():
-    # Backfill / skipped-sweep robustness: a status=skipped payload (no cells)
-    # yields no record rather than a malformed one.
-    assert _build(cov_payload={"status": "skipped", "reason": "x"}) is None
-    assert _build(cov_payload=None) is None
+def test_returns_none_when_no_source_has_metrics():
+    # Robustness: when NEITHER the cov-sweep (no cells) NOR the gate (no
+    # comparison.optimizer) has metrics, no record is written.
+    assert _build(cov_payload={"status": "skipped", "reason": "x"}, gate_payload=None) is None
+    assert _build(cov_payload=None, gate_payload=None) is None
+    assert _build(cov_payload=None, gate_payload={"passed": False}) is None  # no comparison
 
 
 def test_old_schema_cell_missing_metrics_coerces_to_none():
