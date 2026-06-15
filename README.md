@@ -56,7 +56,7 @@ This repo is **public**. Optimizer guardrails, sweep bounds, and config-promotio
 | Research | [`alpha-engine-research`](https://github.com/cipher813/alpha-engine-research) |
 | Predictor | [`alpha-engine-predictor`](https://github.com/cipher813/alpha-engine-predictor) |
 | Dashboard | [`alpha-engine-dashboard`](https://github.com/cipher813/alpha-engine-dashboard) |
-| Library | [`alpha-engine-lib`](https://github.com/cipher813/alpha-engine-lib) |
+| Library | [`alpha-engine-lib`](https://github.com/nousergon/nousergon-lib) |
 | Docs | [`alpha-engine-docs`](https://github.com/cipher813/alpha-engine-docs) |
 
 ## License
