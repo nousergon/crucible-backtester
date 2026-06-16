@@ -54,15 +54,16 @@ logger = logging.getLogger(__name__)
 # circuit breaker, vol target) is operator-owned and never touched here.
 WRITABLE_PARAMS: tuple[str, ...] = ("risk_aversion", "tcost_bps")
 PARAM_BOUNDS: dict[str, tuple[float, float]] = {
-    # λ — variance-penalty strength. Floor lowered 3.0→1.0 (2026-06-15, Brian)
-    # to let the tuner explore a more aggressive (higher-risk) book; the real
-    # risk backstops at low λ are the position/sector caps + drawdown
-    # circuit-breaker, and the tuner only promotes a lower λ if Sortino-justified
-    # (≥promote_margin + holdout). MUST stay in lockstep with the executor's
-    # read-side re-clamp executor/optimizer_shadow.py::_AUTO_TUNED_BOUNDS.
-    "risk_aversion": (1.0, 10.0),
+    "risk_aversion": (3.0, 10.0),   # λ — variance-penalty strength
     "tcost_bps": (1.0, 20.0),       # turnover penalty (bps per $1 traded)
 }
+# Generic public defaults above are the frozen reference band. The OPERATING
+# risk-aversion floor is a private risk-policy variable: override it via the
+# gitignored tuner config (`portfolio_optimizer_tuner.risk_aversion_floor`) — see
+# _effective_param_bounds — so an aggressive floor (e.g. 1.0) never ships in the
+# public repo (divergence policy: alpha-bearing values stay private). MUST stay
+# in lockstep with the executor read-side override
+# executor/optimizer_shadow.py (portfolio_optimizer.tuner_risk_aversion_floor).
 
 S3_PARAMS_KEY = "config/portfolio_optimizer.json"
 S3_SHADOW_PREFIX = "config/portfolio_optimizer_shadow_history"
@@ -83,13 +84,28 @@ def _tuner_cfg(config: dict | None) -> dict:
     return (config or {}).get("portfolio_optimizer_tuner", {}) or {}
 
 
-def _clamp(params: dict) -> tuple[dict, list[str]]:
-    """Clamp each writable param to its bound; return (clamped, notes). A clamp
-    is a loud event — it means the sweep recommended an out-of-band value."""
+def _effective_param_bounds(config: dict | None) -> dict[str, tuple[float, float]]:
+    """PARAM_BOUNDS with the risk_aversion floor overridden from the PRIVATE
+    tuner config (`portfolio_optimizer_tuner.risk_aversion_floor`, gitignored).
+    Public default floor (3.0) ships in the repo; the operating floor (e.g. 1.0,
+    a more aggressive posture) lives only in private config."""
+    bounds = dict(PARAM_BOUNDS)
+    floor = _tuner_cfg(config).get("risk_aversion_floor")
+    if floor is not None:
+        lo, hi = bounds["risk_aversion"]
+        bounds["risk_aversion"] = (float(floor), hi)
+    return bounds
+
+
+def _clamp(params: dict, config: dict | None = None) -> tuple[dict, list[str]]:
+    """Clamp each writable param to its (private-config-resolved) bound; return
+    (clamped, notes). A clamp is a loud event — it means the sweep recommended an
+    out-of-band value."""
+    bounds = _effective_param_bounds(config)
     clamped: dict = {}
     notes: list[str] = []
     for k, v in params.items():
-        lo, hi = PARAM_BOUNDS.get(k, (None, None))
+        lo, hi = bounds.get(k, (None, None))
         if lo is None:
             clamped[k] = v
             continue
@@ -143,7 +159,7 @@ def recommend(sweep_report: dict, *, config: dict | None = None) -> dict:
     raw = {k: win_cfg[k] for k in WRITABLE_PARAMS if k in win_cfg}
     if not raw:
         return {"status": "blocked", "reason": "winner cfg has no writable params"}
-    recommended, clamp_notes = _clamp(raw)
+    recommended, clamp_notes = _clamp(raw, config)
 
     return {
         "status": "ok",
@@ -174,7 +190,7 @@ def apply(result: dict, bucket: str, *, config: dict | None = None) -> dict:
         return {"applied": False, "reason": f"no promotable recommendation (status={status})"}
 
     # Defensive re-clamp at the write boundary (never trust an upstream value).
-    recommended, clamp_notes = _clamp(recommended)
+    recommended, clamp_notes = _clamp(recommended, config)
 
     payload = {
         **recommended,
