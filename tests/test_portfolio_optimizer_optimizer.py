@@ -18,9 +18,28 @@ from optimizer.portfolio_optimizer_optimizer import (
     S3_PARAMS_KEY,
     S3_SHADOW_PREFIX,
     WRITABLE_PARAMS,
+    _clamp,
+    _effective_param_bounds,
     apply,
     recommend,
 )
+
+
+def test_public_default_floor_is_generic():
+    # The repo ships the frozen generic floor; the aggressive operating floor is
+    # private (divergence policy) — never hardcode <3.0 here.
+    assert PARAM_BOUNDS["risk_aversion"][0] == 3.0
+
+
+def test_private_floor_override_lowers_band():
+    # Without the private config, a λ=2.0 recommendation is clamped up to 3.0.
+    clamped, notes = _clamp({"risk_aversion": 2.0}, None)
+    assert clamped["risk_aversion"] == 3.0 and notes
+    # With the private tuner config floor=1.0, λ=2.0 passes through unclamped.
+    cfg = {"portfolio_optimizer_tuner": {"risk_aversion_floor": 1.0}}
+    assert _effective_param_bounds(cfg)["risk_aversion"] == (1.0, 10.0)
+    clamped2, notes2 = _clamp({"risk_aversion": 2.0}, cfg)
+    assert clamped2["risk_aversion"] == 2.0 and not notes2
 
 
 def _sweep(winner, baseline="baseline_ra5_tc5", win_sortino=1.2, base_sortino=0.8,
