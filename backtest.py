@@ -5370,13 +5370,6 @@ def _main_impl() -> None:
     # predictor history + persists a per-run gate report. Saturday SF reads
     # the JSON for PR 5 cutover-readiness signal. Non-fatal — gate failures
     # are observability, not a backtester-pipeline blocker.
-    #
-    # The gate / cov-sweep / γ-sweep payloads are captured here so the
-    # optimizer-risk-history stage below can assemble a single per-run risk
-    # snapshot from them (the dashboard's Optimizer-Risk time-series page).
-    _opt_gate_payload = None
-    _cov_sweep_payload = None
-    _gamma_sweep_payload = None
     if args.mode in ("portfolio-optimizer-backtest", "all"):
         try:
             with registry.phase("portfolio_optimizer_gate", mode=args.mode):
@@ -5385,7 +5378,7 @@ def _main_impl() -> None:
                 # (sortino_min, max_drawdown_floor, cvar_95_floor, turnover_max).
                 # On mode=portfolio-optimizer-backtest (standalone), portfolio_stats
                 # is None and the gate reports skipped verdicts for those.
-                _opt_gate_payload = run_portfolio_optimizer_gate(
+                run_portfolio_optimizer_gate(
                     config=config,
                     run_date=args.date,
                     legacy_metrics=portfolio_stats,
@@ -5417,7 +5410,7 @@ def _main_impl() -> None:
     if args.mode in ("portfolio-optimizer-backtest", "all"):
         try:
             with registry.phase("cov_estimator_sweep", mode=args.mode):
-                _cov_sweep_payload = run_cov_estimator_sweep_stage(
+                run_cov_estimator_sweep_stage(
                     config=config,
                     run_date=args.date,
                 )
@@ -5453,7 +5446,7 @@ def _main_impl() -> None:
     if args.mode in ("portfolio-optimizer-backtest", "all"):
         try:
             with registry.phase("gamma_sweep", mode=args.mode):
-                _gamma_sweep_payload = run_gamma_sweep_stage(
+                run_gamma_sweep_stage(
                     config=config,
                     run_date=args.date,
                 )
@@ -5465,61 +5458,6 @@ def _main_impl() -> None:
             if fd:
                 fd.report(exc, severity="warning", context={
                     "site": "gamma_sweep", "mode": args.mode})
-
-    # ── Optimizer risk-history snapshot ───────────────────────────────────
-    # Assemble one flat per-run record of the optimizer's risk-tolerance levers
-    # (the cov-sweep selected cell's effective config) + its risk metrics, and
-    # append it to config/optimizer_risk_history/{run_id}.json (+ latest). The
-    # dashboard Optimizer-Risk page charts this time-series. Secondary
-    # observability hung off the sweep verdicts above — best-effort, never a
-    # pipeline blocker; absence is monitored via ARTIFACT_REGISTRY freshness.
-    if args.mode in ("portfolio-optimizer-backtest", "all"):
-        try:
-            with registry.phase("optimizer_risk_history", mode=args.mode):
-                import boto3
-                from alpha_engine_lib.eval_artifacts import new_eval_run_id
-                from optimizer.optimizer_risk_history import (
-                    build_optimizer_risk_record,
-                    write_optimizer_risk_history,
-                )
-                # Read the optimizer's static-lever defaults from the executor
-                # itself (executor_paths is on sys.path after the sweeps' import
-                # of executor modules) so static caps are sourced, not hard-coded.
-                try:
-                    from executor.portfolio_optimizer import OPTIMIZER_CONFIG_DEFAULTS
-                except Exception as _imp_exc:  # noqa: BLE001
-                    OPTIMIZER_CONFIG_DEFAULTS = {}
-                    logger.warning(
-                        "optimizer_risk_history: executor OPTIMIZER_CONFIG_DEFAULTS "
-                        "unavailable (%s) — static levers will be null", _imp_exc,
-                    )
-                _bucket = config.get("signals_bucket", "alpha-engine-research")
-                _record = build_optimizer_risk_record(
-                    cov_payload=_cov_sweep_payload,
-                    gamma_payload=_gamma_sweep_payload,
-                    gate_payload=_opt_gate_payload,
-                    optimizer_defaults=OPTIMIZER_CONFIG_DEFAULTS,
-                    trading_day=args.date,
-                    updated_at=args.date,
-                    run_id=new_eval_run_id(),
-                )
-                if _record is None:
-                    logger.info(
-                        "optimizer_risk_history: no usable cov-sweep cells "
-                        "(sweep skipped/absent) — record not written",
-                    )
-                else:
-                    write_optimizer_risk_history(
-                        _record, bucket=_bucket, s3=boto3.client("s3"),
-                    )
-        except Exception as exc:
-            logger.warning(
-                "optimizer_risk_history phase failed (non-fatal): %s",
-                exc, exc_info=True,
-            )
-            if fd:
-                fd.report(exc, severity="warning", context={
-                    "site": "optimizer_risk_history", "mode": args.mode})
 
     # ── Export simulation artifacts for evaluator ────────────────────────
     if args.mode in ("simulate", "param-sweep", "all", "predictor-backtest"):

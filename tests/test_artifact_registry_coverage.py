@@ -67,10 +67,6 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "optimizer/barrier_sizing_optimizer.py": 1,
     "optimizer/config_archive.py": 1,
     "optimizer/executor_optimizer.py": 5,
-    # optimizer risk-history snapshot (dashboard Optimizer-Risk page) — 2 PUTs
-    # (dated {run_id}.json + latest.json). Registered in ARTIFACT_REGISTRY.yaml
-    # as optimizer_risk_history_latest (pointer-pattern, severity warning).
-    "optimizer/optimizer_risk_history.py": 2,
     "optimizer/pipeline_optimizer.py": 2,
     # config#1057 inc 2: MVO optimizer-param auto-apply — 5 PUTs (live + shadow×2
     # + history×2), same config-write shape as optimizer/executor_optimizer.py;
