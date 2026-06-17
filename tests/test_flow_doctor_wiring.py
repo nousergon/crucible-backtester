@@ -374,14 +374,12 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.59.3" in text, (
-            "alpha-engine-lib should pin to v0.59.3 — flow-doctor pytest-guard "
-            "fix (lib#114 keys activation on 'pytest' in sys.modules, closing "
-            "the collection-time test-alert-leakage gap; config#996). Prior: "
-            "v0.58.0 flow-doctor default-on "
-            "roll (lib v0.58.0 makes flow-doctor activate when setup_logging is "
-            "called with a flow_doctor_yaml; adds guard_entrypoint/monitor_handler "
-            "crash-capture helpers). Bumped from the prior v0.53.0 fleet-alignment "
-            "pin (2026-06-06, L4513). "
+        assert "@v0.59.8" in text, (
+            "alpha-engine-lib should pin to v0.59.8 — adds "
+            "quant.stats.calibration.expected_calibration_error, the canonical "
+            "ECE shared by the predictor's calibrator fit and this repo's "
+            "production calibration monitor (fixes the margin-vs-probability "
+            "scale bug behind the recurring false calibration_breakdown alert). "
+            "Prior: v0.59.3 flow-doctor pytest-guard fix (lib#114; config#996). "
             "Update this test if the pin moves further forward."
         )

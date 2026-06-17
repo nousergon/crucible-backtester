@@ -26,7 +26,7 @@ RUN microdnf install -y git && microdnf clean all
 # integration. No [arcticdb] / [rag] — concordance reads decision
 # artifacts from S3 only.
 COPY lambda_concordance/requirements-concordance.txt requirements-concordance.txt
-RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.59.3" && \
+RUN pip install --no-cache-dir "alpha-engine-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.59.8" && \
     pip install --no-cache-dir -r requirements-concordance.txt && \
     rm -rf /root/.cache/pip
 
