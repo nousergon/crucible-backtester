@@ -673,7 +673,8 @@ def compute_calibration_validation(
     ece_result = expected_calibration_error(
         df["p_up"].to_numpy(), actual_up, n_bins=10, min_bin_n=min_bin_n,
     )
-    overall_ece = ece_result.get("ece")
+    _raw_ece = ece_result.get("ece")
+    overall_ece = round(_raw_ece, 4) if _raw_ece is not None else None
     total_n = int(ece_result.get("n", 0))
 
     # Map the lib's per-bin records to the persisted artifact shape. The
