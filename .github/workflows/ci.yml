@@ -30,3 +30,14 @@ jobs:
         run: |
           pip install pip-audit
           pip-audit || true
+
+  # Alert (Telegram) ONLY on genuine post-merge breakage of the default
+  # branch. PR-branch reds — mid-fix commits, cross-repo lib-tag merge-order
+  # races (e.g. the 2026-06-17 `@v0.59.8`-not-yet-tagged race) — stay silent,
+  # since GitHub's built-in failure email can't distinguish transient from
+  # real. Reusable workflow + transport live in nousergon-lib.
+  notify-main-failure:
+    needs: [test]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    secrets: inherit
