@@ -27,6 +27,8 @@ import boto3
 import numpy as np
 import pandas as pd
 
+from alpha_engine_lib.quant.stats.calibration import expected_calibration_error
+
 from pipeline_common import (
     ACTIVE_HORIZON_DAYS,
     ALPHA_COALESCE_SQL,
@@ -44,6 +46,16 @@ _MIN_SAMPLES = 10
 _IC_STD_EPSILON = 1e-8
 _MODE_COLLAPSE_THRESHOLD = 0.75  # if any direction > 75% of predictions → flag
 _DEGRADATION_RATIO = 0.50  # flag if production IC < 50% of training IC
+
+# Calibration needs INDEPENDENT observations, not overlapping daily rows. At a
+# 21d horizon, predictions made within ~horizon of each other share most of
+# their forward window — their outcomes are correlated, so raw row count
+# massively overstates the effective sample. ECE over 2-3 independent windows
+# is noise. Require this many non-overlapping horizon-length cohorts before the
+# ECE is trustworthy enough to drive a calibration_breakdown retrain alert.
+_MIN_INDEPENDENT_WINDOWS = 3
+# trading days → calendar days for cohort spacing (~7/5 + slack).
+_TRADING_TO_CALENDAR = 1.45
 
 _PROD_HEALTH_KEY = "predictor/metrics/production_health.json"
 _CALIBRATION_KEY = "predictor/metrics/calibration_validation.json"
@@ -529,6 +541,39 @@ def _load_calibrator_deployed_at(bucket: str) -> str | None:
         return None
 
 
+def _effective_independent_windows(
+    prediction_dates: pd.Series | list,
+    horizon_days: int = ACTIVE_HORIZON_DAYS,
+) -> int:
+    """Count non-overlapping horizon-length cohorts among the prediction dates.
+
+    Predictions made within one horizon of each other share most of their
+    forward window, so their outcomes are correlated — they are NOT independent
+    calibration observations. Greedily walk the sorted distinct prediction
+    dates, counting a new cohort only once we are at least one horizon (in
+    calendar days) past the last counted date. This is the binding sample-size
+    constraint for ECE at a 21d horizon: 60 daily rows over 3 weeks is ~1
+    independent window, not 60.
+    """
+    parsed = sorted(
+        {
+            datetime.strptime(str(d)[:10], "%Y-%m-%d")
+            for d in prediction_dates
+            if d is not None and str(d)[:10]
+        }
+    )
+    if not parsed:
+        return 0
+    horizon_cal = max(1, int(round(horizon_days * _TRADING_TO_CALENDAR)))
+    count = 1
+    anchor = parsed[0]
+    for d in parsed[1:]:
+        if (d - anchor).days >= horizon_cal:
+            count += 1
+            anchor = d
+    return count
+
+
 def compute_calibration_validation(
     db_path: str,
     bucket: str,
@@ -537,17 +582,27 @@ def compute_calibration_validation(
     min_bin_n: int = _MIN_BIN_N,
 ) -> dict:
     """
-    Phase 2b: Per-bin confidence calibration validation.
+    Phase 2b: Per-bin probability calibration validation.
 
-    For each confidence bin with at least ``min_bin_n`` samples, compute the
-    actual hit rate and compare it to the mean predicted confidence within
-    that bin. ``expected`` is the mean of predicted confidences in the bin —
-    this is the rigorous form of ECE. Using bin midpoints instead would
-    systematically overstate miscalibration when predictions cluster at one
-    end of a bin.
+    Measures ECE the rigorous way: bin the calibrated UP probability ``p_up``
+    and, in each bin, compare its mean to the empirical UP frequency
+    (``1[realized_log_alpha > 0]``). Both are probabilities on the same [0,1]
+    scale, so the ECE is comparable to the predictor's own training-time ECE
+    (both call ``alpha_engine_lib.quant.stats.calibration``).
 
-    Bins with fewer than ``min_bin_n`` samples are dropped from the ECE
-    computation to avoid noise domination in sparse tails.
+    WHY NOT ``prediction_confidence``: that field is ``|p_up - 0.5| * 2`` — a
+    *margin*, not a probability (since the 2026-05-12 convention flip,
+    predictor #143). Binning the margin against the direction hit-rate compares
+    two scales and manufactures a structural ECE (~0.2-0.25) on a perfectly
+    calibrated model — the cause of the recurring false ``calibration_breakdown``
+    retrain alerts. Fixed by measuring ``p_up`` vs the UP outcome here.
+
+    Two guards keep the ECE honest:
+      - raw-sample floor (``_MIN_SAMPLES``) + post-cutover blackout, as the IC
+        path;
+      - effective-independent-window floor (``_MIN_INDEPENDENT_WINDOWS``):
+        overlapping 21d-horizon daily rows are correlated, so a handful of
+        independent windows is too few to trust — skip rather than fire.
 
     Writes to predictor/metrics/calibration_validation.json.
     """
@@ -559,15 +614,21 @@ def compute_calibration_validation(
 
     conn = sqlite3.connect(db_path)
     df = pd.read_sql_query(
-        f"SELECT prediction_confidence, {CORRECT_COALESCE_SQL} AS canonical_correct "
+        "SELECT prediction_date, p_up, "
+        f"{ALPHA_COALESCE_SQL} AS canonical_actual "
         "FROM predictor_outcomes "
         f"WHERE {OUTCOMES_GRADED_SQL} "
+        "  AND p_up IS NOT NULL "
         f"  AND {CURRENT_HORIZON_FILTER_SQL} "
         f"  AND {POST_CUTOVER_FILTER_SQL} "
         f"  AND prediction_date >= ?",
         conn,
         params=(cutoff,),
     )
+
+    df["p_up"] = pd.to_numeric(df["p_up"], errors="coerce")
+    df["canonical_actual"] = pd.to_numeric(df["canonical_actual"], errors="coerce")
+    df = df.dropna(subset=["p_up", "canonical_actual"])
 
     if len(df) < _MIN_SAMPLES:
         # Same blackout classification as the IC path: pre-cutover-model
@@ -582,45 +643,57 @@ def compute_calibration_validation(
 
     conn.close()
 
-    df["confidence"] = pd.to_numeric(df["prediction_confidence"], errors="coerce")
-    df["correct"] = pd.to_numeric(df["canonical_correct"], errors="coerce")
-    df = df.dropna(subset=["confidence", "correct"])
-
-    # ── Bin by confidence ────────────────────────────────────────────────────
-    bin_edges = [0.50, 0.60, 0.70, 0.80, 0.90, 1.01]
-    bins = []
-    dropped_bins = []
-    total_ece = 0.0
-    total_n = 0
-
-    for i in range(len(bin_edges) - 1):
-        lo, hi = bin_edges[i], bin_edges[i + 1]
-        mask = (df["confidence"] >= lo) & (df["confidence"] < hi)
-        subset = df[mask]
-        n = len(subset)
-        if n == 0:
-            continue
-
-        hit_rate = float(subset["correct"].mean())
-        expected = float(subset["confidence"].mean())  # rigorous: mean predicted prob in bin
-
-        bin_record = {
-            "range": [round(lo, 2), round(min(hi, 1.0), 2)],
-            "n": n,
-            "hit_rate": round(hit_rate, 3),
-            "expected": round(expected, 3),
+    # ── Effective-independent-window adequacy gate ────────────────────────────
+    n_windows = _effective_independent_windows(df["prediction_date"])
+    if n_windows < _MIN_INDEPENDENT_WINDOWS:
+        msg = (
+            f"Calibration skipped: {len(df)} post-cutover outcomes span only "
+            f"{n_windows} independent {ACTIVE_HORIZON_DAYS}d window(s) "
+            f"(< {_MIN_INDEPENDENT_WINDOWS}). Overlapping daily rows at this "
+            f"horizon are correlated; ECE over this few independent windows is "
+            f"noise-dominated and must not drive a retrain alert. Self-clears as "
+            f"post-cutover history accumulates."
+        )
+        log.info("Calibration validation: %s", msg)
+        result = {
+            "date": run_date,
+            "status": "skipped",
+            "reason": "insufficient_independent_windows",
+            "n": int(len(df)),
+            "n_independent_windows": n_windows,
+            "min_independent_windows": _MIN_INDEPENDENT_WINDOWS,
+            "active_horizon_days": ACTIVE_HORIZON_DAYS,
+            "message": msg,
         }
+        _persist_metric(bucket, _CALIBRATION_KEY, result)
+        return result
 
-        if n < min_bin_n:
-            bin_record["dropped_reason"] = f"n<{min_bin_n}"
-            dropped_bins.append(bin_record)
-            continue
+    # ── ECE: calibrated p_up vs the realized UP outcome (both probabilities) ──
+    actual_up = (df["canonical_actual"].to_numpy() > 0).astype(float)
+    ece_result = expected_calibration_error(
+        df["p_up"].to_numpy(), actual_up, n_bins=10, min_bin_n=min_bin_n,
+    )
+    _raw_ece = ece_result.get("ece")
+    overall_ece = round(_raw_ece, 4) if _raw_ece is not None else None
+    total_n = int(ece_result.get("n", 0))
 
-        bins.append(bin_record)
-        total_ece += abs(hit_rate - expected) * n
-        total_n += n
+    # Map the lib's per-bin records to the persisted artifact shape. The
+    # persisted key stays ``expected`` (mean predicted prob in bin) for
+    # display/dashboard continuity — additive ``mean_pred`` rides alongside.
+    def _as_bin(rec: dict) -> dict:
+        out = {
+            "range": rec.get("range"),
+            "n": rec.get("n"),
+            "hit_rate": rec.get("hit_rate"),
+            "expected": rec.get("mean_pred"),
+            "mean_pred": rec.get("mean_pred"),
+        }
+        if rec.get("dropped_reason"):
+            out["dropped_reason"] = rec["dropped_reason"]
+        return out
 
-    overall_ece = round(total_ece / total_n, 4) if total_n > 0 else None
+    bins = [_as_bin(b) for b in ece_result.get("bins", [])]
+    dropped_bins = [_as_bin(b) for b in ece_result.get("dropped_bins", [])]
 
     # Calibration quality label
     if overall_ece is None:
@@ -637,6 +710,8 @@ def compute_calibration_validation(
         "lookback_days": lookback_days,
         "min_bin_n": min_bin_n,
         "n_total": total_n,
+        "n_independent_windows": n_windows,
+        "measured_on": "p_up_vs_realized_up",
         "bins": bins,
         "dropped_bins": dropped_bins,
         "overall_ece": overall_ece,
@@ -651,6 +726,10 @@ def compute_calibration_validation(
     if calibrator_deployed_at is not None:
         result["calibrator_deployed_at"] = calibrator_deployed_at
 
-    log.info("Calibration validation: ECE=%.4f (%s)  bins=%d  n=%d", overall_ece or 0, quality, len(bins), total_n)
+    log.info(
+        "Calibration validation: ECE=%s (%s)  bins=%d  n=%d  windows=%d",
+        f"{overall_ece:.4f}" if overall_ece is not None else "n/a",
+        quality, len(bins), total_n, n_windows,
+    )
     _persist_metric(bucket, _CALIBRATION_KEY, result)
     return result
