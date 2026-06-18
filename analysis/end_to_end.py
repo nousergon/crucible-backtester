@@ -362,6 +362,14 @@ def compute_lift_metrics(
         # 1. Scanner lift
         result["scanner_lift"] = _scanner_lift(conn, ur, date_filter, params)
 
+        # 1b. Breadth-conditioned momentum IC (config#1140) — fail-soft so a
+        # producer error can never break the existing e2e_lift contract.
+        try:
+            result["momentum_regime_ic"] = _momentum_regime_ic(conn, ur, date_filter, params)
+        except Exception as _mre:  # pragma: no cover - defensive
+            logger.warning("momentum_regime_ic failed (non-fatal): %s", _mre)
+            result["momentum_regime_ic"] = {"status": "error", "reason": str(_mre)}
+
         # 2. Team lift
         result["team_lift"] = _team_lift(conn, ur, date_filter, params)
 
@@ -694,6 +702,86 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "scanner_evaluations table not found"}
+
+
+def _momentum_regime_ic(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
+    """Breadth-conditioned momentum IC (config#1140).
+
+    Tracks the decisive regime-dependence behind the negative research edge
+    (config#1060): short-horizon momentum (scanner ``tech_score``) skill flips
+    sign with universe breadth (confirmed 2026-06-18 — tech_score IC -0.115 in
+    low-breadth weeks vs +0.030 in high-breadth; corr(breadth, IC)=+0.58). We
+    compute the per-week cross-sectional Spearman rank-IC of tech_score vs
+    realized 21d log market-relative alpha, then stratify the weekly ICs by
+    weekly breadth (fraction of the cohort beating SPY over 21d) into low/high
+    halves and report the breadth<->IC correlation. Per-week-then-average (not
+    pooled) so cross-week temporal structure cannot masquerade as
+    cross-sectional skill. This is the validation target for the Phase-2
+    momentum-neutralization fix (config#1142).
+    """
+    try:
+        # Column-existence check up front so a legacy scanner_evaluations schema
+        # (no tech_score) SKIPs cleanly rather than surfacing a DB error.
+        se_cols = [r[1] for r in conn.execute("PRAGMA table_info(scanner_evaluations)")]
+        if not se_cols:
+            return {"status": "skipped", "reason": "scanner_evaluations table not found"}
+        if "tech_score" not in se_cols:
+            return {"status": "skipped", "reason": "scanner_evaluations has no tech_score column"}
+        se_filter = date_filter.replace("eval_date", "se.eval_date") if date_filter else ""
+        se = pd.read_sql_query(
+            f"SELECT ticker, eval_date, tech_score FROM scanner_evaluations se{se_filter}",
+            conn, params=params,
+        )
+        if se.empty:
+            return {"status": "skipped", "reason": "scanner_evaluations empty"}
+        if "log_return_21d" not in ur.columns or "log_spy_return_21d" not in ur.columns:
+            return {"status": "skipped", "reason": "universe_returns lacks log_return_21d"}
+        m = ur.merge(se, on=["ticker", "eval_date"], how="inner")
+        m = m[
+            m["log_return_21d"].notna()
+            & m["log_spy_return_21d"].notna()
+            & m["tech_score"].notna()
+        ].copy()
+        if m.empty:
+            return {"status": "insufficient_data", "reason": "no realized-21d rows with tech_score"}
+        m["log_alpha_21d"] = m["log_return_21d"] - m["log_spy_return_21d"]
+        weeks = []
+        for d, g in m.groupby("eval_date"):
+            if len(g) < 10:  # need enough names for a stable weekly cross-sectional IC
+                continue
+            ic = g["tech_score"].corr(g["log_alpha_21d"], method="spearman")
+            if ic != ic:  # NaN (e.g. constant tech_score within the week)
+                continue
+            breadth = float((g["log_return_21d"] > g["log_spy_return_21d"]).mean())
+            weeks.append({"breadth": breadth, "ic": float(ic), "n": int(len(g))})
+        n_weeks = len(weeks)
+        if n_weeks < 4:
+            return {
+                "status": "insufficient_data",
+                "reason": f"only {n_weeks} weekly cohorts with realized 21d outcomes",
+                "n_weeks": n_weeks,
+            }
+        wdf = pd.DataFrame(weeks)
+        med = float(wdf["breadth"].median())
+        low = wdf[wdf["breadth"] <= med]["ic"]
+        high = wdf[wdf["breadth"] > med]["ic"]
+        bic = wdf["breadth"].corr(wdf["ic"])
+        return {
+            "status": "ok",
+            "horizon": "21d",
+            "n_weeks": n_weeks,
+            "mean_weekly_ic": round(float(wdf["ic"].mean()), 4),
+            "low_breadth_ic": round(float(low.mean()), 4) if len(low) else None,
+            "high_breadth_ic": round(float(high.mean()), 4) if len(high) else None,
+            "breadth_ic_corr": round(float(bic), 4) if bic == bic else None,
+            "median_breadth": round(med, 4),
+            "n_low_weeks": int(len(low)),
+            "n_high_weeks": int(len(high)),
+        }
+    except sqlite3.OperationalError:
+        return {"status": "skipped", "reason": "scanner_evaluations table not found"}
+    except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
+        return {"status": "error", "reason": str(e)}
 
 
 def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[dict]:
