@@ -771,12 +771,15 @@ echo "Using: \$(\$PYTHON_BIN --version)"
 
 # flow-doctor is now pulled in via alpha-engine-lib[flow_doctor] from
 # requirements.txt — no bundled editable install needed.
-# Three HTTPS clones (no SSH key needed; alpha-engine-lib went public
-# 2026-05-03 and these repos are public siblings).
-for REPO in alpha-engine-backtester alpha-engine alpha-engine-predictor; do
-    echo "Cloning \$REPO ..."
-    git clone --depth 1 --branch ${BRANCH} https://github.com/cipher813/\$REPO.git /home/ec2-user/\$REPO
-done
+# Three HTTPS clones (no SSH key needed; these repos are public siblings).
+# Repos were renamed + moved to the nousergon org 2026-06-15
+# (alpha-engine-* → crucible-*); local checkout dirs intentionally stay
+# alpha-engine-* (dir-name ≠ repo-name split) so every downstream path is
+# unchanged. Clone the new slugs explicitly rather than depending on
+# GitHub's chained rename/transfer 301 redirect from the old cipher813 paths.
+git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/crucible-backtester.git /home/ec2-user/alpha-engine-backtester
+git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/crucible-executor.git /home/ec2-user/alpha-engine
+git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/crucible-predictor.git /home/ec2-user/alpha-engine-predictor
 
 # Fetch staged configs from S3.
 aws s3 cp ${S3_STAGING}/backtester.env /home/ec2-user/alpha-engine-backtester/.env --region ${AWS_REGION} --quiet
