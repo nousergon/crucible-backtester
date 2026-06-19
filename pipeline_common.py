@@ -822,11 +822,19 @@ def load_phase_hard_caps(
 
 
 def load_config(path: str) -> dict:
-    search_paths = [
-        Path.home() / "alpha-engine-config" / "backtester" / "config.yaml",
-        Path(__file__).parent.parent / "alpha-engine-config" / "backtester" / "config.yaml",
-        Path(path),
+    # Experiment-package first (config#1042): backtester config.yaml resolves from
+    # experiments/$ALPHA_ENGINE_EXPERIMENT_ID/backtester/config.yaml (default
+    # experiment `reference`) ahead of the legacy top-level
+    # alpha-engine-config/backtester/config.yaml, then the repo-local fallback.
+    # Mirrors alpha-engine-research/config.py + alpha-engine-data weekly_collector.
+    exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
+    config_roots = [
+        Path.home() / "alpha-engine-config",
+        Path(__file__).parent.parent / "alpha-engine-config",
     ]
+    search_paths = [r / "experiments" / exp / "backtester" / "config.yaml" for r in config_roots]
+    search_paths += [r / "backtester" / "config.yaml" for r in config_roots]
+    search_paths.append(Path(path))
     resolved = next((p for p in search_paths if p.exists()), None)
     if resolved is None:
         raise FileNotFoundError(f"Config not found. Searched: {[str(p) for p in search_paths]}")
