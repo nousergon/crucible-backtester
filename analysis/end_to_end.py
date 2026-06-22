@@ -377,7 +377,7 @@ def compute_lift_metrics(
         # waiting for 4 forward OBSERVE cohorts. Fail-soft like 1b.
         try:
             result["neutralized_composite_ic"] = _neutralized_composite_ic(
-                conn, ur, date_filter, params, factor_loadings or {}
+                conn, factor_loadings or {}
             )
         except Exception as _nci:  # pragma: no cover - defensive
             logger.warning("neutralized_composite_ic failed (non-fatal): %s", _nci)
@@ -798,16 +798,38 @@ def _momentum_regime_ic(conn, ur: pd.DataFrame, date_filter: str, params: list) 
 
 
 # The Barra factor set the composite is residualized against (config#1142) —
-# mirrors research/scoring/neutralization_shadow.py::SHADOW_FACTORS (the same
-# momentum/beta/size loadings the live OBSERVE shadow uses). The config#1060
-# diagnosis pinned the funnel as an unintended short-momentum bet that inverts
-# in narrow-breadth tape.
+# the same momentum/beta/size factors the live OBSERVE shadow uses
+# (research/scoring/neutralization_shadow.py). The config#1060 diagnosis pinned
+# the funnel as an unintended short-momentum bet that inverts in narrow-breadth
+# tape.
+#
+# We residualize against the RAW ArcticDB feature columns, NOT the cross-
+# sectional ``*_zscore`` loadings: the z-scores are computed at feature-store
+# snapshot time and are NOT persisted per-name in the ArcticDB universe library
+# (the only historical source); the dated S3 ``factor_loading.parquet`` snapshots
+# only exist from 2026-06-05 on — too recent to overlap the realized-21d
+# cohorts — whereas the raw inputs go back to 2016. This is EXACT, not an
+# approximation: OLS residualization is invariant to affine transforms of the
+# regressors, and ``_xs_neutralize`` standardizes each factor internally, so
+# residualizing on raw ``momentum_20d`` is identical to residualizing on
+# ``momentum_20d_zscore``. size is the only non-affine case (Barra SIZE =
+# z(log(mktcap))), so the loader emits ``size_log = log(market_cap_raw)`` to
+# match the production definition.
 DEFAULT_NEUTRALIZE_FACTORS: tuple[str, ...] = (
-    "momentum_20d_zscore",
-    "return_60d_zscore",
-    "beta_60d_zscore",
-    "size_zscore",
+    "momentum_20d",
+    "return_60d",
+    "beta_60d",
+    "size_log",
 )
+
+# ArcticDB raw column -> (exposure key, transform). The loader reads these raw
+# columns from the universe feature history and emits the exposure keys above.
+_RAW_FACTOR_SOURCE: dict = {
+    "momentum_20d": ("momentum_20d", None),
+    "return_60d": ("return_60d", None),
+    "beta_60d": ("beta_60d", None),
+    "market_cap_raw": ("size_log", "log"),
+}
 
 
 def _xs_neutralize(
@@ -882,24 +904,26 @@ def _xs_neutralize(
 
 def _neutralized_composite_ic(
     conn,
-    ur: pd.DataFrame,
-    date_filter: str,
-    params: list,
     loadings: dict,
     factors: tuple = DEFAULT_NEUTRALIZE_FACTORS,
 ) -> dict:
     """Historical Barra-neutralized composite counterfactual (config#1142/#1060).
 
     Answers the cutover-gate question directly on HISTORY instead of waiting for
-    4 forward OBSERVE cohorts: does residualizing the research composite
-    (``cio_evaluations.combined_score`` — the layer the config#1060 diagnosis
-    pinned at rank-IC -0.11) against the momentum/beta/size factor loadings
-    RECOVER forward 21d-alpha skill? Computes the per-week cross-sectional
-    Spearman rank-IC of BOTH the raw and the neutralized composite vs realized
-    21d log market-relative alpha, stratified by weekly breadth (identical
-    construction to ``_momentum_regime_ic``), so the harness sees a measured
-    raw->neutralized before/after — including the low-breadth bucket where the
-    un-neutralized momentum bet inverts.
+    4 forward OBSERVE cohorts: does residualizing the research **composite**
+    (``team_candidates.quant_score`` — the wide team-stage quant composite)
+    against the momentum/beta/size factor exposures RECOVER forward 21d-alpha
+    skill? Computes the per-week cross-sectional Spearman rank-IC of BOTH the raw
+    and the neutralized composite vs realized 21d log market-relative alpha,
+    stratified by weekly breadth (same construction as ``_momentum_regime_ic``),
+    so the harness sees a measured raw->neutralized before/after.
+
+    ``team_candidates`` is the right cross-section: ~48 names/week — above the
+    20-name floor ``_xs_neutralize`` needs for a stable cross-sectional
+    regression. The thinner ~17-name ``score_performance`` / ``cio_evaluations``
+    pools fall below it most weeks, so neutralization passes through identity and
+    never engages there (the 2026-06-22 finding behind this repoint). Realized
+    21d alpha comes from the ``universe_returns`` join.
 
     This only MEASURES the counterfactual; the neutralized LIVE cutover stays
     gated/OFF (config#1142). ``loadings``: {(eval_date, ticker): {factor:
@@ -909,29 +933,36 @@ def _neutralized_composite_ic(
     try:
         if not loadings:
             return {"status": "skipped", "reason": "no factor loadings provided"}
-        ce_cols = [r[1] for r in conn.execute("PRAGMA table_info(cio_evaluations)")]
-        if not ce_cols:
-            return {"status": "skipped", "reason": "cio_evaluations table not found"}
-        if "combined_score" not in ce_cols:
-            return {"status": "skipped", "reason": "cio_evaluations has no combined_score column"}
-        ce_filter = date_filter.replace("eval_date", "ce.eval_date") if date_filter else ""
-        ce = pd.read_sql_query(
-            f"SELECT ticker, eval_date, combined_score FROM cio_evaluations ce{ce_filter}",
-            conn, params=params,
+        tabs = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "team_candidates" not in tabs or "universe_returns" not in tabs:
+            return {"status": "skipped", "reason": "team_candidates / universe_returns table not found"}
+        tc_cols = {r[1] for r in conn.execute("PRAGMA table_info(team_candidates)")}
+        if "quant_score" not in tc_cols:
+            return {"status": "skipped", "reason": "team_candidates has no quant_score column"}
+        ur_cols = {r[1] for r in conn.execute("PRAGMA table_info(universe_returns)")}
+        if not {"log_return_21d", "log_spy_return_21d"}.issubset(ur_cols):
+            return {"status": "skipped", "reason": "universe_returns lacks log_return_21d / log_spy_return_21d"}
+        # team_candidates.quant_score is the WIDE composite cross-section
+        # (~48 names/week — clears the 20-name floor _xs_neutralize needs to
+        # engage; the ~17-name score_performance / CIO pools do not). Join
+        # universe_returns for the realized 21d log market-relative alpha.
+        m = pd.read_sql_query(
+            "SELECT t.ticker AS ticker, t.eval_date AS eval_date, "
+            "t.quant_score AS score, "
+            "u.log_return_21d AS r21, u.log_spy_return_21d AS s21, "
+            "(u.log_return_21d - u.log_spy_return_21d) AS log_alpha_21d "
+            "FROM team_candidates t JOIN universe_returns u "
+            "ON u.ticker = t.ticker AND u.eval_date = t.eval_date "
+            "WHERE u.log_return_21d IS NOT NULL AND u.log_spy_return_21d IS NOT NULL "
+            "AND t.quant_score IS NOT NULL",
+            conn,
         )
-        if ce.empty:
-            return {"status": "skipped", "reason": "cio_evaluations empty"}
-        if "log_return_21d" not in ur.columns or "log_spy_return_21d" not in ur.columns:
-            return {"status": "skipped", "reason": "universe_returns lacks log_return_21d"}
-        m = ur.merge(ce, on=["ticker", "eval_date"], how="inner")
-        m = m[
-            m["log_return_21d"].notna()
-            & m["log_spy_return_21d"].notna()
-            & m["combined_score"].notna()
-        ].copy()
         if m.empty:
-            return {"status": "insufficient_data", "reason": "no realized-21d rows with combined_score"}
-        m["log_alpha_21d"] = m["log_return_21d"] - m["log_spy_return_21d"]
+            return {"status": "insufficient_data", "reason": "no team_candidates rows with realized 21d outcomes"}
         factors_l = list(factors)
         raw_weeks: list = []
         neu_weeks: list = []
@@ -941,7 +972,7 @@ def _neutralized_composite_ic(
         for d, g in m.groupby("eval_date"):
             if len(g) < 10:  # need enough names for a stable weekly cross-sectional IC
                 continue
-            scores = dict(zip(g["ticker"], g["combined_score"].astype(float)))
+            scores = dict(zip(g["ticker"], g["score"].astype(float)))
             exposures = {t: (loadings.get((d, t)) or {}) for t in scores}
             tot_names += len(scores)
             cov_names += sum(
@@ -960,7 +991,7 @@ def _neutralized_composite_ic(
             )
             if raw_ic != raw_ic or neu_ic != neu_ic:  # NaN (constant within week)
                 continue
-            breadth = float((g["log_return_21d"] > g["log_spy_return_21d"]).mean())
+            breadth = float((g["r21"] > g["s21"]).mean())
             raw_weeks.append({"breadth": breadth, "ic": float(raw_ic)})
             neu_weeks.append({"breadth": breadth, "ic": float(neu_ic)})
         n_weeks = len(raw_weeks)
@@ -1017,7 +1048,7 @@ def _neutralized_composite_ic(
             "neutralization_recovers_edge": recovers,
         }
     except sqlite3.OperationalError:
-        return {"status": "skipped", "reason": "cio_evaluations table not found"}
+        return {"status": "skipped", "reason": "team_candidates / universe_returns table not found"}
     except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
         return {"status": "error", "reason": str(e)}
 
@@ -1027,35 +1058,71 @@ def load_historical_factor_loadings(
     eval_dates,
     factors: tuple = DEFAULT_NEUTRALIZE_FACTORS,
 ) -> dict:
-    """Build {(eval_date, ticker): {factor: exposure}} from the ArcticDB universe
-    feature history, for the neutralized-composite counterfactual (config#1142).
+    """Build {(eval_date, ticker): {exposure_key: value}} from the RAW ArcticDB
+    universe feature history, for the neutralized-composite counterfactual
+    (config#1142).
 
     ArcticDB is the authoritative per-date feature store (the same source the
-    backtester uses for prices), so the momentum/beta/size ``*_zscore`` loadings
-    exist for every historical eval_date. Fail-soft: any error (ArcticDB
-    unreachable, a factor column absent, a malformed index) returns ``{}`` so
-    the counterfactual reports status ``skipped`` and the e2e_lift contract is
-    never broken.
+    backtester uses for prices) and carries the RAW factor inputs back to 2016 —
+    ``momentum_20d`` / ``return_60d`` / ``beta_60d`` / ``market_cap_raw`` (see
+    ``_RAW_FACTOR_SOURCE``). We deliberately use raw inputs rather than the
+    cross-sectional ``*_zscore`` loadings: the z-scores are NOT persisted in the
+    universe library, and residualizing on raw vs z-scored exposures is
+    mathematically identical (affine invariance + ``_xs_neutralize`` standardizes
+    internally). ``market_cap_raw`` gets the ``log`` transform so size matches
+    Barra SIZE = z(log(mktcap)).
+
+    A research-cycle ``eval_date`` may not be a trading day, so each is matched
+    AS-OF (the last trading row at or before it). Fail-soft: any error (ArcticDB
+    unreachable, a column absent, a malformed index) returns ``{}`` so the
+    counterfactual reports status ``skipped`` and the e2e_lift contract is never
+    broken.
     """
     try:
+        import numpy as np
+
         from store.arctic_reader import load_universe_from_arctic
 
+        # exposure_key -> (raw_column, transform), restricted to the requested
+        # factor set so callers can subset.
+        wanted_keys = set(factors)
+        src = {
+            raw: (key, tf)
+            for raw, (key, tf) in _RAW_FACTOR_SOURCE.items()
+            if key in wanted_keys
+        }
+        if not src:
+            return {}
+        raw_cols = list(src)
+
         _prices, features_by_ticker = load_universe_from_arctic(bucket)
-        wanted = set(eval_dates)
+        dates_sorted = sorted(set(eval_dates))
+        dt_index = pd.to_datetime(dates_sorted)
         out: dict = {}
         for ticker, fdf in (features_by_ticker or {}).items():
-            cols = [f for f in factors if f in getattr(fdf, "columns", [])]
+            cols = [c for c in raw_cols if c in getattr(fdf, "columns", [])]
             if not cols:
                 continue
-            idx = pd.to_datetime(fdf.index).normalize().strftime("%Y-%m-%d")
-            sub = fdf[cols]
-            for i, d in enumerate(idx):
-                if d not in wanted:
-                    continue
-                row = sub.iloc[i]
-                vals = {f: float(row[f]) for f in cols if pd.notna(row[f])}
-                if vals:
-                    out[(d, ticker)] = vals
+            sub = fdf[cols].copy()
+            sub.index = pd.to_datetime(sub.index).normalize()
+            sub = sub[~sub.index.duplicated(keep="last")].sort_index()
+            # AS-OF align to each eval_date: last trading row <= eval_date.
+            aligned = sub.reindex(dt_index, method="ffill")
+            for d_ts, d_str in zip(dt_index, dates_sorted):
+                row = aligned.loc[d_ts]
+                rec: dict = {}
+                for raw in cols:
+                    key, tf = src[raw]
+                    v = row.get(raw)
+                    if v is None or not pd.notna(v):
+                        continue
+                    if tf == "log":
+                        if v <= 0:
+                            continue
+                        v = float(np.log(v))
+                    rec[key] = float(v)
+                if rec:
+                    out[(d_str, ticker)] = rec
         return out
     except Exception as e:  # fail-soft — never break the diagnostics run
         logger.warning("load_historical_factor_loadings failed (non-fatal): %s", e)
