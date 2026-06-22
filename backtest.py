@@ -36,6 +36,15 @@ Options:
     --log-level     DEBUG | INFO | WARNING (default: INFO)
 """
 
+# arcticdb MUST import before pyarrow/pandas — both bundle the AWS C SDK and on
+# macOS whichever loads first wins global symbol resolution; if pyarrow wins,
+# arcticdb's S3 client aborts (allocator != NULL) when constructed. Importing
+# arcticdb first makes its symbols win. No-op on Linux; harmless if absent.
+try:  # noqa: SIM105
+    import arcticdb  # noqa: F401
+except Exception:  # pragma: no cover - arcticdb optional in some envs
+    pass
+
 import argparse
 import json
 import logging

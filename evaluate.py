@@ -22,6 +22,18 @@ Usage:
 
 from __future__ import annotations
 
+# arcticdb MUST import before pyarrow/pandas. Both bundle the AWS C SDK; on
+# macOS whichever loads first wins the global symbol resolution, and if
+# pyarrow's libarrow wins, arcticdb's S3 client binds incompatible aws_*
+# symbols and aborts (allocator != NULL fatal) when it builds the S3 client.
+# Importing arcticdb first makes its symbols win. No-op on Linux (where there
+# is no clash) and harmless if arcticdb is absent (the diagnostics that need it
+# fail-soft). Keep this ABOVE the pandas-pulling imports below.
+try:  # noqa: SIM105
+    import arcticdb  # noqa: F401
+except Exception:  # pragma: no cover - arcticdb optional in some envs
+    pass
+
 import argparse
 import io
 import json
@@ -352,9 +364,16 @@ def _run_diagnostics(
             bucket = config.get("signals_bucket", "alpha-engine-research")
             _conn = _sqlite3.connect(db_path)
             try:
+                # The counterfactual scores against team_candidates (the wide
+                # composite cross-section) joined to universe_returns for
+                # realized 21d outcomes, so the loadings must key off the
+                # team_candidates eval_dates that have a matured 21d return.
                 eval_dates = [
                     r[0] for r in _conn.execute(
-                        "SELECT DISTINCT eval_date FROM universe_returns"
+                        "SELECT DISTINCT t.eval_date FROM team_candidates t "
+                        "JOIN universe_returns u "
+                        "ON u.ticker = t.ticker AND u.eval_date = t.eval_date "
+                        "WHERE u.log_return_21d IS NOT NULL"
                     )
                 ]
             finally:

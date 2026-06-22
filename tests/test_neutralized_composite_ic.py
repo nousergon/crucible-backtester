@@ -2,12 +2,13 @@
 (config#1142/#1060).
 
 ``_neutralized_composite_ic`` answers the cutover-gate question on HISTORY: does
-residualizing the research composite against the momentum/beta/size factor
-loadings recover forward 21d-alpha skill? These tests construct a cross-section
-where the raw composite is dominated by an anti-predictive momentum tilt (so its
-IC vs realized alpha is negative) while the idiosyncratic residual predicts —
-the neutralized IC must then beat the raw IC. The pure ``_xs_neutralize`` and
-the fail-soft paths are also pinned.
+residualizing the wide research composite (``team_candidates.quant_score``,
+joined to ``universe_returns`` for realized 21d alpha) against the
+momentum/beta/size factor exposures recover forward 21d-alpha skill? These tests
+construct a cross-section where the raw composite is dominated by an
+anti-predictive momentum tilt (so its IC vs realized alpha is negative) while the
+idiosyncratic residual predicts — the neutralized IC must then beat the raw IC.
+The pure ``_xs_neutralize`` and the fail-soft paths are also pinned.
 """
 
 from __future__ import annotations
@@ -26,29 +27,31 @@ from analysis.end_to_end import (  # noqa: E402
 )
 
 
-def _conn_ur_loadings(tmp_path):
-    """Build a research.db + universe_returns + loadings on a BALANCED design
-    where momentum is orthogonal to the idiosyncratic part by construction.
+def _conn_loadings(tmp_path):
+    """Build a research.db (``team_candidates`` + ``universe_returns``) + loadings
+    on a BALANCED design where momentum is orthogonal to the idiosyncratic part.
 
     For i in 0..23:  mom = (i % 6) - 2.5   (cycles within each block of 6)
                      idio = (i // 6) - 1.5  (constant within each block)
-    so across the cross-section mom ⊥ idio (every idio block sees the full mom
-    range). Then::
+    so across the cross-section mom ⊥ idio. Then::
 
-        score   = 50 + 10*mom + 3*idio        (momentum DOMINATES the ranking)
-        alpha21 = 0.01*idio - 0.02*mom         (momentum ANTI-predicts; idio predicts)
+        quant_score = 50 + 10*mom + 3*idio    (momentum DOMINATES the ranking)
+        alpha21     = 0.01*idio - 0.02*mom     (momentum ANTI-predicts; idio predicts)
 
-    Raw-score IC is dragged negative by the dominant momentum tilt; residualizing
-    momentum out exposes the positive idiosyncratic signal -> neutralized IC >
-    raw IC. (The 4-factor production path's rank/residual behaviour is covered by
-    the ``_xs_neutralize`` unit tests; here we neutralize the single momentum
-    factor so the mechanism is isolated.)
+    Raw composite IC is dragged negative by the dominant momentum tilt;
+    residualizing momentum out exposes the positive idiosyncratic signal ->
+    neutralized IC > raw IC. (The 4-factor production path's rank/residual
+    behaviour is covered by the ``_xs_neutralize`` unit tests; here we neutralize
+    the single momentum factor so the mechanism is isolated.)
     """
     conn = sqlite3.connect(str(tmp_path / "r.db"))
     conn.execute(
-        "CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, combined_score REAL)"
+        "CREATE TABLE team_candidates (ticker TEXT, eval_date TEXT, quant_score REAL)"
     )
-    ur_rows = []
+    conn.execute(
+        "CREATE TABLE universe_returns ("
+        "ticker TEXT, eval_date TEXT, log_return_21d REAL, log_spy_return_21d REAL)"
+    )
     loadings: dict = {}
     dates = [
         "2026-01-02", "2026-01-09", "2026-01-16",
@@ -61,22 +64,20 @@ def _conn_ur_loadings(tmp_path):
             score = 50.0 + 10.0 * mom + 3.0 * idio
             alpha = 0.01 * idio - 0.02 * mom
             conn.execute(
-                "INSERT INTO cio_evaluations VALUES (?,?,?)", (f"T{i}", d, score)
+                "INSERT INTO team_candidates VALUES (?,?,?)", (f"T{i}", d, score)
             )
-            ur_rows.append({
-                "ticker": f"T{i}", "eval_date": d, "return_5d": 0.01,
-                "log_return_21d": alpha, "log_spy_return_21d": 0.0,
-            })
-            loadings[(d, f"T{i}")] = {"momentum_20d_zscore": mom}
+            # log_spy=0 so realized log-alpha == log_return_21d == alpha.
+            conn.execute(
+                "INSERT INTO universe_returns VALUES (?,?,?,?)", (f"T{i}", d, alpha, 0.0)
+            )
+            loadings[(d, f"T{i}")] = {"momentum_20d": mom}
     conn.commit()
-    return conn, pd.DataFrame(ur_rows), loadings
+    return conn, loadings
 
 
 def test_neutralization_beats_raw_on_history(tmp_path):
-    conn, ur, loadings = _conn_ur_loadings(tmp_path)
-    r = _neutralized_composite_ic(
-        conn, ur, "", [], loadings, factors=("momentum_20d_zscore",)
-    )
+    conn, loadings = _conn_loadings(tmp_path)
+    r = _neutralized_composite_ic(conn, loadings, factors=("momentum_20d",))
     assert r["status"] == "ok", r
     assert r["n_weeks"] == 6
     # Raw composite IC is dragged negative by the dominant momentum tilt...
@@ -91,21 +92,17 @@ def test_neutralization_beats_raw_on_history(tmp_path):
 
 
 def test_skipped_without_loadings(tmp_path):
-    conn, ur, _ = _conn_ur_loadings(tmp_path)
-    r = _neutralized_composite_ic(conn, ur, "", [], {})
+    conn, _ = _conn_loadings(tmp_path)
+    r = _neutralized_composite_ic(conn, {})
     assert r["status"] == "skipped", r
     assert "loadings" in r["reason"]
 
 
-def test_skipped_when_no_combined_score_column(tmp_path):
+def test_skipped_when_no_team_candidates(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "r2.db"))
-    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT)")
+    conn.execute("CREATE TABLE other (x INTEGER)")
     conn.commit()
-    ur = pd.DataFrame([{
-        "ticker": "A", "eval_date": "2026-01-02", "return_5d": 0.01,
-        "log_return_21d": 0.01, "log_spy_return_21d": 0.0,
-    }])
-    r = _neutralized_composite_ic(conn, ur, "", [], {("2026-01-02", "A"): {"x": 1.0}})
+    r = _neutralized_composite_ic(conn, {("2026-01-02", "A"): {"momentum_20d": 1.0}})
     assert r["status"] == "skipped", r
 
 
@@ -118,8 +115,8 @@ def test_xs_neutralize_identity_when_no_factors():
 def test_xs_neutralize_identity_below_min_names():
     # 3 names < min_names=20 -> identity passthrough (fail-soft), never drops.
     scores = {f"T{i}": float(i) for i in range(3)}
-    exposures = {f"T{i}": {"momentum_20d_zscore": float(i)} for i in range(3)}
-    out = _xs_neutralize(scores, exposures, ["momentum_20d_zscore"])
+    exposures = {f"T{i}": {"momentum_20d": float(i)} for i in range(3)}
+    out = _xs_neutralize(scores, exposures, ["momentum_20d"])
     assert out == scores
 
 
@@ -128,8 +125,8 @@ def test_xs_neutralize_residualizes_and_preserves_names():
     # (rescaled) collapses the factor's ranking but returns every name.
     n = 24
     scores = {f"T{i}": 50.0 + 2.0 * i for i in range(n)}
-    exposures = {f"T{i}": {"momentum_20d_zscore": float(i)} for i in range(n)}
-    out = _xs_neutralize(scores, exposures, ["momentum_20d_zscore"])
+    exposures = {f"T{i}": {"momentum_20d": float(i)} for i in range(n)}
+    out = _xs_neutralize(scores, exposures, ["momentum_20d"])
     assert set(out) == set(scores)  # no name dropped
     # Original score ranks strictly by i; after removing the (collinear) factor
     # the residual carries essentially no monotone ranking in i.
