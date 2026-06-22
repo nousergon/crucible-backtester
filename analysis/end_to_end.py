@@ -72,10 +72,25 @@ def _alpha_21d_log_lift(merged: pd.DataFrame, selected_mask) -> dict | None:
     """Selected-vs-baseline 21d log-domain market-relative alpha lift.
 
     Uses ``log_return_21d - log_spy_return_21d`` — the exact unit the system
-    trades toward. Baseline is the full ``merged`` frame mean. Diagnostic
-    (surfaced in the grade reason); the graded signal is the precision-edge of
-    ``classification_21d``. Returns ``None`` when the canonical columns are
-    absent or no 21d outcomes have closed.
+    trades toward. Returns ``None`` when the canonical columns are absent or no
+    21d outcomes have closed.
+
+    Emits THREE baselines so a funnel stage's edge can be read on a clean
+    yardstick (config#967 funnel-measurement, 2026-06-22):
+
+    * ``lift`` — selected vs the FULL input pool (legacy; selected ⊆ baseline,
+      so it DILUTES the contrast — kept for back-compat / existing graders).
+    * ``lift_vs_rejected`` — selected vs the REJECTED complement (the un-diluted
+      selection-skill measure: did this stage keep the better names *out of*
+      what it was handed?).
+    * ``sn_lift_vs_rejected`` — selected vs rejected on the SECTOR(+cycle)-
+      NEUTRALIZED residual (alpha minus its per-``(eval_date, sector)`` group
+      mean), so a stage can't look skillful merely by tilting into a strong
+      sector or a strong week. Present only when ``sector`` is in the frame.
+
+    All new fields are ADDITIVE (S3 schema-contract safe). Beta-matched
+    baselines are a follow-up (need per-name beta from ArcticDB; the alpha is
+    already SPY-relative so beta is a second-order confound).
     """
     if "log_return_21d" not in merged.columns or "log_spy_return_21d" not in merged.columns:
         return None
@@ -84,16 +99,57 @@ def _alpha_21d_log_lift(merged: pd.DataFrame, selected_mask) -> dict | None:
     if base.empty:
         return None
     sel_alpha = alpha[selected_mask].dropna()
+    rej_alpha = alpha[~selected_mask].dropna()
     sel_avg = float(sel_alpha.mean()) if not sel_alpha.empty else None
+    rej_avg = float(rej_alpha.mean()) if not rej_alpha.empty else None
     base_avg = float(base.mean())
     lift = (sel_avg - base_avg) if sel_avg is not None else None
-    return {
+    lift_vs_rej = (
+        (sel_avg - rej_avg) if (sel_avg is not None and rej_avg is not None) else None
+    )
+
+    out = {
         "selected_avg": round(sel_avg, 5) if sel_avg is not None else None,
         "baseline_avg": round(base_avg, 5),
         "lift": round(lift, 5) if lift is not None else None,
         "n_selected": int(sel_alpha.shape[0]),
         "n_baseline": int(base.shape[0]),
+        # Complement (selected vs rejected) — the un-diluted selection contrast.
+        "rejected_avg": round(rej_avg, 5) if rej_avg is not None else None,
+        "n_rejected": int(rej_alpha.shape[0]),
+        "lift_vs_rejected": round(lift_vs_rej, 5) if lift_vs_rej is not None else None,
     }
+
+    # Sector(+cycle)-neutral selected-vs-rejected: residualize alpha against its
+    # per-(eval_date, sector) group mean so the lift reflects WITHIN-peer-group
+    # selection skill, not a sector/time tilt.
+    if "sector" in merged.columns:
+        grp_cols = (["eval_date"] if "eval_date" in merged.columns else []) + ["sector"]
+        valid = alpha.notna() & merged["sector"].notna()
+        if "eval_date" in grp_cols:
+            valid = valid & merged["eval_date"].notna()
+        if valid.any():
+            keys = [merged.loc[valid, c] for c in grp_cols]
+            gmean = alpha[valid].groupby(keys).transform("mean")
+            resid = pd.Series(float("nan"), index=merged.index, dtype="float64")
+            resid.loc[gmean.index] = alpha[valid] - gmean
+            sn_sel = resid[selected_mask].dropna()
+            sn_rej = resid[~selected_mask].dropna()
+            sn_sel_avg = float(sn_sel.mean()) if not sn_sel.empty else None
+            sn_rej_avg = float(sn_rej.mean()) if not sn_rej.empty else None
+            sn_lift = (
+                (sn_sel_avg - sn_rej_avg)
+                if (sn_sel_avg is not None and sn_rej_avg is not None)
+                else None
+            )
+            out["sn_basis"] = "+".join(grp_cols)
+            out["sn_selected_avg"] = round(sn_sel_avg, 5) if sn_sel_avg is not None else None
+            out["sn_rejected_avg"] = round(sn_rej_avg, 5) if sn_rej_avg is not None else None
+            out["sn_lift_vs_rejected"] = round(sn_lift, 5) if sn_lift is not None else None
+            out["sn_n_selected"] = int(sn_sel.shape[0])
+            out["sn_n_rejected"] = int(sn_rej.shape[0])
+
+    return out
 
 
 def _cio_selection_skill(merged: pd.DataFrame) -> dict | None:
