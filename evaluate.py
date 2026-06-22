@@ -340,11 +340,37 @@ def _run_diagnostics(
     trades_db = config.get("_trades_db")
     results = {}
 
+    # Historical Barra factor loadings (ArcticDB) for the neutralized-composite
+    # counterfactual in e2e_lift (config#1142). Built here because evaluate has
+    # the bucket (config) + the eval-date set (research.db). Fail-soft: any
+    # error -> {} and the counterfactual reports status 'skipped'.
+    factor_loadings: dict = {}
+    if avail.get("research_db"):
+        try:
+            import sqlite3 as _sqlite3
+
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            _conn = _sqlite3.connect(db_path)
+            try:
+                eval_dates = [
+                    r[0] for r in _conn.execute(
+                        "SELECT DISTINCT eval_date FROM universe_returns"
+                    )
+                ]
+            finally:
+                _conn.close()
+            factor_loadings = end_to_end.load_historical_factor_loadings(
+                bucket, eval_dates
+            )
+        except Exception as _fl:  # fail-soft — never block diagnostics
+            logger.warning("factor-loadings load skipped (non-fatal): %s", _fl)
+
     # End-to-end lift metrics
     results["e2e_lift"] = tracker.run_module(
         "end_to_end_lift",
         lambda: end_to_end.compute_lift_metrics(
             research_db_path=db_path, trades_db_path=trades_db,
+            factor_loadings=factor_loadings,
         ),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
