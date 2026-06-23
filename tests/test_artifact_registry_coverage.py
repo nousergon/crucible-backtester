@@ -86,7 +86,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "optimizer/trigger_optimizer.py": 1,
     "optimizer/weight_optimizer.py": 5,
     "phase_artifacts.py": 5,
-    "pipeline_common.py": 2,
+    # +1 (2→3) 2026-06-23: config#1151 substrate_ops.json — the per-run watchdog
+    # firing aggregate PhaseRegistry.phase() writes for the report card's
+    # substrate tile (crucible-evaluator watchdog_firings). A per-run report-card
+    # INPUT read windowed by the evaluator (absence → graceful N/A, like
+    # sample_size.json), NOT a freshness-SLA artifact — grandfathered here rather
+    # than added to the freshness registry, matching the per-run-diagnostic
+    # precedent above.
+    "pipeline_common.py": 3,
     "replay/batch.py": 1,
     "replay/counterfactual.py": 1,
     "replay/runner.py": 1,

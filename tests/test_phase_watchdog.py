@@ -26,6 +26,7 @@ from pipeline_common import (
     PhaseRegistry,
     PhaseTimeoutError,
     _start_watchdog,
+    _substrate_ops_key,
     load_phase_hard_caps,
 )
 
@@ -189,6 +190,113 @@ def test_phase_registry_normal_completion_cancels_watchdog(monkeypatch):
         pass
 
     assert cancelled == [True], "watchdog timer should have been cancelled"
+
+
+# ── substrate_ops.json watchdog-firings aggregate (config#1151) ──────────────
+
+
+def _read_substrate_ops(s3: _FakeS3, bucket: str, date: str) -> dict:
+    return json.loads(s3.store[(bucket, _substrate_ops_key(date))])
+
+
+def test_watchdog_trip_persists_firing_and_still_raises(monkeypatch):
+    """A phase that trips its watchdog must (a) record watchdog_fired=true with
+    the cap/wall_time and increment the run firing count, (b) STILL raise
+    PhaseTimeoutError (fail-loud — count+persist THEN re-raise), and (c) leave
+    the aggregate count on S3 even though the phase aborted."""
+    fake_state = {"tripped": True, "name": "test_phase", "cap_s": 0.1}
+    fake_timer = threading.Timer(9999, lambda: None)
+    fake_timer.start()
+
+    def _fake_start_watchdog(name, cap_s, on_trip=None):
+        return fake_timer, fake_state
+
+    monkeypatch.setattr("pipeline_common._start_watchdog", _fake_start_watchdog)
+
+    registry, s3 = _registry(hard_caps={"test_phase": 0.1})
+
+    # (b) fail-loud: PhaseTimeoutError still propagates out of the abort.
+    with pytest.raises(PhaseTimeoutError):
+        with registry.phase("test_phase"):
+            raise KeyboardInterrupt("simulated watchdog trip")
+
+    # (c) the aggregate survived the abort.
+    ops = _read_substrate_ops(s3, "test-bucket", "2026-04-24")
+    assert ops["date"] == "2026-04-24"
+    assert ops["watchdog"]["firing_count"] == 1
+    assert ops["watchdog"]["capped_phases_run"] == 1
+    # (a) per-phase record carries fired flag + cap + wall_time.
+    rec = ops["watchdog"]["per_phase"][0]
+    assert rec["phase"] == "test_phase"
+    assert rec["watchdog_fired"] is True
+    assert rec["cap_s"] == 0.1
+    assert "wall_time_s" in rec and rec["wall_time_s"] >= 0
+
+
+def test_no_trip_records_zero_firings(monkeypatch):
+    """A capped phase that completes cleanly records watchdog_fired=false and a
+    firing_count of 0 — the GREEN baseline the report card grades."""
+    fake_state = {"tripped": False, "name": "test_phase", "cap_s": 60.0}
+    fake_timer = threading.Timer(9999, lambda: None)
+    fake_timer.start()
+
+    def _fake_start_watchdog(name, cap_s, on_trip=None):
+        return fake_timer, fake_state
+
+    monkeypatch.setattr("pipeline_common._start_watchdog", _fake_start_watchdog)
+
+    registry, s3 = _registry(hard_caps={"test_phase": 60.0})
+
+    with registry.phase("test_phase"):
+        pass
+
+    ops = _read_substrate_ops(s3, "test-bucket", "2026-04-24")
+    assert ops["watchdog"]["firing_count"] == 0
+    assert ops["watchdog"]["capped_phases_run"] == 1
+    assert ops["watchdog"]["per_phase"][0]["watchdog_fired"] is False
+
+
+def test_uncapped_phase_writes_no_substrate_ops(monkeypatch):
+    """A phase with no hard cap has no watchdog, so it must not emit a
+    watchdog record (firing is undefined without a cap)."""
+    def _spy_start_watchdog(name, cap_s, on_trip=None):
+        raise AssertionError("watchdog must not start for an uncapped phase")
+
+    monkeypatch.setattr("pipeline_common._start_watchdog", _spy_start_watchdog)
+
+    registry, s3 = _registry(hard_caps={"other_phase": 60.0})
+
+    with registry.phase("uncapped_phase"):
+        pass
+
+    assert (("test-bucket", _substrate_ops_key("2026-04-24")) not in s3.store)
+    assert registry._watchdog_records == []
+
+
+def test_firing_count_aggregates_across_phases(monkeypatch):
+    """firing_count is a per-RUN aggregate: across several capped phases, only
+    the tripped ones count toward the firing total."""
+    states = {
+        "p_clean": {"tripped": False, "name": "p_clean", "cap_s": 60.0},
+        "p_trip": {"tripped": True, "name": "p_trip", "cap_s": 0.1},
+    }
+
+    def _fake_start_watchdog(name, cap_s, on_trip=None):
+        return threading.Timer(9999, lambda: None), states[name]
+
+    monkeypatch.setattr("pipeline_common._start_watchdog", _fake_start_watchdog)
+
+    registry, s3 = _registry(hard_caps={"p_clean": 60.0, "p_trip": 0.1})
+
+    with registry.phase("p_clean"):
+        pass
+    with pytest.raises(PhaseTimeoutError):
+        with registry.phase("p_trip"):
+            raise KeyboardInterrupt("simulated watchdog trip")
+
+    ops = _read_substrate_ops(s3, "test-bucket", "2026-04-24")
+    assert ops["watchdog"]["firing_count"] == 1
+    assert ops["watchdog"]["capped_phases_run"] == 2
 
 
 # ── load_phase_hard_caps ─────────────────────────────────────────────────────
