@@ -937,6 +937,17 @@ DEFAULT_NEUTRALIZE_FACTORS: tuple[str, ...] = (
     "size_log",
 )
 
+# The date the score-neutralization went LIVE (config#1142 — research
+# scoring.yaml ``aggregator.neutralization.live_enabled`` flipped true,
+# private-first). Weeks on/after this date are the LIVE-era cohorts: because the
+# backtester reconstructs the neutralized score with the SAME cross-sectional
+# residualizer the live path uses (``_xs_neutralize`` mirrors research
+# scoring/neutralize.py), the post-cutover segment of ``_neutralized_composite_ic``
+# IS the live neutralization's realized forward efficacy — the measurement the
+# report card otherwise lacks (config#1187; the live cutover only rewrites
+# signals.json score, which no IC producer reads back).
+NEUTRALIZATION_LIVE_CUTOVER_DATE: str = "2026-06-22"
+
 # ArcticDB raw column -> (exposure key, transform). The loader reads these raw
 # columns from the universe feature history and emits the exposure keys above.
 _RAW_FACTOR_SOURCE: dict = {
@@ -1121,8 +1132,8 @@ def _neutralized_composite_ic(
             if raw_ic != raw_ic or neu_ic != neu_ic:  # NaN (constant within week)
                 continue
             breadth = float((g["r21"] > g["s21"]).mean())
-            raw_weeks.append({"breadth": breadth, "ic": float(raw_ic)})
-            neu_weeks.append({"breadth": breadth, "ic": float(neu_ic)})
+            raw_weeks.append({"eval_date": str(d), "breadth": breadth, "ic": float(raw_ic)})
+            neu_weeks.append({"eval_date": str(d), "breadth": breadth, "ic": float(neu_ic)})
         n_weeks = len(raw_weeks)
         if n_weeks < 4:
             return {
@@ -1158,6 +1169,47 @@ def _neutralized_composite_ic(
             and (raw_mean is None or neu_mean > raw_mean)
             and (neu_low is None or raw_low is None or neu_low >= raw_low)
         )
+
+        # ── LIVE forward efficacy (config#1187) ──────────────────────────────
+        # The block above is the HISTORICAL counterfactual (all weeks). This
+        # segments the SAME per-week raw/neutralized IC series at the live
+        # cutover date so the report card can see whether the neutralization is
+        # actually recovering edge on LIVE post-cutover cohorts — the question
+        # neither research_composite_ic (reads raw research.db scores) nor the
+        # OBSERVE shadow (no outcome join) answers. Because _xs_neutralize mirrors
+        # the live residualizer, the post-cutover neutralized IC equals what the
+        # live system realized. Each week is ONE observation: the per-week paired
+        # delta (neu_ic − raw_ic) gets a Grinold-Kahn one-sample t-test
+        # (config#1164), n_weeks = effective N. Under-powered (<3 wks) → p=None,
+        # WATCH/accumulating downstream.
+        from scipy.stats import ttest_1samp as _ttest_1samp
+
+        rdf2 = rdf.assign(neu_ic=ndf["ic"].values, delta=ndf["ic"].values - rdf["ic"].values)
+
+        def _segment(seg: pd.DataFrame) -> dict:
+            n = int(len(seg))
+            out: dict = {
+                "n_weeks": n,
+                "raw_mean_weekly_ic": round(float(seg["ic"].mean()), 4) if n else None,
+                "neutralized_mean_weekly_ic": round(float(seg["neu_ic"].mean()), 4) if n else None,
+                "mean_weekly_delta": round(float(seg["delta"].mean()), 4) if n else None,
+                "delta_t_p": None,
+                "recovers_edge_live": False,
+                "significant": False,
+            }
+            if n >= 3 and seg["delta"].nunique() >= 2:
+                _t, _p = _ttest_1samp(seg["delta"], 0.0)
+                out["delta_t_p"] = round(float(_p), 4) if _p == _p else None
+            out["recovers_edge_live"] = bool(out["mean_weekly_delta"] is not None and out["mean_weekly_delta"] > 0)
+            out["significant"] = bool(
+                n >= 4 and out["delta_t_p"] is not None and out["delta_t_p"] < 0.05
+            )
+            return out
+
+        cutover = NEUTRALIZATION_LIVE_CUTOVER_DATE
+        live_forward = _segment(rdf2[rdf2["eval_date"] >= cutover])
+        pre_cutover = _segment(rdf2[rdf2["eval_date"] < cutover])
+
         return {
             "status": "ok",
             "horizon": "21d",
@@ -1175,6 +1227,9 @@ def _neutralized_composite_ic(
             "ic_improvement": _delta(neu_mean, raw_mean),
             "low_breadth_ic_improvement": _delta(neu_low, raw_low),
             "neutralization_recovers_edge": recovers,
+            "cutover_date": cutover,
+            "live_forward": live_forward,
+            "pre_cutover": pre_cutover,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "team_candidates / universe_returns table not found"}

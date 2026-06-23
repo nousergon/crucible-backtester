@@ -91,6 +91,52 @@ def test_neutralization_beats_raw_on_history(tmp_path):
     assert r["n_neutralized_weeks"] == 6, r
 
 
+def test_live_forward_segments_at_cutover(tmp_path):
+    # config#1187 — segment the per-week raw/neutralized IC at the 2026-06-22
+    # live cutover. Dates straddle it (2 pre, 5 post); neutralizing the dominant
+    # anti-predictive momentum tilt beats raw EVERY week, with small per-week
+    # jitter so the post-cutover per-week delta has variance for the t-test.
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    conn.execute("CREATE TABLE team_candidates (ticker TEXT, eval_date TEXT, quant_score REAL)")
+    conn.execute("CREATE TABLE universe_returns ("
+                 "ticker TEXT, eval_date TEXT, log_return_21d REAL, log_spy_return_21d REAL)")
+    loadings: dict = {}
+    dates = ["2026-05-01", "2026-05-08",                                   # pre-cutover
+             "2026-06-26", "2026-07-03", "2026-07-10", "2026-07-17", "2026-07-24"]  # post
+    for di, d in enumerate(dates):
+        jitter = 0.001 * di  # tiny per-week tilt → non-degenerate weekly deltas
+        for i in range(24):
+            mom = (i % 6) - 2.5
+            idio = (i // 6) - 1.5
+            score = 50.0 + 10.0 * mom + 3.0 * idio
+            alpha = (0.01 + jitter) * idio - 0.02 * mom
+            conn.execute("INSERT INTO team_candidates VALUES (?,?,?)", (f"T{i}", d, score))
+            conn.execute("INSERT INTO universe_returns VALUES (?,?,?,?)", (f"T{i}", d, alpha, 0.0))
+            loadings[(d, f"T{i}")] = {"momentum_20d": mom}
+    conn.commit()
+    r = _neutralized_composite_ic(conn, loadings, factors=("momentum_20d",))
+    assert r["status"] == "ok", r
+    assert r["cutover_date"] == "2026-06-22"
+    lf, pre = r["live_forward"], r["pre_cutover"]
+    assert lf["n_weeks"] == 5 and pre["n_weeks"] == 2, (lf, pre)
+    assert lf["recovers_edge_live"] is True, lf
+    assert lf["mean_weekly_delta"] > 0, lf
+    assert lf["neutralized_mean_weekly_ic"] > lf["raw_mean_weekly_ic"], lf
+    assert lf["delta_t_p"] is not None, lf  # >=3 post weeks → t-test runs
+    assert lf["significant"] is True, lf    # 5 wks, consistent +delta → significant
+
+
+def test_live_forward_underpowered_when_few_post_weeks(tmp_path):
+    # The original all-pre-cutover fixture → live_forward is empty (0 weeks),
+    # under-powered (p=None, not significant) — the accumulating state.
+    conn, loadings = _conn_loadings(tmp_path)
+    r = _neutralized_composite_ic(conn, loadings, factors=("momentum_20d",))
+    lf = r["live_forward"]
+    assert lf["n_weeks"] == 0
+    assert lf["delta_t_p"] is None and lf["significant"] is False
+    assert r["pre_cutover"]["n_weeks"] == 6
+
+
 def test_skipped_without_loadings(tmp_path):
     conn, _ = _conn_loadings(tmp_path)
     r = _neutralized_composite_ic(conn, {})
