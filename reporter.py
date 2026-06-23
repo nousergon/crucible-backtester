@@ -1190,6 +1190,7 @@ def save(
     scanner_opt: dict | None = None,
     cio_opt: dict | None = None,
     behavioral_anomaly: dict | None = None,
+    sample_size: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -1264,6 +1265,9 @@ def save(
         # Behavioral-anomaly suite (L4514/config#698) — always-emit from birth;
         # the evaluator's Behavioral tile grades insufficient_data explicitly.
         ("behavioral_anomaly.json", behavioral_anomaly),
+        # Sample-size adequacy (config#1151 Batch C) — always-emit from birth so
+        # the evaluator distinguishes "producer didn't run" from "ran, too few".
+        ("sample_size.json", sample_size),
     ]:
         if data is not None:
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
