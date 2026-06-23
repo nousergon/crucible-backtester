@@ -330,6 +330,19 @@ def _marker_key(date: str, phase_name: str) -> str:
     return f"backtest/{date}/.phases/{phase_name}.json"
 
 
+# Per-run substrate-operations aggregate. Reaches the report card's substrate
+# tile (crucible-evaluator grading/tiles/substrate.py, config#1151) which grades
+# `watchdog_firings` off `firing_count`. Top-level under backtest/{date}/ (NOT
+# under .phases/) so it sits beside the other evaluator-read artifacts
+# (sample_size.json, etc.). Schema is additive-only — future fields add, never
+# rename/remove (S3 Contract Safety, CLAUDE.md).
+_SUBSTRATE_OPS_SCHEMA_VERSION = 1
+
+
+def _substrate_ops_key(date: str) -> str:
+    return f"backtest/{date}/substrate_ops.json"
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -486,6 +499,13 @@ class PhaseRegistry:
         # post-filter run where smoke-param-sweep "passed" at 96s < 500s
         # but param_sweep itself errored with recursion depth exceeded.
         self.phase_errors: list[str] = []
+        # Per-run watchdog telemetry. One record per CAPPED phase that ran this
+        # invocation: {phase, watchdog_fired, cap_s, wall_time_s}. Aggregated to
+        # backtest/{date}/substrate_ops.json on every capped-phase exit so the
+        # report card's substrate tile (config#1151) can read the per-run firing
+        # count. A "firing" = the phase hit its hard cap (the silent-burn
+        # tripwire), which the watchdog converts to a PhaseTimeoutError abort.
+        self._watchdog_records: list[dict] = []
 
     # ── S3 helpers ───────────────────────────────────────────────────────
 
@@ -553,6 +573,35 @@ class PhaseRegistry:
         # contextmanager, so we see status before callers' try/except.
         if marker.get("status") == "error":
             self.phase_errors.append(marker["phase"])
+
+    def _write_substrate_ops(self) -> None:
+        """Persist the per-run watchdog aggregate to backtest/{date}/substrate_ops.json.
+
+        Re-written (idempotently overwritten) after each capped phase so a
+        pipeline that aborts on a watchdog trip STILL leaves the firing count on
+        S3 — the abort is the loud failure, the artifact is the receipt the
+        report card reads. `firing_count` is the headline the evaluator's
+        substrate tile grades (config#1151): 0 = no phase hit its hard cap
+        (healthy); >0 = one or more phases burned through their silent-compute
+        cap and were force-aborted (degradation).
+        """
+        firing_count = sum(1 for r in self._watchdog_records if r.get("watchdog_fired"))
+        ops = {
+            "schema_version": _SUBSTRATE_OPS_SCHEMA_VERSION,
+            "date": self.date,
+            "updated_at": _now_iso(),
+            "watchdog": {
+                "firing_count": firing_count,
+                "capped_phases_run": len(self._watchdog_records),
+                "per_phase": list(self._watchdog_records),
+            },
+        }
+        self._client().put_object(
+            Bucket=self.bucket,
+            Key=_substrate_ops_key(self.date),
+            Body=json.dumps(ops, indent=2).encode(),
+            ContentType="application/json",
+        )
 
     def _first_missing_artifact(self, artifact_keys: Iterable[str]) -> str | None:
         """Return the first declared artifact key that is absent on S3, or
@@ -719,6 +768,32 @@ class PhaseRegistry:
                 watchdog_timer.cancel()
             dur = time.monotonic() - t0
             completed_at = _now_iso()
+            # Watchdog telemetry — record only for CAPPED phases (an uncapped
+            # phase has no watchdog, so "fired" is undefined for it). A
+            # `watchdog_fired` here means the phase hit its hard cap and is being
+            # force-aborted with a PhaseTimeoutError. Persist the aggregate
+            # NOW (in the finally, before the PhaseTimeoutError propagates) so
+            # the firing count survives the abort: fail-loud = count + persist,
+            # THEN re-raise. A persist failure must NOT mask the abort, so it's
+            # best-effort + loud-logged, never swallowing the timeout.
+            if cap_s is not None and cap_s > 0:
+                fired = bool(watchdog_state is not None and watchdog_state.get("tripped"))
+                self._watchdog_records.append({
+                    "phase": name,
+                    "watchdog_fired": fired,
+                    "cap_s": round(cap_s, 2),
+                    "wall_time_s": round(dur, 2),
+                })
+                try:
+                    self._write_substrate_ops()
+                except Exception as ops_exc:
+                    logger.warning(
+                        "phase_registry: failed to write substrate_ops.json for "
+                        "date %s after phase %s (watchdog_fired=%s): %s. The phase "
+                        "abort/result is unaffected; the report card's "
+                        "watchdog_firings may under-count this run.",
+                        self.date, name, fired, ops_exc,
+                    )
             plog.info(
                 "PHASE_END name=%s duration_s=%.2f status=%s %s",
                 name, dur, status, kv,
