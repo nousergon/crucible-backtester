@@ -66,6 +66,7 @@ import pandas as pd
 import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
+from analysis.sample_size_adequacy import compute_sample_size_adequacy
 from analysis import factor_blend_sensitivity
 from analysis import veto_analysis
 from analysis import decision_capture_coverage, executor_decision_capture_coverage, provenance_grounding, quant_rank_quality
@@ -1566,6 +1567,7 @@ def _main_impl() -> None:
             shadow_book=diagnostics.get("shadow_book"),
             exit_timing=diagnostics.get("exit_timing"),
             behavioral_anomaly=diagnostics.get("behavioral_anomaly"),
+            sample_size=compute_sample_size_adequacy(sq_result, attr_result),
             e2e_lift=diagnostics.get("e2e_lift"),
             veto_result=opt_results.get("veto_result"),
             confusion_matrix=diagnostics.get("confusion_matrix"),
