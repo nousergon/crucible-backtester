@@ -352,10 +352,14 @@ def _run_diagnostics(
     trades_db = config.get("_trades_db")
     results = {}
 
-    # Historical Barra factor loadings (ArcticDB) for the neutralized-composite
-    # counterfactual in e2e_lift (config#1142). Built here because evaluate has
-    # the bucket (config) + the eval-date set (research.db). Fail-soft: any
-    # error -> {} and the counterfactual reports status 'skipped'.
+    # Historical factor loadings (ArcticDB) for the e2e_lift counterfactuals
+    # (config#1142 neutralized composite, config#967 consolidation + scanner
+    # multi-factor). Built here because evaluate has the bucket (config) + the
+    # eval-date set (research.db). Loads the FULL factor superset
+    # (ALL_LOADING_FACTORS) so one read serves every counterfactual, and keys
+    # off the SCANNER eval-dates (the widest, earliest funnel stage — covers the
+    # downstream team/CIO cycles too). Fail-soft: any error -> {} and each
+    # counterfactual reports status 'skipped'.
     factor_loadings: dict = {}
     if avail.get("research_db"):
         try:
@@ -364,22 +368,18 @@ def _run_diagnostics(
             bucket = config.get("signals_bucket", "alpha-engine-research")
             _conn = _sqlite3.connect(db_path)
             try:
-                # The counterfactual scores against team_candidates (the wide
-                # composite cross-section) joined to universe_returns for
-                # realized 21d outcomes, so the loadings must key off the
-                # team_candidates eval_dates that have a matured 21d return.
                 eval_dates = [
                     r[0] for r in _conn.execute(
-                        "SELECT DISTINCT t.eval_date FROM team_candidates t "
+                        "SELECT DISTINCT se.eval_date FROM scanner_evaluations se "
                         "JOIN universe_returns u "
-                        "ON u.ticker = t.ticker AND u.eval_date = t.eval_date "
+                        "ON u.ticker = se.ticker AND u.eval_date = se.eval_date "
                         "WHERE u.log_return_21d IS NOT NULL"
                     )
                 ]
             finally:
                 _conn.close()
             factor_loadings = end_to_end.load_historical_factor_loadings(
-                bucket, eval_dates
+                bucket, eval_dates, factors=end_to_end.ALL_LOADING_FACTORS
             )
         except Exception as _fl:  # fail-soft — never block diagnostics
             logger.warning("factor-loadings load skipped (non-fatal): %s", _fl)
