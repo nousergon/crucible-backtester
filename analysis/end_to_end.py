@@ -457,6 +457,17 @@ def compute_lift_metrics(
         # 1. Scanner lift
         result["scanner_lift"] = _scanner_lift(conn, ur, date_filter, params)
 
+        # 1a2. Scanner multi-factor counterfactual (config#967) — would a
+        # multi-factor (or single-sleeve) candidate generation beat the
+        # momentum-only scanner? Fail-soft; needs injected ArcticDB loadings.
+        try:
+            result["scanner_factor_counterfactual"] = _scanner_factor_counterfactual(
+                conn, factor_loadings or None
+            )
+        except Exception as _sfc:  # pragma: no cover - defensive
+            logger.warning("scanner_factor_counterfactual failed (non-fatal): %s", _sfc)
+            result["scanner_factor_counterfactual"] = {"status": "error", "reason": str(_sfc)}
+
         # 1b. Breadth-conditioned momentum IC (config#1140) — fail-soft so a
         # producer error can never break the existing e2e_lift contract.
         try:
@@ -933,7 +944,21 @@ _RAW_FACTOR_SOURCE: dict = {
     "return_60d": ("return_60d", None),
     "beta_60d": ("beta_60d", None),
     "market_cap_raw": ("size_log", "log"),
+    # Additional raw factors for the scanner multi-factor counterfactual
+    # (config#967) — value / quality / low-vol sleeves. Passed through raw; the
+    # scanner producer z-scores them cross-sectionally per cycle.
+    "pe_ratio": ("pe_ratio", None),
+    "pb_ratio": ("pb_ratio", None),
+    "roe": ("roe", None),
+    "fcf_yield": ("fcf_yield", None),
+    "realized_vol_63d": ("realized_vol_63d", None),
+    "idio_vol_60d": ("idio_vol_60d", None),
 }
+
+# Every exposure key the loader can emit — used by callers that want the full
+# superset (the neutralization producer needs 4 of these; the scanner
+# counterfactual needs 8; a single load serves both).
+ALL_LOADING_FACTORS: tuple = tuple(key for key, _ in _RAW_FACTOR_SOURCE.values())
 
 
 def _xs_neutralize(
@@ -1398,6 +1423,176 @@ def _cio_consolidation_counterfactual(conn, ur: pd.DataFrame, loadings: dict | N
             "methods": out_methods,
             "best_method": best or "cio_advance",
             "any_deterministic_beats_cio": best is not None,
+        }
+    except sqlite3.OperationalError as e:
+        return {"status": "skipped", "reason": f"sqlite: {e}"}
+    except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
+        return {"status": "error", "reason": str(e)}
+
+
+# Multi-factor candidate-generation composite for the scanner counterfactual
+# (config#967). Each sleeve is the mean of its cross-sectionally z-scored,
+# sign-oriented (higher = better) raw factors; the composite is the equal-weight
+# mean of the sleeves. This is the institutional alternative to the current
+# scanner's momentum-only ``tech_score``. Raw factor column names match the
+# ArcticDB universe feature set (the loader emits them).
+_SCANNER_FACTOR_SLEEVES: dict = {
+    "momentum": [("momentum_20d", 1.0), ("return_60d", 1.0)],
+    "value": [("pe_ratio", -1.0), ("pb_ratio", -1.0)],          # cheap = good
+    "quality": [("roe", 1.0), ("fcf_yield", 1.0)],
+    "low_vol": [("realized_vol_63d", -1.0), ("idio_vol_60d", -1.0)],  # calm = good
+}
+SCANNER_RAW_FACTORS: tuple = tuple(
+    f for sl in _SCANNER_FACTOR_SLEEVES.values() for f, _ in sl
+)
+
+
+def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
+    """Would a MULTI-FACTOR candidate-generation beat the momentum-only scanner?
+    (config#967 — the candidate-generation / scanner-edge test.)
+
+    The funnel analysis showed candidate-pool alpha is absolutely negative, so
+    the bottleneck is candidate generation. Today's scanner ranks ~900 -> ~60 on
+    a momentum/technical ``tech_score`` only. This counterfactual asks, on the
+    full scanned universe (``scanner_evaluations`` x realized 21d), per cycle and
+    count-matched to the actual pass count: does ranking by an institutional
+    multi-factor composite — or by any single factor SLEEVE (momentum / value /
+    quality / low-vol) — produce a candidate pool with better realized 21d
+    log-alpha than the names the live scanner actually passed?
+
+    The composite is built per cycle (cross-sectional z-score within the scanned
+    universe; sleeves equal-weighted). ``loadings``: {(eval_date, ticker):
+    {raw_factor: value}} from ArcticDB — empty -> status skipped. Pure read.
+    """
+    try:
+        if not loadings:
+            return {"status": "skipped", "reason": "no factor loadings provided"}
+        tabs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "scanner_evaluations" not in tabs or "universe_returns" not in tabs:
+            return {"status": "skipped", "reason": "scanner_evaluations / universe_returns absent"}
+        se_cols = {r[1] for r in conn.execute("PRAGMA table_info(scanner_evaluations)")}
+        if "quant_filter_pass" not in se_cols:
+            return {"status": "skipped", "reason": "scanner_evaluations has no quant_filter_pass"}
+        m = pd.read_sql_query(
+            "SELECT se.ticker, se.eval_date, se.quant_filter_pass, u.sector, "
+            "(u.log_return_21d - u.log_spy_return_21d) AS alpha21 "
+            "FROM scanner_evaluations se "
+            "JOIN universe_returns u ON u.ticker=se.ticker AND u.eval_date=se.eval_date "
+            "WHERE u.log_return_21d IS NOT NULL AND u.log_spy_return_21d IS NOT NULL",
+            conn,
+        )
+        if m.empty:
+            return {"status": "insufficient_data", "reason": "no scanned rows with realized 21d"}
+
+        sleeve_names = list(_SCANNER_FACTOR_SLEEVES)
+        methods = ["actual_scanner_pass", "multifactor_topN"] + [s + "_sleeve_topN" for s in sleeve_names]
+        picked: dict = {k: [] for k in methods}
+        picked_sn: dict = {k: [] for k in methods}
+        universe_alpha: list = []
+        n_pass_total = 0
+        n_cycles = 0
+
+        for d, g in m.groupby("eval_date"):
+            g = g[g["alpha21"].notna()].copy()
+            if g.empty:
+                continue
+            n_pass = int((g["quant_filter_pass"] == 1).sum())
+            if n_pass == 0:
+                continue
+            n_cycles += 1
+            n_pass_total += n_pass
+            universe_alpha.extend(g["alpha21"].tolist())
+            if g["sector"].notna().any():
+                g["alpha_sn"] = g["alpha21"] - g.groupby("sector")["alpha21"].transform("mean")
+            else:
+                g["alpha_sn"] = g["alpha21"]
+
+            exrows = {t: (loadings.get((d, t)) or {}) for t in g["ticker"]}
+            fac = pd.DataFrame.from_dict(exrows, orient="index")
+            z = pd.DataFrame(index=fac.index)
+            for col in SCANNER_RAW_FACTORS:
+                if col in fac.columns:
+                    s = pd.to_numeric(fac[col], errors="coerce")
+                    sd = s.std(ddof=0)
+                    z[col] = (s - s.mean()) / sd if sd and sd > 1e-12 else 0.0
+            sleeve_score = {}
+            for sl, facs in _SCANNER_FACTOR_SLEEVES.items():
+                cols = [(f, sign) for f, sign in facs if f in z.columns]
+                if cols:
+                    sleeve_score[sl] = pd.concat([sign * z[f] for f, sign in cols], axis=1).mean(axis=1)
+            if not sleeve_score:
+                continue
+            composite = pd.concat(sleeve_score.values(), axis=1).mean(axis=1)
+            g = g.set_index("ticker")
+            g["_composite"] = composite
+            for sl, sc in sleeve_score.items():
+                g["_sleeve_" + sl] = sc
+
+            def _topN_alpha(score_col):
+                sub = g[g[score_col].notna()]
+                if sub.empty:
+                    return None, None
+                top = sub.sort_values(score_col, ascending=False).head(n_pass)
+                return top["alpha21"].tolist(), top["alpha_sn"].tolist()
+
+            actual = g[g["quant_filter_pass"] == 1]
+            picked["actual_scanner_pass"].extend(actual["alpha21"].tolist())
+            picked_sn["actual_scanner_pass"].extend(actual["alpha_sn"].tolist())
+            mf_a, mf_sn = _topN_alpha("_composite")
+            if mf_a:
+                picked["multifactor_topN"].extend(mf_a)
+                picked_sn["multifactor_topN"].extend(mf_sn)
+            for sl in sleeve_names:
+                col = "_sleeve_" + sl
+                if col in g.columns:
+                    a, sn = _topN_alpha(col)
+                    if a:
+                        picked[sl + "_sleeve_topN"].extend(a)
+                        picked_sn[sl + "_sleeve_topN"].extend(sn)
+
+        if n_cycles < 3:
+            return {"status": "insufficient_data", "reason": f"only {n_cycles} cycles", "n_cycles": n_cycles}
+
+        def _mean(xs):
+            return round(float(sum(xs) / len(xs)), 5) if xs else None
+
+        actual_mean = _mean(picked["actual_scanner_pass"])
+        actual_sn = _mean(picked_sn["actual_scanner_pass"])
+        out_methods: dict = {}
+        best = None
+        best_alpha = actual_mean if actual_mean is not None else -1e9
+        for k in methods:
+            ma = _mean(picked[k])
+            sn = _mean(picked_sn[k])
+            e = {"mean_alpha_21d": ma, "sector_neutral_mean_alpha_21d": sn, "n_picks": len(picked[k])}
+            if k != "actual_scanner_pass" and ma is not None and actual_mean is not None:
+                e["lift_vs_actual_scanner"] = round(ma - actual_mean, 5)
+                e["sn_lift_vs_actual_scanner"] = (
+                    round(sn - actual_sn, 5) if (sn is not None and actual_sn is not None) else None
+                )
+                if ma > best_alpha:
+                    best_alpha, best = ma, k
+            out_methods[k] = e
+
+        best_sleeve = None
+        sleeve_best = -1e9
+        for sl in sleeve_names:
+            ma = out_methods[sl + "_sleeve_topN"]["mean_alpha_21d"]
+            if ma is not None and ma > sleeve_best:
+                sleeve_best, best_sleeve = ma, sl
+
+        return {
+            "status": "ok",
+            "horizon": "21d",
+            "n_cycles": n_cycles,
+            "n_pass_total": n_pass_total,
+            "composite": "equal-weight z(momentum,value,quality,low_vol)",
+            "selection_count_basis": "per-cycle top-N matched to the live scanner pass count",
+            "universe_mean_alpha_21d": _mean(universe_alpha),
+            "methods": out_methods,
+            "best_method": best or "actual_scanner_pass",
+            "best_sleeve": best_sleeve,
+            "any_factor_beats_actual_scanner": best is not None,
         }
     except sqlite3.OperationalError as e:
         return {"status": "skipped", "reason": f"sqlite: {e}"}
