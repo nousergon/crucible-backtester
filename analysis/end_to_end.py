@@ -305,6 +305,44 @@ def _cio_layer_attribution(merged: pd.DataFrame) -> dict | None:
             out[f"{layer}_ic"] = None
             out[f"{layer}_ic_p"] = None
 
+    # Date-clustered IC significance (de-pseudo-replication of the pooled ICs above).
+    # The pooled ``{layer}_ic`` Spearman counts every CIO-evaluated name as an
+    # independent observation, but a research cycle's signal lives at the eval_date
+    # level — and ``macro_shift`` in particular is a per-(sector,date) tilt with only
+    # a handful of distinct values per cycle, so pooling ~K weeks of names as N≈K·25
+    # draws manufactures significance the panel does not have (on live data the
+    # pooled ``final_score_ic`` reads p≈0.02 while the date-clustered estimator reads
+    # ≈0.18 on the SAME rows — a textbook pseudo-replication artifact that was driving
+    # a false "significant negative composite IC" report-card flag). The institutional
+    # estimator is the Grinold-Kahn IC t-stat: compute each eval_date's cross-sectional
+    # Spearman IC, then test the mean across dates with each date as ONE observation
+    # (``n_eval_dates`` = the honest effective N). Emitted additively so the grader can
+    # read significance off ``{layer}_date_ic_p`` instead of the inflated pooled p.
+    # A layer with < 3 usable dates is under-powered → ``None`` (let it accumulate).
+    if "eval_date" in df.columns:
+        import numpy as np
+        from scipy.stats import ttest_1samp
+
+        out["n_eval_dates"] = int(df["eval_date"].nunique())
+        for layer in ("combined_score", "macro_shift", "final_score", "cio_conviction"):
+            if layer not in df.columns:
+                continue
+            per_date_ics: list[float] = []
+            for _, sub in df.dropna(subset=[layer]).groupby("eval_date"):
+                if sub[layer].nunique() >= 3 and sub["alpha21"].nunique() >= 3:
+                    rho, _p = spearmanr(sub[layer], sub["alpha21"])
+                    if rho == rho:  # not NaN
+                        per_date_ics.append(float(rho))
+            if len(per_date_ics) >= 3:
+                t_stat, p_val = ttest_1samp(per_date_ics, 0.0)
+                out[f"{layer}_date_ic"] = round(float(np.mean(per_date_ics)), 4)
+                out[f"{layer}_date_ic_p"] = round(float(p_val), 4) if p_val == p_val else None
+                out[f"{layer}_date_ic_n"] = len(per_date_ics)
+            else:
+                out[f"{layer}_date_ic"] = None
+                out[f"{layer}_date_ic_p"] = None
+                out[f"{layer}_date_ic_n"] = len(per_date_ics)
+
     # De-blending substrate (L4563): does CROSS-SECTIONALLY rank-normalizing the
     # stock-quality score within each cycle recover forward signal the raw score
     # lacks? (The apples-to-apples hypothesis — a 70 from Tech ≠ a 70 from
