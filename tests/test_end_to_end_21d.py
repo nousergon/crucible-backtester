@@ -106,6 +106,61 @@ def test_cio_layer_attribution_block(tmp_path):
     assert attr["combined_score_sector_neutral_ic"] is not None
     assert attr["combined_score_sector_neutral_frac"] == 0.0
     assert attr["combined_score_sector_neutral_n"] == 20
+    # Single-date fixture: the date-clustered (Grinold-Kahn) block needs >= 3 dates,
+    # so each layer's date-IC is None but the keys are present and n_eval_dates == 1.
+    assert attr["n_eval_dates"] == 1
+    for layer in ("combined_score", "macro_shift", "final_score", "cio_conviction"):
+        assert attr[f"{layer}_date_ic"] is None
+        assert attr[f"{layer}_date_ic_n"] == 0
+
+
+def test_cio_layer_attribution_date_clustered_block(tmp_path):
+    # De-pseudo-replication guard: across 4 eval_dates where combined_score tracks
+    # realized 21d alpha cross-sectionally EVERY date, the Grinold-Kahn estimator
+    # (mean of per-date ICs, t-test across the 4 dates) yields a positive,
+    # significant date-IC — and n_eval_dates is the honest effective N (4), NOT the
+    # pooled row count. This is the metric that replaces the pseudo-replicated pooled
+    # p in the report-card composite-IC grade (config#1164).
+    db = tmp_path / "research.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE universe_returns ("
+        "ticker TEXT, eval_date TEXT, sector TEXT, "
+        "return_5d REAL, spy_return_5d REAL, beat_spy_5d INTEGER, "
+        "return_21d REAL, spy_return_21d REAL, beat_spy_21d INTEGER, "
+        "log_return_21d REAL, log_spy_return_21d REAL)"
+    )
+    conn.execute("CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT, quant_filter_pass INTEGER)")
+    conn.execute("CREATE TABLE team_candidates (ticker TEXT, eval_date TEXT, team_id TEXT, team_recommended INTEGER)")
+    conn.execute("CREATE TABLE cio_evaluations (ticker TEXT, eval_date TEXT, cio_decision TEXT, final_score REAL, cio_conviction REAL, combined_score REAL, macro_shift REAL)")
+    conn.execute("CREATE TABLE predictor_outcomes (symbol TEXT, prediction_date TEXT, "
+                 "predicted_direction TEXT, prediction_confidence REAL)")
+    dates = ["2026-05-01", "2026-05-08", "2026-05-15", "2026-05-22"]
+    for di, d in enumerate(dates):
+        for i in range(8):  # 8 names/date, combined_score ~monotone in realized alpha
+            t = f"T{i:02d}"
+            # Higher score → higher alpha every date; perturb the last date's top two
+            # names so per-date ICs are NOT all identically 1.0 (a degenerate
+            # zero-variance t-test) — strongly positive but with real dispersion.
+            rank_i = (6 if i == 7 else 7 if i == 6 else i) if di == len(dates) - 1 else i
+            log_ret = 0.01 * rank_i
+            conn.execute(
+                "INSERT INTO universe_returns VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (t, d, "Tech", 1.0, 0.5, i % 2, 2.0, 1.0, 1 if i >= 4 else 0, log_ret, 0.0),
+            )
+            conn.execute(
+                "INSERT INTO cio_evaluations VALUES (?,?,?,?,?,?,?)",
+                (t, d, "ADVANCE" if i >= 4 else "REJECT", float(50 + i), float(50 + i),
+                 float(50 + i), float(i)),
+            )
+    conn.commit()
+    conn.close()
+    attr = compute_lift_metrics(str(db))["cio_lift"]["layer_attribution_21d"]
+    assert attr["n_eval_dates"] == 4
+    assert attr["combined_score_date_ic_n"] == 4
+    # 3 dates IC=1.0 + 1 date slightly below → strongly positive mean, real variance.
+    assert attr["combined_score_date_ic"] > 0.9
+    assert attr["combined_score_date_ic_p"] is not None and attr["combined_score_date_ic_p"] < 0.05
 
 
 def test_trailing_sector_neutral_leakfree_and_fallback():
