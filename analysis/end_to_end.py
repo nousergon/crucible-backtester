@@ -448,6 +448,16 @@ def compute_lift_metrics(
         # 3b. CIO vs score-ranking baseline (2e)
         result["cio_vs_ranking"] = _cio_vs_ranking_lift(conn, ur, date_filter, params)
 
+        # 3c. CIO consolidation counterfactual (config#967/#968): does a
+        # deterministic top-N selection beat the LLM CIO ADVANCE gate? Fail-soft.
+        try:
+            result["cio_consolidation_counterfactual"] = _cio_consolidation_counterfactual(
+                conn, ur, factor_loadings or None
+            )
+        except Exception as _ccf:  # pragma: no cover - defensive
+            logger.warning("cio_consolidation_counterfactual failed (non-fatal): %s", _ccf)
+            result["cio_consolidation_counterfactual"] = {"status": "error", "reason": str(_ccf)}
+
         # 4. Predictor lift
         result["predictor_lift"] = _predictor_lift(conn, ur, date_filter, params)
 
@@ -1183,6 +1193,178 @@ def load_historical_factor_loadings(
     except Exception as e:  # fail-soft — never break the diagnostics run
         logger.warning("load_historical_factor_loadings failed (non-fatal): %s", e)
         return {}
+
+
+def _cio_consolidation_counterfactual(conn, ur: pd.DataFrame, loadings: dict | None = None) -> dict:
+    """Does a DETERMINISTIC top-N consolidation beat the LLM CIO's ADVANCE gate?
+    (config#967/#968 — the "better way to consolidate sector-team picks" test.)
+
+    The CIO's job is to select the final entrants from the candidate pool it
+    scores (``cio_evaluations``). The funnel measurement (config#967) showed the
+    CIO is value-subtractive — its ADVANCE set realizes LOWER 21d alpha than its
+    REJECT set, and it doesn't beat a naive ranking. This counterfactual makes
+    the alternative explicit: per cycle, hold the entrant COUNT fixed at the
+    CIO's own ADVANCE count, and compare the realized 21d log-alpha the CIO's
+    ADVANCE picks achieved vs what a deterministic top-N by each candidate
+    ranking signal would have achieved from the SAME pool:
+
+      * ``cio_advance``           — the live LLM ADVANCE/ADVANCE_FORCED set (baseline)
+      * ``combined_score_topN``   — the CIO's OWN combined_score, top-N (isolates
+                                    the LLM advance DECISION from its RANKING)
+      * ``quant_score_topN``      — raw team quant score, top-N
+      * ``sector_neutral_quant_topN`` — quant score demeaned per (cycle, sector)
+      * ``predictor_p_up_topN``   — the ML predictor's p_up, top-N (thin coverage)
+
+    Reports each method's pooled realized 21d alpha (the avg alpha of the names
+    it would have held) + sector-neutral alpha + lift vs the CIO. Pure read;
+    changes nothing. Fail-soft -> status skipped/error.
+    """
+    try:
+        tabs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "cio_evaluations" not in tabs or "universe_returns" not in tabs:
+            return {"status": "skipped", "reason": "cio_evaluations / universe_returns absent"}
+        ce_cols = {r[1] for r in conn.execute("PRAGMA table_info(cio_evaluations)")}
+        if not {"cio_decision", "quant_score", "combined_score"}.issubset(ce_cols):
+            return {"status": "skipped", "reason": "cio_evaluations missing decision/score columns"}
+        has_pred = "predictor_outcomes" in tabs
+        pred_join = (
+            "LEFT JOIN predictor_outcomes po ON po.symbol=ce.ticker "
+            "AND po.prediction_date=ce.eval_date"
+            if has_pred else ""
+        )
+        pred_sel = ", po.p_up AS p_up" if has_pred else ""
+        m = pd.read_sql_query(
+            f"SELECT ce.ticker, ce.eval_date, ce.cio_decision, ce.quant_score, "
+            f"ce.combined_score, u.sector, "
+            f"(u.log_return_21d - u.log_spy_return_21d) AS alpha21{pred_sel} "
+            f"FROM cio_evaluations ce "
+            f"JOIN universe_returns u ON u.ticker=ce.ticker AND u.eval_date=ce.eval_date "
+            f"{pred_join} "
+            f"WHERE u.log_return_21d IS NOT NULL AND u.log_spy_return_21d IS NOT NULL",
+            conn,
+        )
+        if m.empty:
+            return {"status": "insufficient_data", "reason": "no cio_evaluations rows with realized 21d"}
+
+        ADVANCE = {"ADVANCE", "ADVANCE_FORCED"}
+        # accumulate per-method realized alpha (pooled across cycles) + sector-neutral
+        methods = ("cio_advance", "combined_score_topN", "quant_score_topN",
+                   "sector_neutral_quant_topN", "factor_neutral_quant_topN",
+                   "predictor_p_up_topN")
+        picked: dict = {k: [] for k in methods}       # realized alpha of picked names
+        picked_sn: dict = {k: [] for k in methods}    # sector-neutral alpha
+        pred_cov_num = pred_cov_den = 0
+        n_cycles = 0
+        n_adv_total = 0
+
+        for d, g in m.groupby("eval_date"):
+            g = g[g["alpha21"].notna()].copy()
+            if g.empty:
+                continue
+            adv_mask = g["cio_decision"].isin(ADVANCE)
+            n_adv = int(adv_mask.sum())
+            if n_adv == 0:
+                continue
+            n_cycles += 1
+            n_adv_total += n_adv
+            # sector-neutral alpha within this cycle (demean by sector)
+            if g["sector"].notna().any():
+                g["alpha_sn"] = g["alpha21"] - g.groupby("sector")["alpha21"].transform("mean")
+            else:
+                g["alpha_sn"] = g["alpha21"]
+
+            def _take(order_col, mask=None, ascending=False):
+                sub = g if mask is None else g[mask]
+                sub = sub[sub[order_col].notna()]
+                if sub.empty:
+                    return None
+                top = sub.sort_values(order_col, ascending=ascending).head(n_adv)
+                return top
+
+            # baseline: the actual CIO ADVANCE set
+            cio = g[adv_mask]
+            sel = {
+                "cio_advance": cio,
+                "combined_score_topN": _take("combined_score"),
+                "quant_score_topN": _take("quant_score"),
+            }
+            # sector-neutral quant rank
+            g["quant_sn"] = g["quant_score"] - g.groupby("sector")["quant_score"].transform("mean")
+            sel["sector_neutral_quant_topN"] = _take("quant_sn")
+            # factor-neutral (momentum/beta/size) quant rank — the #1142 lever,
+            # the only ranking signal with positive forward evidence. Needs the
+            # injected Barra loadings; absent -> method skipped (None).
+            if loadings:
+                qscores = {
+                    t: float(s) for t, s in zip(g["ticker"], g["quant_score"])
+                    if s is not None and pd.notna(s)
+                }
+                exposures = {t: (loadings.get((d, t)) or {}) for t in qscores}
+                neu = _xs_neutralize(qscores, exposures, list(DEFAULT_NEUTRALIZE_FACTORS))
+                g["quant_fn"] = g["ticker"].map(neu)
+                sel["factor_neutral_quant_topN"] = (
+                    _take("quant_fn") if g["quant_fn"].notna().any() else None
+                )
+            else:
+                sel["factor_neutral_quant_topN"] = None
+            # predictor p_up (only where present)
+            if has_pred and "p_up" in g.columns and g["p_up"].notna().any():
+                sel["predictor_p_up_topN"] = _take("p_up")
+                pred_cov_num += int(g["p_up"].notna().sum())
+                pred_cov_den += len(g)
+            else:
+                sel["predictor_p_up_topN"] = None
+
+            for k, sub in sel.items():
+                if sub is not None and not sub.empty:
+                    picked[k].extend(sub["alpha21"].tolist())
+                    picked_sn[k].extend(sub["alpha_sn"].tolist())
+
+        if n_cycles < 3:
+            return {"status": "insufficient_data", "reason": f"only {n_cycles} cycles", "n_cycles": n_cycles}
+
+        def _mean(xs):
+            return round(float(sum(xs) / len(xs)), 5) if xs else None
+
+        cio_mean = _mean(picked["cio_advance"])
+        cio_sn = _mean(picked_sn["cio_advance"])
+        out_methods: dict = {}
+        best = None
+        best_alpha = cio_mean if cio_mean is not None else -1e9
+        for k in methods:
+            ma = _mean(picked[k])
+            sn = _mean(picked_sn[k])
+            entry = {
+                "mean_alpha_21d": ma,
+                "sector_neutral_mean_alpha_21d": sn,
+                "n_picks": len(picked[k]),
+            }
+            if k != "cio_advance" and ma is not None and cio_mean is not None:
+                entry["lift_vs_cio"] = round(ma - cio_mean, 5)
+                entry["sn_lift_vs_cio"] = (
+                    round(sn - cio_sn, 5) if (sn is not None and cio_sn is not None) else None
+                )
+                if ma > best_alpha:
+                    best_alpha, best = ma, k
+            out_methods[k] = entry
+
+        return {
+            "status": "ok",
+            "horizon": "21d",
+            "n_cycles": n_cycles,
+            "n_advanced_total": n_adv_total,
+            "selection_count_basis": "per-cycle top-N matched to the CIO ADVANCE count",
+            "predictor_coverage_frac": (
+                round(pred_cov_num / pred_cov_den, 3) if pred_cov_den else 0.0
+            ),
+            "methods": out_methods,
+            "best_method": best or "cio_advance",
+            "any_deterministic_beats_cio": best is not None,
+        }
+    except sqlite3.OperationalError as e:
+        return {"status": "skipped", "reason": f"sqlite: {e}"}
+    except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
+        return {"status": "error", "reason": str(e)}
 
 
 def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[dict]:
