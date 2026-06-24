@@ -18,6 +18,7 @@ import pytest
 
 from analysis.action_entropy import (
     compute_action_entropy,
+    compute_action_entropy_artifact,
     compute_rolling_entropy,
     shannon_entropy,
 )
@@ -97,3 +98,73 @@ class TestRollingEntropy:
         actions = pd.Series(["BUY", "HOLD"] * 10)
         with pytest.raises(ValueError):
             compute_rolling_entropy(actions, window=1)
+
+
+class TestComputeActionEntropyArtifact:
+    """Report-card producer (config#1151 Batch C) — decision-stream extraction."""
+
+    def test_diverse_stance_stream_is_graded(self):
+        df = pd.DataFrame({
+            "stance": (["momentum", "quality", "value", "low_vol"] * 15),  # 60 obs
+            "score": range(60),
+        })
+        r = compute_action_entropy_artifact(df)
+        assert r["status"] == "ok"
+        assert r["action_field"] == "stance"
+        assert r["n_signals"] == 60
+        assert r["entropy_normalized"] == pytest.approx(1.0, abs=1e-9)
+        assert r["alarm"] is False
+
+    def test_collapsed_stance_stream_alarms(self):
+        df = pd.DataFrame({"stance": ["momentum"] * 40})
+        r = compute_action_entropy_artifact(df)
+        assert r["status"] == "ok"
+        assert r["entropy_normalized"] == 0.0
+        assert r["alarm"] is True
+        assert r["action_field"] == "stance"
+
+    def test_falls_back_to_conviction_when_no_stance(self):
+        df = pd.DataFrame({
+            "conviction": (["rising", "stable", "declining"] * 10),  # 30 obs
+        })
+        r = compute_action_entropy_artifact(df)
+        assert r["status"] == "ok"
+        assert r["action_field"] == "conviction"
+
+    def test_prefers_stance_over_conviction(self):
+        df = pd.DataFrame({
+            "stance": ["momentum", "quality"] * 15,
+            "conviction": ["rising"] * 30,
+        })
+        r = compute_action_entropy_artifact(df)
+        assert r["action_field"] == "stance"
+
+    def test_no_decision_stream_when_no_label_column(self):
+        df = pd.DataFrame({"score": range(50)})
+        r = compute_action_entropy_artifact(df)
+        assert r["status"] == "no_decision_stream"
+        assert r["n_signals"] == 50
+
+    def test_all_null_label_column_is_no_decision_stream(self):
+        df = pd.DataFrame({"stance": [None] * 30})
+        r = compute_action_entropy_artifact(df)
+        assert r["status"] == "no_decision_stream"
+
+    def test_too_few_signals_is_insufficient(self):
+        df = pd.DataFrame({"stance": ["momentum", "quality", "value"]})  # 3 < 20
+        r = compute_action_entropy_artifact(df)
+        assert r["status"] == "insufficient_data"
+        assert r["n_signals"] == 3
+
+    def test_none_or_empty_frame_is_insufficient(self):
+        assert compute_action_entropy_artifact(None)["status"] == "insufficient_data"
+        assert compute_action_entropy_artifact(pd.DataFrame())["status"] == "insufficient_data"
+
+    def test_nulls_dropped_before_entropy(self):
+        # 40 momentum + 40 None → after dropna, single-action collapse.
+        df = pd.DataFrame({"stance": ["momentum"] * 40 + [None] * 40})
+        r = compute_action_entropy_artifact(df)
+        assert r["status"] == "ok"
+        assert r["n"] == 40  # nulls excluded from the stream
+        assert r["n_signals"] == 80  # but counted as rows seen
+        assert r["alarm"] is True
