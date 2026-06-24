@@ -780,6 +780,11 @@ def _run_optimizers(
     """Run all optimizer modules. Returns dict of results."""
     bucket = config.get("signals_bucket", "alpha-engine-research")
     db_path = config.get("research_db")
+    # config#1017: explicit backfill run_date threaded into each optimizer's
+    # apply()/produce_artifact() so a --date backfill keys recommendation
+    # artifacts to the BACKFILL trading day (matching the assemble read),
+    # not today's. None on a live run → optimizers fall back to today_iso().
+    run_date = config.get("_run_date")
     results = {}
 
     # Weight optimizer
@@ -810,7 +815,7 @@ def _run_optimizers(
     trigger_result = diagnostics.get("trigger_scorecard")
     results["trigger_opt"] = tracker.run_module(
         "trigger_optimizer",
-        lambda: _run_trigger_opt(trigger_result, freeze, bucket),
+        lambda: _run_trigger_opt(trigger_result, freeze, bucket, run_date),
         required_inputs={"trigger_scorecard": trigger_result is not None and trigger_result.get("status") == "ok"},
         skip_if_missing=["trigger_scorecard"],
     )
@@ -818,7 +823,7 @@ def _run_optimizers(
     # Predictor sizing optimizer
     results["predictor_sizing"] = tracker.run_module(
         "predictor_sizing",
-        lambda: _run_predictor_sizing(db_path, freeze, bucket),
+        lambda: _run_predictor_sizing(db_path, freeze, bucket, run_date),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
     )
@@ -829,7 +834,7 @@ def _run_optimizers(
     # barrier_win_prob into predictor_outcomes (B3 activation prerequisite).
     results["barrier_sizing"] = tracker.run_module(
         "barrier_sizing",
-        lambda: _run_barrier_sizing(db_path, freeze, bucket),
+        lambda: _run_barrier_sizing(db_path, freeze, bucket, run_date),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
     )
@@ -841,7 +846,7 @@ def _run_optimizers(
     stance_sizing_optimizer.init_config(config)
     results["stance_sizing"] = tracker.run_module(
         "stance_sizing",
-        lambda: _run_stance_sizing(db_path, freeze, bucket),
+        lambda: _run_stance_sizing(db_path, freeze, bucket, run_date),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
     )
@@ -947,37 +952,45 @@ def _run_research_opt(config: dict, df_base, freeze: bool) -> dict:
     return rp_result
 
 
-def _run_trigger_opt(trigger_result: dict, freeze: bool, bucket: str) -> dict:
+def _run_trigger_opt(
+    trigger_result: dict, freeze: bool, bucket: str, run_date: str | None = None,
+) -> dict:
     result = trigger_optimizer.analyze(trigger_result)
     if result.get("status") == "ok":
         if freeze:
             result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         else:
-            result["apply_result"] = trigger_optimizer.apply(result, bucket)
+            result["apply_result"] = trigger_optimizer.apply(result, bucket, run_date)
     return result
 
 
-def _run_predictor_sizing(db_path: str, freeze: bool, bucket: str) -> dict:
+def _run_predictor_sizing(
+    db_path: str, freeze: bool, bucket: str, run_date: str | None = None,
+) -> dict:
     result = predictor_sizing_optimizer.analyze(db_path)
     if result.get("status") == "ok":
         if freeze:
             result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         elif result.get("recommendation") == "enable":
-            result["apply_result"] = predictor_sizing_optimizer.apply(result, bucket)
+            result["apply_result"] = predictor_sizing_optimizer.apply(result, bucket, run_date)
     return result
 
 
-def _run_barrier_sizing(db_path: str, freeze: bool, bucket: str) -> dict:
+def _run_barrier_sizing(
+    db_path: str, freeze: bool, bucket: str, run_date: str | None = None,
+) -> dict:
     result = barrier_sizing_optimizer.analyze(db_path)
     if result.get("status") == "ok":
         if freeze:
             result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         elif result.get("recommendation") == "enable":
-            result["apply_result"] = barrier_sizing_optimizer.apply(result, bucket)
+            result["apply_result"] = barrier_sizing_optimizer.apply(result, bucket, run_date)
     return result
 
 
-def _run_stance_sizing(db_path: str, freeze: bool, bucket: str) -> dict:
+def _run_stance_sizing(
+    db_path: str, freeze: bool, bucket: str, run_date: str | None = None,
+) -> dict:
     """L300: offline-IC stance-sizing optimizer. Reports stance_column_absent
     until the score_performance stance migration lands (mirrors barrier)."""
     result = stance_sizing_optimizer.analyze(db_path)
@@ -985,7 +998,7 @@ def _run_stance_sizing(db_path: str, freeze: bool, bucket: str) -> dict:
         if freeze:
             result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         elif result.get("recommendation") == "enable":
-            result["apply_result"] = stance_sizing_optimizer.apply(result, bucket)
+            result["apply_result"] = stance_sizing_optimizer.apply(result, bucket, run_date)
     return result
 
 
@@ -1136,7 +1149,11 @@ def _run_executor_opt(config: dict, sweep_df, freeze: bool) -> dict:
         if freeze:
             result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         else:
-            result["apply_result"] = executor_optimizer.apply(result, bucket)
+            # config#1017: thread the backfill run_date from config["_run_date"]
+            # so the recommendation artifact keys to the backfilled trading day.
+            result["apply_result"] = executor_optimizer.apply(
+                result, bucket, config.get("_run_date"),
+            )
     else:
         _publish_executor_opt_rejection_alert(result, config)
     return result
