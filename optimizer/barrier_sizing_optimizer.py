@@ -176,7 +176,9 @@ def _build_overlay_params(result: dict) -> tuple[dict, list[str]]:
     return params, list(params.keys())
 
 
-def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> dict:
+def produce_artifact(
+    result: dict, bucket: str, run_id: str | None = None, run_date: str | None = None,
+) -> dict:
     """Write a typed RecommendationArtifact to S3 (always — full audit trail).
 
     Mirrors predictor_sizing_optimizer.produce_artifact; field_overlay kind
@@ -208,7 +210,9 @@ def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> di
         artifact = RecommendationArtifact(
             fit_target="barrier_sizing_ic",
             optimizer_name="barrier_sizing_optimizer",
-            run_date=today_iso(),
+            # config#1017: explicit backfill run_date over ambient today_iso()
+            # (None on a live run → current trading day).
+            run_date=run_date or today_iso(),
             recommendation_kind="field_overlay",
             recommended_params=params,
             overlay_keys=overlay_keys,
@@ -228,13 +232,13 @@ def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> di
         return {"written": False, "reason": str(e)}
 
 
-def apply(result: dict, bucket: str) -> dict:
+def apply(result: dict, bucket: str, run_date: str | None = None) -> dict:
     """Write barrier_win_prob_sizing_enabled flag to executor_params.json on S3.
 
     Always produces the recommendation artifact first (audit trail). Honors the
     assembler cutover gate, mirroring predictor_sizing_optimizer.apply.
     """
-    produce_artifact(result, bucket)
+    produce_artifact(result, bucket, run_date=run_date)
 
     from optimizer.assembler import is_cutover_enabled
     if is_cutover_enabled():

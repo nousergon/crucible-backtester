@@ -968,7 +968,9 @@ def validate_holdout(
     return result
 
 
-def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> dict:
+def produce_artifact(
+    result: dict, bucket: str, run_id: str | None = None, run_date: str | None = None,
+) -> dict:
     """
     Convert an executor_optimizer ``recommend()`` result into a typed
     ``RecommendationArtifact`` and write it to S3 at
@@ -1012,7 +1014,9 @@ def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> di
         artifact = RecommendationArtifact(
             fit_target=result.get("fit_target", "sharpe_legacy"),
             optimizer_name="executor_optimizer",
-            run_date=today_iso(),
+            # config#1017: explicit backfill run_date over ambient today_iso()
+            # (None on a live run → current trading day).
+            run_date=run_date or today_iso(),
             recommendation_kind="full_replace",
             recommended_params=result.get("recommended_params", {}),
             promotion_intent=derive_promotion_intent(result),
@@ -1033,7 +1037,7 @@ def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> di
         return {"written": False, "reason": str(e)}
 
 
-def apply(result: dict, bucket: str) -> dict:
+def apply(result: dict, bucket: str, run_date: str | None = None) -> dict:
     """
     Write recommended executor params to S3 if recommendation is valid.
 
@@ -1062,7 +1066,8 @@ def apply(result: dict, bucket: str) -> dict:
     """
     # Produce the per-optimizer recommendation artifact regardless of
     # outcome — captures every invocation for audit. Non-fatal on failure.
-    produce_artifact(result, bucket)
+    # config#1017: thread the backfill run_date through to the artifact.
+    produce_artifact(result, bucket, run_date=run_date)
 
     # Cutover gate: when assembler.cutover_enabled is true, the assembler
     # is the sole writer of the live key. Skip the legacy live + history +
