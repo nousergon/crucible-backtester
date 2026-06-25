@@ -76,6 +76,80 @@ def test_multifactor_beats_momentum_scanner(tmp_path):
     assert mset["actual_scanner_pass"]["n_picks"] == 20, r
 
 
+def _db_with_tech_and_gradient(tmp_path):
+    """Fixture exercising BOTH reconciliation axes (config#1186): a continuous
+    alpha gradient (so cross-sectional rank-IC is well-defined) + a ``tech_score``
+    column for the live scanner (anti-correlated with alpha — it passes losers),
+    while momentum loads on the winners. 5 cycles with mild per-cycle jitter so
+    the date-clustered t-tests are non-degenerate.
+    """
+    conn = sqlite3.connect(str(tmp_path / "rt.db"))
+    conn.execute(
+        "CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT, "
+        "quant_filter_pass INTEGER, tech_score REAL)"
+    )
+    conn.execute(
+        "CREATE TABLE universe_returns (ticker TEXT, eval_date TEXT, sector TEXT, "
+        "log_return_21d REAL, log_spy_return_21d REAL)"
+    )
+    dates = ["2026-01-02", "2026-01-09", "2026-01-16", "2026-01-23", "2026-01-30"]
+    loadings: dict = {}
+    for di, d in enumerate(dates):
+        jitter = (di - 2) * 0.002  # mild per-cycle shift, keeps cycles distinct
+        for i in range(12):
+            alpha = (6 - i) * 0.01 + jitter          # monotonic: low i = winner
+            qpass = 1 if i >= 6 else 0                 # live scanner passes losers
+            conn.execute(
+                "INSERT INTO scanner_evaluations VALUES (?,?,?,?)",
+                (f"T{i}", d, qpass, float(i)),         # tech_score = i (anti-corr w/ alpha)
+            )
+            conn.execute(
+                "INSERT INTO universe_returns VALUES (?,?,?,?,?)",
+                (f"T{i}", d, "Tech", alpha, 0.0),
+            )
+            loadings[(d, f"T{i}")] = {
+                "pe_ratio": float(i), "pb_ratio": float(i),
+                "momentum_20d": float(12 - i), "return_60d": float(12 - i),
+                "roe": float(12 - i), "fcf_yield": float(12 - i),
+                "realized_vol_63d": float(i), "idio_vol_60d": float(i),
+            }
+    conn.commit()
+    return conn, loadings
+
+
+def test_reconciliation_two_axes_present(tmp_path):
+    conn, loadings = _db_with_tech_and_gradient(tmp_path)
+    r = _scanner_factor_counterfactual(conn, loadings)
+    assert r["status"] == "ok", r
+    assert r["n_cycles"] == 5, r
+
+    # objective_axes: every method carries BOTH axes, each well-formed.
+    axes = r["objective_axes"]
+    for k, v in axes.items():
+        for ax in ("longonly_topn_alpha", "xs_rank_ic"):
+            assert set(v[ax]) == {"mean", "p", "n"}, (k, ax, v)
+    # momentum long-only axis is fully populated (one obs per cycle).
+    assert axes["momentum_sleeve_topN"]["longonly_topn_alpha"]["n"] == 5, axes
+
+    # With tech_score + a 12-point alpha gradient, the live scanner's cross-
+    # sectional rank-IC is computable and NEGATIVE (tech_score passes losers).
+    live_ic = axes["actual_scanner_pass"]["xs_rank_ic"]
+    assert live_ic["n"] >= 3 and live_ic["mean"] is not None, live_ic
+    assert live_ic["mean"] < 0, live_ic
+
+    # reconciliation block contract + the momentum sleeve beats live long-only.
+    rec = r["reconciliation"]
+    assert isinstance(rec["verdict"], str) and rec["verdict"], rec
+    assert isinstance(rec["sleeve_beats_live_longonly_significant"], bool), rec
+    assert isinstance(rec["consistent_with_1142_neutralization"], bool), rec
+    assert rec["momentum_sleeve_longonly_lift_vs_live"]["mean"] > 0, rec
+
+    # breadth stratification present with >= 4 cycles.
+    bs = r["breadth_stratified"]
+    assert bs is not None and "median_breadth" in bs, bs
+    assert "momentum_sleeve_topN" in bs and "actual_scanner_pass" in bs, bs
+
+
 def test_skipped_without_loadings(tmp_path):
     conn, _ = _db_and_loadings(tmp_path)
     r = _scanner_factor_counterfactual(conn, None)

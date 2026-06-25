@@ -1486,7 +1486,7 @@ def _cio_consolidation_counterfactual(conn, ur: pd.DataFrame, loadings: dict | N
 
 
 # Multi-factor candidate-generation composite for the scanner counterfactual
-# (config#967). Each sleeve is the mean of its cross-sectionally z-scored,
+# (config#1186). Each sleeve is the mean of its cross-sectionally z-scored,
 # sign-oriented (higher = better) raw factors; the composite is the equal-weight
 # mean of the sleeves. This is the institutional alternative to the current
 # scanner's momentum-only ``tech_score``. Raw factor column names match the
@@ -1504,7 +1504,8 @@ SCANNER_RAW_FACTORS: tuple = tuple(
 
 def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
     """Would a MULTI-FACTOR candidate-generation beat the momentum-only scanner?
-    (config#967 — the candidate-generation / scanner-edge test.)
+    (config#1186 — the candidate-generation / scanner-edge test + reconciliation
+    with the live momentum-neutralization #1142.)
 
     The funnel analysis showed candidate-pool alpha is absolutely negative, so
     the bottleneck is candidate generation. Today's scanner ranks ~900 -> ~60 on
@@ -1528,8 +1529,13 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
         se_cols = {r[1] for r in conn.execute("PRAGMA table_info(scanner_evaluations)")}
         if "quant_filter_pass" not in se_cols:
             return {"status": "skipped", "reason": "scanner_evaluations has no quant_filter_pass"}
+        # tech_score is the live scanner's CONTINUOUS score — pulled (when present)
+        # so the live scanner can be ranked on the cross-sectional rank-IC axis
+        # alongside the factor sleeves, which is the axis #1142 neutralizes.
+        has_tech = "tech_score" in se_cols
+        tech_sel = "se.tech_score, " if has_tech else ""
         m = pd.read_sql_query(
-            "SELECT se.ticker, se.eval_date, se.quant_filter_pass, u.sector, "
+            f"SELECT se.ticker, se.eval_date, se.quant_filter_pass, {tech_sel}u.sector, "
             "(u.log_return_21d - u.log_spy_return_21d) AS alpha21 "
             "FROM scanner_evaluations se "
             "JOIN universe_returns u ON u.ticker=se.ticker AND u.eval_date=se.eval_date "
@@ -1546,6 +1552,25 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
         universe_alpha: list = []
         n_pass_total = 0
         n_cycles = 0
+        # Per-cycle records for the objective-asymmetry reconciliation (config#1186
+        # vs #1142). Each cycle contributes ONE observation per variant on two
+        # axes: (a) ``topn`` — mean realized 21d alpha of the count-matched top-N
+        # selection (the scanner's OWN objective: pick names to BUY); (b) ``ic`` —
+        # the full cross-sectional Spearman rank-IC of the variant's score vs
+        # realized alpha (the axis #1142 neutralizes). Date-clustered post-loop so
+        # significance uses weeks-as-N, not pooled names (the pseudo-replication
+        # trap, config#1164).
+        cycle_recs: list[dict] = []
+        from scipy.stats import spearmanr
+
+        def _xs_ic(score: pd.Series, alpha: pd.Series):
+            """Full cross-sectional Spearman rank-IC within one cycle (or None if
+            under-powered: <5 names or a degenerate score/alpha distribution)."""
+            valid = score.notna() & alpha.notna()
+            if valid.sum() < 5 or score[valid].nunique() < 3 or alpha[valid].nunique() < 3:
+                return None
+            rho, _p = spearmanr(score[valid], alpha[valid])
+            return float(rho) if rho == rho else None
 
         for d, g in m.groupby("eval_date"):
             g = g[g["alpha21"].notna()].copy()
@@ -1605,6 +1630,34 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
                         picked[sl + "_sleeve_topN"].extend(a)
                         picked_sn[sl + "_sleeve_topN"].extend(sn)
 
+            # --- per-cycle records for the two-axis reconciliation ---
+            rec_topn: dict = {}
+            rec_ic: dict = {}
+            if len(actual):
+                rec_topn["actual_scanner_pass"] = float(actual["alpha21"].mean())
+            if has_tech and "tech_score" in g.columns:
+                ic_ts = _xs_ic(g["tech_score"], g["alpha21"])
+                if ic_ts is not None:
+                    rec_ic["actual_scanner_pass"] = ic_ts
+            if mf_a:
+                rec_topn["multifactor_topN"] = float(sum(mf_a) / len(mf_a))
+            ic_mf = _xs_ic(g["_composite"], g["alpha21"])
+            if ic_mf is not None:
+                rec_ic["multifactor_topN"] = ic_mf
+            for sl in sleeve_names:
+                col = "_sleeve_" + sl
+                if col not in g.columns:
+                    continue
+                a2, _sn2 = _topN_alpha(col)
+                if a2:
+                    rec_topn[sl + "_sleeve_topN"] = float(sum(a2) / len(a2))
+                ic_sl = _xs_ic(g[col], g["alpha21"])
+                if ic_sl is not None:
+                    rec_ic[sl + "_sleeve_topN"] = ic_sl
+            cycle_recs.append(
+                {"breadth": float((g["alpha21"] > 0).mean()), "topn": rec_topn, "ic": rec_ic}
+            )
+
         if n_cycles < 3:
             return {"status": "insufficient_data", "reason": f"only {n_cycles} cycles", "n_cycles": n_cycles}
 
@@ -1636,6 +1689,102 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
             if ma is not None and ma > sleeve_best:
                 sleeve_best, best_sleeve = ma, sl
 
+        # ---- Objective-asymmetry reconciliation (config#1186 vs #1142) --------
+        # The pooled means above answer "which candidate-gen picks the best top-N
+        # pool" but pool draws across weeks as if independent (pseudo-replication,
+        # config#1164). Here we date-cluster EACH variant on TWO axes so the
+        # +0.050 momentum-sleeve read is tested honestly and reconciled with the
+        # live momentum-NEUTRALIZATION (#1142): the scanner's own objective is
+        # long-only top-N selection (momentum should help), while #1142 targets
+        # the cross-sectional rank-IC (where momentum is toxic in low-breadth).
+        import numpy as np
+        from scipy.stats import ttest_1samp
+
+        def _date_cluster(values: list) -> dict:
+            vals = [v for v in values if v is not None and v == v]
+            if len(vals) < 3:
+                return {"mean": (round(float(np.mean(vals)), 5) if vals else None), "p": None, "n": len(vals)}
+            _t, p = ttest_1samp(vals, 0.0)
+            return {"mean": round(float(np.mean(vals)), 5), "p": round(float(p), 4) if p == p else None, "n": len(vals)}
+
+        axes: dict = {}
+        for k in methods:
+            axes[k] = {
+                "longonly_topn_alpha": _date_cluster([r["topn"].get(k) for r in cycle_recs if k in r["topn"]]),
+                "xs_rank_ic": _date_cluster([r["ic"].get(k) for r in cycle_recs if k in r["ic"]]),
+            }
+
+        def _paired_lift(variant_key: str, axis: str) -> dict:
+            # Per-cycle diff vs the live scanner on ``axis`` (paired where both present).
+            diffs = [
+                r[axis][variant_key] - r[axis]["actual_scanner_pass"]
+                for r in cycle_recs
+                if variant_key in r[axis] and "actual_scanner_pass" in r[axis]
+            ]
+            return _date_cluster(diffs)
+
+        mom_key = "momentum_sleeve_topN"
+        mom_longonly_lift = _paired_lift(mom_key, "topn")
+        mom_xs_ic = axes.get(mom_key, {}).get("xs_rank_ic", {"mean": None, "p": None, "n": 0})
+
+        breadths = [r["breadth"] for r in cycle_recs]
+        breadth_strat = None
+        if len(breadths) >= 4:
+            med_b = float(np.median(breadths))
+
+            def _regime(lo: bool, key: str, axis: str) -> dict:
+                return _date_cluster([
+                    r[axis].get(key) for r in cycle_recs
+                    if key in r[axis] and ((r["breadth"] <= med_b) == lo)
+                ])
+
+            breadth_strat = {"median_breadth": round(med_b, 4)}
+            for key in (mom_key, "actual_scanner_pass"):
+                breadth_strat[key] = {
+                    "low_breadth": {"longonly_topn_alpha": _regime(True, key, "topn"), "xs_rank_ic": _regime(True, key, "ic")},
+                    "high_breadth": {"longonly_topn_alpha": _regime(False, key, "topn"), "xs_rank_ic": _regime(False, key, "ic")},
+                }
+
+        ll_mean, ll_p = mom_longonly_lift.get("mean"), mom_longonly_lift.get("p")
+        ic_mean, ic_p = mom_xs_ic.get("mean"), mom_xs_ic.get("p")
+        sleeve_beats_live_longonly_significant = bool(
+            ll_mean is not None and ll_mean > 0 and ll_p is not None and ll_p < 0.05
+        )
+        # Reconciliation holds when momentum's value is selection-tail (long-only),
+        # NOT a significant-positive cross-sectional rank skill — i.e. exactly what
+        # #1142 neutralizes out.
+        consistent_with_1142 = bool(ic_mean is None or ic_mean <= 0 or ic_p is None or ic_p >= 0.05)
+        if sleeve_beats_live_longonly_significant and consistent_with_1142:
+            verdict = (
+                "momentum sleeve beats the live scanner on the long-only top-N objective with "
+                "date-clustered significance while its cross-sectional rank-IC is flat/negative — "
+                "asymmetry confirmed: the scanner (long-only selection) should KEEP momentum even "
+                "though the composite (cross-sectional rank) neutralizes it out (#1142). PROCEED to "
+                "an observe-mode shadow scanner (A3)."
+            )
+        elif ll_mean is not None and ll_mean > 0:
+            verdict = (
+                "momentum sleeve leads the live scanner on the long-only objective but NOT with "
+                "date-clustered significance — the original +0.050 pooled read was pseudo-replicated; "
+                "ACCUMULATE more cohorts before standing up a shadow scanner."
+            )
+        else:
+            verdict = (
+                "momentum sleeve does NOT beat the live scanner on the long-only objective once "
+                "date-clustered — do NOT promote a momentum-sleeve scanner."
+            )
+        reconciliation = {
+            "axis_definitions": {
+                "longonly_topn_alpha": "the scanner's OWN objective — mean realized 21d alpha of the count-matched top-N BUY selection",
+                "xs_rank_ic": "the axis #1142 neutralizes — full cross-sectional Spearman rank-IC of the score vs realized alpha",
+            },
+            "momentum_sleeve_longonly_lift_vs_live": mom_longonly_lift,
+            "momentum_sleeve_xs_rank_ic": mom_xs_ic,
+            "sleeve_beats_live_longonly_significant": sleeve_beats_live_longonly_significant,
+            "consistent_with_1142_neutralization": consistent_with_1142,
+            "verdict": verdict,
+        }
+
         return {
             "status": "ok",
             "horizon": "21d",
@@ -1648,6 +1797,9 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
             "best_method": best or "actual_scanner_pass",
             "best_sleeve": best_sleeve,
             "any_factor_beats_actual_scanner": best is not None,
+            "objective_axes": axes,
+            "breadth_stratified": breadth_strat,
+            "reconciliation": reconciliation,
         }
     except sqlite3.OperationalError as e:
         return {"status": "skipped", "reason": f"sqlite: {e}"}
