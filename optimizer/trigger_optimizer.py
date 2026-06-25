@@ -133,7 +133,9 @@ def _build_overlay_params(result: dict) -> tuple[dict, list[str]]:
     return params, list(params.keys())
 
 
-def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> dict:
+def produce_artifact(
+    result: dict, bucket: str, run_id: str | None = None, run_date: str | None = None,
+) -> dict:
     """
     Convert a trigger_optimizer ``recommend()`` result into a typed
     ``RecommendationArtifact`` and write it to S3 at
@@ -173,7 +175,11 @@ def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> di
         artifact = RecommendationArtifact(
             fit_target="entry_timing_alpha",
             optimizer_name="trigger_optimizer",
-            run_date=today_iso(),
+            # config#1017: explicit backfill run_date over ambient today_iso().
+            # A live run passes None → today_iso() (current trading day); an
+            # explicit --date backfill threads config["_run_date"] so the
+            # artifact partition matches the backfilled assemble read.
+            run_date=run_date or today_iso(),
             recommendation_kind="field_overlay",
             recommended_params=params,
             overlay_keys=overlay_keys,
@@ -193,7 +199,7 @@ def produce_artifact(result: dict, bucket: str, run_id: str | None = None) -> di
         return {"written": False, "reason": str(e)}
 
 
-def apply(result: dict, bucket: str) -> dict:
+def apply(result: dict, bucket: str, run_date: str | None = None) -> dict:
     """Write disabled_triggers list to executor_params.json on S3.
 
     Additionally — and unconditionally — produces a per-optimizer
@@ -204,7 +210,8 @@ def apply(result: dict, bucket: str) -> dict:
     write) and is consumed by the future assembler module.
     """
     # Always produce the artifact — captures every invocation for audit.
-    produce_artifact(result, bucket)
+    # Thread the backfill run_date (config#1017) through to the artifact.
+    produce_artifact(result, bucket, run_date=run_date)
 
     # Cutover gate: when assembler.cutover_enabled is true, the assembler
     # is the sole writer of the live key.
