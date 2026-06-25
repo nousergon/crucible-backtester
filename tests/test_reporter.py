@@ -752,13 +752,40 @@ class TestSavePersistence:
         assert json.loads((out / "score_calibration.json").read_text())["ece"] == 0.04
         assert json.loads((out / "team_metrics.json").read_text())["tech"]["grade"] == 80
 
-    def test_na_status_not_persisted(self, tmp_path):
+    def test_non_ok_status_is_still_persisted(self, tmp_path):
+        """Regression for config#1189. The three research Saturday eval-artifacts
+        are ALWAYS-EMIT: a non-"ok" producer return (the normal graceful-degrade
+        for a thin/absent research.db) must STILL write the S3 object — with the
+        non-ok status preserved in the body — so the evaluator can distinguish
+        "producer never ran" (absent) from "ran, no data" (insufficient_data).
+        Previously these landed in the OK-ONLY block and were silently dropped,
+        leaving composite_scoring / macro_agent / calibration_diagnostics N/A
+        from birth (2026-06-04 / #279)."""
+        import json
         out = self._save(
             tmp_path,
             score_calibration={"status": "insufficient_data"},
-            calibration_diagnostics={"status": "insufficient_data"},
+            macro_eval={"status": "error", "error": "cio_evaluations table not found"},
+            calibration_diagnostics={"status": "insufficient_data", "n": 3},
+        )
+        assert (out / "score_calibration.json").exists()
+        assert (out / "macro_eval.json").exists()
+        assert (out / "portfolio_calibration.json").exists()
+        assert json.loads((out / "score_calibration.json").read_text())["status"] == "insufficient_data"
+        assert json.loads((out / "macro_eval.json").read_text())["status"] == "error"
+        assert json.loads((out / "portfolio_calibration.json").read_text())["status"] == "insufficient_data"
+
+    def test_none_research_artifacts_not_persisted(self, tmp_path):
+        """None means the producer never ran (e.g. evaluate.py mode without
+        diagnostics) → absence is the correct, diagnosable signal."""
+        out = self._save(
+            tmp_path,
+            score_calibration=None,
+            macro_eval=None,
+            calibration_diagnostics=None,
         )
         assert not (out / "score_calibration.json").exists()
+        assert not (out / "macro_eval.json").exists()
         assert not (out / "portfolio_calibration.json").exists()
 
     def test_empty_team_metrics_not_persisted(self, tmp_path):
