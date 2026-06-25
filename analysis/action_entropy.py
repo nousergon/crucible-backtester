@@ -26,6 +26,18 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+# Decision-stream column on the score_performance frame (``df_base``), in
+# preference order. ``stance`` is the within-sector factor composite the
+# scorer assigns each finalized signal (alpha-engine-research factor_scoring.py:
+# momentum / quality / value / low_vol / unknown) — the system's per-decision
+# action label. ``conviction`` (rising / stable / declining) is the fallback
+# when the stance column hasn't been joined into score_performance yet (it was
+# added 2026-05-11 and back-joins lag). Collapse to one stance across a whole
+# cycle is the degenerate-behavior tripwire entropy catches: returns-based
+# metrics look fine, but the decision distribution has stopped discriminating.
+_ACTION_STREAM_COLUMNS: tuple[str, ...] = ("stance", "conviction")
+
+
 class EntropyResult(TypedDict, total=False):
     status: str
     n: int
@@ -183,3 +195,64 @@ def compute_rolling_entropy(
     if not rows:
         return pd.DataFrame(columns=["entropy", "entropy_normalized", "alarm"])
     return pd.DataFrame(rows, index=pd.Index(valid_index, name=actions.index.name))
+
+
+def compute_action_entropy_artifact(
+    df_base: pd.DataFrame | None,
+    *,
+    alarm_threshold: float = 0.3,
+    min_samples: int = 20,
+) -> dict:
+    """Report-card producer (config#1151 Batch C) — decision-stream entropy.
+
+    Extracts the per-signal decision label (``stance``, falling back to
+    ``conviction``) from the finalized-signal frame the evaluator already has
+    (``df_base`` = score_performance rows) and computes the normalized Shannon
+    entropy of that stream. This is the EXECUTOR-tile ``action_entropy``
+    diagnostic the report card grades off ``entropy_normalized``: a value near 1
+    means the system is discriminating across the decision vocabulary; a value
+    collapsing toward 0 means it has degenerated to one action (prompt drift /
+    confidence collapse / rubric divergence) — pathology the Sharpe/Sortino
+    surface can't see.
+
+    Pure-compute over already-loaded analysis inputs (no new data read), mirroring
+    the ``sample_size_adequacy`` producer. ALWAYS-EMIT (even
+    ``insufficient_data`` / ``no_decision_stream``) so the evaluator distinguishes
+    "producer didn't run" from "ran, genuinely too few / no labelled decisions".
+
+    Args:
+        df_base: score_performance frame (the finalized-signal stream). ``None``
+            or empty → ``insufficient_data`` with ``n=0``.
+        alarm_threshold: normalized-entropy floor for the collapse alarm.
+        min_samples: minimum stream length for a meaningful estimate (default 20,
+            matching the executor tile's ``n_floor``).
+
+    Returns the ``compute_action_entropy`` result dict, annotated with
+    ``action_field`` (which column supplied the stream) and ``n_signals`` (rows
+    seen). ``no_decision_stream`` status when neither label column is present.
+    """
+    if df_base is None or len(df_base) == 0:
+        return {"status": "insufficient_data", "n": 0, "n_signals": 0,
+                "reason": "no finalized-signal frame this cycle"}
+
+    field = next(
+        (c for c in _ACTION_STREAM_COLUMNS
+         if c in df_base.columns and df_base[c].notna().any()),
+        None,
+    )
+    if field is None:
+        return {
+            "status": "no_decision_stream",
+            "n": 0,
+            "n_signals": int(len(df_base)),
+            "reason": (f"no labelled decision column in score_performance "
+                       f"(looked for {list(_ACTION_STREAM_COLUMNS)})"),
+        }
+
+    actions = [str(a) for a in df_base[field].dropna().tolist()]
+    result = compute_action_entropy(
+        actions, alarm_threshold=alarm_threshold, min_samples=min_samples,
+    )
+    result["action_field"] = field
+    result["n_signals"] = int(len(df_base))
+    return dict(result)

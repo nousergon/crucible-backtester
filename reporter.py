@@ -1191,6 +1191,7 @@ def save(
     cio_opt: dict | None = None,
     behavioral_anomaly: dict | None = None,
     sample_size: dict | None = None,
+    action_entropy: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -1268,6 +1269,10 @@ def save(
         # Sample-size adequacy (config#1151 Batch C) — always-emit from birth so
         # the evaluator distinguishes "producer didn't run" from "ran, too few".
         ("sample_size.json", sample_size),
+        # Decision-stream action entropy (config#1151 Batch C, executor tile) —
+        # always-emit so the evaluator distinguishes "producer didn't run" from
+        # "ran, decision distribution collapsed / no labelled decision stream".
+        ("action_entropy.json", action_entropy),
         # Research Saturday eval-artifacts (Phase B1a #279). Migrated from the
         # OK-ONLY block to always-emit (config#1189): these were added to the
         # persist on 2026-06-04 but landed in the OK-ONLY block, so any cycle
