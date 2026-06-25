@@ -99,3 +99,63 @@ class TestCustomBinEdges:
         result = compute_calibration(probs, outcomes, bin_edges=edges, min_bin_n=5)
         # Should produce up to 10 bins (some may be dropped if sparse).
         assert len(result["bins"]) + len(result["dropped_bins"]) <= 10
+
+
+class TestLibConsolidation:
+    """Regression for #1125: the headline ECE must come from the one fleet-wide
+    primitive (``alpha_engine_lib.quant.stats.calibration``), and the
+    margin-vs-probability bug class must stay caught — feeding the *margin*
+    ``|p-0.5|*2`` instead of the probability produces a materially different
+    (inflated) ECE, which a calibrated probability set must not.
+    """
+
+    def test_ece_matches_lib_primitive(self):
+        # calibration_diagnostics must delegate the ECE scalar to the lib, not
+        # re-derive it. Bit-for-bit identical on the same edges + min_bin_n.
+        from alpha_engine_lib.quant.stats.calibration import (
+            expected_calibration_error,
+        )
+
+        edges = [0.0, 0.20, 0.40, 0.60, 0.80, 1.01]
+        rng = np.random.default_rng(11)
+        probs = rng.uniform(0.0, 1.0, size=600)
+        outcomes = (rng.uniform(size=600) < probs).astype(float)
+
+        result = compute_calibration(probs, outcomes, min_bin_n=10)
+        lib = expected_calibration_error(
+            probs, outcomes, bin_edges=edges, min_bin_n=10, min_samples=1,
+        )
+        assert result["status"] == "ok"
+        # compute_calibration rounds the headline ECE to 4dp for display; the
+        # unrounded lib value must agree to that precision (i.e. the scalar is
+        # the lib's, not a separately-derived one).
+        assert result["ece"] == pytest.approx(round(lib["ece"], 4), abs=1e-9)
+
+    def test_margin_vs_probability_bug_class(self):
+        # A perfectly-calibrated probability set: P(y=1) == p in each bucket.
+        # ECE on the PROBABILITY is ~0. ECE on the MARGIN |p-0.5|*2 binned
+        # against the same hit-rate manufactures a large structural gap — the
+        # exact scale-mismatch that produced months of false calibration_breakdown
+        # alerts. The two must NOT be interchangeable.
+        rng = np.random.default_rng(12)
+        probs = []
+        outcomes = []
+        for p_target in [0.1, 0.3, 0.5, 0.7, 0.9]:
+            n = 200
+            probs.extend([p_target] * n)
+            n_hits = round(n * p_target)
+            outcomes.extend([1] * n_hits + [0] * (n - n_hits))
+        probs = np.array(probs, dtype=float)
+        outcomes = np.array(outcomes, dtype=float)
+
+        on_probability = compute_calibration(probs, outcomes, min_bin_n=10)
+        assert on_probability["status"] == "ok"
+        assert on_probability["ece"] < 0.02  # well-calibrated as a probability
+
+        # Same outcomes, but ECE computed over the confidence MARGIN.
+        margin = np.abs(probs - 0.5) * 2.0
+        on_margin = compute_calibration(margin, outcomes, min_bin_n=10)
+        # Margin-vs-hit-rate is a scale mismatch: ECE is structurally large
+        # even though the model is perfectly calibrated as a probability.
+        assert on_margin["ece"] > 0.15
+        assert on_margin["ece"] > on_probability["ece"] + 0.1
