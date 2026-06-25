@@ -67,6 +67,7 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis.sample_size_adequacy import compute_sample_size_adequacy
+from analysis.action_entropy import compute_action_entropy_artifact
 from analysis import factor_blend_sensitivity
 from analysis import veto_analysis
 from analysis import decision_capture_coverage, executor_decision_capture_coverage, provenance_grounding, quant_rank_quality
@@ -1421,6 +1422,14 @@ def _main_impl() -> None:
         except Exception as e:
             log.warning("evaluator-revamp metric bundle failed: %s", e)
 
+        # Decision-stream entropy (config#1151 Batch C) — the executor-tile
+        # action_entropy diagnostic. Computed over the finalized-signal frame's
+        # decision label (stance/conviction); ALWAYS-EMIT so the report card
+        # distinguishes "producer didn't run" from "ran, decision distribution
+        # collapsed / too few labelled decisions". Feeds both the self-grade
+        # scorecard below and the persisted action_entropy.json save() reads.
+        action_entropy_result = compute_action_entropy_artifact(df_base)
+
         # Compute grading scorecard
         from analysis.grading import compute_scorecard
         grading_result = compute_scorecard(
@@ -1441,8 +1450,11 @@ def _main_impl() -> None:
             team_metrics=team_metrics or None,
             calibration_diagnostics=portfolio_calibration if portfolio_calibration.get("status") == "ok" else None,
             excursion_summary=portfolio_excursion if portfolio_excursion.get("status") == "ok" else None,
-            # action_entropy left None until a decision-stream extraction
-            # source is wired in (PR 7 — regime indicator email).
+            # Decision-stream entropy off the finalized-signal stance/conviction
+            # labels (config#1151 Batch C). Only the "ok" result is gradable; any
+            # other status (insufficient_data / no_decision_stream) leaves the
+            # self-grade component a transparent N/A.
+            action_entropy=action_entropy_result if action_entropy_result.get("status") == "ok" else None,
         )
 
         # Build report using existing reporter (includes completeness)
@@ -1585,6 +1597,7 @@ def _main_impl() -> None:
             exit_timing=diagnostics.get("exit_timing"),
             behavioral_anomaly=diagnostics.get("behavioral_anomaly"),
             sample_size=compute_sample_size_adequacy(sq_result, attr_result),
+            action_entropy=action_entropy_result,
             e2e_lift=diagnostics.get("e2e_lift"),
             veto_result=opt_results.get("veto_result"),
             confusion_matrix=diagnostics.get("confusion_matrix"),

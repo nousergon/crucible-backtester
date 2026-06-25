@@ -1191,6 +1191,7 @@ def save(
     cio_opt: dict | None = None,
     behavioral_anomaly: dict | None = None,
     sample_size: dict | None = None,
+    action_entropy: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -1268,6 +1269,10 @@ def save(
         # Sample-size adequacy (config#1151 Batch C) — always-emit from birth so
         # the evaluator distinguishes "producer didn't run" from "ran, too few".
         ("sample_size.json", sample_size),
+        # Decision-stream action entropy (config#1151 Batch C, executor tile) —
+        # always-emit so the evaluator distinguishes "producer didn't run" from
+        # "ran, decision distribution collapsed / no labelled decision stream".
+        ("action_entropy.json", action_entropy),
     ]:
         if data is not None:
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
