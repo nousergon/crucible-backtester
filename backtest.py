@@ -4736,7 +4736,12 @@ def _run_simulation_pipeline(
                         if args.freeze:
                             executor_rec["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
                         else:
-                            executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
+                            # config#1017: thread the backfill run_date so the
+                            # recommendation artifact keys to the backfilled
+                            # trading day (config["_run_date"] == normalized args.date).
+                            executor_rec["apply_result"] = executor_optimizer.apply(
+                                executor_rec, bucket, config.get("_run_date"),
+                            )
 
                     # Persist final state (includes holdout + twin_sim +
                     # apply_result) so an auto-skipped retry restores the
@@ -4811,7 +4816,10 @@ def _run_predictor_pipeline(
                 if args.freeze:
                     executor_rec["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
                 else:
-                    executor_rec["apply_result"] = executor_optimizer.apply(executor_rec, bucket)
+                    # config#1017: thread the backfill run_date (predictor-sweep path).
+                    executor_rec["apply_result"] = executor_optimizer.apply(
+                        executor_rec, bucket, config.get("_run_date"),
+                    )
         except Exception as e:
             logger.error("Executor optimizer (predictor sweep) failed: %s", e)
             if fd:
