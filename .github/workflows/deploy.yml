@@ -1,0 +1,86 @@
+name: Deploy
+
+on:
+  # NO path filter — every main commit rebuilds + redeploys the health-check
+  # Lambda image. This is deliberate, and is the structural fix for the
+  # recurring drift that bit on 2026-04-08→05-11 and again 2026-05-15→06-25:
+  # a calibration fix (e.g. #346, analysis/production_health.py) lands in main,
+  # but the manually-deployed image was never rebuilt, so the live Lambda
+  # silently re-raised an already-fixed false `calibration_breakdown` retrain
+  # alert. The Lambda image is built from many repo paths (analysis/**,
+  # pipeline_common.py, health_status.py, preflight.py, lambda_health/**,
+  # requirements-health.txt, flow-doctor.yaml, plus the lib pin in the
+  # Dockerfile). A path filter would have to enumerate all of them and stay in
+  # lockstep with every future `COPY` — exactly the kind of silent miss that
+  # caused this. Rebuilding unconditionally (~3-5 min on a native-amd64 GH
+  # runner) is the right trade vs another month of false retrain alerts.
+  # Mirrors alpha-engine-predictor deploy.yml's documented no-filter rationale.
+  push:
+    branches: [main]
+  workflow_dispatch:  # manual trigger (e.g. ship an already-merged change)
+
+# One deploy at a time; never cancel an in-progress deploy mid-push.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for OIDC role assumption
+  contents: read
+
+jobs:
+  deploy:
+    name: Build + deploy health-check Lambda
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout backtester repo
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # deploy_health.sh builds lambda_health/Dockerfile (which COPYs the
+      # fixed analysis/production_health.py + pins the lib ECE primitive),
+      # pushes to ECR, publishes a version, runs a dry-run canary against the
+      # new version, and only promotes the :live alias on canary success — so
+      # a bad build leaves live on the prior good version (no manual rollback).
+      - name: Build image + deploy health-check Lambda
+        run: bash infrastructure/deploy_health.sh
+
+      - name: Report deployed version
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-predictor-health-check \
+            --query "Configuration.[LastModified,CodeSha256]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy.yml
+          subsystem: backtester
+
+  # Alert (Telegram) on genuine post-merge failure of this workflow on the
+  # default branch. Reusable workflow + transport in nousergon-lib. config#1128.
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    secrets: inherit
