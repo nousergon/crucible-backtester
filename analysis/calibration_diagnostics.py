@@ -17,6 +17,15 @@ CIO advance/reject decisions, etc. This module provides that primitive;
 production_health can later delegate to it.
 
 Pure-compute. Operates on parallel arrays; no I/O.
+
+The headline ECE scalar is **not** computed locally — it delegates to
+``alpha_engine_lib.quant.stats.calibration.expected_calibration_error``, the
+one canonical ECE implementation for the fleet (per the lift-to-chokepoint
+rule). A train-time ECE (predictor) and a production-time ECE (backtester) are
+only comparable if both bin the *same quantity the same way*; keeping a second
+ECE loop here would let the two drift. This module still owns the reliability
+diagram records and the Brier score (the lib primitive doesn't compute Brier),
+but the |hit_rate - expected| sum that defines ECE comes from the lib.
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from typing import TypedDict
 
 import numpy as np
 import pandas as pd
+from alpha_engine_lib.quant.stats.calibration import expected_calibration_error
 
 logger = logging.getLogger(__name__)
 
@@ -133,10 +143,17 @@ def compute_calibration(
 
     edges = bin_edges if bin_edges is not None else list(_DEFAULT_BIN_EDGES)
 
+    # Headline ECE comes from the ONE fleet-wide primitive — do not re-derive
+    # the |hit_rate - expected| sum here. Same edges + min_bin_n as the local
+    # reliability diagram below, so the bins shown match the bins the lib summed.
+    # NaN-filtering already happened above, so min_samples=1 here just guards the
+    # empty case (the min_total_samples floor is enforced earlier).
+    lib_result = expected_calibration_error(
+        p, y, bin_edges=edges, min_bin_n=min_bin_n, min_samples=1,
+    )
+
     bins: list[ReliabilityBin] = []
     dropped: list[ReliabilityBin] = []
-    total_weighted_gap = 0.0
-    total_kept_n = 0
 
     for i in range(len(edges) - 1):
         lo, hi = edges[i], edges[i + 1]
@@ -158,10 +175,11 @@ def compute_calibration(
             dropped.append(record)
             continue
         bins.append(record)
-        total_weighted_gap += abs(gap) * bin_n
-        total_kept_n += bin_n
 
-    ece = total_weighted_gap / total_kept_n if total_kept_n > 0 else 0.0
+    # ``ece`` is None from the lib only when every bin was dropped by min_bin_n;
+    # preserve the prior 0.0-when-no-kept-bins contract for the grading layer.
+    ece = lib_result.get("ece")
+    ece = ece if ece is not None else 0.0
     brier = float(((p - y) ** 2).mean())
 
     if ece < 0.05:
