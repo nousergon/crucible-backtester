@@ -1275,6 +1275,21 @@ def save(
         # always-emit so the evaluator distinguishes "producer didn't run" from
         # "ran, decision distribution collapsed / no labelled decision stream".
         ("action_entropy.json", action_entropy),
+        # Research Saturday eval-artifacts (Phase B1a #279). Migrated from the
+        # OK-ONLY block to always-emit (config#1189): these were added to the
+        # persist on 2026-06-04 but landed in the OK-ONLY block, so any cycle
+        # where the producer returned insufficient_data/error (its normal
+        # graceful-degrade for a thin/absent research.db) silently emitted NO
+        # S3 object → the evaluator's research tile read them as "absent this
+        # cycle" and graded composite_scoring / macro_agent /
+        # calibration_diagnostics N/A from birth. Always-emit makes absence
+        # mean "producer never ran" (a true infra failure) rather than "ran,
+        # no data" — same rationale as the freshness-monitored artifacts above.
+        # The evaluator consumer already graceful-degrades each to a visible
+        # N/A on any non-"ok" status, so emitting the non-ok body is safe.
+        ("score_calibration.json", score_calibration),
+        ("macro_eval.json", macro_eval),
+        ("portfolio_calibration.json", calibration_diagnostics),
         # Optimizer churn / walk-forward stability (config#1151 Batch C) —
         # always-emit so the evaluator's backtester tile distinguishes "producer
         # didn't run" from "ran, optimizer had no usable recommendation / too
@@ -1301,12 +1316,10 @@ def save(
         ("quant_rank_quality.json", quant_rank_quality),
         ("agent_justification.json", agent_justification),
         ("barrier_coherence.json", barrier_coherence),
-        # Computed in evaluate.py but previously unpersisted — the evaluator
-        # (Report Card v2, Option B) reads these tiles over S3. (Director plan
-        # Phase B1a.)
-        ("score_calibration.json", score_calibration),
-        ("macro_eval.json", macro_eval),
-        ("portfolio_calibration.json", calibration_diagnostics),
+        # NOTE: score_calibration.json / macro_eval.json / portfolio_calibration.json
+        # were moved to the ALWAYS-EMIT block above (config#1189) — they were
+        # silently absent from birth here because the OK-ONLY gate dropped the
+        # producer's normal insufficient_data/error graceful-degrade.
         ("portfolio_excursion.json", excursion_summary),
     ]:
         if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
