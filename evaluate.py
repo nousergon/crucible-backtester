@@ -68,6 +68,8 @@ import yaml
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis.sample_size_adequacy import compute_sample_size_adequacy
 from analysis.action_entropy import compute_action_entropy_artifact
+from analysis.optimizer_churn import compute_optimizer_churn
+from analysis.walk_forward_stability import compute_walk_forward_stability
 from analysis import factor_blend_sensitivity
 from analysis import veto_analysis
 from analysis import decision_capture_coverage, executor_decision_capture_coverage, provenance_grounding, quant_rank_quality
@@ -1565,6 +1567,18 @@ def _main_impl() -> None:
                 "",
             ])
 
+        # Report-card Batch C producers (config#1151) — backtester self-grade
+        # inputs. Pure-compute over the weight optimizer's already-computed
+        # result (no new data read); ALWAYS-EMIT so the evaluator's backtester
+        # tile distinguishes "producer didn't run" from "ran, optimizer had no
+        # usable recommendation / too little history". optimizer_churn = largest
+        # proposed per-param move vs the guardrail cap (config thrash);
+        # walk_forward_stability = cross-week recommendation-reversal rate
+        # (weekly drift). Both grade in crucible-evaluator's backtester tile.
+        weight_result = opt_results.get("weight_result")
+        optimizer_churn_result = compute_optimizer_churn(weight_result)
+        walk_forward_stability_result = compute_walk_forward_stability(weight_result)
+
         # Save
         out_dir = save(
             report_md=report_md,
@@ -1581,6 +1595,8 @@ def _main_impl() -> None:
             behavioral_anomaly=diagnostics.get("behavioral_anomaly"),
             sample_size=compute_sample_size_adequacy(sq_result, attr_result),
             action_entropy=action_entropy_result,
+            optimizer_churn=optimizer_churn_result,
+            walk_forward_stability=walk_forward_stability_result,
             e2e_lift=diagnostics.get("e2e_lift"),
             veto_result=opt_results.get("veto_result"),
             confusion_matrix=diagnostics.get("confusion_matrix"),

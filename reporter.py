@@ -1192,6 +1192,8 @@ def save(
     behavioral_anomaly: dict | None = None,
     sample_size: dict | None = None,
     action_entropy: dict | None = None,
+    optimizer_churn: dict | None = None,
+    walk_forward_stability: dict | None = None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
@@ -1273,6 +1275,12 @@ def save(
         # always-emit so the evaluator distinguishes "producer didn't run" from
         # "ran, decision distribution collapsed / no labelled decision stream".
         ("action_entropy.json", action_entropy),
+        # Optimizer churn / walk-forward stability (config#1151 Batch C) —
+        # always-emit so the evaluator's backtester tile distinguishes "producer
+        # didn't run" from "ran, optimizer had no usable recommendation / too
+        # little weekly history". Uploaded to backtest/{date}/ by upload_to_s3.
+        ("optimizer_churn.json", optimizer_churn),
+        ("walk_forward_stability.json", walk_forward_stability),
     ]:
         if data is not None:
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
