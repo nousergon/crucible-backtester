@@ -294,9 +294,21 @@ class TestComputeAndEmit:
         assert "agent_counterfactual_rule_fit" in names
         assert "agent_counterfactual_rule_fit_n_samples" in names
 
-        # Per-agent analysis persisted at the canonical key.
-        put_call = s3.put_object.call_args
-        assert "_counterfactual/ic_cio/2026-W19" in put_call.kwargs["Key"]
+        # Per-agent analysis persisted under the canonical eval_artifacts
+        # layout: keep the {agent_id_base}/ partition, swap the weekly
+        # {YYYY-Www} file to {run_id}.json (YYMMDDHHMM), add a per-agent
+        # latest.json sidecar. end_time 2026-05-09 00:00 UTC → "2605090000".
+        put_keys = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        dated = sorted(k for k in put_keys if not k.endswith("/latest.json"))
+        latest = sorted(k for k in put_keys if k.endswith("/latest.json"))
+        assert dated == [
+            "decision_artifacts/_counterfactual/ic_cio/2605090000.json"
+        ]
+        assert latest == [
+            "decision_artifacts/_counterfactual/ic_cio/latest.json"
+        ]
+        # No legacy ISO-week filename in the new layout.
+        assert all("2026-W" not in k for k in put_keys)
 
     def test_unsupported_agent_excluded_from_per_agent(self):
         from replay.counterfactual import compute_and_emit
