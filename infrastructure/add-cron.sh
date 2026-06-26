@@ -26,8 +26,20 @@ fi
 
 SOURCE_ENV=". ${ENV_FILE} &&"
 
-# Launch spot instance for the full backtest (10y data, param sweep, upload results)
-CRON_LINE="0 8 * * 6  cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && ${SOURCE_ENV} bash infrastructure/spot_backtest.sh >> /var/log/backtester.log 2>&1"
+# Path to the alpha-engine-config checkout on the dispatcher. The backtester's
+# config.yaml is a symlink into this checkout and spot_backtest.sh also stages
+# executor/risk.yaml from here (see spot_backtest.sh), so config edits only
+# reach the running system if this checkout is pulled each run (config#822).
+CONFIG_REPO="/home/ec2-user/alpha-engine-config"
+
+# Launch spot instance for the full backtest (10y data, param sweep, upload results).
+# Pull alpha-engine-config FIRST so config edits (backtester guardrails, risk.yaml,
+# predictor.yaml, the symlinked config.yaml) propagate on every run — without this
+# the dispatcher silently runs whatever stale config it last had (config#822). The
+# pull is fail-LOUD but non-blocking: a failed pull logs a warning and the backtest
+# still runs on the last-good config (better than skipping the weekly run entirely),
+# rather than silently lagging.
+CRON_LINE="0 8 * * 6  { git -C ${CONFIG_REPO} pull --ff-only || echo 'WARN(add-cron): alpha-engine-config pull failed — backtest may run on STALE config (config#822)'; } >> /var/log/backtester.log 2>&1 && cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && ${SOURCE_ENV} bash infrastructure/spot_backtest.sh >> /var/log/backtester.log 2>&1"
 
 # Remove existing backtester entry, then add new one
 EXISTING=$(crontab -l 2>/dev/null || true)
