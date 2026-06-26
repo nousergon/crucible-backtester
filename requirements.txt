@@ -48,4 +48,4 @@ cvxpy>=1.4,<1.8
 # NOTE: flow-doctor extra is HYPHENATED — setuptools normalizes the lib's
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
 # normalize underscore->hyphen, so `[flow_doctor]` silently drops it (config#1178).
-alpha-engine-lib[arcticdb,flow-doctor,quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.59.8
+nousergon-lib[arcticdb,flow-doctor,quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.60.2
