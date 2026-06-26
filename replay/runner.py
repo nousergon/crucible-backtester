@@ -18,8 +18,10 @@ Pipeline:
      surface as ``replay_error`` on the artifact — they're the
      silent-drift signal we wanted to expose (target model emits a
      structurally divergent output that the canonical schema rejects).
-  5. Persist side-by-side artifact at
-     ``decision_artifacts/_replay/{run_id}/{original_model}_vs_{target_model}.json``.
+  5. Persist side-by-side artifact under the canonical eval_artifacts
+     layout: ``decision_artifacts/_replay/{run_id}_{original_model}_vs_{target_model}.json``
+     (flat, YYMMDDHHMM run_id) + a ``decision_artifacts/_replay/latest.json``
+     sidecar. Key format owned by ``alpha_engine_lib.eval_artifacts``.
 
 Why langchain_anthropic.with_structured_output (not bare SDK):
 
@@ -169,17 +171,49 @@ def _persist_replay(
     replay_prefix: str,
     replay: ReplayOutput,
 ) -> str:
-    """Write the replay artifact to
-    ``{replay_prefix}/{run_id}/{original_model}_vs_{target_model}.json``.
-    Sanitize model names so colons or slashes don't break the S3 key."""
+    """Write the replay artifact under the canonical ``eval_artifacts``
+    layout: a flat, structured-timestamp dated key
+    ``{replay_prefix}/{run_id}_{original_model}_vs_{target_model}.json``
+    plus a ``{replay_prefix}/latest.json`` operator-UX sidecar.
+
+    Migrated from the legacy nested ``{replay_prefix}/{original_run_id}/
+    {orig}_vs_{target}.json`` layout (backtester #179 deferred this site;
+    config#792). The key format is owned by ``alpha_engine_lib.
+    eval_artifacts`` — we mint a fresh ``run_id`` per replay invocation
+    (``new_eval_run_id`` → ``YYMMDDHHMM``) and stamp it into the payload
+    as ``replay_run_id`` so the dated artifact is self-describing, while
+    the ``{orig}_vs_{target}`` discriminator survives as the canonical
+    multi-file basename. Sanitize model names so colons or slashes don't
+    break the S3 key.
+
+    The dated key is the forensic source of truth (re-runs are preserved
+    under distinct YYMMDDHHMM run_ids); the ``latest.json`` sidecar is a
+    pure mirror of the most-recently-written replay for operator UX.
+    """
+    from alpha_engine_lib.eval_artifacts import (
+        eval_artifact_key,
+        eval_latest_key,
+        new_eval_run_id,
+    )
+
     safe_orig = replay.original_model.replace(":", "-").replace("/", "-")
     safe_target = replay.replay_model.replace(":", "-").replace("/", "-")
-    key = (
-        f"{replay_prefix}/{replay.original_run_id}/"
-        f"{safe_orig}_vs_{safe_target}.json"
-    )
-    body = json.dumps(replay.to_dict(), indent=2, default=str).encode("utf-8")
+    run_id = new_eval_run_id()
+    basename = f"{safe_orig}_vs_{safe_target}.json"
+    key = eval_artifact_key(replay_prefix, run_id, basename=basename)
+
+    payload = replay.to_dict()
+    payload["replay_run_id"] = run_id
+    body = json.dumps(payload, indent=2, default=str).encode("utf-8")
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+
+    # Operator-UX latest sidecar — pure mirror of the dated artifact.
+    s3.put_object(
+        Bucket=bucket,
+        Key=eval_latest_key(replay_prefix),
+        Body=body,
+        ContentType="application/json",
+    )
     return key
 
 
