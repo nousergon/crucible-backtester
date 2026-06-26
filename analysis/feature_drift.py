@@ -197,14 +197,14 @@ def _load_features_from_arctic(
 ) -> dict[str, pd.DataFrame]:
     """Load feature DataFrames for specific tickers from ArcticDB."""
     try:
-        from store.arctic_reader import _get_arctic, OHLCV_COLS
+        from store.arctic_reader import OHLCV_COLS
+        from alpha_engine_lib.arcticdb import open_universe_lib
     except ImportError:
         log.warning("ArcticDB reader not available — cannot load features")
         return {}
 
     try:
-        arctic = _get_arctic(bucket)
-        universe = arctic.get_library("universe")
+        universe = open_universe_lib(bucket)
         available = set(universe.list_symbols())
 
         result = {}
