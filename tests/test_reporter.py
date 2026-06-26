@@ -128,6 +128,41 @@ class TestBuildReport:
         assert "# Alpha Engine Backtest Report" in md
         assert "2026-03-29" in md
 
+    def test_lookahead_disclosure_always_rendered(self):
+        """G7: the LLM look-ahead disclosure section is always emitted —
+        an absent disclosure is itself the gap."""
+        md = build_report(
+            run_date="2026-03-29",
+            signal_quality={"status": "ok", "overall": {}},
+            regime_analysis=[],
+            score_analysis=[],
+            attribution={"status": "skipped"},
+        )
+        assert "LLM Look-Ahead-Bias Disclosure (G7)" in md
+        # No models in config -> MISSING flag (credibility-correct default).
+        assert "MISSING" in md
+
+    def test_lookahead_disclosure_flags_overlap_from_config(self):
+        """Disclosure sources model IDs + cutoffs from config and flags an
+        overlap when the backtest window precedes the cutoff."""
+        md = build_report(
+            run_date="2026-03-29",
+            signal_quality={"status": "ok", "overall": {}},
+            regime_analysis=[],
+            score_analysis=[],
+            attribution={"status": "skipped"},
+            config={
+                "llm": {"per_stock_model": "claude-haiku-4-5-20251001"},
+                "llm_training_cutoffs": {
+                    "claude-haiku-4-5-20251001": "2025-01-31"
+                },
+                "backtest_start": "2024-01-01",
+                "backtest_end": "2024-12-31",
+            },
+        )
+        assert "LOOK-AHEAD OVERLAP" in md
+        assert "claude-haiku-4-5-20251001" in md
+
     def test_pipeline_health_included_when_provided(self):
         """Pipeline health section should appear when health dict is passed."""
         md = build_report(
