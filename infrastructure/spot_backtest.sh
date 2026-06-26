@@ -396,8 +396,18 @@ fi
 # Locate the executor risk.yaml + predictor predictor.yaml on the dispatcher
 # so we can stage them to S3 for the spot. Mirrors the legacy SCP-source
 # resolution; only the transport changed.
+#
+# Experiment-package first (config#1042): risk.yaml resolves from
+# alpha-engine-config/experiments/$ALPHA_ENGINE_EXPERIMENT_ID/executor/risk.yaml
+# (default experiment `reference`) ahead of the legacy top-level
+# alpha-engine-config/executor/risk.yaml, then the repo-local fallback —
+# mirroring pipeline_common.load_config + preflight._check_executor_config.
+# Behavior-preserving: config#1159 made the package copy byte-identical to legacy.
+EXPERIMENT_ID="${ALPHA_ENGINE_EXPERIMENT_ID:-reference}"
 EXECUTOR_CONFIG=""
 for candidate in \
+    "$HOME/alpha-engine-config/experiments/$EXPERIMENT_ID/executor/risk.yaml" \
+    "$HOME/Development/alpha-engine-config/experiments/$EXPERIMENT_ID/executor/risk.yaml" \
     "$HOME/alpha-engine-config/executor/risk.yaml" \
     "$HOME/Development/alpha-engine-config/executor/risk.yaml" \
     "$HOME/alpha-engine/config/risk.yaml" \
@@ -409,6 +419,8 @@ for candidate in \
 done
 if [ -z "$EXECUTOR_CONFIG" ]; then
     echo "ERROR: executor risk.yaml not found in any search path:" >&2
+    echo "  ~/alpha-engine-config/experiments/$EXPERIMENT_ID/executor/risk.yaml" >&2
+    echo "  ~/Development/alpha-engine-config/experiments/$EXPERIMENT_ID/executor/risk.yaml" >&2
     echo "  ~/alpha-engine-config/executor/risk.yaml" >&2
     echo "  ~/Development/alpha-engine-config/executor/risk.yaml" >&2
     echo "  ~/alpha-engine/config/risk.yaml (legacy)" >&2

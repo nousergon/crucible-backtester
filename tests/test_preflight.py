@@ -223,3 +223,90 @@ class TestExecutorConfigCheck:
         )
         with pytest.raises(RuntimeError, match="empty value"):
             pf._check_executor_config()
+
+
+class TestExecutorConfigExperimentPackage:
+    """Experiment-package precedence for _check_executor_config's risk.yaml
+    resolution (config#1042, step 4).
+
+    The reader now resolves
+    ~/alpha-engine-config/experiments/$ALPHA_ENGINE_EXPERIMENT_ID/executor/risk.yaml
+    ahead of the legacy ~/alpha-engine-config/executor/risk.yaml, mirroring
+    pipeline_common.load_config. config#1159 made the package copy
+    byte-identical to legacy, so this is behavior-preserving; the tests pin
+    the resolution ORDER by giving the package/legacy copies distinct (valid)
+    bucket values and asserting which one wins.
+    """
+
+    _OK = (
+        "signals_bucket: alpha-engine-research\n"
+        "trades_bucket: alpha-engine-research\n"
+    )
+    _MISMATCH = (
+        "signals_bucket: legacy-only-bucket\ntrades_bucket: legacy-only-bucket\n"
+    )
+
+    @pytest.fixture
+    def isolated_home(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        return fake_home
+
+    def _executor_root(self, tmp_path):
+        # Real executor root with NO repo-local config/risk.yaml so the
+        # ~-anchored package/legacy candidates are the only ones in play.
+        executor_root = tmp_path / "alpha-engine"
+        (executor_root / "config").mkdir(parents=True)
+        return executor_root
+
+    def test_package_wins_over_legacy(self, tmp_path, isolated_home, monkeypatch):
+        monkeypatch.delenv("ALPHA_ENGINE_EXPERIMENT_ID", raising=False)
+        cfg = isolated_home / "alpha-engine-config"
+        # Legacy carries a MISMATCHING bucket: if it were resolved first the
+        # check would raise "does not match". Package carries the right one.
+        legacy = cfg / "executor" / "risk.yaml"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text(self._MISMATCH)
+        pkg = cfg / "experiments" / "reference" / "executor" / "risk.yaml"
+        pkg.parent.mkdir(parents=True)
+        pkg.write_text(self._OK)
+
+        pf = BacktesterPreflight(
+            bucket="alpha-engine-research",
+            mode="backtest",
+            executor_paths=[str(self._executor_root(tmp_path))],
+        )
+        pf._check_executor_config()  # package resolved first → no exception
+
+    def test_experiment_id_selects_slot(self, tmp_path, isolated_home, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_EXPERIMENT_ID", "myexp")
+        cfg = isolated_home / "alpha-engine-config"
+        ref = cfg / "experiments" / "reference" / "executor" / "risk.yaml"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(self._MISMATCH)
+        myexp = cfg / "experiments" / "myexp" / "executor" / "risk.yaml"
+        myexp.parent.mkdir(parents=True)
+        myexp.write_text(self._OK)
+
+        pf = BacktesterPreflight(
+            bucket="alpha-engine-research",
+            mode="backtest",
+            executor_paths=[str(self._executor_root(tmp_path))],
+        )
+        pf._check_executor_config()  # myexp slot resolved → no exception
+
+    def test_falls_back_to_legacy_when_no_package(self, tmp_path, isolated_home, monkeypatch):
+        monkeypatch.delenv("ALPHA_ENGINE_EXPERIMENT_ID", raising=False)
+        cfg = isolated_home / "alpha-engine-config"
+        legacy = cfg / "executor" / "risk.yaml"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text(self._OK)
+        # No experiments/.../executor/risk.yaml present.
+
+        pf = BacktesterPreflight(
+            bucket="alpha-engine-research",
+            mode="backtest",
+            executor_paths=[str(self._executor_root(tmp_path))],
+        )
+        pf._check_executor_config()  # legacy fallback resolved → no exception

@@ -24,8 +24,10 @@ Pipeline:
      mean + count + min + max per group.
   4. Emit CloudWatch metric ``agent_cheap_model_concordance`` per
      group (Dimensions: judged_agent_id, target_model).
-  5. Persist per-target-model analysis JSON to
-     ``decision_artifacts/_replay_summary/{YYYY-MM-DD}/{target_model}.json``.
+  5. Persist per-target-model analysis JSON under the canonical
+     eval_artifacts layout: ``decision_artifacts/_replay_summary/{run_id}_{target_model}.json``
+     (flat, YYMMDDHHMM run_id) + a ``decision_artifacts/_replay_summary/latest.json``
+     sidecar. Key format owned by ``alpha_engine_lib.eval_artifacts``.
 
 Cost discipline:
 
@@ -245,15 +247,52 @@ def _persist_batch_summary(
     end_date: datetime,
     payload: dict[str, Any],
 ) -> str:
-    """Write the per-target-model batch summary JSON to
-    ``{summary_prefix}/{YYYY-MM-DD}/{target_model}.json``. The
-    target_model is sanitized to drop colon-aliases (e.g. ``:live``)
-    so the S3 key is portable."""
+    """Write the per-target-model batch summary JSON under the canonical
+    ``eval_artifacts`` layout: a flat dated key
+    ``{summary_prefix}/{run_id}_{target_model}.json`` plus a
+    ``{summary_prefix}/latest.json`` operator-UX sidecar.
+
+    Migrated from the legacy date-partitioned ``{summary_prefix}/
+    {YYYY-MM-DD}/{target_model}.json`` layout (backtester #179 deferred
+    this site; config#792). The ``run_id`` is minted from the batch
+    ``end_date`` via ``new_eval_run_id`` so the YYMMDDHHMM timestamp
+    encodes the run instant (replacing the ``{YYYY-MM-DD}/`` partition —
+    the structured run_id already sorts chronologically across the flat
+    prefix). The ``target_model`` survives as the canonical multi-file
+    basename and is sanitized to drop colon-aliases (e.g. ``:live``) so
+    the S3 key stays portable.
+
+    The dated key is the forensic source of truth; the ``latest.json``
+    sidecar is a pure mirror of the most-recently-written summary. Key
+    format is owned by ``alpha_engine_lib.eval_artifacts``.
+
+    Note: with multiple target_models in one batch run, each writes its
+    own dated key (distinct basename) but they all mirror into the single
+    shared ``latest.json`` — last writer wins, matching the per-pipeline
+    "latest" semantic (operators inspect the dated keys for the full set).
+    """
+    from alpha_engine_lib.eval_artifacts import (
+        eval_artifact_key,
+        eval_latest_key,
+        new_eval_run_id,
+    )
+
     safe_target = target_model.replace(":", "-").replace("/", "-")
-    end_str = end_date.strftime("%Y-%m-%d")
-    key = f"{summary_prefix}/{end_str}/{safe_target}.json"
-    body = json.dumps(payload, indent=2, default=str).encode("utf-8")
+    run_id = new_eval_run_id(now=end_date)
+    key = eval_artifact_key(
+        summary_prefix, run_id, basename=f"{safe_target}.json",
+    )
+    enriched = {**payload, "run_id": run_id}
+    body = json.dumps(enriched, indent=2, default=str).encode("utf-8")
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+
+    # Operator-UX latest sidecar — pure mirror of the dated artifact.
+    s3.put_object(
+        Bucket=bucket,
+        Key=eval_latest_key(summary_prefix),
+        Body=body,
+        ContentType="application/json",
+    )
     return key
 
 

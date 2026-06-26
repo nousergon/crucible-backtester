@@ -116,10 +116,21 @@ def _load_active_horizon_days(
     pathlib internals.
     """
     if search_paths is None:
-        search_paths = [
-            Path.home() / "alpha-engine-config" / "predictor" / "predictor.yaml",
-            Path(__file__).parent.parent / "alpha-engine-config" / "predictor" / "predictor.yaml",
+        # Experiment-package first (config#1042): predictor.yaml resolves from
+        # experiments/$ALPHA_ENGINE_EXPERIMENT_ID/predictor/predictor.yaml
+        # (default experiment `reference`) ahead of the legacy top-level
+        # alpha-engine-config/predictor/predictor.yaml. Mirrors load_config's
+        # precedence exactly. Behavior-preserving: config#1159 made the package
+        # copy byte-identical to legacy.
+        exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
+        config_roots = [
+            Path.home() / "alpha-engine-config",
+            Path(__file__).parent.parent / "alpha-engine-config",
         ]
+        search_paths = [
+            r / "experiments" / exp / "predictor" / "predictor.yaml" for r in config_roots
+        ]
+        search_paths += [r / "predictor" / "predictor.yaml" for r in config_roots]
     for p in search_paths:
         if not p.exists():
             continue
