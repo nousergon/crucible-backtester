@@ -55,7 +55,7 @@
 # **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 3).**
 # Mirrors alpha-engine-data PR 2 (#330). Communication with the spot is
 # now via `aws ssm send-command` wrapped at the lib chokepoint
-# `python -m alpha_engine_lib.ssm_dispatcher run`. No port-22 inbound on
+# `python -m nousergon_lib.ssm_dispatcher run`. No port-22 inbound on
 # the spot SG; no ssh / scp / ssh-keyscan. The .env + 3 config files are
 # staged to a temporary S3 prefix and pulled down by the spot. PR 3 of
 # the 5-PR L342 arc.
@@ -396,8 +396,18 @@ fi
 # Locate the executor risk.yaml + predictor predictor.yaml on the dispatcher
 # so we can stage them to S3 for the spot. Mirrors the legacy SCP-source
 # resolution; only the transport changed.
+#
+# Experiment-package first (config#1042): risk.yaml resolves from
+# alpha-engine-config/experiments/$ALPHA_ENGINE_EXPERIMENT_ID/executor/risk.yaml
+# (default experiment `reference`) ahead of the legacy top-level
+# alpha-engine-config/executor/risk.yaml, then the repo-local fallback —
+# mirroring pipeline_common.load_config + preflight._check_executor_config.
+# Behavior-preserving: config#1159 made the package copy byte-identical to legacy.
+EXPERIMENT_ID="${ALPHA_ENGINE_EXPERIMENT_ID:-reference}"
 EXECUTOR_CONFIG=""
 for candidate in \
+    "$HOME/alpha-engine-config/experiments/$EXPERIMENT_ID/executor/risk.yaml" \
+    "$HOME/Development/alpha-engine-config/experiments/$EXPERIMENT_ID/executor/risk.yaml" \
     "$HOME/alpha-engine-config/executor/risk.yaml" \
     "$HOME/Development/alpha-engine-config/executor/risk.yaml" \
     "$HOME/alpha-engine/config/risk.yaml" \
@@ -409,6 +419,8 @@ for candidate in \
 done
 if [ -z "$EXECUTOR_CONFIG" ]; then
     echo "ERROR: executor risk.yaml not found in any search path:" >&2
+    echo "  ~/alpha-engine-config/experiments/$EXPERIMENT_ID/executor/risk.yaml" >&2
+    echo "  ~/Development/alpha-engine-config/experiments/$EXPERIMENT_ID/executor/risk.yaml" >&2
     echo "  ~/alpha-engine-config/executor/risk.yaml" >&2
     echo "  ~/Development/alpha-engine-config/executor/risk.yaml" >&2
     echo "  ~/alpha-engine/config/risk.yaml (legacy)" >&2
@@ -513,7 +525,7 @@ pre_launch_preflight
 # us-east-1f.
 echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
 
-INSTANCE_ID=$("$LIB_PYTHON" -m alpha_engine_lib.ec2_spot launch \
+INSTANCE_ID=$("$LIB_PYTHON" -m nousergon_lib.ec2_spot launch \
     --types "$INSTANCE_TYPES" \
     --subnets "$SUBNETS" \
     --image-id "$AMI_ID" \
@@ -606,7 +618,7 @@ cleanup() {
         # "Lambda CI canary rollback should Telegram/email the operator
         # on rollback" pattern and the CLAUDE.md SOTA rule sub-sub-rule
         # (lift-to-lib for ≥2 consumers; this is consumer #1 of the new
-        # `python -m alpha_engine_lib.alerts publish` CLI primitive).
+        # `python -m nousergon_lib.alerts publish` CLI primitive).
         # Best-effort: ``|| true`` keeps cleanup running even if Python /
         # the lib / SNS / Telegram are all unreachable — the local stdout
         # diagnostic above is the primary surface; the alert is the
@@ -617,7 +629,7 @@ cleanup() {
         else
             _alert_python="$(command -v python3 || command -v python || echo python)"
         fi
-        "$_alert_python" -m alpha_engine_lib.alerts publish \
+        "$_alert_python" -m nousergon_lib.alerts publish \
             --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_reason_code='$reason_code' spot_transition_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>} will_relaunch=$_will_relaunch" \
             --severity "$_alert_sev" \
             --source alpha-engine-backtester/spot_backtest.sh \
@@ -718,7 +730,7 @@ done
 # ── SSM dispatch primitive (lib chokepoint) ──────────────────────────────────
 # run_ssm "<description>" [timeout_seconds] <<HEREDOC ... HEREDOC
 #
-# Thin wrapper around `python -m alpha_engine_lib.ssm_dispatcher run`
+# Thin wrapper around `python -m nousergon_lib.ssm_dispatcher run`
 # (lib v0.35.0+). Body read from stdin via --script-stdin so the
 # dispatcher's bash parser does not scan it for quote/paren balance.
 # Records the description in LAST_SSM_DESC so the EXIT trap can name
@@ -733,7 +745,7 @@ done
 run_ssm() {
     local description="$1" timeout_s="${2:-3600}"
     LAST_SSM_DESC="$description"
-    "$LIB_PYTHON" -m alpha_engine_lib.ssm_dispatcher run \
+    "$LIB_PYTHON" -m nousergon_lib.ssm_dispatcher run \
         --instance-id "$INSTANCE_ID" \
         --description "backtester: $description" \
         --timeout "$timeout_s" \

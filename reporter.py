@@ -621,6 +621,76 @@ def _section_quant_rank_quality(quality: dict) -> list[str]:
     return lines
 
 
+def _section_cio_rule_tag_precision(precision: dict) -> list[str]:
+    """Build the CIO Rule-Tag Precision section.
+
+    Per-rule-tag precision of the LLM CIO's gates: of ADVANCE decisions
+    carrying a tag, what fraction beat SPY at 5d (precision); of REJECT
+    decisions carrying it, what fraction *would have* beaten SPY (the per-tag
+    false-negative rate). A high reject-beat rate flags a gate that is
+    systematically rejecting winners. Consumes cio_evaluations.rule_tags
+    (research migration 14) joined to universe_returns.beat_spy_5d.
+    """
+    lines = ["## CIO Rule-Tag Precision", ""]
+
+    status = precision.get("status")
+    if status == "insufficient_data":
+        lines.append(f"> {precision.get('reason', 'insufficient tagged decisions')}")
+        lines.append("")
+        return lines
+    if status == "no_data":
+        lines.append(f"> {precision.get('reason', 'no tagged CIO decisions in window')}")
+        lines.append("")
+        return lines
+    if status != "ok":
+        err = precision.get("error", "unknown error")
+        lines.append(f"> CIO rule-tag precision skipped: {err}")
+        lines.append("")
+        return lines
+
+    win_start = precision.get("window_start", "?")
+    win_end = precision.get("window_end", "?")
+    n_tagged = precision.get("n_tagged_decisions", 0)
+    overall_prec = precision.get("overall_advance_precision")
+    alarm = precision.get("reject_beat_alarm", 0.50)
+    alarm_tags = precision.get("alarm_tags", []) or []
+
+    lines.append(f"- Window: **{win_start}** → **{win_end}** ({n_tagged} tagged decisions)")
+    overall_str = f"{overall_prec * 100:.1f}%" if overall_prec is not None else "—"
+    lines.append(f"- Overall ADVANCE precision (beat SPY 5d): **{overall_str}**")
+    lines.append(
+        f"  *Per tag: ADVANCE precision = % of tag's ADVANCEs that beat SPY; "
+        f"REJECT-beat = % of tag's REJECTs that would have beaten SPY "
+        f"(false-negative rate). Alarm when REJECT-beat > {alarm * 100:.0f}%.*"
+    )
+
+    if alarm_tags:
+        lines.append(
+            f"- ⚠️ Over-rejecting tags (REJECT-beat > {alarm * 100:.0f}%): "
+            f"**{', '.join(alarm_tags)}**"
+        )
+
+    per_tag = precision.get("per_tag", []) or []
+    if per_tag:
+        lines.append("")
+        lines.append("| Rule tag | n | ADVANCE prec | n_adv | REJECT-beat | n_rej |")
+        lines.append("|---|---|---|---|---|---|")
+        for entry in per_tag:
+            ap = entry.get("advance_precision")
+            rb = entry.get("reject_beat_rate")
+            ap_str = f"{ap * 100:.0f}%" if ap is not None else "—"
+            rb_str = f"{rb * 100:.0f}%" if rb is not None else "—"
+            flag = " ⚠️" if (rb is not None and rb > alarm) else ""
+            lines.append(
+                f"| {entry['rule_tag']}{flag} | {entry.get('n_decisions', 0)} | "
+                f"{ap_str} | {entry.get('n_advance', 0)} | "
+                f"{rb_str} | {entry.get('n_reject', 0)} |"
+            )
+
+    lines.append("")
+    return lines
+
+
 def _section_agent_justification(summary: dict) -> list[str]:
     """Build the Agent Justification Stack section.
 
@@ -905,6 +975,7 @@ def build_report(
     executor_decision_capture_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
     quant_rank_quality: dict | None = None,
+    cio_rule_tag_precision: dict | None = None,
     agent_justification: dict | None = None,
     trigger_opt: dict | None = None,
     predictor_sizing: dict | None = None,
@@ -978,6 +1049,9 @@ def build_report(
 
     if quant_rank_quality:
         lines += _section_quant_rank_quality(quant_rank_quality)
+
+    if cio_rule_tag_precision:
+        lines += _section_cio_rule_tag_precision(cio_rule_tag_precision)
 
     if agent_justification:
         lines += _section_agent_justification(agent_justification)
@@ -1178,6 +1252,7 @@ def save(
     executor_decision_capture_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
     quant_rank_quality: dict | None = None,
+    cio_rule_tag_precision: dict | None = None,
     agent_justification: dict | None = None,
     barrier_coherence: dict | None = None,
     score_calibration: dict | None = None,
@@ -1194,11 +1269,28 @@ def save(
     action_entropy: dict | None = None,
     optimizer_churn: dict | None = None,
     walk_forward_stability: dict | None = None,
+    *,
+    upload_bucket: str | None = None,
+    upload_prefix: str = "backtest",
+    s3_client=None,
 ) -> Path:
     """
     Write report.md, signal_quality.csv, and metrics.json to results/{date}/.
 
     Returns the output directory path.
+
+    Write-as-you-compute (config#1190): when ``upload_bucket`` is set, each
+    artifact is uploaded to S3 the MOMENT it is persisted locally — not all
+    at the end. This means a mid-Saturday interruption no longer strands
+    every computed tile (previously they were buffered locally and only
+    swept up by a single terminal ``upload_to_s3`` batch). Per-tile uploads
+    are fail-soft (log + continue) so one tile's S3 hiccup can't abort the
+    compute phase; the terminal ``upload_to_s3`` sweep is the safety net.
+
+    ``upload_bucket=None`` (the default) preserves the legacy local-only
+    behavior exactly — nothing is uploaded from inside ``save``. Callers
+    gate this on the SAME flag as the terminal upload (e.g. ``args.upload``)
+    so local-only / dry-run modes never incur a per-tile S3 cost.
     """
     if run_date is None:
         run_date = date.today().isoformat()
@@ -1206,15 +1298,36 @@ def save(
     out_dir = Path(results_dir) / run_date
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    def _persist(path: Path) -> None:
+        """Mark a just-written artifact as persisted and, when uploads are
+        enabled, push it to S3 immediately (write-as-you-compute). Per-tile
+        upload is fail-soft: a single tile's S3 failure logs and continues
+        so it cannot abort the compute phase — the terminal sweep recovers
+        any straggler."""
+        if upload_bucket is None:
+            return
+        try:
+            upload_one(
+                path, upload_bucket, upload_prefix, run_date, s3_client=s3_client,
+            )
+        except Exception as e:  # noqa: BLE001 — fail-soft; terminal sweep is the net
+            logger.warning(
+                "Per-tile S3 upload failed for %s (continuing; terminal "
+                "sweep will retry): %s",
+                path, e,
+            )
+
     # Markdown report
     (out_dir / "report.md").write_text(report_md)
     logger.info("Wrote %s", out_dir / "report.md")
+    _persist(out_dir / "report.md")
 
     # Signal quality CSV
     if score_analysis:
         df = pd.DataFrame(score_analysis)
         df.to_csv(out_dir / "signal_quality.csv", index=False)
         logger.info("Wrote %s", out_dir / "signal_quality.csv")
+        _persist(out_dir / "signal_quality.csv")
 
     # Metrics JSON (overall summary + report card)
     overall = signal_quality.get("overall", {})
@@ -1227,16 +1340,19 @@ def save(
         metrics["report_card"] = grading
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
     logger.info("Wrote %s", out_dir / "metrics.json")
+    _persist(out_dir / "metrics.json")
 
     # Param sweep CSV
     if sweep_df is not None and not sweep_df.empty:
         sweep_df.to_csv(out_dir / "param_sweep.csv", index=False)
         logger.info("Wrote %s", out_dir / "param_sweep.csv")
+        _persist(out_dir / "param_sweep.csv")
 
     # Attribution JSON
     if attribution and attribution.get("status") == "ok":
         (out_dir / "attribution.json").write_text(json.dumps(attribution, indent=2, default=str))
         logger.info("Wrote %s", out_dir / "attribution.json")
+        _persist(out_dir / "attribution.json")
 
     # Structured analysis files for dashboard consumption.
     #
@@ -1296,10 +1412,18 @@ def save(
         # little weekly history". Uploaded to backtest/{date}/ by upload_to_s3.
         ("optimizer_churn.json", optimizer_churn),
         ("walk_forward_stability.json", walk_forward_stability),
+        # CIO rule-tag precision (config#840) — always-emit from birth. The
+        # gate intentionally returns insufficient_data until ≥4 weeks of
+        # rule_tags data accumulate (going forward from research#152's deploy),
+        # so the evaluator must distinguish "producer never ran" (absent S3
+        # object) from "ran, gated on thin data" (present, status-tagged body)
+        # — same rationale as the freshness-monitored artifacts above.
+        ("cio_rule_tag_precision.json", cio_rule_tag_precision),
     ]:
         if data is not None:
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
             logger.info("Wrote %s (status=%s)", out_dir / filename, data.get("status"))
+            _persist(out_dir / filename)
 
     # OK-ONLY contract (dashboard panels): write only on a meaningful result.
     # Migrating the rest of these to the always-emit contract is a filed
@@ -1325,8 +1449,56 @@ def save(
         if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
             logger.info("Wrote %s", out_dir / filename)
+            _persist(out_dir / filename)
 
     return out_dir
+
+
+def _artifact_key(prefix: str, run_date: str, filename: str) -> str:
+    """Canonical S3 key for a report-card artifact:
+    ``{prefix}/{run_date}/{filename}``.
+
+    Single source of truth for the key layout so the write-as-you-compute
+    per-tile path (`upload_one`) and the terminal sweep (`upload_to_s3`)
+    can never drift. Mirrors ``phase_artifacts.artifact_key``.
+    """
+    return f"{prefix}/{run_date}/{filename}"
+
+
+def _s3_client(s3_client=None):
+    """Return the injected client or a fresh default boto3 S3 client.
+    Mirrors ``phase_artifacts._client`` so unit tests can stub S3."""
+    return s3_client if s3_client is not None else boto3.client("s3")
+
+
+def upload_one(
+    file_path: Path,
+    bucket: str,
+    prefix: str = "backtest",
+    run_date: str | None = None,
+    *,
+    s3_client=None,
+) -> str:
+    """Upload a SINGLE local file to ``s3://{bucket}/{prefix}/{run_date}/``.
+
+    Returns the S3 key. This is the write-as-you-compute primitive: a tile
+    artifact lands on S3 the moment it is persisted to ``out_dir``, so a
+    mid-Saturday interruption no longer strands every computed tile (they
+    are buffered locally and only swept up at the very end). See config#1190.
+
+    Idempotent: re-uploading an already-present key is a harmless overwrite
+    (``put_object`` semantics) — which is what lets ``upload_to_s3`` run as
+    a straggler sweep after the per-tile uploads. Uses ``put_object`` (not
+    ``upload_file``) to match the ``phase_artifacts`` resilience-infra
+    convention and to be stub-friendly for unit tests.
+    """
+    if run_date is None:
+        run_date = date.today().isoformat()
+    file_path = Path(file_path)
+    key = _artifact_key(prefix, run_date, file_path.name)
+    _s3_client(s3_client).put_object(Bucket=bucket, Key=key, Body=file_path.read_bytes())
+    logger.info("Uploaded s3://%s/%s", bucket, key)
+    return key
 
 
 def upload_to_s3(
@@ -1334,19 +1506,26 @@ def upload_to_s3(
     bucket: str,
     prefix: str = "backtest",
     run_date: str | None = None,
+    *,
+    s3_client=None,
 ) -> None:
     """
     Upload all files in local_dir to s3://{bucket}/{prefix}/{run_date}/.
+
+    With per-tile write-as-you-compute uploads now firing inside ``save``
+    (config#1190), this remains as the terminal IDEMPOTENT sweep: it
+    re-uploads everything in ``local_dir`` — already-uploaded tiles
+    (harmless overwrite) plus any straggler not covered by the per-tile
+    path (report.md, completeness.json written post-`save`, etc.). It is
+    the safety net, so a per-tile S3 failure during compute can still be
+    recovered here.
     """
     if run_date is None:
         run_date = date.today().isoformat()
 
-    s3 = boto3.client("s3")
     for file_path in local_dir.iterdir():
-        key = f"{prefix}/{run_date}/{file_path.name}"
         try:
-            s3.upload_file(str(file_path), bucket, key)
-            logger.info("Uploaded s3://%s/%s", bucket, key)
+            upload_one(file_path, bucket, prefix, run_date, s3_client=s3_client)
         except ClientError as e:
             logger.error("Failed to upload %s: %s", file_path, e)
             raise

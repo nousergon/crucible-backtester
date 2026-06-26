@@ -500,13 +500,46 @@ def _persist_per_agent_analysis(
     end_date: datetime,
     payload: dict[str, Any],
 ) -> str:
-    """Write per-agent analysis JSON to
-    ``{analysis_prefix}/{agent_id_base}/{YYYY-WW}.json``. ISO week is
-    the natural cadence (one analysis per Saturday SF run)."""
-    iso_year, iso_week, _ = end_date.isocalendar()
-    key = f"{analysis_prefix}/{agent_id_base}/{iso_year}-W{iso_week:02d}.json"
-    body = json.dumps(payload, indent=2, default=str).encode("utf-8")
+    """Write per-agent analysis JSON under the canonical ``eval_artifacts``
+    layout, keeping the ``{agent_id_base}/`` partition: a flat dated key
+    ``{analysis_prefix}/{agent_id_base}/{run_id}.json`` plus a per-agent
+    ``{analysis_prefix}/{agent_id_base}/latest.json`` sidecar.
+
+    Migrated from the legacy ISO-week-keyed ``{analysis_prefix}/
+    {agent_id_base}/{YYYY-Www}.json`` layout (backtester #179 deferred
+    this site; config#792). The ``run_id`` is minted from the run
+    ``end_date`` via ``new_eval_run_id`` → ``YYMMDDHHMM`` (replacing the
+    weekly ``{YYYY-Www}`` filename — the structured run_id sorts
+    chronologically and carries the run instant, not just the ISO week).
+    The ``{agent_id_base}/`` partition is preserved per the issue scope,
+    so each agent gets its own dated history + its own latest sidecar.
+
+    The dated key is the forensic source of truth (Saturday-SF re-runs
+    within a week land on distinct YYMMDDHHMM run_ids rather than
+    clobbering the single weekly file); the per-agent ``latest.json`` is
+    a pure mirror of that agent's most-recently-written analysis. Key
+    format is owned by ``alpha_engine_lib.eval_artifacts``.
+    """
+    from alpha_engine_lib.eval_artifacts import (
+        eval_artifact_key,
+        eval_latest_key,
+        new_eval_run_id,
+    )
+
+    agent_prefix = f"{analysis_prefix}/{agent_id_base}"
+    run_id = new_eval_run_id(now=end_date)
+    key = eval_artifact_key(agent_prefix, run_id)
+    enriched = {**payload, "run_id": run_id}
+    body = json.dumps(enriched, indent=2, default=str).encode("utf-8")
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+
+    # Per-agent operator-UX latest sidecar — pure mirror of the dated key.
+    s3.put_object(
+        Bucket=bucket,
+        Key=eval_latest_key(agent_prefix),
+        Body=body,
+        ContentType="application/json",
+    )
     return key
 
 

@@ -432,11 +432,60 @@ class TestPersistence:
             s3_client=s3, chat_anthropic_factory=factory,
         )
 
-        put_call = s3.put_object.call_args
-        assert put_call.kwargs["Bucket"] == "alpha-engine-research"
-        key = put_call.kwargs["Key"]
-        assert key.startswith("decision_artifacts/_replay/run-xyz/")
-        assert "claude-sonnet-4-6_vs_claude-haiku-4-5.json" in key
+        # Canonical eval_artifacts layout: a flat dated key
+        # {run_id}_{orig}_vs_{target}.json + a latest.json sidecar. The
+        # run_id is a fresh YYMMDDHHMM mint (NOT the original_run_id), so
+        # the legacy nested {original_run_id}/ partition is gone.
+        put_keys = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        assert all(
+            c.kwargs["Bucket"] == "alpha-engine-research"
+            for c in s3.put_object.call_args_list
+        )
+        dated = [k for k in put_keys if not k.endswith("/latest.json")]
+        latest = [k for k in put_keys if k.endswith("/latest.json")]
+        assert len(dated) == 1
+        key = dated[0]
+        # Flat — exactly one path segment after the prefix, no run-xyz dir.
+        assert key.startswith("decision_artifacts/_replay/")
+        assert "run-xyz/" not in key
+        assert key.endswith("_claude-sonnet-4-6_vs_claude-haiku-4-5.json")
+        basename = key.rsplit("/", 1)[-1]
+        run_id = basename.split("_", 1)[0]
+        assert len(run_id) == 10 and run_id.isdigit()  # YYMMDDHHMM
+        assert latest == ["decision_artifacts/_replay/latest.json"]
+
+    def test_latest_sidecar_mirrors_dated_artifact(self):
+        """The latest.json sidecar must be a byte-for-byte mirror of the
+        dated forensic artifact, and the payload must carry the minted
+        replay_run_id so the dated key is self-describing (config#792)."""
+        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from replay.runner import replay_artifact
+
+        artifact = _make_captured_artifact(
+            run_id="run-xyz", model_name="claude-sonnet-4-6",
+        )
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_chat_anthropic_factory(
+            parsed=QuantAnalystOutput(ranked_picks=[]),
+        )
+
+        replay_artifact(
+            artifact_key="src.json", target_model="claude-haiku-4-5",
+            s3_client=s3, chat_anthropic_factory=factory,
+        )
+
+        bodies_by_key = {
+            c.kwargs["Key"]: c.kwargs["Body"]
+            for c in s3.put_object.call_args_list
+        }
+        dated_key = next(k for k in bodies_by_key if not k.endswith("/latest.json"))
+        latest_key = "decision_artifacts/_replay/latest.json"
+        # Sidecar is a pure mirror of the dated artifact.
+        assert bodies_by_key[dated_key] == bodies_by_key[latest_key]
+        # Payload carries the minted run_id matching the dated basename.
+        payload = json.loads(bodies_by_key[dated_key])
+        run_id = dated_key.rsplit("/", 1)[-1].split("_", 1)[0]
+        assert payload["replay_run_id"] == run_id
 
     def test_no_persist_skips_put_object(self):
         from alpha_engine_lib.agent_schemas import QuantAnalystOutput
@@ -475,8 +524,12 @@ class TestPersistence:
             s3_client=s3, chat_anthropic_factory=factory,
         )
 
-        key = s3.put_object.call_args.kwargs["Key"]
-        assert ":" not in key.rsplit("/", 1)[-1]
+        dated = [
+            c.kwargs["Key"] for c in s3.put_object.call_args_list
+            if not c.kwargs["Key"].endswith("/latest.json")
+        ]
+        assert len(dated) == 1
+        assert ":" not in dated[0].rsplit("/", 1)[-1]
 
 
 # ── Usage extraction ─────────────────────────────────────────────────────

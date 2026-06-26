@@ -33,9 +33,18 @@ def _mock_s3_client(list_dirs: dict, list_objects: dict, get_objects: dict) -> M
 
     def list_v2(Bucket, Prefix, Delimiter=None):
         if Delimiter == "/":
+            # Real S3 with a delimiter returns BOTH the CommonPrefixes
+            # (sub-"directories") AND any objects sitting directly under
+            # the prefix with no further "/" (Contents). Mirror that so
+            # the flat canonical-layout reader path is exercised.
             cp = list_dirs.get(Prefix, [])
+            flat = [
+                k for k in list_objects.get(Prefix, [])
+                if "/" not in k[len(Prefix):]
+            ]
             return {
                 "CommonPrefixes": [{"Prefix": f"{Prefix}{name}/"} for name in cp],
+                "Contents": [{"Key": k} for k in flat],
             }
         objs = list_objects.get(Prefix, [])
         return {"Contents": [{"Key": k} for k in objs]}
@@ -210,6 +219,83 @@ class TestSummarizeCounterfactual:
         )
         assert out["status"] == "no_data"
 
+    def test_reads_canonical_run_id_layout(self):
+        """config#792 cutover: per-agent files are now {run_id}.json
+        (YYMMDDHHMM) + a latest.json sidecar instead of {YYYY-Www}.json.
+        The reader must pick the most-recent dated run_id and IGNORE the
+        latest.json sidecar (otherwise it double-counts / mis-labels)."""
+        s3 = _mock_s3_client(
+            list_dirs={
+                "decision_artifacts/_counterfactual/": ["ic_cio"],
+            },
+            list_objects={
+                "decision_artifacts/_counterfactual/ic_cio/": [
+                    # Two dated runs in the same week + the sidecar mirror.
+                    "decision_artifacts/_counterfactual/ic_cio/2605030900.json",
+                    "decision_artifacts/_counterfactual/ic_cio/2605100900.json",
+                    "decision_artifacts/_counterfactual/ic_cio/latest.json",
+                ],
+            },
+            get_objects={
+                "decision_artifacts/_counterfactual/ic_cio/2605030900.json": {
+                    "match_rate": 0.70,
+                },
+                "decision_artifacts/_counterfactual/ic_cio/2605100900.json": {
+                    "match_rate": 0.95,
+                },
+                # latest.json mirrors the newest run; if the reader wrongly
+                # selected it the match_rate would still be 0.95, so give it
+                # a sentinel value that would corrupt the result if read.
+                "decision_artifacts/_counterfactual/ic_cio/latest.json": {
+                    "match_rate": -1.0,
+                },
+            },
+        )
+        out = agent_justification.summarize_counterfactual(
+            "test-bucket", "2026-05-07", s3_client=s3,
+        )
+        assert out["status"] == "ok"
+        assert out["n_agents"] == 1
+        # Most-recent dated run (2605100900), NOT the sidecar sentinel.
+        assert out["mean_match_rate"] == 0.95
+
+    def test_tolerates_mixed_legacy_and_canonical_agents(self):
+        """During cutover, some agents may have legacy {YYYY-Www} files
+        and others canonical {run_id} files. Both must read cleanly."""
+        s3 = _mock_s3_client(
+            list_dirs={
+                "decision_artifacts/_counterfactual/": ["ic_cio", "macro_economist"],
+            },
+            list_objects={
+                # Legacy ISO-week file.
+                "decision_artifacts/_counterfactual/ic_cio/": [
+                    "decision_artifacts/_counterfactual/ic_cio/2026-W19.json",
+                ],
+                # Canonical run_id file + sidecar.
+                "decision_artifacts/_counterfactual/macro_economist/": [
+                    "decision_artifacts/_counterfactual/macro_economist/2605100900.json",
+                    "decision_artifacts/_counterfactual/macro_economist/latest.json",
+                ],
+            },
+            get_objects={
+                "decision_artifacts/_counterfactual/ic_cio/2026-W19.json": {
+                    "match_rate": 0.80,
+                },
+                "decision_artifacts/_counterfactual/macro_economist/2605100900.json": {
+                    "match_rate": 0.90,
+                },
+                "decision_artifacts/_counterfactual/macro_economist/latest.json": {
+                    "match_rate": -1.0,
+                },
+            },
+        )
+        out = agent_justification.summarize_counterfactual(
+            "test-bucket", "2026-05-07", s3_client=s3,
+        )
+        assert out["status"] == "ok"
+        assert out["n_agents"] == 2
+        assert out["mean_match_rate"] == 0.85  # (0.80 + 0.90) / 2
+
 
 class TestSummarizeClustering:
     def test_aggregates_top3_concentration(self):
@@ -246,6 +332,77 @@ class TestSummarizeConcordance:
             "test-bucket", "2026-05-07", s3_client=s3,
         )
         assert out["status"] == "no_recent_sf_run"
+
+    def test_reads_canonical_flat_layout(self):
+        """config#792 cutover: summaries are now flat
+        {run_id}_{target_model}.json directly under _replay_summary/ +
+        a latest.json sidecar, instead of the {date}/{target_model}.json
+        partition. Reader groups by target_model, keeps the most-recent
+        dated key per model, and skips the latest.json sidecar."""
+        prefix = "decision_artifacts/_replay_summary/"
+        s3 = _mock_s3_client(
+            list_dirs={},  # flat layout has no date sub-partitions
+            list_objects={
+                prefix: [
+                    # Two runs for haiku (older + newer) + one for sonnet
+                    # + the shared latest.json sidecar.
+                    f"{prefix}2605030900_claude-haiku-4-5.json",
+                    f"{prefix}2605100900_claude-haiku-4-5.json",
+                    f"{prefix}2605100900_claude-sonnet-4-6.json",
+                    f"{prefix}latest.json",
+                ],
+            },
+            get_objects={
+                f"{prefix}2605030900_claude-haiku-4-5.json": {"n_artifacts_replayed": 1},
+                f"{prefix}2605100900_claude-haiku-4-5.json": {"n_artifacts_replayed": 9},
+                f"{prefix}2605100900_claude-sonnet-4-6.json": {"n_artifacts_replayed": 7},
+                f"{prefix}latest.json": {"n_artifacts_replayed": 999},
+            },
+        )
+        out = agent_justification.summarize_concordance(
+            "test-bucket", "2026-05-07", s3_client=s3,
+        )
+        assert out["status"] == "ok"
+        assert out["layout"] == "canonical"
+        # Two distinct target models, sidecar excluded.
+        assert out["n_target_models"] == 2
+        assert set(out["per_target"].keys()) == {
+            "claude-haiku-4-5", "claude-sonnet-4-6",
+        }
+        # Most-recent dated key won for haiku (9, not the older 1).
+        assert out["per_target"]["claude-haiku-4-5"]["n_artifacts_replayed"] == 9
+
+    def test_falls_back_to_legacy_date_partition(self):
+        """When no canonical flat keys are present (pre-cutover bucket),
+        the reader falls back to the legacy {date}/{target_model}.json
+        partition so existing data is never stranded."""
+        prefix = "decision_artifacts/_replay_summary/"
+        s3 = _mock_s3_client(
+            list_dirs={
+                # Legacy date partitions appear as CommonPrefixes.
+                prefix: ["2026-05-09"],
+            },
+            list_objects={
+                # No flat Contents directly under the prefix...
+                prefix: [],
+                # ...only the legacy date-partitioned files.
+                f"{prefix}2026-05-09/": [
+                    f"{prefix}2026-05-09/claude-haiku-4-5.json",
+                ],
+            },
+            get_objects={
+                f"{prefix}2026-05-09/claude-haiku-4-5.json": {
+                    "n_artifacts_replayed": 5,
+                },
+            },
+        )
+        out = agent_justification.summarize_concordance(
+            "test-bucket", "2026-05-09", s3_client=s3,
+        )
+        assert out["status"] == "ok"
+        assert out["layout"] == "legacy"
+        assert out["n_target_models"] == 1
+        assert "claude-haiku-4-5" in out["per_target"]
 
 
 # ── Composite ─────────────────────────────────────────────────────────────
