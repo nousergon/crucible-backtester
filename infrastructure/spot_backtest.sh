@@ -847,19 +847,24 @@ if [ -f requirements.txt ]; then
     \$PIP install -q -r requirements.txt 2>/dev/null || true
 fi
 
-# Fail-loud dependency GUARD (L4513 class fix). Assert the alpha-engine-lib
+# Fail-loud dependency GUARD (L4513 class fix). Assert the nousergon-lib
 # modules the Evaluator imports are actually present AFTER all installs — so if a
 # future sibling-repo pin drift ever downgrades the lib below quant.stats, this
 # breaks LOUD at deps time instead of silently at evaluate.py's import weeks
 # later. Per feedback_no_silent_fails. PYBIN derives from PIP ("py -m pip" -> py).
+# The lib was renamed alpha-engine-lib -> nousergon-lib (alpha_engine_lib is now a
+# deprecated import alias); requirements.txt installs the nousergon-lib
+# distribution, so the guard MUST verify via the real module + distribution name
+# -- "pip show alpha-engine-lib" returns nothing and exits 1 under pipefail.
+# (NB: no backticks in this heredoc comment -- they would command-substitute.)
 cd /home/ec2-user/alpha-engine-backtester
 PYBIN="\${PIP% -m pip}"
-\$PYBIN -c "import alpha_engine_lib.quant.stats.multiple_testing, alpha_engine_lib.quant" || {
-    echo "FATAL: alpha-engine-lib is missing quant.stats — a co-installed sibling repo's pin likely downgraded it below v0.49.0. Resolved version:" >&2
-    \$PIP show alpha-engine-lib | grep -E '^Version:' >&2 || true
+\$PYBIN -c "import nousergon_lib.quant.stats.multiple_testing, nousergon_lib.quant" || {
+    echo "FATAL: nousergon-lib is missing quant.stats — a co-installed sibling repo's pin likely downgraded it below v0.49.0. Resolved version:" >&2
+    \$PIP show nousergon-lib | grep -E '^Version:' >&2 || true
     exit 1
 }
-\$PIP show alpha-engine-lib | grep -E '^Version:'
+\$PIP show nousergon-lib | grep -E '^Version:'
 
 # Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)
 \$PIP install -q 'numpy<2'
