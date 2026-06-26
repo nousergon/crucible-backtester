@@ -621,6 +621,76 @@ def _section_quant_rank_quality(quality: dict) -> list[str]:
     return lines
 
 
+def _section_cio_rule_tag_precision(precision: dict) -> list[str]:
+    """Build the CIO Rule-Tag Precision section.
+
+    Per-rule-tag precision of the LLM CIO's gates: of ADVANCE decisions
+    carrying a tag, what fraction beat SPY at 5d (precision); of REJECT
+    decisions carrying it, what fraction *would have* beaten SPY (the per-tag
+    false-negative rate). A high reject-beat rate flags a gate that is
+    systematically rejecting winners. Consumes cio_evaluations.rule_tags
+    (research migration 14) joined to universe_returns.beat_spy_5d.
+    """
+    lines = ["## CIO Rule-Tag Precision", ""]
+
+    status = precision.get("status")
+    if status == "insufficient_data":
+        lines.append(f"> {precision.get('reason', 'insufficient tagged decisions')}")
+        lines.append("")
+        return lines
+    if status == "no_data":
+        lines.append(f"> {precision.get('reason', 'no tagged CIO decisions in window')}")
+        lines.append("")
+        return lines
+    if status != "ok":
+        err = precision.get("error", "unknown error")
+        lines.append(f"> CIO rule-tag precision skipped: {err}")
+        lines.append("")
+        return lines
+
+    win_start = precision.get("window_start", "?")
+    win_end = precision.get("window_end", "?")
+    n_tagged = precision.get("n_tagged_decisions", 0)
+    overall_prec = precision.get("overall_advance_precision")
+    alarm = precision.get("reject_beat_alarm", 0.50)
+    alarm_tags = precision.get("alarm_tags", []) or []
+
+    lines.append(f"- Window: **{win_start}** → **{win_end}** ({n_tagged} tagged decisions)")
+    overall_str = f"{overall_prec * 100:.1f}%" if overall_prec is not None else "—"
+    lines.append(f"- Overall ADVANCE precision (beat SPY 5d): **{overall_str}**")
+    lines.append(
+        f"  *Per tag: ADVANCE precision = % of tag's ADVANCEs that beat SPY; "
+        f"REJECT-beat = % of tag's REJECTs that would have beaten SPY "
+        f"(false-negative rate). Alarm when REJECT-beat > {alarm * 100:.0f}%.*"
+    )
+
+    if alarm_tags:
+        lines.append(
+            f"- ⚠️ Over-rejecting tags (REJECT-beat > {alarm * 100:.0f}%): "
+            f"**{', '.join(alarm_tags)}**"
+        )
+
+    per_tag = precision.get("per_tag", []) or []
+    if per_tag:
+        lines.append("")
+        lines.append("| Rule tag | n | ADVANCE prec | n_adv | REJECT-beat | n_rej |")
+        lines.append("|---|---|---|---|---|---|")
+        for entry in per_tag:
+            ap = entry.get("advance_precision")
+            rb = entry.get("reject_beat_rate")
+            ap_str = f"{ap * 100:.0f}%" if ap is not None else "—"
+            rb_str = f"{rb * 100:.0f}%" if rb is not None else "—"
+            flag = " ⚠️" if (rb is not None and rb > alarm) else ""
+            lines.append(
+                f"| {entry['rule_tag']}{flag} | {entry.get('n_decisions', 0)} | "
+                f"{ap_str} | {entry.get('n_advance', 0)} | "
+                f"{rb_str} | {entry.get('n_reject', 0)} |"
+            )
+
+    lines.append("")
+    return lines
+
+
 def _section_agent_justification(summary: dict) -> list[str]:
     """Build the Agent Justification Stack section.
 
@@ -905,6 +975,7 @@ def build_report(
     executor_decision_capture_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
     quant_rank_quality: dict | None = None,
+    cio_rule_tag_precision: dict | None = None,
     agent_justification: dict | None = None,
     trigger_opt: dict | None = None,
     predictor_sizing: dict | None = None,
@@ -978,6 +1049,9 @@ def build_report(
 
     if quant_rank_quality:
         lines += _section_quant_rank_quality(quant_rank_quality)
+
+    if cio_rule_tag_precision:
+        lines += _section_cio_rule_tag_precision(cio_rule_tag_precision)
 
     if agent_justification:
         lines += _section_agent_justification(agent_justification)
@@ -1178,6 +1252,7 @@ def save(
     executor_decision_capture_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
     quant_rank_quality: dict | None = None,
+    cio_rule_tag_precision: dict | None = None,
     agent_justification: dict | None = None,
     barrier_coherence: dict | None = None,
     score_calibration: dict | None = None,
@@ -1296,6 +1371,13 @@ def save(
         # little weekly history". Uploaded to backtest/{date}/ by upload_to_s3.
         ("optimizer_churn.json", optimizer_churn),
         ("walk_forward_stability.json", walk_forward_stability),
+        # CIO rule-tag precision (config#840) — always-emit from birth. The
+        # gate intentionally returns insufficient_data until ≥4 weeks of
+        # rule_tags data accumulate (going forward from research#152's deploy),
+        # so the evaluator must distinguish "producer never ran" (absent S3
+        # object) from "ran, gated on thin data" (present, status-tagged body)
+        # — same rationale as the freshness-monitored artifacts above.
+        ("cio_rule_tag_precision.json", cio_rule_tag_precision),
     ]:
         if data is not None:
             (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
