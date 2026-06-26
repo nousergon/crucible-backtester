@@ -242,11 +242,15 @@ def _load_price_cache(tickers: list[str], bucket: str = "alpha-engine-research")
     # Wave-4 terminal state (predictor/price_cache_slim deleted): the
     # ArcticDB universe lib is the source for traded tickers (all equities
     # + SPY, which are universe members — exit_timing never needs macro/
-    # index symbols, so no macro-lib read). predictor/price_cache (the 10y
-    # full parquet — Wave-3's scope, untouched here) is the sole fallback
-    # for any ticker ArcticDB does not return. The slim leg + parity
-    # dual-read were removed after the 5/23 observation confirmed
-    # slim<->ArcticDB equivalence.
+    # index symbols, so no macro-lib read). The 10y full per-ticker parquet
+    # is the sole fallback for any ticker ArcticDB does not return. The slim
+    # leg + parity dual-read were removed after the 5/23 observation
+    # confirmed slim<->ArcticDB equivalence.
+    #
+    # Wave-3 PR4 cutover (#780, W3 slice): the 10y price_cache tree migrated
+    # from predictor/price_cache/ to reference/price_cache/; the producer
+    # (nousergon-data) now writes reference/ only and the legacy tree is
+    # removed live via `aws s3 rm`. This fallback reads the reference home.
     tickers = list(tickers)
     s3 = boto3.client("s3")
 
@@ -274,11 +278,11 @@ def _load_price_cache(tickers: list[str], bucket: str = "alpha-engine-research")
             return None
 
     cache = dict(arctic)
-    # Fallback: predictor/price_cache (10y) for any ticker ArcticDB missed.
+    # Fallback: reference/price_cache (10y) for any ticker ArcticDB missed.
     for ticker in tickers:
         if ticker in cache:
             continue
-        df = _read_parquet("predictor/price_cache", ticker)
+        df = _read_parquet("reference/price_cache", ticker)
         if df is not None:
             cache[ticker] = df
     return cache
