@@ -3,7 +3,9 @@
 Loads a stored ``DecisionArtifact`` from S3, reconstructs the original
 prompt context (system + user + tool definitions), invokes a target
 model via the Anthropic SDK, and persists a side-by-side comparison
-artifact at ``decision_artifacts/_replay/{run_id}/{original_model}_vs_{target_model}.json``.
+artifact under the canonical eval_artifacts layout at
+``decision_artifacts/_replay/{run_id}_{original_model}_vs_{target_model}.json``
+(flat + ``latest.json`` sidecar; config#792).
 
 Per ROADMAP P0 "Replay harness + agent-justification gate" (Model-
 Agnostic Capability Upgrade deliverable #3):
