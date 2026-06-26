@@ -1656,6 +1656,16 @@ def _main_impl() -> None:
             predictor_sizing=opt_results.get("predictor_sizing"),
             scanner_opt=opt_results.get("scanner_opt"),
             cio_opt=opt_results.get("cio_opt"),
+            # Write-as-you-compute (config#1190): when uploading, push each
+            # tile artifact to S3 the moment it is persisted so a mid-Saturday
+            # interruption doesn't strand every computed tile. Gated on the
+            # SAME `args.upload` flag as the terminal sweep below, so
+            # local-only / dry-run runs incur no per-tile S3 cost.
+            upload_bucket=(
+                config.get("output_bucket", "alpha-engine-research")
+                if args.upload else None
+            ),
+            upload_prefix=config.get("output_prefix", "evaluation"),
         )
 
         # Save completeness manifest

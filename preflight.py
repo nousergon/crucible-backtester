@@ -491,7 +491,21 @@ class BacktesterPreflight(BasePreflight):
         if executor_root is None:
             return
 
+        # Experiment-package first (config#1042): executor risk.yaml resolves
+        # from experiments/$ALPHA_ENGINE_EXPERIMENT_ID/executor/risk.yaml
+        # (default experiment `reference`) ahead of the legacy top-level
+        # alpha-engine-config/executor/risk.yaml, then the repo-local fallback.
+        # Mirrors pipeline_common.load_config's precedence. Behavior-preserving:
+        # config#1159 made the package copy byte-identical to legacy.
+        exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
         candidate_paths = [
+            os.path.expanduser(f"~/alpha-engine-config/experiments/{exp}/executor/risk.yaml"),
+            os.path.realpath(
+                os.path.join(
+                    executor_root, "..", "alpha-engine-config",
+                    "experiments", exp, "executor", "risk.yaml",
+                )
+            ),
             os.path.expanduser("~/alpha-engine-config/executor/risk.yaml"),
             os.path.realpath(
                 os.path.join(executor_root, "..", "alpha-engine-config", "executor", "risk.yaml")
