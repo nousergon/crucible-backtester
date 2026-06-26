@@ -19,6 +19,9 @@ import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
 
+from analysis.lookahead_disclosure import build_disclosure as _build_lookahead
+from analysis.lookahead_disclosure import render_section as _render_lookahead
+
 logger = logging.getLogger(__name__)
 
 
@@ -945,6 +948,55 @@ def _section_optimizer_param_sweep(sweep: dict | None) -> list[str]:
     return lines
 
 
+def _section_lookahead_disclosure(
+    config: dict | None, run_date: str, override: dict | None
+) -> list[str]:
+    """Build + render the LLM look-ahead-bias disclosure (L4581 / G7).
+
+    The disclosure inputs are sourced from ``config`` so they stay
+    operator-owned (never hardcoded cutoff guesses):
+
+    * model IDs — the consumed research LLMs (``llm.per_stock_model`` /
+      ``llm.strategic_model``, with a flat ``per_stock_model`` /
+      ``strategic_model`` fallback);
+    * cutoffs — ``llm_training_cutoffs`` (``model_id -> ISO date``);
+    * window — ``backtest_start`` / ``backtest_end`` (falling back to
+      ``run_date`` for the end).
+
+    A test/caller may pass an ``override`` dict with explicit
+    ``backtest_start`` / ``backtest_end`` / ``model_ids`` /
+    ``training_cutoffs`` keys. The section ALWAYS renders — an absent
+    disclosure is itself the G7 gap — so empty inputs surface a "MISSING"
+    flag rather than silently omitting it.
+    """
+    cfg = config or {}
+    ov = override or {}
+
+    llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+    model_ids = ov.get("model_ids")
+    if model_ids is None:
+        model_ids = [
+            m
+            for m in (
+                llm_cfg.get("per_stock_model") or cfg.get("per_stock_model"),
+                llm_cfg.get("strategic_model") or cfg.get("strategic_model"),
+            )
+            if m
+        ]
+
+    disclosure = _build_lookahead(
+        backtest_start=ov.get("backtest_start", cfg.get("backtest_start")),
+        backtest_end=ov.get(
+            "backtest_end", cfg.get("backtest_end") or run_date
+        ),
+        model_ids=model_ids,
+        training_cutoffs=ov.get(
+            "training_cutoffs", cfg.get("llm_training_cutoffs")
+        ),
+    )
+    return _render_lookahead(disclosure)
+
+
 def build_report(
     run_date: str,
     signal_quality: dict,
@@ -990,6 +1042,7 @@ def build_report(
     monte_carlo: dict | None = None,
     factor_blend_sensitivity: dict | None = None,
     barrier_coherence: dict | None = None,
+    lookahead_disclosure: dict | None = None,
 ) -> str:
     """
     Build a markdown report string from analysis results.
@@ -1222,6 +1275,11 @@ def build_report(
     if predictor_sweep_df is not None and not predictor_sweep_df.empty:
         lines += _section_param_sweep_predictor(predictor_sweep_df)
         lines += [""]
+
+    # LLM look-ahead-bias disclosure (L4581 / G7). ALWAYS rendered — an
+    # absent disclosure for an LLM-signal-driven backtest is itself the gap.
+    lines += _section_lookahead_disclosure(config, run_date, lookahead_disclosure)
+    lines += [""]
 
     lines += [
         "---",
