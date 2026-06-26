@@ -406,8 +406,11 @@ def test_load_price_cache_arcticdb_primary_no_parquet_needed(monkeypatch):
     assert set(cache) == {"AAPL", "SPY"}
 
 
-def test_load_price_cache_falls_back_to_price_cache_when_arctic_empty(monkeypatch):
-    """Sole fallback is predictor/price_cache (10y) — the slim leg is gone."""
+def test_load_price_cache_falls_back_to_reference_price_cache_when_arctic_empty(monkeypatch):
+    """Wave-3 PR4 cutover (#780, W3): the 10y fallback reads
+    reference/price_cache/ (the migrated home) — the legacy
+    predictor/price_cache/ tree is removed live and is no longer consulted.
+    The slim leg is gone (Wave-4)."""
     monkeypatch.setattr(
         "analysis.exit_timing.load_universe_ohlcv",
         lambda bucket, symbols: {},
@@ -415,11 +418,14 @@ def test_load_price_cache_falls_back_to_price_cache_when_arctic_empty(monkeypatc
     store = {
         # slim is deleted: a slim-only ticker is now unrecoverable.
         "predictor/price_cache_slim/AAPL.parquet": _pf(),
-        "predictor/price_cache/MSFT.parquet": _pf(start=300),
+        # Legacy-prefix copy must NOT resolve post-cutover.
+        "predictor/price_cache/LEGACYONLY.parquet": _pf(start=300),
+        # The reference home is the sole live fallback.
+        "reference/price_cache/MSFT.parquet": _pf(start=300),
     }
     monkeypatch.setattr("boto3.client", lambda svc: _FakeS3(store))
-    cache = _load_price_cache(["AAPL", "MSFT", "GONE"])
-    # Only the price_cache(10y) leg is consulted now -> MSFT only.
+    cache = _load_price_cache(["AAPL", "MSFT", "LEGACYONLY", "GONE"])
+    # Only the reference/price_cache(10y) leg is consulted now -> MSFT only.
     assert set(cache) == {"MSFT"}
 
 
@@ -428,7 +434,7 @@ def test_load_price_cache_arctic_failure_is_caught(monkeypatch):
         raise RuntimeError("ArcticDB down")
 
     monkeypatch.setattr("analysis.exit_timing.load_universe_ohlcv", _boom)
-    store = {"predictor/price_cache/AAPL.parquet": _pf()}
+    store = {"reference/price_cache/AAPL.parquet": _pf()}
     monkeypatch.setattr("boto3.client", lambda svc: _FakeS3(store))
     cache = _load_price_cache(["AAPL"])
     assert set(cache) == {"AAPL"}  # graceful fallback, no raise
