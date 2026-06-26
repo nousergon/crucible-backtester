@@ -6,6 +6,7 @@ import pytest
 
 from analysis.attribution import (
     SUB_SCORES,
+    _compute_multivariate_attribution,
     _resolve_sub_score_columns,
     compute_attribution,
 )
@@ -175,3 +176,160 @@ def test_resolve_sub_score_columns_empty_when_neither_present():
     df = pd.DataFrame({"some_other_col": [1, 2, 3]})
     resolved = _resolve_sub_score_columns(df)
     assert resolved == {}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Multivariate attribution (config#920)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _make_mv_df(
+    n: int = 400,
+    quant_beta: float = 0.8,
+    qual_beta: float = 0.2,
+    regime_beta: float = 0.0,
+    with_regime: bool = True,
+    seed: int = 13,
+) -> pd.DataFrame:
+    """score_performance-shaped frame with a *known* linear data-generating
+    process so the recovered standardized coefficients are checkable.
+
+    return_10d = quant_beta*z(quant) + qual_beta*z(qual)
+                 + regime_beta*1[bear] + small noise
+    """
+    rng = np.random.default_rng(seed)
+    quant = rng.normal(50, 10, n)
+    qual = rng.normal(50, 10, n)
+    zq = (quant - quant.mean()) / quant.std()
+    zl = (qual - qual.mean()) / qual.std()
+
+    regimes = rng.choice(["bull", "neutral", "bear"], size=n)
+    bear = (regimes == "bear").astype(float)
+
+    noise = rng.normal(0, 0.05, n)
+    latent = quant_beta * zq + qual_beta * zl + regime_beta * bear + noise
+
+    df = pd.DataFrame({
+        "symbol": [f"T{i % 30}" for i in range(n)],
+        "score_date": pd.date_range("2026-01-01", periods=n, freq="h"),
+        "quant_score": quant,
+        "qual_score": qual,
+        "return_10d": latent,
+        "return_30d": latent + rng.normal(0, 0.05, n),
+        "beat_spy_10d": (latent > latent.mean()).astype(int),
+        "beat_spy_30d": (latent > latent.mean()).astype(int),
+    })
+    if with_regime:
+        df["market_regime"] = regimes
+    return df
+
+
+def test_multivariate_recovers_known_coefficients():
+    """Synthetic known-beta DGP → recovered standardized coefficients match,
+    and quant (larger beta) outranks qual."""
+    df = _make_mv_df(n=600, quant_beta=0.8, qual_beta=0.2)
+    result = compute_attribution(df)
+
+    assert result["status"] == "ok"
+    mv = result["multivariate"]
+    assert mv["status"] == "ok"
+    fit = mv["targets"]["return_10d"]
+    assert fit["method"] == "multivariate_ols"
+
+    coefs = fit["coefficients"]
+    # Standardized coefficients are the generating betas rescaled by
+    # std(x_i)/std(y); with near-noiseless data the *ratio* of the two
+    # coefficients recovers the ratio of the generating betas (0.8/0.2 = 4).
+    assert coefs["quant"] / coefs["qual"] == pytest.approx(4.0, rel=0.2)
+    # Quant is the stronger joint driver.
+    assert abs(coefs["quant"]) > abs(coefs["qual"])
+    assert fit["r_squared"] is not None and fit["r_squared"] > 0.8
+
+
+def test_multivariate_includes_regime_dummies():
+    """market_regime is one-hot encoded (drop-first) into the design."""
+    df = _make_mv_df(n=500, with_regime=True)
+    mv = compute_attribution(df)["multivariate"]
+
+    assert mv["status"] == "ok"
+    assert set(mv["regime_levels"]) == {"bull", "neutral", "bear"}
+    # drop-first → two of the three levels appear as features.
+    regime_feats = [f for f in mv["feature_labels"] if f.startswith("regime=")]
+    assert len(regime_feats) == 2
+    # A target fit jointly carries a regime coefficient.
+    fit = mv["targets"]["return_10d"]
+    assert any(k.startswith("regime=") for k in fit["coefficients"])
+
+
+def test_multivariate_recovers_regime_effect():
+    """A real bear-regime effect in the DGP is recovered as a non-trivial
+    standardized regime coefficient. Levels sort alphabetically and
+    drop-first drops 'bear', so the bear effect surfaces as a negative
+    coefficient on the retained bull/neutral dummies (relative to bear)."""
+    df = _make_mv_df(n=600, quant_beta=0.5, qual_beta=0.2, regime_beta=0.6)
+    fit = compute_attribution(df)["multivariate"]["targets"]["return_10d"]
+    regime_coefs = [v for k, v in fit["coefficients"].items() if k.startswith("regime=")]
+    assert regime_coefs  # regime dummies present
+    # At least one retained regime dummy carries a non-trivial effect.
+    assert max(abs(c) for c in regime_coefs) > 0.05
+
+
+def test_multivariate_falls_back_on_collinear_inputs():
+    """Perfectly collinear sub-scores → rank-deficient design → safe
+    fallback to univariate Pearson, not a crash."""
+    df = _make_mv_df(n=500, with_regime=False)
+    df["qual_score"] = df["quant_score"] * 2.0 + 1.0  # perfect collinearity
+
+    result = compute_attribution(df)
+    assert result["status"] == "ok"  # no crash
+
+    mv = result["multivariate"]
+    target = mv["targets"]["return_10d"]
+    assert target["method"] == "univariate_fallback"
+    assert "return_10d" in (mv.get("targets_fell_back_to_univariate") or [])
+    # Fallback coefficients come from the retained univariate correlations.
+    assert set(target["coefficients"].keys()) == {"quant", "qual"}
+
+
+def test_multivariate_falls_back_on_low_n():
+    """Below the rows-per-regressor floor → univariate fallback per target."""
+    df = _make_mv_df(n=120, with_regime=True)  # 120 rows, several regressors
+    # Force a regressor-heavy / low-N regime by keeping only ~ the floor.
+    small = df.head(35)
+    mv = _compute_multivariate_attribution(
+        small,
+        {"quant": "quant_score", "qual": "qual_score"},
+        fallback_correlations={
+            "quant": {"return_10d": 0.3},
+            "qual": {"return_10d": 0.1},
+        },
+    )
+    # With regime dummies the design has 4 regressors; 35 rows < 10*4 floor.
+    fit = mv["targets"]["return_10d"]
+    assert fit["method"] == "univariate_fallback"
+
+
+def test_multivariate_works_without_regime_column():
+    """No market_regime column → regression still runs on sub-scores alone."""
+    df = _make_mv_df(n=500, with_regime=False)
+    mv = compute_attribution(df)["multivariate"]
+    assert mv["status"] == "ok"
+    assert mv["regime_levels"] == []
+    fit = mv["targets"]["return_10d"]
+    assert fit["method"] == "multivariate_ols"
+    assert set(fit["coefficients"].keys()) == {"quant", "qual"}
+
+
+def test_legacy_univariate_schema_preserved():
+    """The pre-existing univariate output (correlations / rankings / FDR)
+    is unchanged so existing consumers keep working."""
+    df = _make_df(n=200)
+    result = compute_attribution(df)
+
+    # Legacy keys still present and well-formed.
+    assert set(result["correlations"].keys()) == {"quant", "qual"}
+    assert result["ranking_10d"]
+    assert result["ranking_30d"]
+    assert "p_values" in result
+    # New block added without removing the old contract.
+    assert "multivariate" in result
