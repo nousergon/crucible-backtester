@@ -309,11 +309,25 @@ class TestComputeAndEmitConcordance:
         assert "agent_cheap_model_concordance" in names_emitted
         assert "agent_cheap_model_concordance_n_observations" in names_emitted
 
-        # Summary JSON persisted at the canonical key.
-        put_call = s3.put_object.call_args
-        assert put_call.kwargs["Bucket"] == "alpha-engine-research"
-        assert "_replay_summary/2026-05-09/" in put_call.kwargs["Key"]
-        assert "claude-haiku-4-5" in put_call.kwargs["Key"]
+        # Summary JSON persisted under the canonical eval_artifacts layout:
+        # a flat dated key {run_id}_{target}.json + a latest.json sidecar.
+        put_keys = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        assert all(
+            c.kwargs["Bucket"] == "alpha-engine-research"
+            for c in s3.put_object.call_args_list
+        )
+        # end_time=2026-05-09 00:00 UTC → run_id "2605090000".
+        dated_keys = [
+            k for k in put_keys
+            if not k.endswith("/latest.json")
+        ]
+        latest_keys = [k for k in put_keys if k.endswith("/latest.json")]
+        assert dated_keys == [
+            "decision_artifacts/_replay_summary/2605090000_claude-haiku-4-5.json"
+        ]
+        assert latest_keys == ["decision_artifacts/_replay_summary/latest.json"]
+        # No legacy {YYYY-MM-DD}/ date partition in the new layout.
+        assert all("/2026-05-09/" not in k for k in put_keys)
 
     def test_multi_target_model_grouping(self):
         from replay.batch import compute_and_emit_concordance
@@ -347,8 +361,16 @@ class TestComputeAndEmitConcordance:
         }
         assert means_by_target["claude-haiku-4-5"] == pytest.approx(0.9)
         assert means_by_target["claude-sonnet-4-6"] == pytest.approx(0.99)
-        # 2 summary JSONs persisted.
-        assert s3.put_object.call_count == 2
+        # 2 dated summary JSONs (one per target_model) + 2 latest.json
+        # sidecar mirrors = 4 put_object calls. Each target writes its own
+        # dated key but all mirror into the single shared latest sidecar.
+        put_keys = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        dated_keys = sorted(k for k in put_keys if not k.endswith("/latest.json"))
+        assert dated_keys == [
+            "decision_artifacts/_replay_summary/2605090000_claude-haiku-4-5.json",
+            "decision_artifacts/_replay_summary/2605090000_claude-sonnet-4-6.json",
+        ]
+        assert s3.put_object.call_count == 4
 
     def test_max_artifacts_caps_corpus(self):
         from replay.batch import compute_and_emit_concordance

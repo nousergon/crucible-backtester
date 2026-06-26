@@ -373,13 +373,16 @@ class TestLibVersionPin:
         text = (REPO_ROOT / "requirements.txt").read_text()
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
-        assert "@main" not in text, "alpha-engine-lib must be pinned to a tag, not @main"
-        assert "@v0.59.8" in text, (
-            "alpha-engine-lib should pin to v0.59.8 — adds "
-            "quant.stats.calibration.expected_calibration_error, the canonical "
-            "ECE shared by the predictor's calibrator fit and this repo's "
-            "production calibration monitor (fixes the margin-vs-probability "
-            "scale bug behind the recurring false calibration_breakdown alert). "
-            "Prior: v0.59.3 flow-doctor pytest-guard fix (lib#114; config#996). "
-            "Update this test if the pin moves further forward."
+        assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
+        assert "@v0.60.2" in text, (
+            "nousergon-lib should pin to v0.60.2 — the alpha_engine_lib -> "
+            "nousergon_lib rename crossing (config#1245 / #1172). v0.60.x is "
+            "the first renamed line; the same PR migrates this repo's "
+            "'python -m alpha_engine_lib.<mod>' invocations to "
+            "'-m nousergon_lib.<mod>' (the old meta-path alias shim lacks "
+            "runpy's get_code, so '-m' dies under runpy on crossed boxes). "
+            "Prior: v0.59.8 — quant.stats.calibration.expected_calibration_error "
+            "(ECE shared by predictor's calibrator fit + this repo's production "
+            "calibration monitor). Update this test if the pin moves further "
+            "forward."
         )

@@ -123,7 +123,7 @@ if [ "$CANARY_STATUS" != "200" ]; then
   # an image-wide rebuild that breaks N Lambdas' canaries within the hour
   # into one alert per (Lambda, version). Best-effort; trailing || true
   # never overrides exit 1.
-  python3 -m alpha_engine_lib.alerts publish \
+  python3 -m nousergon_lib.alerts publish \
     --severity error \
     --source "alpha-engine-backtester/infrastructure/deploy_health.sh" \
     --dedup-key "canary-fail-${LAMBDA_FUNCTION}-v${VERSION}" \

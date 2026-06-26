@@ -13,6 +13,7 @@ from analysis.feature_drift import (
     compute_feature_drift,
     _classify_drift,
     _join_outcomes_with_features,
+    _load_features_from_arctic,
 )
 
 
@@ -100,6 +101,30 @@ def test_join_outcomes_missing_ticker():
 
     joined = _join_outcomes_with_features(outcomes, features)
     assert joined.empty
+
+
+# ── _load_features_from_arctic uses the shared universe-lib helper (config#804) ─
+
+def test_load_features_from_arctic_uses_open_universe_lib():
+    """The universe library must be opened via the shared
+    ``alpha_engine_lib.arcticdb.open_universe_lib`` helper, not a raw
+    ``Arctic(...).get_library("universe")`` call (config#804 migration).
+
+    ``open_universe_lib`` is imported inside the function at call time, so
+    patching the lib attribute intercepts the migrated site.
+    """
+    dates = pd.to_datetime(["2026-04-01", "2026-04-02"])
+    lib = MagicMock()
+    lib.list_symbols.return_value = ["AAPL"]
+    read_result = MagicMock()
+    read_result.data = pd.DataFrame({"rsi_14": [50.0, 55.0]}, index=dates)
+    lib.read.return_value = read_result
+
+    with patch("alpha_engine_lib.arcticdb.open_universe_lib", return_value=lib) as helper:
+        result = _load_features_from_arctic("alpha-engine-research", ["AAPL"])
+
+    helper.assert_called_once_with("alpha-engine-research")
+    assert "AAPL" in result
 
 
 # ── compute_feature_drift integration tests ──────────────────────────────────

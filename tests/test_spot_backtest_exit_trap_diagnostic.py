@@ -122,11 +122,14 @@ def test_cleanup_fans_out_via_lib_alerts_cli():
     m = re.search(r"^cleanup\(\) \{.*?^\}", text, re.MULTILINE | re.DOTALL)
     assert m, "no cleanup() function found — spot_backtest.sh structure changed"
     body = m.group(0)
-    assert "alpha_engine_lib.alerts publish" in body, (
+    assert "nousergon_lib.alerts publish" in body, (
         "cleanup() must fan out the diagnostic via the lib alerts CLI "
         "(L2246 SOTA upgrade — see CLAUDE.md sub-sub-rule). Mirrors the "
         "L117 'Lambda CI canary rollback should Telegram/email the "
-        "operator on rollback' pattern via the canonical primitive."
+        "operator on rollback' pattern via the canonical primitive. "
+        "Package renamed alpha_engine_lib -> nousergon_lib at lib 0.60.0 "
+        "(config#1245); '-m alpha_engine_lib.alerts' breaks under runpy "
+        "on crossed boxes."
     )
     # L4485-b: severity is now variable — defaults to "error" (Telegram push),
     # downgraded to "warning" only on a recoverable spot reclaim about to relaunch.
@@ -162,8 +165,10 @@ def test_lib_pin_at_least_v0_21_0():
     reqs = (
         Path(__file__).resolve().parent.parent / "requirements.txt"
     ).read_text()
-    m = re.search(r"alpha-engine-lib\[[^\]]+\]\s*@\s*git\+https://[^@]+@v(\d+)\.(\d+)\.(\d+)", reqs)
-    assert m, "no alpha-engine-lib version pin found in requirements.txt"
+    # Dist name renamed alpha-engine-lib -> nousergon-lib at lib 0.60.0
+    # (config#1245). Accept either spelling.
+    m = re.search(r"(?:alpha-engine-lib|nousergon-lib)\[[^\]]+\]\s*@\s*git\+https://[^@]+@v(\d+)\.(\d+)\.(\d+)", reqs)
+    assert m, "no nousergon-lib version pin found in requirements.txt"
     major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
     assert (major, minor, patch) >= (0, 21, 0), (
         f"alpha-engine-lib pin v{major}.{minor}.{patch} is below the "

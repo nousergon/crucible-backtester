@@ -94,9 +94,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # than added to the freshness registry, matching the per-run-diagnostic
     # precedent above.
     "pipeline_common.py": 3,
-    "replay/batch.py": 1,
-    "replay/counterfactual.py": 1,
-    "replay/runner.py": 1,
+    # +1 (1→2) 2026-06-26: config#792 canonical eval_artifacts layout — each
+    # replay producer now writes its dated eval artifact PLUS an operator-UX
+    # latest.json sidecar that is a pure mirror of the dated key (last-writer-
+    # wins "latest" semantic). The sidecar is not a distinct freshness-SLA
+    # artifact — it mirrors the already-registered dated artifact — so it is
+    # grandfathered here rather than added to the freshness registry.
+    "replay/batch.py": 2,
+    "replay/counterfactual.py": 2,
+    "replay/runner.py": 2,
     "reporter.py": 1,
 }
 

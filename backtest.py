@@ -5586,6 +5586,14 @@ def _main_impl() -> None:
             sweep_df=save_sweep_df,
             run_date=args.date,
             results_dir=config.get("results_dir", "results"),
+            # Write-as-you-compute (config#1190): upload each artifact as it
+            # is persisted, gated on the SAME `args.upload` flag as the
+            # terminal sweep below. `None` when not uploading → local-only.
+            upload_bucket=(
+                config.get("output_bucket", "alpha-engine-research")
+                if args.upload else None
+            ),
+            upload_prefix=config.get("output_prefix", "backtest"),
         )
 
         print(f"\nReport saved to {out_dir}/")

@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import logging
 
+import pandas as pd
+from unittest.mock import MagicMock
+
 
 def test_get_arctic_first_call_does_not_nameerror(monkeypatch, caplog):
     import store.arctic_reader as ar
@@ -58,3 +61,48 @@ def test_get_arctic_list_libraries_failure_is_non_fatal(monkeypatch, caplog):
         result = ar._get_arctic("alpha-engine-research")
     assert isinstance(result, _FakeArctic)
     assert "list_libraries failed" in caplog.text
+
+
+def test_load_universe_opens_universe_via_helper_macro_via_local_arctic(monkeypatch):
+    """config#804: ``load_universe_from_arctic`` must open the ``universe``
+    library via the shared ``open_universe_lib`` helper. The ``macro``
+    library open and the #826 empty-universe diagnostic still go through the
+    local ``_get_arctic`` handle — assert that split so a future refactor
+    can't silently reroute (or break) the diagnostic path.
+    """
+    import store.arctic_reader as ar
+
+    dates = pd.DatetimeIndex(["2024-01-02", "2024-01-03"])
+    universe_df = pd.DataFrame(
+        {"Open": [1.0, 2.0], "High": [1.0, 2.0], "Low": [1.0, 2.0],
+         "Close": [1.0, 2.0], "Volume": [10, 20], "rsi_14": [50.0, 55.0]},
+        index=dates,
+    )
+
+    universe_lib = MagicMock()
+    universe_lib.list_symbols.return_value = ["AAPL"]
+    universe_read = MagicMock()
+    universe_read.data = universe_df
+    universe_lib.read.return_value = universe_read
+
+    macro_lib = MagicMock()
+    macro_lib.read.side_effect = KeyError("no macro symbol")
+
+    # Local arctic handle still owns ``macro`` (+ list_libraries for the
+    # #826 diagnostic) — proving that block is untouched by the migration.
+    fake_arctic = MagicMock()
+    fake_arctic.get_library.return_value = macro_lib
+
+    monkeypatch.setattr(ar, "_get_arctic", lambda bucket: fake_arctic)
+
+    helper = MagicMock(return_value=universe_lib)
+    monkeypatch.setattr("alpha_engine_lib.arcticdb.open_universe_lib", helper)
+
+    price_data, features = ar.load_universe_from_arctic("alpha-engine-research")
+
+    # Universe opened via the shared helper, with the bucket.
+    helper.assert_called_once_with("alpha-engine-research")
+    # Macro still opened off the local arctic handle (diagnostic block intact).
+    fake_arctic.get_library.assert_called_once_with("macro")
+    assert "AAPL" in price_data
+    assert "AAPL" in features

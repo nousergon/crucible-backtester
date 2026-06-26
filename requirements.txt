@@ -48,4 +48,11 @@ cvxpy>=1.4,<1.8
 # NOTE: flow-doctor extra is HYPHENATED — setuptools normalizes the lib's
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
 # normalize underscore->hyphen, so `[flow_doctor]` silently drops it (config#1178).
-alpha-engine-lib[arcticdb,flow-doctor,quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.59.8
+nousergon-lib[arcticdb,flow-doctor,quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.60.2
+
+# krepis (MIT foundation) — direct dep for krepis.dates.resolve_trading_day
+# (pipeline_common re-exports it). This nousergon-lib pin (v0.60.2) predates
+# the krepis rebase (lib v0.66.0) so krepis is NOT pulled transitively; pin it
+# directly. PyPI dep (krepis is published) — NOT a git pin, so it is outside
+# the nousergon-lib lockstep guard (which tracks only the lib git-tag pins).
+krepis>=0.3.0
