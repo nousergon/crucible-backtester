@@ -739,6 +739,30 @@ class TestAlwaysEmitDecisionCapture:
         out = self._save(tmp_path, decision_capture_coverage=None)
         assert not (out / "decision_capture_coverage.json").exists()
 
+    def test_measurement_coverage_partial_is_still_written(self, tmp_path):
+        """config#909 — coverage.json is always-emit: a partial body (some
+        stage unmeasured) must still be written so the dashboard distinguishes
+        "producer never ran" (absent object) from "ran, partial" (present
+        body with nulls)."""
+        import json
+        out = self._save(
+            tmp_path,
+            measurement_coverage={
+                "status": "partial", "date": "2026-05-29",
+                "signal_count": 5, "predicted_count": None,
+                "executed_count": None, "attributed_count": None,
+            },
+        )
+        f = out / "coverage.json"
+        assert f.exists(), "partial measurement coverage must still emit coverage.json"
+        body = json.loads(f.read_text())
+        assert body["status"] == "partial"
+        assert body["predicted_count"] is None
+
+    def test_measurement_coverage_none_is_not_written(self, tmp_path):
+        out = self._save(tmp_path, measurement_coverage=None)
+        assert not (out / "coverage.json").exists()
+
     def test_ok_only_artifact_skips_error_status(self, tmp_path):
         """A non-always-emit artifact (barrier_coherence) keeps ok-only."""
         out = self._save(

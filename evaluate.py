@@ -72,7 +72,7 @@ from analysis.optimizer_churn import compute_optimizer_churn
 from analysis.walk_forward_stability import compute_walk_forward_stability
 from analysis import factor_blend_sensitivity
 from analysis import veto_analysis
-from analysis import decision_capture_coverage, executor_decision_capture_coverage, provenance_grounding, quant_rank_quality
+from analysis import decision_capture_coverage, executor_decision_capture_coverage, measurement_coverage, provenance_grounding, quant_rank_quality
 from analysis import cio_rule_tag_precision
 from analysis import agent_justification
 from analysis import end_to_end
@@ -602,6 +602,25 @@ def _run_diagnostics(
         lambda: executor_decision_capture_coverage.compute_executor_decision_capture_coverage(
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=config.get("_run_date"),
+        ),
+        required_inputs={},
+    )
+
+    # Measurement-coverage funnel (config#909) — the *outcome*-observability
+    # sibling of the decision-capture coverage above. Traces the actionable
+    # signal set through predictions → fills → P&L attribution and emits
+    # backtest/{date}/coverage.json for the dashboard's measurement-coverage
+    # panel. Read-only over signals/ + predictor/predictions/ (S3) and the
+    # trades.db ENTER rows; tolerant of any missing input (degrades the
+    # affected stage to null rather than raising). required_inputs left empty
+    # so it runs even when the trades.db pull failed — it self-reports which
+    # stages were measured via stage_availability.
+    results["measurement_coverage"] = tracker.run_module(
+        "measurement_coverage",
+        lambda: measurement_coverage.compute_measurement_coverage(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            run_date=config.get("_run_date"),
+            trades_db_path=trades_db,
         ),
         required_inputs={},
     )
@@ -1640,6 +1659,7 @@ def _main_impl() -> None:
             monte_carlo=diagnostics.get("monte_carlo"),
             decision_capture_coverage=diagnostics.get("decision_capture_coverage"),
             executor_decision_capture_coverage=diagnostics.get("executor_decision_capture_coverage"),
+            measurement_coverage=diagnostics.get("measurement_coverage"),
             provenance_grounding=diagnostics.get("provenance_grounding"),
             quant_rank_quality=diagnostics.get("quant_rank_quality"),
             cio_rule_tag_precision=diagnostics.get("cio_rule_tag_precision"),
