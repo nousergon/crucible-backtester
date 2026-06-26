@@ -1038,3 +1038,144 @@ def test_optimizer_sweep_section_shows_not_applied_reason():
     }
     text = "\n".join(_section_optimizer_param_sweep(sweep))
     assert "Not applied" in text
+
+
+# ── write-as-you-compute: per-tile S3 upload (config#1190) ───────────────────
+
+
+class TestWriteAsYouCompute:
+    """``save`` must upload each report-card tile artifact to S3 the MOMENT it
+    is persisted locally — not buffer everything and upload in a single
+    terminal batch. A mid-Saturday SF interruption previously stranded every
+    computed tile (they never reached S3). Regression guard for config#1190.
+
+    Uses the in-memory ``_FakeS3`` stub (the repo's phase_artifacts test
+    convention) for the deterministic "raise before the terminal sweep"
+    assertion, plus a moto round-trip for the real-S3-key contract.
+    """
+
+    def _save(self, tmp_path, s3, **kw):
+        from reporter import save
+        # A representative spread of always-emit report-card tiles. They are
+        # written in source order inside ``save`` (decision_capture_coverage
+        # first), so an injected mid-stream failure strands the LATER ones.
+        return save(
+            report_md="# r",
+            signal_quality={"status": "ok", "overall": {}},
+            score_analysis=[],
+            run_date="2026-06-26",
+            results_dir=str(tmp_path),
+            decision_capture_coverage={"status": "ok", "coverage_pct": 100.0},
+            executor_decision_capture_coverage={"status": "ok", "coverage_pct": 90.0},
+            veto_value={"status": "ok", "net_value": 1.0},
+            predictor_sizing={"status": "ok", "overall_rank_ic": 0.05},
+            scanner_opt={"leakage_pct": 0.1},
+            cio_opt={"status": "ok"},
+            upload_bucket="alpha-engine-research",
+            upload_prefix="evaluation",
+            s3_client=s3,
+            **kw,
+        )
+
+    def test_tiles_land_on_s3_as_they_are_computed(self, tmp_path):
+        from tests.test_phase_registry import _FakeS3
+        s3 = _FakeS3()
+        self._save(tmp_path, s3)
+        keys = {k for (_b, k) in s3.store}
+        # The earliest-written tile and report.md are already on S3.
+        assert "evaluation/2026-06-26/report.md" in keys
+        assert "evaluation/2026-06-26/decision_capture_coverage.json" in keys
+        assert "evaluation/2026-06-26/metrics.json" in keys
+        # Bucket is honored.
+        assert all(b == "alpha-engine-research" for (b, _k) in s3.store)
+
+    def test_first_K_tiles_present_when_interrupted_before_terminal_upload(self, tmp_path):
+        """The core proof: raise partway through the compute/persist loop and
+        assert the FIRST tiles already exist as S3 keys — proving they were
+        uploaded as computed, not buffered for a terminal batch that never
+        ran. report.md is the first artifact persisted; we fail the upload as
+        soon as the cio_opt tile is reached, simulating an interruption."""
+        from tests.test_phase_registry import _FakeS3
+
+        class _FailLateS3(_FakeS3):
+            def put_object(self, *, Bucket, Key, Body, ContentType=None):
+                if Key.endswith("cio_opt.json"):
+                    raise RuntimeError("Saturday SF interrupted")
+                return super().put_object(
+                    Bucket=Bucket, Key=Key, Body=Body, ContentType=ContentType,
+                )
+
+        s3 = _FailLateS3()
+        # Per-tile upload is fail-soft, so ``save`` itself does NOT raise — the
+        # interruption strands only the failing tile, earlier ones are safe.
+        self._save(tmp_path, s3)
+        keys = {k for (_b, k) in s3.store}
+        # First K tiles uploaded BEFORE the failure point are on S3.
+        assert "evaluation/2026-06-26/report.md" in keys
+        assert "evaluation/2026-06-26/metrics.json" in keys
+        assert "evaluation/2026-06-26/decision_capture_coverage.json" in keys
+        assert "evaluation/2026-06-26/veto_value.json" in keys
+        # The interrupted tile did NOT land (its upload raised, was swallowed).
+        assert "evaluation/2026-06-26/cio_opt.json" not in keys
+        # Fail-soft: the local artifact is still written even though S3 failed.
+        assert (tmp_path / "2026-06-26" / "cio_opt.json").exists()
+
+    def test_no_upload_when_bucket_none_local_only(self, tmp_path):
+        """``upload_bucket=None`` (local-only / dry-run) must NOT touch S3 —
+        respects the same gate as the terminal sweep so dry-runs pay no
+        per-tile S3 cost."""
+        from reporter import save
+        from tests.test_phase_registry import _FakeS3
+        s3 = _FakeS3()
+        save(
+            report_md="# r",
+            signal_quality={"status": "ok", "overall": {}},
+            score_analysis=[],
+            run_date="2026-06-26",
+            results_dir=str(tmp_path),
+            decision_capture_coverage={"status": "ok", "coverage_pct": 100.0},
+            upload_bucket=None,          # local-only
+            s3_client=s3,
+        )
+        assert s3.store == {}, "no per-tile upload may fire when bucket is None"
+        # Artifacts still written locally.
+        assert (tmp_path / "2026-06-26" / "report.md").exists()
+
+    def test_upload_to_s3_is_idempotent_sweep(self, tmp_path):
+        """The terminal ``upload_to_s3`` re-uploads everything in out_dir —
+        re-uploading an already-present tile is a harmless overwrite, and any
+        straggler (e.g. completeness.json written post-`save`) is swept up."""
+        from reporter import save, upload_to_s3
+        from tests.test_phase_registry import _FakeS3
+        s3 = _FakeS3()
+        out = self._save(tmp_path, s3)
+        # A straggler written AFTER save (mirrors evaluate.py's completeness.json).
+        (out / "completeness.json").write_text('{"ok": true}')
+        before = dict(s3.store)
+        upload_to_s3(out, "alpha-engine-research", "evaluation", "2026-06-26", s3_client=s3)
+        keys = {k for (_b, k) in s3.store}
+        # Straggler now present; previously-uploaded tiles still present.
+        assert "evaluation/2026-06-26/completeness.json" in keys
+        assert "evaluation/2026-06-26/report.md" in keys
+        # Idempotent: re-sweeping the already-present report.md didn't error and
+        # the body is unchanged.
+        assert s3.store[("alpha-engine-research", "evaluation/2026-06-26/report.md")] \
+            == before[("alpha-engine-research", "evaluation/2026-06-26/report.md")]
+
+    def test_upload_one_round_trips_real_s3_key_layout(self, tmp_path):
+        """moto round-trip: ``upload_one`` writes to the canonical
+        ``{prefix}/{run_date}/{name}`` key and the object is readable back."""
+        boto3 = pytest.importorskip("boto3")
+        moto = pytest.importorskip("moto")
+        from reporter import upload_one, _artifact_key
+        assert _artifact_key("evaluation", "2026-06-26", "metrics.json") \
+            == "evaluation/2026-06-26/metrics.json"
+        f = tmp_path / "metrics.json"
+        f.write_text('{"run_date": "2026-06-26"}')
+        with moto.mock_aws():
+            s3 = boto3.client("s3", region_name="us-east-1")
+            s3.create_bucket(Bucket="alpha-engine-research")
+            key = upload_one(f, "alpha-engine-research", "evaluation", "2026-06-26", s3_client=s3)
+            assert key == "evaluation/2026-06-26/metrics.json"
+            body = s3.get_object(Bucket="alpha-engine-research", Key=key)["Body"].read()
+            assert body == b'{"run_date": "2026-06-26"}'
