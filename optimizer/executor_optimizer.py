@@ -859,6 +859,233 @@ def _l2_distance(row: pd.Series, param_cols: list[str], target: dict, valid: pd.
     return dist ** 0.5
 
 
+def _call_sim_fn(sim_fn, combo_config: dict, dates: list[str] | None):
+    """Invoke a sweep ``sim_fn`` over an optional date SUBSET.
+
+    Historically ``sim_fn`` was ``callable(combo_config) -> stats`` and closed
+    over the *full* date range, so the holdout path computed ``holdout_dates``
+    but never actually restricted the simulation to them — the "holdout" check
+    ran over every date (latent bug; the walk-forward work, config#950, depends
+    on real date-windowing). This shim lets a date-aware ``sim_fn`` —
+    ``callable(combo_config, dates=...)`` — receive the window while remaining
+    backward-compatible with the old single-arg form.
+    """
+    import inspect
+    if dates is None:
+        return sim_fn(combo_config)
+    try:
+        params = inspect.signature(sim_fn).parameters
+        accepts_dates = "dates" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (TypeError, ValueError):
+        accepts_dates = False
+    if accepts_dates:
+        return sim_fn(combo_config, dates=dates)
+    # Old-style sim_fn cannot window — fall back to the full-range run. The
+    # caller records this so a non-windowed validation is never mistaken for a
+    # true out-of-sample check.
+    return sim_fn(combo_config)
+
+
+def _grade_fold(
+    holdout_stats: dict, result: dict, fit_target: str,
+) -> dict:
+    """Grade one out-of-sample window against the train metric.
+
+    Returns a dict with ``metric_name``, ``holdout_value``, ``train_value``,
+    ``ratio``, ``passed`` and a human ``note`` — the same pass rule the legacy
+    single-split holdout used (metric matches the ranking axis; holdout must be
+    positive AND >= 50% of train). Pure: no result mutation, so it composes for
+    multi-fold walk-forward."""
+    holdout_sharpe = holdout_stats.get("sharpe_ratio")
+    holdout_sortino = holdout_stats.get("sortino_ratio")
+
+    if fit_target == "skill_composite":
+        metric_name = "Sortino"
+        holdout_value = holdout_sortino
+        train_value = result.get("best_sortino", 0)
+    else:
+        metric_name = "Sharpe"
+        holdout_value = holdout_sharpe
+        train_value = result.get("best_sharpe", 0)
+
+    if holdout_value is None:
+        return {
+            "metric_name": metric_name, "holdout_value": None,
+            "train_value": train_value, "ratio": None, "passed": True,
+            "note": f"Holdout produced no {metric_name} — skipped",
+        }
+    if train_value is None or train_value < 0:
+        return {
+            "metric_name": metric_name, "holdout_value": round(float(holdout_value), 4),
+            "train_value": train_value, "ratio": 0.0, "passed": False,
+            "note": (f"Train {metric_name} is non-positive ({train_value}) — "
+                     f"cannot validate holdout ratio"),
+        }
+    ratio = holdout_value / train_value if train_value != 0 else 0.0
+    passed = ratio >= 0.50 and holdout_value > 0
+    if passed:
+        note = f"Holdout {metric_name} ({holdout_value:.4f}) is {ratio:.0%} of train — PASS"
+    elif holdout_value <= 0:
+        note = (f"Holdout {metric_name} is non-positive ({holdout_value:.4f}) — "
+                f"loss-making out-of-sample")
+    else:
+        note = (f"Holdout {metric_name} ({holdout_value:.4f}) is {ratio:.0%} of train "
+                f"({train_value:.4f}) — need >= 50%")
+    return {
+        "metric_name": metric_name, "holdout_value": round(float(holdout_value), 4),
+        "train_value": train_value, "ratio": round(ratio, 4),
+        "passed": passed, "note": note,
+    }
+
+
+def _rolling_windows(
+    dates: list[str], n_folds: int, test_frac: float,
+) -> list[tuple[list[str], list[str]]]:
+    """Build ``n_folds`` expanding-train / rolling-test splits (chronological).
+
+    Each fold trains on everything up to a cut point and tests on the next
+    ``test_frac`` slice — anchored walk-forward, the standard cross-validation
+    for time series (no look-ahead; test windows are disjoint and advance
+    forward). Returns ``(train_dates, test_dates)`` per fold; folds whose test
+    window is too small to grade are dropped by the caller."""
+    n = len(dates)
+    test_len = max(1, int(n * test_frac))
+    # Place the LAST test window flush against the end, earlier ones stepping
+    # back by test_len, so the most-recent data is always validated.
+    windows: list[tuple[list[str], list[str]]] = []
+    for k in range(n_folds):
+        test_end = n - k * test_len
+        test_start = test_end - test_len
+        if test_start <= 0:
+            break
+        windows.append((dates[:test_start], dates[test_start:test_end]))
+    windows.reverse()  # chronological order (oldest fold first)
+    return windows
+
+
+def validate_walk_forward(
+    result: dict,
+    sim_fn,
+    dates: list[str],
+    config: dict,
+    *,
+    n_folds: int = 3,
+    test_frac: float = 0.30,
+    min_pass_fraction: float = 1.0,
+) -> dict:
+    """Rolling walk-forward cross-validation of the recommended params.
+
+    Replaces the single 70/30 holdout (config#950) with ``n_folds`` rolling
+    out-of-sample windows, each graded by :func:`_grade_fold`. The recommendation
+    PASSES only if at least ``min_pass_fraction`` of gradeable folds pass — default
+    1.0 (ALL folds), the conservative choice for a gate that auto-applies params
+    to LIVE trading.
+
+    Requires a date-aware ``sim_fn`` (``callable(combo_config, dates=...)``) to
+    actually run out-of-sample; with an old single-arg ``sim_fn`` it degrades to
+    the legacy single-window behavior and says so (``walk_forward_degraded``).
+
+    Updates ``result`` in place with ``walk_forward`` (per-fold detail),
+    ``holdout_passed``, ``holdout_ratio`` (worst-fold ratio), and on failure
+    ``status="holdout_failed"``.
+    """
+    if result.get("status") != "ok":
+        return result
+    recommended = result.get("recommended_params", {})
+    if not recommended:
+        return result
+
+    fit_target = result.get("fit_target", "sharpe_legacy")
+    holdout_config = {**config, **recommended}
+
+    import inspect
+    try:
+        date_aware = "dates" in inspect.signature(sim_fn).parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in inspect.signature(sim_fn).parameters.values()
+        )
+    except (TypeError, ValueError):
+        date_aware = False
+
+    windows = _rolling_windows(dates, n_folds, test_frac) if date_aware else []
+    # Drop folds whose test window is too short to grade (mirrors the legacy
+    # <3-date skip).
+    windows = [(tr, te) for tr, te in windows if len(te) >= 3]
+
+    if not windows:
+        # Either too little data for multiple folds, or a non-date-aware sim_fn:
+        # fall back to the single-split holdout so behavior never regresses.
+        result["walk_forward_degraded"] = (
+            "no date-aware sim_fn or insufficient dates for rolling folds — "
+            "fell back to single-window holdout"
+        )
+        return validate_holdout(result, sim_fn, dates, config)
+
+    fold_results = []
+    for i, (_train_dates, test_dates) in enumerate(windows):
+        try:
+            stats = _call_sim_fn(sim_fn, holdout_config, test_dates)
+        except Exception as e:
+            logger.warning("Walk-forward fold %d simulation failed: %s", i, e)
+            fold_results.append({
+                "fold": i, "passed": True, "ratio": None,
+                "note": f"fold {i} simulation error: {e}", "skipped": True,
+            })
+            continue
+        graded = _grade_fold(stats, result, fit_target)
+        graded["fold"] = i
+        graded["n_test_dates"] = len(test_dates)
+        fold_results.append(graded)
+
+    gradeable = [f for f in fold_results if f.get("ratio") is not None and not f.get("skipped")]
+    n_pass = sum(1 for f in gradeable if f["passed"])
+    n_grade = len(gradeable)
+
+    result["walk_forward"] = {
+        "n_folds": len(fold_results),
+        "n_gradeable": n_grade,
+        "n_passed": n_pass,
+        "test_frac": test_frac,
+        "min_pass_fraction": min_pass_fraction,
+        "folds": fold_results,
+    }
+
+    if n_grade == 0:
+        result["holdout_passed"] = True
+        result["holdout_note"] = "Walk-forward: no gradeable folds — skipped validation"
+        return result
+
+    pass_fraction = n_pass / n_grade
+    worst_ratio = min((f["ratio"] for f in gradeable if f["ratio"] is not None), default=0.0)
+    result["holdout_ratio"] = round(worst_ratio, 4)
+    metric_name = gradeable[0]["metric_name"]
+    result[f"holdout_{metric_name.lower()}"] = min(
+        (f["holdout_value"] for f in gradeable if f["holdout_value"] is not None),
+        default=None,
+    )
+
+    if pass_fraction + 1e-9 >= min_pass_fraction:
+        result["holdout_passed"] = True
+        result["holdout_note"] = (
+            f"Walk-forward {n_pass}/{n_grade} folds PASS "
+            f"(worst-fold ratio {worst_ratio:.0%}) — PASS"
+        )
+        logger.info("Executor optimizer walk-forward passed: %s", result["holdout_note"])
+    else:
+        result["holdout_passed"] = False
+        result["status"] = "holdout_failed"
+        failing = [f"fold {f['fold']}: {f['note']}" for f in gradeable if not f["passed"]]
+        result["holdout_note"] = (
+            f"Walk-forward {n_pass}/{n_grade} folds pass "
+            f"(need {min_pass_fraction:.0%}) — "
+            + "; ".join(failing[:3])
+        )
+        logger.warning("Executor optimizer walk-forward failed: %s", result["holdout_note"])
+    return result
+
+
 def validate_holdout(
     result: dict,
     sim_fn,
@@ -873,12 +1100,18 @@ def validate_holdout(
 
     Args:
         result: dict from recommend() with status="ok".
-        sim_fn: callable(combo_config) -> stats dict (same as param sweep sim_fn).
+        sim_fn: callable(combo_config[, dates=...]) -> stats dict. A date-aware
+            sim_fn restricts the simulation to the holdout window (true
+            out-of-sample); a legacy single-arg sim_fn runs the full range and
+            the result is marked ``holdout_degraded``.
         dates: full list of signal dates (chronological).
         config: base config dict.
 
     Returns:
         result dict with added holdout_sharpe, holdout_passed fields.
+
+    See also :func:`validate_walk_forward` (config#950) for the rolling
+    multi-fold cross-validation that supersedes this single split.
     """
     if result.get("status") != "ok":
         return result
@@ -899,8 +1132,26 @@ def validate_holdout(
     # Build holdout config with recommended params
     holdout_config = {**config, **recommended}
 
+    import inspect
     try:
-        holdout_stats = sim_fn(holdout_config)
+        _date_aware = "dates" in inspect.signature(sim_fn).parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in inspect.signature(sim_fn).parameters.values()
+        )
+    except (TypeError, ValueError):
+        _date_aware = False
+    if not _date_aware:
+        # Legacy sim_fn cannot window — the "holdout" run is the full range.
+        # Surface that rather than silently passing it off as out-of-sample.
+        result["holdout_degraded"] = (
+            "sim_fn is not date-aware — holdout ran over the full date range, "
+            "not the held-out window (not a true out-of-sample check)"
+        )
+
+    try:
+        holdout_stats = _call_sim_fn(
+            sim_fn, holdout_config, holdout_dates if _date_aware else None,
+        )
     except Exception as e:
         logger.warning("Holdout validation failed: %s", e)
         result["holdout_passed"] = True
