@@ -34,8 +34,16 @@ if "arcticdb" not in sys.modules:
 
 
 def _make_fake_arctic(symbols: list[str]):
-    """Build a MagicMock hierarchy matching the ArcticDB API surface:
-    Arctic → .get_library(name) → .list_symbols() / .read(symbol)."""
+    """Build a MagicMock hierarchy matching the ArcticDB API surface.
+
+    Since config#804, ``load_universe_from_arctic`` opens the ``universe``
+    library via the shared ``alpha_engine_lib.arcticdb.open_universe_lib``
+    helper (see test patching below), while the ``macro`` open and the #826
+    empty-universe diagnostic still go through the local ``_get_arctic``
+    handle. So the returned ``arctic`` mock owns ``macro`` (+ ``list_libraries``
+    for the diagnostic) and the returned ``universe`` mock must be wired in
+    via an ``open_universe_lib`` patch.
+    """
     def _fake_read(symbol):
         df = pd.DataFrame(
             {"Close": [100.0, 101.0], "Open": [99.0, 100.0],
@@ -53,6 +61,9 @@ def _make_fake_arctic(symbols: list[str]):
     macro.read.side_effect = _fake_read
 
     arctic = MagicMock()
+    # ``universe`` is now opened via open_universe_lib, not get_library; the
+    # local handle only serves ``macro`` (the get_library branch is kept
+    # tolerant in case a future caller reintroduces a local universe open).
     arctic.get_library.side_effect = lambda name: (
         universe if name == "universe" else macro
     )
@@ -65,7 +76,8 @@ def test_load_universe_respects_tickers_allowlist():
     from store import arctic_reader
 
     arctic, universe = _make_fake_arctic(["AAPL", "MSFT", "NVDA", "TSLA"])
-    with patch.object(arctic_reader, "_get_arctic", return_value=arctic):
+    with patch.object(arctic_reader, "_get_arctic", return_value=arctic), \
+         patch("alpha_engine_lib.arcticdb.open_universe_lib", return_value=universe):
         price_data, features = arctic_reader.load_universe_from_arctic(
             bucket="test-bucket",
             tickers_allowlist={"AAPL", "MSFT"},
@@ -81,7 +93,8 @@ def test_load_universe_none_allowlist_reads_all():
     from store import arctic_reader
 
     arctic, universe = _make_fake_arctic(["AAPL", "MSFT", "NVDA"])
-    with patch.object(arctic_reader, "_get_arctic", return_value=arctic):
+    with patch.object(arctic_reader, "_get_arctic", return_value=arctic), \
+         patch("alpha_engine_lib.arcticdb.open_universe_lib", return_value=universe):
         arctic_reader.load_universe_from_arctic(bucket="test-bucket")
 
     read_calls = [c.args[0] for c in universe.read.call_args_list]
@@ -94,7 +107,8 @@ def test_load_universe_allowlist_misses_fall_through():
     from store import arctic_reader
 
     arctic, universe = _make_fake_arctic(["AAPL", "MSFT"])
-    with patch.object(arctic_reader, "_get_arctic", return_value=arctic):
+    with patch.object(arctic_reader, "_get_arctic", return_value=arctic), \
+         patch("alpha_engine_lib.arcticdb.open_universe_lib", return_value=universe):
         price_data, _ = arctic_reader.load_universe_from_arctic(
             bucket="test-bucket",
             tickers_allowlist={"AAPL", "NONEXISTENT"},  # NONEXISTENT not in catalog
