@@ -73,6 +73,7 @@ from analysis.walk_forward_stability import compute_walk_forward_stability
 from analysis import factor_blend_sensitivity
 from analysis import veto_analysis
 from analysis import decision_capture_coverage, executor_decision_capture_coverage, provenance_grounding, quant_rank_quality
+from analysis import cio_rule_tag_precision
 from analysis import agent_justification
 from analysis import end_to_end
 from analysis import trigger_scorecard, alpha_distribution, veto_value
@@ -627,6 +628,23 @@ def _run_diagnostics(
     results["quant_rank_quality"] = tracker.run_module(
         "quant_rank_quality",
         lambda: quant_rank_quality.compute_quant_rank_quality(
+            db_path=config.get("research_db"),
+            run_date=config.get("_run_date"),
+        ),
+        required_inputs={"research_db": config.get("research_db")},
+    )
+
+    # CIO rule-tag precision — per-tag precision of the LLM CIO's gates over a
+    # rolling 8-week window. Consumes cio_evaluations.rule_tags (research
+    # migration 14, persisted from crucible-research#152) joined to
+    # universe_returns.beat_spy_5d. Per tag: n_decisions, ADVANCE precision
+    # (% of ADVANCE-tagged that beat SPY at 5d) and the REJECT-beat rate
+    # (per-tag false-negative rate). Gated to insufficient_data until ≥4 weeks
+    # of rule_tags data accumulate; surfaces "which CIO gates are systematically
+    # over- or under-rejecting?" so the LLM-CIO drop decision stays defensible.
+    results["cio_rule_tag_precision"] = tracker.run_module(
+        "cio_rule_tag_precision",
+        lambda: cio_rule_tag_precision.compute_cio_rule_tag_precision(
             db_path=config.get("research_db"),
             run_date=config.get("_run_date"),
         ),
@@ -1488,6 +1506,7 @@ def _main_impl() -> None:
             executor_decision_capture_coverage=diagnostics.get("executor_decision_capture_coverage"),
             provenance_grounding=diagnostics.get("provenance_grounding"),
             quant_rank_quality=diagnostics.get("quant_rank_quality"),
+            cio_rule_tag_precision=diagnostics.get("cio_rule_tag_precision"),
             agent_justification=diagnostics.get("agent_justification"),
             trigger_opt=opt_results.get("trigger_opt"),
             predictor_sizing=opt_results.get("predictor_sizing"),
@@ -1623,6 +1642,7 @@ def _main_impl() -> None:
             executor_decision_capture_coverage=diagnostics.get("executor_decision_capture_coverage"),
             provenance_grounding=diagnostics.get("provenance_grounding"),
             quant_rank_quality=diagnostics.get("quant_rank_quality"),
+            cio_rule_tag_precision=diagnostics.get("cio_rule_tag_precision"),
             agent_justification=diagnostics.get("agent_justification"),
             barrier_coherence=diagnostics.get("barrier_coherence"),
             score_calibration=diagnostics.get("score_calibration"),
@@ -1636,6 +1656,16 @@ def _main_impl() -> None:
             predictor_sizing=opt_results.get("predictor_sizing"),
             scanner_opt=opt_results.get("scanner_opt"),
             cio_opt=opt_results.get("cio_opt"),
+            # Write-as-you-compute (config#1190): when uploading, push each
+            # tile artifact to S3 the moment it is persisted so a mid-Saturday
+            # interruption doesn't strand every computed tile. Gated on the
+            # SAME `args.upload` flag as the terminal sweep below, so
+            # local-only / dry-run runs incur no per-tile S3 cost.
+            upload_bucket=(
+                config.get("output_bucket", "alpha-engine-research")
+                if args.upload else None
+            ),
+            upload_prefix=config.get("output_prefix", "evaluation"),
         )
 
         # Save completeness manifest

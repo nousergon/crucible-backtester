@@ -32,37 +32,14 @@ _MIN_IC_SAMPLES = 10
 _IC_STD_EPSILON = 1e-8
 
 
-def resolve_trading_day(date_str: str | None = None) -> str:
-    """Normalize a date to the most recent NYSE trading day on or before it.
-
-    DATE_CONVENTIONS: every trade artifact keys by the TRADING DAY, not the
-    calendar date. The Saturday SF threads a CALENDAR run_date
-    (``date(Execution.StartTime)`` — e.g. Sat 2026-05-30) but Research +
-    signals.json + the standalone scanner key by trading day (Fri 2026-05-29).
-    Keying backtester artifacts (``backtest/{date}/``, incl. pit_parity.json +
-    parity_metrics) by the calendar date misaligns them with signals/{trading_day}
-    and the ARTIFACT_REGISTRY trading-day axis (the research↔backtester
-    pit-parity drift surfaced this, L4466). Mirrors the scanner fix (research #257).
-
-    Idempotent: a trading-day input returns unchanged (so re-normalizing the
-    bash-normalized RUN_DATE is a no-op). Default = today UTC. Defensive: on any
-    lib/parse failure, return the input unchanged with a WARNING — a date
-    normalization miss must not abort the whole backtester.
-    """
-    import datetime as _dt
-
-    raw = date_str or _dt.date.today().isoformat()
-    try:
-        from alpha_engine_lib import trading_calendar as _tc
-
-        d = _dt.date.fromisoformat(raw[:10])
-        td = d if _tc.is_trading_day(d) else _tc.previous_trading_day(d)
-        return td.isoformat()
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning(
-            "resolve_trading_day(%r) failed (%s) — using input unchanged", raw, exc
-        )
-        return raw
+# Calendar→trading-day artifact-key normalizer. Lifted to the shared
+# foundation as ``krepis.dates.resolve_trading_day`` (krepis#2) — the single
+# SoT the evaluator's grading layer also consumes, so the two can never drift
+# (the research↔backtester pit-parity drift, L4466, and the evaluator's
+# 0/18-graded report card both traced to a consumer keying by the calendar
+# date). Re-exported here so the in-repo callers
+# (``from pipeline_common import resolve_trading_day``) stay unchanged.
+from krepis.dates import resolve_trading_day  # noqa: F401  (re-export)
 
 
 # ── Predictor outcomes column-canonicalization helpers ───────────────────────
@@ -116,10 +93,21 @@ def _load_active_horizon_days(
     pathlib internals.
     """
     if search_paths is None:
-        search_paths = [
-            Path.home() / "alpha-engine-config" / "predictor" / "predictor.yaml",
-            Path(__file__).parent.parent / "alpha-engine-config" / "predictor" / "predictor.yaml",
+        # Experiment-package first (config#1042): predictor.yaml resolves from
+        # experiments/$ALPHA_ENGINE_EXPERIMENT_ID/predictor/predictor.yaml
+        # (default experiment `reference`) ahead of the legacy top-level
+        # alpha-engine-config/predictor/predictor.yaml. Mirrors load_config's
+        # precedence exactly. Behavior-preserving: config#1159 made the package
+        # copy byte-identical to legacy.
+        exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
+        config_roots = [
+            Path.home() / "alpha-engine-config",
+            Path(__file__).parent.parent / "alpha-engine-config",
         ]
+        search_paths = [
+            r / "experiments" / exp / "predictor" / "predictor.yaml" for r in config_roots
+        ]
+        search_paths += [r / "predictor" / "predictor.yaml" for r in config_roots]
     for p in search_paths:
         if not p.exists():
             continue
