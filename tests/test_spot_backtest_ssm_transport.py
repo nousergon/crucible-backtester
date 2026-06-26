@@ -137,10 +137,17 @@ def test_uses_lib_ssm_dispatcher_chokepoint():
     with an inline ``aws ssm send-command`` bash helper (the pre-lift
     pattern L342 explicitly lifts to the lib chokepoint)."""
     body = _SCRIPT.read_text()
-    assert "alpha_engine_lib.ssm_dispatcher" in body, (
+    assert "nousergon_lib.ssm_dispatcher" in body, (
         "spot_backtest.sh does not reference "
-        "alpha_engine_lib.ssm_dispatcher. The 2026-05-27 migration uses "
-        "the lib chokepoint as the SSM dispatch path."
+        "nousergon_lib.ssm_dispatcher. The 2026-05-27 migration uses "
+        "the lib chokepoint as the SSM dispatch path (package renamed "
+        "alpha_engine_lib -> nousergon_lib at lib 0.60.0; config#1245)."
+    )
+    assert "-m alpha_engine_lib." not in body, (
+        "spot_backtest.sh still invokes 'python -m alpha_engine_lib.<mod>'. "
+        "That deprecated meta-path alias shim lacks runpy's get_code, so "
+        "'-m' dies under runpy on any box crossed to nousergon-lib "
+        ">=0.60.x. Use '-m nousergon_lib.<mod>' (config#1245 / #1172)."
     )
 
 

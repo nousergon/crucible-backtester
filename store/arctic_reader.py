@@ -166,8 +166,12 @@ def load_universe_from_arctic(
     """
     t0 = time.time()
     arctic = _get_arctic(bucket)
+    # Universe library opens via the shared lib helper (config#804). The
+    # ``macro`` open and the #826 empty-universe diagnostic below still use
+    # the local ``arctic`` handle and are intentionally left as-is.
+    from alpha_engine_lib.arcticdb import open_universe_lib
     try:
-        universe = arctic.get_library("universe")
+        universe = open_universe_lib(bucket)
         macro_lib = arctic.get_library("macro")
     except Exception as exc:
         raise RuntimeError(

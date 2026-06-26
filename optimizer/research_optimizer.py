@@ -357,23 +357,35 @@ def apply(result: dict, bucket: str) -> dict:
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
 
-    s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
-    logger.info("Research params updated in S3: %s", {k: v for k, v in recommended.items() if k in SAFE_PARAMS})
+    try:
+        s3.put_object(Bucket=bucket, Key=S3_PARAMS_KEY, Body=body, ContentType="application/json")
+        logger.info("Research params updated in S3: %s", {k: v for k, v in recommended.items() if k in SAFE_PARAMS})
+    except Exception as e:
+        # A failed live write must NOT take down the whole backtester run.
+        # Match the sibling optimizers' fail-soft contract (see
+        # executor_optimizer.apply): log loud and return the not-applied
+        # shape so evaluate.py records it as unapplied and the run continues.
+        logger.error("CRITICAL: Failed to write research params to S3: %s", e)
+        return {"applied": False, "reason": f"S3 write failed: {e}"}
 
     # Canonical eval-style archive layout per lib v0.8.0
     run_id = new_eval_run_id()
     history_prefix = "config/research_params_history"
     history_key = eval_artifact_key(history_prefix, run_id)
     history_latest_key = eval_latest_key(history_prefix)
-    s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
-    s3.put_object(
-        Bucket=bucket, Key=history_latest_key, Body=body,
-        ContentType="application/json",
-    )
-    logger.info(
-        "Research params archived to s3://%s/%s (+ latest.json sidecar)",
-        bucket, history_key,
-    )
+    try:
+        s3.put_object(Bucket=bucket, Key=history_key, Body=body, ContentType="application/json")
+        s3.put_object(
+            Bucket=bucket, Key=history_latest_key, Body=body,
+            ContentType="application/json",
+        )
+        logger.info(
+            "Research params archived to s3://%s/%s (+ latest.json sidecar)",
+            bucket, history_key,
+        )
+    except Exception as e:
+        # Live params are already durable; the history archive is best-effort.
+        logger.warning("Failed to archive research params history (non-fatal): %s", e)
 
     # Bitemporal knowledge-time index for PIT walk-forward resolution
     # (best-effort, never fatal — live + history already durable). plan §D3.
