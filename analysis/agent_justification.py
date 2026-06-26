@@ -20,8 +20,12 @@ S3 layout this module reads (all rooted at
 
   ``_eval/{date}/{agent_id}/{date}.{model}.json``   — judge rubric scores
   ``_analysis/{agent_id_base}/{YYYY-WWW}.json``     — clustering aggregates
-  ``_counterfactual/{agent_id_base}/{YYYY-WWW}.json`` — DT rule fits
-  ``_replay_summary/{date}/{target_model}.json``    — concordance summaries
+  ``_counterfactual/{agent_id_base}/{run_id}.json`` — DT rule fits (canonical
+      eval_artifacts layout post config#792; tolerant of legacy
+      ``{YYYY-WWW}.json`` weekly files + the per-agent ``latest.json`` sidecar)
+  ``_replay_summary/{run_id}_{target_model}.json``  — concordance summaries
+      (canonical flat layout post config#792; tolerant of legacy
+      ``{date}/{target_model}.json`` partitions + the ``latest.json`` sidecar)
 """
 
 from __future__ import annotations
@@ -183,9 +187,24 @@ def summarize_judge(
 def _summarize_per_agent_weekly(
     s3_client: Any, *, bucket: str, prefix_root: str,
 ) -> dict:
-    """Shared shape for clustering + counterfactual: per-agent weekly JSONs
-    under {prefix_root}/{agent_id_base}/{YYYY-Www}.json. Returns the
-    most-recent week's entries across agents."""
+    """Shared shape for clustering + counterfactual: per-agent JSONs under
+    {prefix_root}/{agent_id_base}/{stem}.json. Returns the most-recent
+    entry per agent across agents.
+
+    Tolerant of BOTH per-agent file conventions (config#792 cutover for
+    the counterfactual prefix; clustering's ``_analysis/`` prefix is
+    unchanged and still ISO-week-keyed — both work here):
+
+    - **Canonical (new):** ``{run_id}.json`` where run_id is a sortable
+      ``YYMMDDHHMM`` timestamp, plus a ``latest.json`` operator sidecar.
+    - **Legacy (old):** ``{YYYY-Www}.json`` ISO-week files (no sidecar).
+
+    Both the YYMMDDHHMM run_ids and the YYYY-Www week labels sort
+    chronologically under lexical ``max``, so the most-recent dated file
+    is selected uniformly. The ``latest.json`` sidecar is explicitly
+    excluded from the dated-key selection (it lexically outsorts the
+    digit-prefixed run_ids but is a redundant mirror, not a dated
+    forensic artifact) — reading it would double-count the newest run."""
     agent_bases = _list_dirs(s3_client, bucket, prefix_root)
     if not agent_bases:
         return {"status": "no_data"}
@@ -199,10 +218,14 @@ def _summarize_per_agent_weekly(
             )
         except ClientError:
             continue
-        keys = [c["Key"] for c in resp.get("Contents") or [] if c["Key"].endswith(".json")]
+        keys = [
+            c["Key"] for c in resp.get("Contents") or []
+            if c["Key"].endswith(".json")
+            and c["Key"].rsplit("/", 1)[-1] != "latest.json"
+        ]
         if not keys:
             continue
-        latest_key = max(keys)  # lexical max on YYYY-Www = chronological max
+        latest_key = max(keys)  # lexical max on YYMMDDHHMM | YYYY-Www = chronological
         wk = latest_key.rsplit("/", 1)[-1].replace(".json", "")
         if most_recent_week is None or wk > most_recent_week:
             most_recent_week = wk
@@ -279,31 +302,98 @@ def summarize_counterfactual(
     }
 
 
+def _target_model_from_summary_basename(basename: str) -> str:
+    """Recover the target_model label from a replay-summary file basename.
+
+    Canonical layout (config#792): ``{run_id}_{target_model}.json`` where
+    run_id is a 10-char ``YYMMDDHHMM`` structured timestamp. Strip the
+    ``{run_id}_`` prefix to recover the target_model. Legacy layout had
+    the bare ``{target_model}.json`` (under a ``{date}/`` partition) — no
+    run_id prefix to strip, so fall through to the whole stem.
+    """
+    stem = basename[:-5] if basename.endswith(".json") else basename
+    head, sep, tail = stem.partition("_")
+    if sep and len(head) == 10 and head.isdigit():
+        # ``YYMMDDHHMM_...`` canonical prefix — tail is the target_model.
+        return tail
+    return stem
+
+
 def summarize_concordance(
     bucket: str, run_date: str, *, s3_client: Optional[Any] = None,
 ) -> dict:
-    """Aggregate replay-concordance summaries (per-target-model)."""
+    """Aggregate replay-concordance summaries (per-target-model).
+
+    Tolerant of BOTH layouts (config#792 cutover):
+
+    - **Canonical (new):** flat ``decision_artifacts/_replay_summary/
+      {run_id}_{target_model}.json`` + a ``latest.json`` sidecar, where
+      run_id is a sortable ``YYMMDDHHMM`` timestamp. Read-new-first: list
+      the flat prefix, group by recovered target_model, keep the
+      lexically-greatest (== most recent) dated key per target_model.
+    - **Legacy (old):** date-partitioned ``_replay_summary/{YYYY-MM-DD}/
+      {target_model}.json``. Used as a fallback only when no canonical
+      flat keys are present, so the swap never strands pre-cutover data.
+    """
     s3 = s3_client or boto3.client("s3")
+    prefix = "decision_artifacts/_replay_summary/"
+
+    # ── New canonical flat layout (read-new-first) ──
+    try:
+        resp = s3.list_objects_v2(
+            Bucket=bucket, Prefix=prefix, Delimiter="/",
+        )
+    except ClientError:
+        resp = {}
+    # Flat per-run keys live directly under the prefix (Contents); the
+    # legacy date partitions appear as CommonPrefixes and are ignored on
+    # this path.
+    flat_keys = [
+        c["Key"] for c in resp.get("Contents") or []
+        if c["Key"].endswith(".json")
+        and not c["Key"].rsplit("/", 1)[-1].startswith("latest.")
+    ]
+    if flat_keys:
+        # Group by target_model, keep the most-recent dated key per model
+        # (lexical max on the YYMMDDHHMM-prefixed basename == chronological).
+        latest_key_by_target: dict[str, str] = {}
+        for k in flat_keys:
+            basename = k.rsplit("/", 1)[-1]
+            target = _target_model_from_summary_basename(basename)
+            if target not in latest_key_by_target or k > latest_key_by_target[target]:
+                latest_key_by_target[target] = k
+
+        per_target: dict[str, dict] = {}
+        for target, k in latest_key_by_target.items():
+            body = _get_json(s3, bucket, k)
+            if body is not None:
+                per_target[target] = body
+
+        if per_target:
+            return {
+                "status": "ok",
+                "run_date": run_date,
+                "layout": "canonical",
+                "n_target_models": len(per_target),
+                "per_target": per_target,
+            }
+
+    # ── Legacy date-partitioned layout (fallback) ──
     sf_date = _find_most_recent_date_subdir(
-        s3, bucket=bucket,
-        prefix="decision_artifacts/_replay_summary/",
-        run_date=run_date,
+        s3, bucket=bucket, prefix=prefix, run_date=run_date,
     )
     if sf_date is None:
         return {"status": "no_recent_sf_run", "run_date": run_date}
 
     try:
-        resp = s3.list_objects_v2(
-            Bucket=bucket,
-            Prefix=f"decision_artifacts/_replay_summary/{sf_date}/",
-        )
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{prefix}{sf_date}/")
     except ClientError:
         return {"status": "no_data", "run_date": run_date}
     keys = [c["Key"] for c in resp.get("Contents") or [] if c["Key"].endswith(".json")]
     if not keys:
         return {"status": "no_data", "run_date": run_date}
 
-    per_target: dict[str, dict] = {}
+    per_target = {}
     for k in keys:
         body = _get_json(s3, bucket, k)
         if body is None:
@@ -314,6 +404,7 @@ def summarize_concordance(
     return {
         "status": "ok",
         "run_date": run_date,
+        "layout": "legacy",
         "most_recent_sf_date": sf_date,
         "n_target_models": len(per_target),
         "per_target": per_target,
