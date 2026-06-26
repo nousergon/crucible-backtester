@@ -65,3 +65,35 @@ def test_no_secret_environ_reads():
         "`from alpha_engine_lib.secrets import get_secret` instead:\n"
         + "\n".join(f"  {p}:{ln}  {name}" for p, ln, name in violations)
     )
+
+
+# Active (non-comment) shell statements that would re-introduce the deprecated
+# .env plumbing into the spot launcher. #890 removed .env staging/fetch/source;
+# this guard fails CI if any of them come back. Matches code lines only —
+# comment lines (leading ``#``) are skipped so the historical rationale that
+# still references ``.env`` stays documented without tripping the test.
+_DOTENV_PLUMBING_RE = re.compile(
+    r"(?:"
+    r"cp\s+\S*backtester\.env"               # stage to / fetch from S3
+    r"|source\s+\S*\.env\b"                   # source the .env on the spot
+    r"|ENV_FILE="                             # resolve the launcher-side .env path
+    r"|\]\s*&&\s*source\s+\S*\.env\b"         # `[ -f .env ] && source .env` fragment
+    r")"
+)
+
+
+def test_spot_backtest_has_no_dotenv_plumbing():
+    """#890: spot_backtest.sh must not stage, fetch, or source a .env file."""
+    script = _REPO_ROOT / "infrastructure" / "spot_backtest.sh"
+    assert script.exists(), f"spot_backtest.sh not found at {script}"
+    offenders = [
+        (lineno, line)
+        for lineno, line in enumerate(script.read_text().splitlines(), start=1)
+        if not line.lstrip().startswith("#") and _DOTENV_PLUMBING_RE.search(line)
+    ]
+    assert not offenders, (
+        "spot_backtest.sh must not re-introduce .env plumbing after #890 "
+        "(non-secret config → config.yaml, secrets → SSM get_secret()). "
+        "Offending line(s):\n"
+        + "\n".join(f"  {ln}: {line.strip()}" for ln, line in offenders)
+    )

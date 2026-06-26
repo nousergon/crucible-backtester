@@ -199,16 +199,20 @@ def test_no_inline_aws_ssm_send_command():
     )
 
 
-def test_stages_four_configs_via_s3():
-    """The script MUST stage all 4 configs (.env, config.yaml, risk.yaml,
+def test_stages_three_configs_via_s3():
+    """The script MUST stage all 3 configs (config.yaml, risk.yaml,
     predictor.yaml) to S3 before dispatch. Without S3 staging, the spot
     has no path to read the dispatcher's private configs (no SCP, no
-    shared filesystem). Pinning ALL 4 staging calls catches a regression
+    shared filesystem). Pinning ALL 3 staging calls catches a regression
     that drops one but keeps the bootstrap fetch (which would then
-    return NoSuchKey)."""
+    return NoSuchKey).
+
+    Post-#890: ``.env`` (backtester.env) is no longer staged — its
+    non-secret config (EMAIL_SENDER/EMAIL_RECIPIENTS/OUTPUT_BUCKET)
+    moved into config.yaml and secrets load from SSM. The inverse guard
+    below pins that the legacy ``.env`` staging stays gone."""
     body = _SCRIPT.read_text()
     for name in (
-        "backtester.env",
         "config.yaml",
         "risk.yaml",
         "predictor.yaml",
@@ -218,10 +222,16 @@ def test_stages_four_configs_via_s3():
         # The simpler chokepoint: just assert the filename is in the script.
         assert name in body, (
             f"spot_backtest.sh does not reference {name!r}. The migration "
-            f"requires staging 4 configs to S3; missing this name means "
+            f"requires staging 3 configs to S3; missing this name means "
             f"the bootstrap fetch will fail and the spot will run with a "
             f"missing config file."
         )
+    # #890 cutover guard: the legacy .env staging must NOT reappear.
+    assert "backtester.env" not in body, (
+        "spot_backtest.sh still references 'backtester.env' — #890 "
+        "deprecated the .env; its config moved to config.yaml and secrets "
+        "to SSM. The .env must no longer be staged, fetched, or sourced."
+    )
 
 
 def test_no_residual_key_file_dispatch_use():

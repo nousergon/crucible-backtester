@@ -47,17 +47,18 @@
 #     ssm_dispatcher CLIs); LIB_PYTHON points at it
 #   - Code committed and pushed to origin (instance clones from GitHub
 #     via HTTPS — no SSH key needed)
-#   - .env file with EMAIL_SENDER, EMAIL_RECIPIENTS (staged to S3 by this script)
 #   - config.yaml + executor risk.yaml + predictor predictor.yaml
 #     (gitignored — staged to S3 by this script for the spot to fetch
-#     via its alpha-engine-executor-profile IAM role)
+#     via its alpha-engine-executor-profile IAM role). config.yaml carries
+#     the non-secret runtime config (EMAIL_SENDER, EMAIL_RECIPIENTS,
+#     OUTPUT_BUCKET) the .env used to hold (#890 deprecated the .env).
 #
 # **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 3).**
 # Mirrors alpha-engine-data PR 2 (#330). Communication with the spot is
 # now via `aws ssm send-command` wrapped at the lib chokepoint
 # `python -m nousergon_lib.ssm_dispatcher run`. No port-22 inbound on
-# the spot SG; no ssh / scp / ssh-keyscan. The .env + 3 config files are
-# staged to a temporary S3 prefix and pulled down by the spot. PR 3 of
+# the spot SG; no ssh / scp / ssh-keyscan. The 3 config files (no .env post
+# #890) are staged to a temporary S3 prefix and pulled down by the spot. PR 3 of
 # the 5-PR L342 arc.
 #
 # For scheduled weekly runs, call this script from the always-on EC2 cron
@@ -71,23 +72,14 @@ set -euo pipefail
 export HOME="${HOME:-/home/ec2-user}"
 
 # ── Path setup ───────────────────────────────────────────────────────────────
-# Launcher-side .env sourcing was retired in L2998 PR 9c (2026-05-14):
-# secrets load from SSM via alpha_engine_lib.secrets.get_secret() at
-# Python startup; the EC2 instance role grants ssm:GetParameter on
-# /alpha-engine/*. ENV_FILE is still resolved for the spot-side SCP at
-# the upload step below, which carries non-secret runtime config
-# (EMAIL_*, S3_BUCKET, etc.) until that path is also retired under a
-# follow-on PR.
+# .env fully deprecated (#890). Secrets load from SSM via
+# alpha_engine_lib.secrets.get_secret() at Python startup (the EC2 instance
+# role grants ssm:GetParameter on /alpha-engine/*). The remaining non-secret
+# runtime config the .env used to carry (EMAIL_SENDER, EMAIL_RECIPIENTS,
+# OUTPUT_BUCKET) now lives in config.yaml — already staged to S3 and fetched
+# by the spot — so no .env is staged, fetched, or sourced anywhere below.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-ENV_FILE="$(dirname "$REPO_ROOT")/alpha-engine-data/.env"
-if [ ! -f "$ENV_FILE" ]; then
-    ENV_FILE="$HOME/.alpha-engine.env"
-fi
-if [ ! -f "$ENV_FILE" ]; then
-    ENV_FILE="$REPO_ROOT/.env"
-fi
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -664,18 +656,11 @@ trap cleanup EXIT
 echo "==> Waiting for instance to enter running state..."
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
 
-# ── Stage .env + config files to S3 ──────────────────────────────────────────
+# ── Stage config files to S3 ─────────────────────────────────────────────────
 # Replaces the pre-2026-05-27 SCP path. The spot pulls each file via its
 # existing alpha-engine-executor-profile IAM role's s3:GetObject grant.
+# .env is no longer staged (#890): its non-secret config moved to config.yaml.
 echo "==> Staging configs to ${S3_STAGING}/"
-
-# .env: non-secret runtime config (EMAIL_*, S3_BUCKET, etc.).
-if [ ! -f "$ENV_FILE" ]; then
-    echo "ERROR: .env not found (checked alpha-engine-data/.env, ~/.alpha-engine.env, ./.env)"
-    exit 1
-fi
-aws s3 cp "$ENV_FILE" "${S3_STAGING}/backtester.env" --region "$AWS_REGION" --quiet
-echo "  staged .env from $ENV_FILE"
 
 # config.yaml: gitignored backtester runtime config.
 aws s3 cp "$REPO_ROOT/config.yaml" "${S3_STAGING}/config.yaml" --region "$AWS_REGION" --quiet
@@ -759,8 +744,8 @@ run_ssm() {
 
 # ── Bootstrap spot: watchdog + python + git + clone + fetch configs ─────────
 # Single SSM call covering: spot-side hard-timeout watchdog,
-# python3.12/git install, the 3 HTTPS repo clones, .env + 3 config-file
-# fetches from S3 staging. Watchdog rationale: dispatcher-side
+# python3.12/git install, the 3 HTTPS repo clones, 3 config-file
+# fetches from S3 staging (no .env post #890). Watchdog rationale: dispatcher-side
 # `trap cleanup EXIT` only fires when THIS bash script exits cleanly.
 # If the dispatcher SSM command is cancelled, the dispatcher EC2 is
 # stopped mid-run, or the shell gets SIGKILLed, the trap never runs and
@@ -793,10 +778,7 @@ git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/crucible-bac
 git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/crucible-executor.git /home/ec2-user/alpha-engine
 git clone --depth 1 --branch ${BRANCH} https://github.com/nousergon/crucible-predictor.git /home/ec2-user/alpha-engine-predictor
 
-# Fetch staged configs from S3.
-aws s3 cp ${S3_STAGING}/backtester.env /home/ec2-user/alpha-engine-backtester/.env --region ${AWS_REGION} --quiet
-echo "Fetched .env from ${S3_STAGING}/backtester.env"
-
+# Fetch staged configs from S3. (.env no longer staged/fetched — #890.)
 aws s3 cp ${S3_STAGING}/config.yaml /home/ec2-user/alpha-engine-backtester/config.yaml --region ${AWS_REGION} --quiet
 echo "Fetched config.yaml"
 
@@ -822,14 +804,10 @@ set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=${AWS_REGION} AWS_DEFAULT_REGION=${AWS_REGION}
 cd /home/ec2-user/alpha-engine-backtester
 
-# Source .env for non-secret runtime vars (EMAIL_*, S3_BUCKET, etc.).
-# alpha-engine-lib is public; pip resolves the git+https URL in
-# requirements.txt without auth.
-set -a
-# shellcheck disable=SC1091
-source /home/ec2-user/alpha-engine-backtester/.env
-set +a
-
+# No .env source (#890): the deps step only needs pip, which resolves the
+# alpha-engine-lib git+https URL in requirements.txt without auth (public repo).
+# Non-secret runtime config (EMAIL_*, OUTPUT_BUCKET) is read from config.yaml
+# by the python pipeline and by the per-stage BUCKET resolution below.
 command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
 
 \$PIP install --upgrade pip -q
@@ -906,8 +884,9 @@ CACHE
 # this closes the "silent 110-minute phase" blind spot. Paired with
 # `python -u` on each backtest.py invocation below as belt-and-suspenders.
 #
-# ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true is exported AFTER the .env
-# source so it overrides whatever the dispatcher's env passes through.
+# ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true is exported in ENV_SOURCE so it
+# overrides whatever the dispatcher's env passes through (#890 removed the .env
+# source that previously preceded it; the suppress export is unconditional now).
 # The executor's decision_capture short-circuits at is_decision_capture_enabled()
 # when this flag is truthy. Sim hot loop (param_sweep × N_dates × N_positions)
 # would otherwise emit ~50k-200k per-decision S3 PUTs and blow the
@@ -915,15 +894,16 @@ CACHE
 # adhoc-skipto-backtester-20260513-2333). Capture artifacts exist for
 # production observability — they have no semantic meaning in the sweep.
 # Paired with alpha-engine #177.
-# AWS_REGION/AWS_DEFAULT_REGION: the .env-deprecation arc deleted the
-# sourced .env, so the region env vars boto3 + lib preflight require are
-# no longer set in the spot shell. Same #247 regression as alpha-engine-data's
-# spot scripts; spot_backtest.sh was in a sibling repo the original arc
-# didn't touch. System is single-region us-east-1 (matches this file's own
-# ${AWS_REGION:-us-east-1} defaults). Origin: 2026-05-16 Saturday SF
-# PredictorTraining failure (spot_train.sh sibling) — audited forward to
-# prevent the identical Backtester/Parity/Evaluator failure.
-ENV_SOURCE='set -a; [ -f /home/ec2-user/alpha-engine-backtester/.env ] && source /home/ec2-user/alpha-engine-backtester/.env; set +a; export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1; command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3; export PYTHON_BIN;'
+# AWS_REGION/AWS_DEFAULT_REGION: #890 removed the sourced .env entirely, so
+# the region env vars boto3 + lib preflight require must be exported here.
+# Same #247 regression class as alpha-engine-data's spot scripts; this script
+# was in a sibling repo the original arc didn't touch. System is single-region
+# us-east-1 (matches this file's own ${AWS_REGION:-us-east-1} defaults).
+# Origin: 2026-05-16 Saturday SF PredictorTraining failure (spot_train.sh
+# sibling) — audited forward to prevent the identical Backtester/Parity/
+# Evaluator failure. No .env is sourced; OUTPUT_BUCKET is now read from the
+# staged config.yaml at each per-stage BUCKET resolution below.
+ENV_SOURCE='export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1; command -v python3.12 >/dev/null && PYTHON_BIN=python3.12 || PYTHON_BIN=python3; export PYTHON_BIN;'
 
 # Spot-side python is resolved inline per SSM step via PYTHON_BIN in the
 # ENV_SOURCE above. The pre-2026-05-27 SSH transport captured this on the
@@ -1015,7 +995,11 @@ set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
-BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
+# OUTPUT_BUCKET formerly came from the sourced .env (#890 removed it). Read it
+# from the staged config.yaml instead, with the same default fallback so
+# \`\`set -u\`\` never trips on a missing key. config.yaml was fetched into cwd
+# by BOOTSTRAP; \$PYTHON_BIN is set by ENV_SOURCE.
+BUCKET="\$(\$PYTHON_BIN -c 'import yaml,sys; print((yaml.safe_load(open(\"config.yaml\")) or {}).get(\"output_bucket\") or \"alpha-engine-research\")' 2>/dev/null || echo alpha-engine-research)"
 
 # Per-mode smoke summary — collected throughout the run and printed as
 # a single table at the end. Each entry: "name|status|duration|budget|usage".
@@ -1203,10 +1187,12 @@ set -eo pipefail
 cd /home/ec2-user/alpha-engine-backtester
 ${ENV_SOURCE}
 
-# BUCKET used across all three stages. OUTPUT_BUCKET is set by .env (sourced
-# above) but fall back to the default so \`\`set -u\`\` doesn't blow up on an
-# environment without the .env line. Matches the smoke-only heredoc's line.
-BUCKET="\${OUTPUT_BUCKET:-alpha-engine-research}"
+# BUCKET used across all three stages. OUTPUT_BUCKET formerly came from the
+# sourced .env (#890 removed it); read it from the staged config.yaml instead,
+# falling back to the default so \`\`set -u\`\` doesn't blow up on a missing key.
+# Matches the smoke-only heredoc's line. config.yaml is in cwd (fetched by
+# BOOTSTRAP); \$PYTHON_BIN is set by ENV_SOURCE.
+BUCKET="\$(\$PYTHON_BIN -c 'import yaml,sys; print((yaml.safe_load(open(\"config.yaml\")) or {}).get(\"output_bucket\") or \"alpha-engine-research\")' 2>/dev/null || echo alpha-engine-research)"
 # SKIP_STAGES baked in from the dispatcher's --skip-stages flag. Stages in
 # this CSV are skipped with a loud ⊘ echo; everything else runs.
 SKIP_STAGES="${SKIP_STAGES}"
