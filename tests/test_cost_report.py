@@ -525,7 +525,7 @@ class TestTelemetryFirstCaptureDate:
         assert _telemetry_first_capture_date(inventory=inv) == "2026-05-02"
 
     def test_falls_back_when_lib_import_fails(self, caplog, monkeypatch):
-        """If alpha_engine_lib.transparency isn't on the path (e.g. lib
+        """If nousergon_lib.transparency isn't on the path (e.g. lib
         pin is too old), the helper returns None with a WARN log so the
         legacy "all gaps equal" classification kicks in.
         """
@@ -536,8 +536,8 @@ class TestTelemetryFirstCaptureDate:
         real_import = builtins.__import__
 
         def _raise_on_transparency(name, *args, **kwargs):
-            if name == "alpha_engine_lib.transparency":
-                raise ImportError("no module named 'alpha_engine_lib.transparency'")
+            if name == "nousergon_lib.transparency":
+                raise ImportError("no module named 'nousergon_lib.transparency'")
             return real_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", _raise_on_transparency)
@@ -1130,7 +1130,7 @@ class TestChangelogAutoEmitOnAnomaly:
 class TestAnomalyAlertPublish:
     """Operator-facing SNS+Telegram fan-out on cost anomalies (ROADMAP L717).
 
-    Uses alpha_engine_lib.alerts (v0.21.0+) — the same canonical
+    Uses nousergon_lib.alerts (v0.21.0+) — the same canonical
     primitive the dispatcher EXIT-trap diagnostic in spot_backtest.sh
     consumes. Verifies the publish call fires on anomaly status, is
     suppressed on quiet weeks, and never breaks build_cost_section
@@ -1164,7 +1164,7 @@ class TestAnomalyAlertPublish:
             })
             return _FakeResult()
 
-        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _fake_publish)
+        monkeypatch.setattr("nousergon_lib.alerts.publish", _fake_publish)
 
         current_df = pd.DataFrame([
             _make_row(agent_id="ic_cio", sector_team_id=None,
@@ -1213,7 +1213,7 @@ class TestAnomalyAlertPublish:
             calls.append((a, k))
             return _FakeResult()
 
-        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _spy)
+        monkeypatch.setattr("nousergon_lib.alerts.publish", _spy)
 
         current_df = pd.DataFrame([
             _make_row(agent_id="ic_cio", sector_team_id=None,
@@ -1243,7 +1243,7 @@ class TestAnomalyAlertPublish:
         def _raises(*a, **k):
             raise RuntimeError("fake SNS endpoint timeout")
 
-        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _raises)
+        monkeypatch.setattr("nousergon_lib.alerts.publish", _raises)
 
         current_df = pd.DataFrame([
             _make_row(agent_id="ic_cio", sector_team_id=None,
@@ -1279,7 +1279,7 @@ class TestAnomalyAlertPublish:
             calls.append((a, k))
             return MagicMock()
 
-        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _spy)
+        monkeypatch.setattr("nousergon_lib.alerts.publish", _spy)
 
         current_df = pd.DataFrame([
             _make_row(agent_id="ic_cio", sector_team_id=None,
@@ -1387,7 +1387,7 @@ class TestAnomalyAlertDedup:
             publish_calls.append({"message": message, **kwargs})
             return _FakeResult()
 
-        monkeypatch.setattr("alpha_engine_lib.alerts.publish", _spy)
+        monkeypatch.setattr("nousergon_lib.alerts.publish", _spy)
 
         current_df = pd.DataFrame([
             _make_row(agent_id="ic_cio", sector_team_id=None,
@@ -1434,7 +1434,7 @@ class TestAnomalyAlertDedup:
             dedup_reason = "marker_present"
 
         monkeypatch.setattr(
-            "alpha_engine_lib.alerts.publish",
+            "nousergon_lib.alerts.publish",
             lambda *a, **k: _DedupSkippedResult(),
         )
 

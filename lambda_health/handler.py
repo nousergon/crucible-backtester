@@ -52,12 +52,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 #
 # exclude_patterns starts empty by deliberate convention.
 #
-# Secrets load via alpha_engine_lib.secrets.get_secret() at use-site
+# Secrets load via nousergon_lib.secrets.get_secret() at use-site
 # (per-process cached); flow-doctor.yaml only references EMAIL_SENDER /
 # EMAIL_RECIPIENTS / GMAIL_APP_PASSWORD, all populated by Lambda's
 # `--environment` block BEFORE the Python interpreter starts.
-from alpha_engine_lib.logging import setup_logging, monitor_handler
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.logging import setup_logging, monitor_handler
+from nousergon_lib.secrets import get_secret
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -79,7 +79,7 @@ log = logging.getLogger(__name__)
 # Idempotent via the `_init_done` flag.
 #
 # Post-L2998-PR-9c (2026-05-14): secrets now load via
-# alpha_engine_lib.secrets.get_secret() at use-site (lazy, per-process
+# nousergon_lib.secrets.get_secret() at use-site (lazy, per-process
 # cached). No bulk SSM round-trip on cold-start. Stub retained to
 # preserve the handler() call shape + idempotency flag in case future
 # deferred init is needed.

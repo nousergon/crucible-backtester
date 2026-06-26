@@ -54,7 +54,7 @@ from datetime import datetime
 # lambda_concordance pattern.
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from alpha_engine_lib.logging import setup_logging, monitor_handler
+from nousergon_lib.logging import setup_logging, monitor_handler
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -79,7 +79,7 @@ def _ensure_init() -> None:
     """Run deferred init once, on the first handler invocation.
 
     Post-L2998-PR-9c (2026-05-14): secrets load via
-    alpha_engine_lib.secrets.get_secret() at use-site. No bulk SSM
+    nousergon_lib.secrets.get_secret() at use-site. No bulk SSM
     fetch here. Retained for parity with the Lambda fleet + the
     XDG_CACHE_HOME default needed for Lambda's read-only /var/task."""
     global _init_done

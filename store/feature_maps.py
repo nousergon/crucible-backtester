@@ -101,7 +101,7 @@ def load_precomputed_feature_maps(
     # Lazy import so test suites without arcticdb installed can still
     # import this module and monkey-patch. Matches the pattern in
     # executor/price_cache.py.
-    from alpha_engine_lib.arcticdb import open_universe_lib
+    from nousergon_lib.arcticdb import open_universe_lib
     try:
         universe = open_universe_lib(bucket)
     except Exception as exc:

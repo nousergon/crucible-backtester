@@ -16,7 +16,7 @@ Inputs: ``predictor/predictions/{date}.json`` for the current Saturday +
 the most recent prediction in each of the prior 4 ISO weeks.
 
 Outputs: structured report dict + optional Telegram + SNS alert via
-``alpha_engine_lib.alerts.publish`` on ``status="fail"``. Mirrors the
+``nousergon_lib.alerts.publish`` on ``status="fail"``. Mirrors the
 canonical lift-to-lib pattern from
 ``analysis/cost_report._publish_anomaly_alert``.
 
@@ -30,7 +30,7 @@ Composes with:
     defense-in-depth class, observes upstream pillar-emission failures
     in the score_aggregator node; this module observes the downstream
     expression in the predictor's stance assignment.
-  - alpha_engine_lib.alerts (v0.21.0) — the canonical SNS+Telegram
+  - nousergon_lib.alerts (v0.21.0) — the canonical SNS+Telegram
     publish primitive; same lift-to-lib pattern as
     ``cost_report._publish_anomaly_alert``.
 """
@@ -206,7 +206,7 @@ def _check_within_band(
 
 def _publish_drift_alert(report: dict) -> None:
     """Fan a stance-drift FAIL out to SNS + Telegram via the canonical
-    ``alpha_engine_lib.alerts`` lift-to-lib primitive (v0.21.0+).
+    ``nousergon_lib.alerts`` lift-to-lib primitive (v0.21.0+).
 
     Mirrors ``cost_report._publish_anomaly_alert``. Best-effort —
     import + transport failures swallow at WARN; the load-bearing
@@ -221,10 +221,10 @@ def _publish_drift_alert(report: dict) -> None:
     ):
         return
     try:
-        from alpha_engine_lib import alerts  # noqa: PLC0415 — lazy import
+        from nousergon_lib import alerts  # noqa: PLC0415 — lazy import
     except ImportError as e:
         logger.warning(
-            "[stance_distribution] alerts publish skipped — alpha_engine_lib.alerts "
+            "[stance_distribution] alerts publish skipped — nousergon_lib.alerts "
             "unavailable (lib pin <v0.21.0?): %s", e,
         )
         return
@@ -291,7 +291,7 @@ def compute_stance_distribution_drift(
     Returns ``{status, ...}`` with status ∈ ``{"ok", "fail",
     "insufficient_data", "error"}``. On ``"fail"`` and unless
     ``publish_alert=False``, fires a Telegram + SNS alert via
-    ``alpha_engine_lib.alerts.publish``.
+    ``nousergon_lib.alerts.publish``.
     """
     try:
         current = _dt.date.fromisoformat(current_date)

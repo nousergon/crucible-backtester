@@ -51,7 +51,7 @@ from pathlib import Path
 # simple repo-root path resolution works.
 #
 # exclude_patterns starts empty by deliberate convention.
-from alpha_engine_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.logging import setup_logging, guard_entrypoint
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
 setup_logging(
@@ -577,7 +577,7 @@ def _run_diagnostics(
     # (attractiveness-pillars-260520.md). Compares this week's
     # predictor/predictions/{date}.json stance counts to the prior 4 ISO
     # weeks' mean ± 2σ; fires a Telegram + SNS alert via
-    # alpha_engine_lib.alerts.publish on FAIL. Defense-in-depth against
+    # nousergon_lib.alerts.publish on FAIL. Defense-in-depth against
     # the pillar-aware classify_stance code path collapsing the
     # distribution into a single stance without surfacing through NAV
     # for weeks. ROADMAP L1614.
@@ -1097,7 +1097,7 @@ def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
     Post-fix: status ∈ {``alpha_below_floor``, ``insufficient_data``,
     ``no_params``, ``no_improvement``, ``insufficient_trades``,
     ``insufficient_psr_confidence``, ``degraded``, ...} → publish a WARN
-    alert via ``alpha_engine_lib.alerts.publish`` with dedup_key keyed on
+    alert via ``nousergon_lib.alerts.publish`` with dedup_key keyed on
     ``(run_date, status)`` so a recurring class doesn't N-spam the operator.
     Mirrors the stance_distribution + cost_report patterns.
     """
@@ -1110,10 +1110,10 @@ def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
     if status == "ok":
         return
     try:
-        from alpha_engine_lib import alerts  # noqa: PLC0415
+        from nousergon_lib import alerts  # noqa: PLC0415
     except ImportError as e:
         logger.warning(
-            "[executor_optimizer] alerts publish skipped — alpha_engine_lib.alerts "
+            "[executor_optimizer] alerts publish skipped — nousergon_lib.alerts "
             "unavailable (lib pin <v0.21.0?): %s", e,
         )
         return
@@ -1255,7 +1255,7 @@ def _main_impl() -> None:
         logger.info("Normalized run-date %s (calendar) → %s (trading day)", _orig_date, args.date)
 
     # setup_logging already ran at module-top (see comment near the
-    # alpha_engine_lib.logging import). Apply the user-requested level here.
+    # nousergon_lib.logging import). Apply the user-requested level here.
     # Note: get_flow_doctor() retrieval was dropped — every fd.report()
     # call site lived in backtest.py, never in this module's body.
     # ERROR-level escalation still flows through the root-attached

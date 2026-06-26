@@ -68,7 +68,7 @@ from pathlib import Path
 #
 # exclude_patterns starts empty by deliberate convention; add patterns
 # only after observing real ERROR-level noise during a backtest run.
-from alpha_engine_lib.logging import setup_logging, get_flow_doctor, guard_entrypoint
+from nousergon_lib.logging import setup_logging, get_flow_doctor, guard_entrypoint
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
 setup_logging(
@@ -1295,7 +1295,7 @@ def _run_simulation_loop(
     universe_symbols: set[str] | None = None
     rejected_ticker_counter: dict[str, int] = {}
     try:
-        from alpha_engine_lib.arcticdb import get_universe_symbols
+        from nousergon_lib.arcticdb import get_universe_symbols
         universe_symbols = get_universe_symbols(bucket)
     except Exception as exc:
         # Fail loud: simulate would otherwise crash later at load_daily_vwap
@@ -1823,7 +1823,7 @@ def _replay_for_dates_per_date_bootstrap(
         )
 
     try:
-        from alpha_engine_lib.arcticdb import get_universe_symbols
+        from nousergon_lib.arcticdb import get_universe_symbols
         universe_symbols = get_universe_symbols(bucket)
     except Exception as exc:
         raise RuntimeError(
@@ -2041,7 +2041,7 @@ def replay_for_dates(
     universe_symbols: set[str] | None = None
     rejected_ticker_counter: dict[str, int] = {}
     try:
-        from alpha_engine_lib.arcticdb import get_universe_symbols
+        from nousergon_lib.arcticdb import get_universe_symbols
         universe_symbols = get_universe_symbols(bucket)
     except Exception as exc:
         raise RuntimeError(
@@ -2377,7 +2377,7 @@ def _compute_risk_matched_headline(
             "note": "optimizer backtest returned no aligned daily-return series",
         }
     try:
-        from alpha_engine_lib.quant.stats.risk_matched_benchmark import (
+        from nousergon_lib.quant.stats.risk_matched_benchmark import (
             compute_alpha_vs_benchmark,
             construct_beta_matched_spy_benchmark,
         )
@@ -3607,7 +3607,7 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
         # it into the per-date precompute and skip the per-call
         # _filter_signals_to_universe inside _simulate_single_date.
         try:
-            from alpha_engine_lib.arcticdb import get_universe_symbols
+            from nousergon_lib.arcticdb import get_universe_symbols
             _universe_symbols_for_sweep = get_universe_symbols(bucket)
         except Exception as exc:
             raise RuntimeError(
@@ -4155,7 +4155,7 @@ def _runtime_smoke(config: dict) -> None:
     the real problem is — not "your 80-minute backtest died in stage N."
 
     Motivated by the 2026-04-21 Saturday SF dry-run where
-    ``No module named 'alpha_engine_lib.arcticdb'`` surfaced ~80 minutes
+    ``No module named 'nousergon_lib.arcticdb'`` surfaced ~80 minutes
     into a spot run. With preflight + runtime smoke, the same failure
     would surface in ~2 seconds (preflight) or ~30 seconds (smoke).
     """
@@ -4172,7 +4172,7 @@ def _runtime_smoke(config: dict) -> None:
     # Stage 1: universe symbols end-to-end (catches lib/arcticdb issues
     # that preflight's import check only surfaces at import time).
     try:
-        from alpha_engine_lib.arcticdb import get_universe_symbols
+        from nousergon_lib.arcticdb import get_universe_symbols
         symbols = get_universe_symbols(bucket)
         if not symbols:
             raise RuntimeError("empty universe — ArcticDB has zero symbols")
@@ -4189,7 +4189,7 @@ def _runtime_smoke(config: dict) -> None:
     # Stage 2: per-ticker ArcticDB read (catches per-symbol read failures
     # that list_symbols alone wouldn't surface).
     try:
-        from alpha_engine_lib.arcticdb import open_universe_lib
+        from nousergon_lib.arcticdb import open_universe_lib
         lib = open_universe_lib(bucket)
         for t in sample:
             df = lib.read(t).data
@@ -5033,7 +5033,7 @@ def _main_impl() -> None:
         logger.info("Normalized run-date %s (calendar) → %s (trading day)", _orig_date, args.date)
 
     # setup_logging already ran at module-top (see comment near the
-    # alpha_engine_lib.logging import). Apply the user-requested level here.
+    # nousergon_lib.logging import). Apply the user-requested level here.
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     _health_start = _time.time()
 
@@ -5167,7 +5167,7 @@ def _main_impl() -> None:
                 _iq_cfg = config.get("input_quality_gate") or {}
                 _bucket = config.get("signals_bucket", "alpha-engine-research")
                 try:
-                    from alpha_engine_lib.alerts import publish as _iq_alert
+                    from nousergon_lib.alerts import publish as _iq_alert
                 except Exception:  # noqa: BLE001 — alerts optional
                     _iq_alert = None
                 gate_signal_inputs(
@@ -5245,7 +5245,7 @@ def _main_impl() -> None:
                     args.pit_parity_pass, peak_mb, budget_mb)
         if peak_mb > budget_mb:
             try:
-                from alpha_engine_lib.alerts import publish as _alerts_publish
+                from nousergon_lib.alerts import publish as _alerts_publish
                 _alerts_publish(
                     f"pit_parity pass={args.pit_parity_pass} peak RSS {peak_mb:.0f} MB "
                     f"exceeded budget {budget_mb:.0f} MB on {args.date} — the per-pass "
@@ -5282,7 +5282,7 @@ def _main_impl() -> None:
             # ``backtest/{date}/pit_parity.json`` with status=failed +
             # error_class + error_msg so the operator's manual-flip gate
             # never sees a missing artifact again; (2) Telegram + SNS
-            # alert via ``alpha_engine_lib.alerts.publish`` (sev=warning,
+            # alert via ``nousergon_lib.alerts.publish`` (sev=warning,
             # dedup-keyed on run_date so a swept-cycle retry collapses to
             # one alert). The 2026-05-17→2026-05-24 incident swallowed
             # 4 silent failures with only an spot-stdout log line —
@@ -5299,7 +5299,7 @@ def _main_impl() -> None:
                     artifact_err,
                 )
             try:
-                from alpha_engine_lib.alerts import publish as _alerts_publish
+                from nousergon_lib.alerts import publish as _alerts_publish
                 run_date = config.get("_run_date") or "unknown"
                 _alerts_publish(
                     f"pit_parity failed on {run_date}: "
@@ -5507,7 +5507,7 @@ def _main_impl() -> None:
                 # gate is the follow-up that classifies legit-vs-garbage.
                 logger.warning("%s", outcome.reason)
                 try:
-                    import alpha_engine_lib.alerts as _alerts
+                    import nousergon_lib.alerts as _alerts
                     _alerts.publish(
                         message=(
                             f"Backtester empty param-sweep (mode={args.mode}, "
