@@ -1390,6 +1390,7 @@ def save(
     monte_carlo: dict | None = None,
     decision_capture_coverage: dict | None = None,
     executor_decision_capture_coverage: dict | None = None,
+    measurement_coverage: dict | None = None,
     provenance_grounding: dict | None = None,
     quant_rank_quality: dict | None = None,
     cio_rule_tag_precision: dict | None = None,
@@ -1509,6 +1510,13 @@ def save(
     for filename, data in [
         ("decision_capture_coverage.json", decision_capture_coverage),
         ("executor_decision_capture_coverage.json", executor_decision_capture_coverage),
+        # Measurement-coverage funnel (config#909): signals→predictions→fills→
+        # P&L. Always-emit (not OK-only) so the dashboard's coverage panel can
+        # distinguish "producer never ran" (absent object) from "ran, some
+        # stage unmeasured this cycle" (partial body with explicit nulls) —
+        # same rationale as the freshness-monitored artifacts above. The
+        # consumer reads explicit nulls as N/A rather than fabricating 0%.
+        ("coverage.json", measurement_coverage),
         # team_metrics carries no status field; emit whenever populated (the
         # evaluator passes `team_metrics or None`, so empty {} reaches here as None).
         ("team_metrics.json", team_metrics),
