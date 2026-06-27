@@ -26,6 +26,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pandas as pd
 import pytest
+from botocore.exceptions import ClientError
 
 from synthetic import predictor_backtest
 from synthetic.pit_weights import _ARCHIVE_PREFIX
@@ -214,7 +215,12 @@ def test_download_helper_messages_survive_pit_keys():
     error substrings the model_source guard asserts, for any key — so a
     missing archived booster is just as legible as a missing live one."""
     s3 = MagicMock()
-    s3.download_file.side_effect = Exception("NoSuchKey")
+    # botocore raises ClientError (NoSuchKey) for a missing object — the real
+    # type _download_gbm_to_temp's narrowed except now catches (#806).
+    s3.download_file.side_effect = ClientError(
+        {"Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."}},
+        "GetObject",
+    )
     akey = "predictor/weights/meta/archive/2026-05-10/momentum_model.txt"
     with pytest.raises(RuntimeError) as exc:
         predictor_backtest._download_gbm_to_temp(s3, "b", akey, akey + ".meta.json")
