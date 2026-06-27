@@ -488,6 +488,18 @@ def compute_lift_metrics(
             logger.warning("neutralized_composite_ic failed (non-fatal): %s", _nci)
             result["neutralized_composite_ic"] = {"status": "error", "reason": str(_nci)}
 
+        # 1d. GRADED LIVE forward efficacy from the PERSISTED neutralized score
+        # (config#1187). Unlike 1c (which re-derives neutralization from history
+        # via _xs_neutralize), this reads the dual field the live cutover now
+        # persists to cio_evaluations and joins THE ACTUAL live ranking score to
+        # realized 21d alpha — the true forward measurement. Honest skip until
+        # the research.db migration + a live cutover cohort land. Fail-soft.
+        try:
+            result["neutralization_live_forward_ic"] = _neutralized_live_forward_ic(conn)
+        except Exception as _nlf:  # pragma: no cover - defensive
+            logger.warning("neutralization_live_forward_ic failed (non-fatal): %s", _nlf)
+            result["neutralization_live_forward_ic"] = {"status": "error", "reason": str(_nlf)}
+
         # 2. Team lift
         result["team_lift"] = _team_lift(conn, ur, date_filter, params)
 
@@ -1233,6 +1245,151 @@ def _neutralized_composite_ic(
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "team_candidates / universe_returns table not found"}
+    except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
+        return {"status": "error", "reason": str(e)}
+
+
+def _neutralized_live_forward_ic(conn) -> dict:
+    """Graded LIVE forward efficacy of the #1142 neutralization (config#1187).
+
+    The companion ``_neutralized_composite_ic.live_forward`` block measures a
+    RE-DERIVED counterfactual: it residualizes ``team_candidates.quant_score``
+    with the backtester's ``_xs_neutralize`` (which only MIRRORS the live
+    residualizer) and segments at the cutover. It never reads the score the live
+    system ACTUALLY ranked on — because, before config#1187, that score was
+    written only to ``signals.json`` and never persisted to ``research.db``.
+
+    config#1187 fixes that at the source: ``cio_evaluations`` now persists BOTH
+    the raw composite (``final_score``) AND the live neutralized ranking score
+    (``neutralized_final_score``) as a DUAL field, populated at the exact point
+    the live cutover rewrites the signal. This producer is the consumer: it
+    joins the PERSISTED neutralized score to realized 21d log market-relative
+    alpha (``universe_returns``) and computes the per-week cross-sectional
+    Spearman rank-IC for BOTH the raw and the LIVE neutralized score, then the
+    per-week paired delta (neutralized − raw) with a date-clustered
+    Grinold-Kahn one-sample t-test (config#1164). Each week is ONE observation;
+    ``n_weeks`` = effective N.
+
+    Unlike the re-derived counterfactual, this is the ACTUAL live ranking score's
+    realized forward efficacy — the measurement the issue's 'closes when'
+    requires. Rows where ``neutralized_final_score`` is NULL (the live gate was
+    OFF, or the name had no neutralized score) are identity: neutralized == raw,
+    so a pre-cutover / gate-off week shows a zero delta rather than spurious lift.
+
+    Fail-soft: any precondition miss / error -> status skipped/insufficient_data/
+    error, never breaking the e2e_lift contract. Returns ``live_forward`` (rows
+    with a NON-NULL persisted neutralized score, i.e. the live cutover cohorts)
+    and ``all_weeks`` (every week with realized outcomes, for context).
+    """
+    try:
+        tabs = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "cio_evaluations" not in tabs or "universe_returns" not in tabs:
+            return {"status": "skipped", "reason": "cio_evaluations / universe_returns absent"}
+        ce_cols = {r[1] for r in conn.execute("PRAGMA table_info(cio_evaluations)")}
+        if "neutralized_final_score" not in ce_cols:
+            # research.db predates the config#1187 migration — the persisted
+            # dual field does not exist yet. Honest skip (NOT an error): the
+            # measurement only becomes possible once the migrated writer has run.
+            return {
+                "status": "skipped",
+                "reason": "cio_evaluations.neutralized_final_score not present "
+                          "(research.db pre-config#1187 migration)",
+            }
+        if "final_score" not in ce_cols:
+            return {"status": "skipped", "reason": "cio_evaluations missing final_score"}
+        ur_cols = {r[1] for r in conn.execute("PRAGMA table_info(universe_returns)")}
+        if not {"log_return_21d", "log_spy_return_21d"}.issubset(ur_cols):
+            return {"status": "skipped", "reason": "universe_returns lacks log_return_21d / log_spy_return_21d"}
+
+        m = pd.read_sql_query(
+            "SELECT ce.ticker AS ticker, ce.eval_date AS eval_date, "
+            "ce.final_score AS raw_score, "
+            "ce.neutralized_final_score AS neu_score, "
+            "(u.log_return_21d - u.log_spy_return_21d) AS log_alpha_21d "
+            "FROM cio_evaluations ce "
+            "JOIN universe_returns u ON u.ticker = ce.ticker AND u.eval_date = ce.eval_date "
+            "WHERE u.log_return_21d IS NOT NULL AND u.log_spy_return_21d IS NOT NULL "
+            "AND ce.final_score IS NOT NULL",
+            conn,
+        )
+        if m.empty:
+            return {"status": "insufficient_data", "reason": "no cio_evaluations rows with realized 21d outcomes"}
+
+        # Where the live gate did NOT rewrite this name (NULL persisted
+        # neutralized score), the live ranking == the raw composite. Treating it
+        # as identity is exactly right: the neutralization had no live effect on
+        # that name, so its raw and neutralized forward IC must coincide.
+        m["neu_eff"] = m["neu_score"].where(m["neu_score"].notna(), m["raw_score"])
+        # A row is a LIVE neutralization cohort member iff a neutralized score
+        # was actually persisted for it (gate ON for that run).
+        m["is_live"] = m["neu_score"].notna()
+
+        def _weekly_ic(df: pd.DataFrame) -> list:
+            weeks = []
+            for d, g in df.groupby("eval_date"):
+                if len(g) < 10:  # need enough names for a stable weekly IC
+                    continue
+                raw_ic = g["raw_score"].corr(g["log_alpha_21d"], method="spearman")
+                neu_ic = g["neu_eff"].corr(g["log_alpha_21d"], method="spearman")
+                if raw_ic != raw_ic or neu_ic != neu_ic:  # NaN (constant within week)
+                    continue
+                weeks.append({
+                    "eval_date": str(d),
+                    "raw_ic": float(raw_ic),
+                    "neu_ic": float(neu_ic),
+                    "delta": float(neu_ic - raw_ic),
+                })
+            return weeks
+
+        from scipy.stats import ttest_1samp as _ttest_1samp
+
+        def _segment(df: pd.DataFrame) -> dict:
+            weeks = _weekly_ic(df)
+            n = len(weeks)
+            out: dict = {
+                "n_weeks": n,
+                "raw_mean_weekly_ic": round(
+                    float(sum(w["raw_ic"] for w in weeks) / n), 4) if n else None,
+                "neutralized_mean_weekly_ic": round(
+                    float(sum(w["neu_ic"] for w in weeks) / n), 4) if n else None,
+                "mean_weekly_delta": round(
+                    float(sum(w["delta"] for w in weeks) / n), 4) if n else None,
+                "delta_t_p": None,
+                "recovers_edge_live": False,
+                "significant": False,
+            }
+            deltas = [w["delta"] for w in weeks]
+            if n >= 3 and len({round(x, 9) for x in deltas}) >= 2:
+                _t, _p = _ttest_1samp(deltas, 0.0)
+                out["delta_t_p"] = round(float(_p), 4) if _p == _p else None
+            out["recovers_edge_live"] = bool(
+                out["mean_weekly_delta"] is not None and out["mean_weekly_delta"] > 0
+            )
+            out["significant"] = bool(
+                n >= 4 and out["delta_t_p"] is not None and out["delta_t_p"] < 0.05
+            )
+            return out
+
+        live_df = m[m["is_live"]]
+        live_forward = _segment(live_df)
+        all_weeks = _segment(m)
+
+        return {
+            "status": "ok",
+            "horizon": "21d",
+            "source": "persisted cio_evaluations.neutralized_final_score (config#1187)",
+            "cutover_date": NEUTRALIZATION_LIVE_CUTOVER_DATE,
+            "n_live_rows": int(m["is_live"].sum()),
+            "n_total_rows": int(len(m)),
+            "live_forward": live_forward,
+            "all_weeks": all_weeks,
+        }
+    except sqlite3.OperationalError:
+        return {"status": "skipped", "reason": "cio_evaluations / universe_returns table not found"}
     except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
         return {"status": "error", "reason": str(e)}
 
