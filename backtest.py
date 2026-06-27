@@ -84,7 +84,6 @@ import yaml
 from analysis import param_sweep
 from optimizer import executor_optimizer
 from optimizer.config_archive import read_params_pit_or_current
-from emailer import send_report_email
 from reporter import build_report, save, upload_to_s3
 from pipeline_common import (
     PhaseOutcome,
@@ -5611,33 +5610,35 @@ def _main_impl() -> None:
             )
             print(f"\nUploaded to s3://{config.get('output_bucket')}/{config.get('output_prefix')}/{args.date}/")
 
-        # Suppress email for smoke-phase runs and any run with --freeze
-        # set (freeze signals "don't promote / don't notify"; smoke-phase
-        # modes are test invocations with synthetic fixtures and their
-        # reports would pollute the operator inbox + risk being confused
-        # with real Saturday SF emails). Detection uses _is_smoke_phase
-        # (captured at main() entry, before args.mode was rewritten to
-        # the routed full mode) and args.freeze.
-        suppress_email = _is_smoke_phase or args.freeze
-        sender = config.get("email_sender")
-        recipients = config.get("email_recipients", [])
-        if suppress_email:
-            logger.info(
-                "Email suppressed (mode=%s, freeze=%s) — skipping report email",
-                _original_mode, args.freeze,
-            )
-        elif sender and recipients:
-            send_report_email(
-                run_date=args.date,
-                report_md=report_md,
-                status="simulation",
-                sender=sender,
-                recipients=recipients,
-                s3_bucket=config.get("output_bucket") if args.upload else None,
-                s3_prefix=config.get("output_prefix", "backtest"),
-            )
-        else:
-            logger.warning("No email_sender/email_recipients in config — skipping email")
+            # Persist the deployed-strategy headline as a first-class artifact so
+            # the consolidated weekly digest (sent by evaluate.py, a separate
+            # process) can source the live-performance headline robustly instead
+            # of re-parsing report.md. Best-effort: a failure must not break the
+            # run — the headline still renders in the uploaded report.md.
+            try:
+                _ps_bucket = config.get("output_bucket", "alpha-engine-research")
+                _ps_key = f"backtest/{args.date}/production_stats.json"
+                boto3.client("s3").put_object(
+                    Bucket=_ps_bucket, Key=_ps_key,
+                    Body=json.dumps(production_stats, default=str, indent=2).encode("utf-8"),
+                    ContentType="application/json",
+                )
+                logger.info("persisted deployed-strategy headline s3://%s/%s", _ps_bucket, _ps_key)
+            except Exception as _ps_exc:  # noqa: BLE001 — digest enrichment is best-effort
+                logger.warning("production_stats.json persist failed (non-fatal): %s", _ps_exc)
+
+        # The standalone simulation email is RETIRED — its content is now folded
+        # into the single consolidated weekly digest sent by evaluate.py (which
+        # runs last in the atomic spot pipeline and deep-links to the console for
+        # the full detail), mirroring the EOD and model-zoo digest patterns. The
+        # full simulation report.md + the deployed-strategy headline
+        # (production_stats.json) are uploaded above for the console + the digest
+        # to consume. backtest.py therefore sends no email of its own.
+        logger.info(
+            "Simulation email retired — folded into evaluate.py's consolidated "
+            "Backtest+Eval digest (report.md + production_stats.json uploaded for "
+            "the console Analysis page)."
+        )
     except Exception as e:
         logger.error("Report/upload/email failed: %s", e)
         if fd:

@@ -88,8 +88,8 @@ from optimizer import (
 )
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
 from optimizer.config_archive import read_params_pit_or_current
-from emailer import send_report_email
-from reporter import build_report, save, upload_to_s3
+from emailer import send_digest_email
+from reporter import build_digest, build_report, save, upload_to_s3
 from completeness import CompletenessTracker
 from pipeline_common import (
     load_config,
@@ -1696,19 +1696,50 @@ def _main_impl() -> None:
                 except Exception as e:
                     logger.warning("Grade history update failed (non-fatal): %s", e)
 
-        # Email
+        # Email — ONE consolidated Backtest+Eval digest (config: single-email
+        # consolidation). Replaces BOTH the simulation email (retired in
+        # backtest.py) and the former full-markdown evaluator email. The digest
+        # is a thin executive summary; the full backtest + evaluation detail
+        # lives on the console Analysis page (deep-linked, keyed by run_date) +
+        # the uploaded report.md artifacts — mirroring the EOD + model-zoo
+        # patterns. Sim-side headlines (deployed-strategy performance, optimizer
+        # sweep) are produced by backtest.py and read back here best-effort from
+        # S3; their absence degrades the digest gracefully (the console link
+        # still carries the full detail).
         sender = config.get("email_sender")
         recipients = config.get("email_recipients", [])
         if sender and recipients:
-            send_report_email(
+            _bucket = config.get("output_bucket", "alpha-engine-research")
+
+            def _read_sim_json(name):
+                try:
+                    obj = boto3.client("s3").get_object(
+                        Bucket=_bucket, Key=f"backtest/{args.date}/{name}")
+                    return json.loads(obj["Body"].read())
+                except Exception as _e:  # noqa: BLE001 — best-effort digest enrichment
+                    logger.info("digest: %s unavailable (non-fatal): %s", name, _e)
+                    return None
+
+            digest_md = build_digest(
                 run_date=args.date,
-                report_md=report_md,
-                status=sq_result.get("status", "unknown"),
+                grading=grading_result,
+                production_stats=_read_sim_json("production_stats.json"),
+                optimizer_param_sweep=_read_sim_json("optimizer_param_sweep.json"),
+                weight_result=opt_results.get("weight_result"),
+                veto_result=opt_results.get("veto_result"),
+                executor_rec=opt_results.get("executor_rec"),
+                regression_result=regression_result,
+                completeness=tracker.summary(),
+                degraded_modules=tracker.degraded_modules(),
+                failed_modules=tracker.failed_modules(),
+            )
+            send_digest_email(
+                run_date=args.date,
+                digest_md=digest_md,
                 sender=sender,
                 recipients=recipients,
-                s3_bucket=config.get("output_bucket") if args.upload else None,
-                s3_prefix=config.get("output_prefix", "evaluation"),
-                product_name="Evaluator",
+                status=sq_result.get("status", "ok"),
+                s3_bucket=_bucket if args.upload else None,
             )
 
         report_ok = True

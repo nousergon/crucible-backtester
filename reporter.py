@@ -1289,6 +1289,90 @@ def build_report(
     return "\n".join(lines)
 
 
+def build_digest(
+    run_date: str,
+    *,
+    grading: dict | None = None,
+    production_stats: dict | None = None,
+    optimizer_param_sweep: dict | None = None,
+    weight_result: dict | None = None,
+    veto_result: dict | None = None,
+    executor_rec: dict | None = None,
+    regression_result: dict | None = None,
+    completeness: dict | None = None,
+    degraded_modules: list[str] | None = None,
+    failed_modules: list[str] | None = None,
+) -> str:
+    """Build the SHORT consolidated digest markdown — the executive summary that
+    headlines the single weekly backtester+evaluation email.
+
+    Reuses the same ``_section_*`` renderers as ``build_report`` (DRY — the
+    digest is a curated SUBSET, never a divergent re-implementation), so a metric
+    reads identically in the email headline and the full console report. The
+    full detail (every diagnostic, ablation, attribution) stays in ``report.md``
+    on S3 + the console Analysis page the email deep-links to.
+
+    Sections (each omitted cleanly when its input is absent):
+      • Deployed-strategy headline (the live-trading risk-matched performance).
+      • Optimizer-param sweep recommendation (the auto-tuned MVO cell).
+      • System Report Card (overall + per-module grades).
+      • What Changed This Week (config promotions + regression verdict).
+      • Evaluator completeness counts (so a degraded run is visible at a glance).
+    """
+    lines = [
+        "# Alpha Engine — Weekly Backtest + Evaluation Digest",
+        f"_Run date: {run_date}_",
+        "",
+        "_Executive summary — the full detail is on the console "
+        "(linked below) and in the uploaded report.md artifacts._",
+        "",
+        "---",
+        "",
+    ]
+
+    # Deployed-strategy headline — the number operators trust as live performance.
+    if production_stats is not None:
+        lines += _section_deployed_strategy(production_stats)
+        lines += [""]
+
+    # Optimizer-param sweep recommendation (the tuned MVO cell).
+    if optimizer_param_sweep is not None:
+        lines += _section_optimizer_param_sweep(optimizer_param_sweep)
+
+    # System Report Card — overall + per-module grades.
+    if grading and grading.get("status") in ("ok", "partial"):
+        lines += _section_scorecard(grading)
+
+    # What Changed This Week — config promotions + regression verdict.
+    lines += _section_what_changed(
+        weight_result=weight_result,
+        veto_result=veto_result,
+        executor_rec=executor_rec,
+        regression_result=regression_result,
+    )
+
+    # Evaluator completeness — make a degraded/partial run obvious in the inbox.
+    if completeness is not None:
+        lines += [
+            "",
+            "## Evaluator Completeness",
+            "",
+            "| Status | Count |",
+            "|--------|-------|",
+            f"| OK | {completeness.get('ok', 0)} |",
+            f"| Degraded | {completeness.get('degraded', 0)} |",
+            f"| Skipped | {completeness.get('skipped', 0)} |",
+            f"| Error | {completeness.get('error', 0)} |",
+            f"| **Total** | **{completeness.get('total', 0)}** |",
+        ]
+        if degraded_modules:
+            lines += ["", f"**Degraded modules:** {', '.join(degraded_modules)}"]
+        if failed_modules:
+            lines += ["", f"**Failed modules:** {', '.join(failed_modules)}"]
+
+    return "\n".join(lines)
+
+
 def save(
     report_md: str,
     signal_quality: dict,
