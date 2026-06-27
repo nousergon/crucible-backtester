@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 import boto3
 import numpy as np
 import pandas as pd
+from botocore.exceptions import BotoCoreError, ClientError
 from scipy.stats import spearmanr
 
 from pipeline_common import (
@@ -174,7 +175,11 @@ def compute_feature_drift(
             len(drifted_features), evaluated_count, drift_fraction * 100,
             recommendation, len(joined),
         )
-    except Exception as exc:
+    except (ClientError, BotoCoreError, TypeError, ValueError) as exc:
+        # Fail-soft: the drift result is already computed and returned to the
+        # caller; persisting it to S3 is best-effort. Narrowed to S3/botocore
+        # transport errors plus the TypeError/ValueError a non-serializable
+        # value in ``result`` would raise in json.dumps.
         log.warning("Failed to write feature_drift.json to S3: %s", exc)
 
     return result
@@ -218,13 +223,24 @@ def _load_features_from_arctic(
                     feat_cols = [c for c in df.columns if c not in OHLCV_COLS]
                     if feat_cols:
                         result[ticker] = df[feat_cols]
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                # Intentionally broad per-ticker resilience boundary: one
+                # corrupt / unreadable symbol must not abort the whole feature
+                # load. ArcticDB read raises library-specific exceptions whose
+                # hierarchy is not statically importable here (arcticdb is an
+                # optional, lazily-imported dep), so we cannot enumerate a
+                # precise type set — skip the bad ticker and continue.
+                continue
 
         log.info("Feature drift: loaded features for %d/%d tickers from ArcticDB", len(result), len(tickers))
         return result
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
+        # Intentionally broad ArcticDB-connection boundary: open_universe_lib /
+        # list_symbols failures (network, missing library, auth) are all
+        # arcticdb-internal exception types not importable without the optional
+        # arcticdb dep. Feature drift degrades to "no_feature_data" rather than
+        # crashing the diagnostics run.
         log.warning("Feature drift: ArcticDB load failed: %s", exc)
         return {}
 
@@ -277,6 +293,11 @@ def _load_training_feature_ics(bucket: str) -> dict[str, float]:
         obj = s3.get_object(Bucket=bucket, Key="predictor/metrics/training_summary_latest.json")
         summary = json.loads(obj["Body"].read())
         return summary.get("feature_ics", {})
-    except Exception as exc:
+    except (ClientError, BotoCoreError, ValueError, KeyError) as exc:
+        # Fail-soft: a missing/unreadable training summary just means we can't
+        # compare production ICs to a training baseline (drift comparison
+        # degrades to "no baseline"). Narrowed to S3/botocore transport errors,
+        # the ValueError from json.loads on a malformed body, and the KeyError
+        # from an unexpected get_object response shape.
         log.debug("Failed to load training feature ICs: %s", exc)
         return {}

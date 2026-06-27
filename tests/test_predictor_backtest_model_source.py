@@ -23,6 +23,22 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from botocore.exceptions import ClientError
+
+
+def _no_such_key_error(operation: str = "GetObject") -> ClientError:
+    """Build the ClientError boto3 actually raises for a missing S3 key.
+
+    The download-failure tests originally raised a bare ``Exception`` to
+    simulate a missing object; that never happens in production — botocore
+    surfaces a NoSuchKey as a ``ClientError``. Using the real type keeps the
+    tests honest against ``_download_gbm_to_temp``'s narrowed
+    ``except (ClientError, BotoCoreError, OSError)`` (#806).
+    """
+    return ClientError(
+        {"Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."}},
+        operation,
+    )
 
 
 def test_download_gbm_model_pulls_momentum_model(monkeypatch):
@@ -61,7 +77,7 @@ def test_download_gbm_model_hard_fails_when_model_missing(monkeypatch):
     """Missing momentum_model.txt is a PredictorTraining-pipeline
     problem, not something to silently fall back on."""
     mock_s3 = MagicMock()
-    mock_s3.download_file.side_effect = Exception("NoSuchKey")
+    mock_s3.download_file.side_effect = _no_such_key_error()
     monkeypatch.setattr("boto3.client", lambda *a, **kw: mock_s3)
 
     from synthetic import predictor_backtest
@@ -85,7 +101,7 @@ def test_download_gbm_model_hard_fails_when_meta_missing(monkeypatch):
         call_count["n"] += 1
         # First call (booster) succeeds. Second call (meta.json) fails.
         if call_count["n"] == 2:
-            raise Exception("NoSuchKey: momentum_model.txt.meta.json")
+            raise _no_such_key_error()
 
     mock_s3 = MagicMock()
     mock_s3.download_file.side_effect = fake_download_file
