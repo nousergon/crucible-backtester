@@ -518,9 +518,9 @@ def _persist_per_agent_analysis(
     within a week land on distinct YYMMDDHHMM run_ids rather than
     clobbering the single weekly file); the per-agent ``latest.json`` is
     a pure mirror of that agent's most-recently-written analysis. Key
-    format is owned by ``alpha_engine_lib.eval_artifacts``.
+    format is owned by ``nousergon_lib.eval_artifacts``.
     """
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key,
         eval_latest_key,
         new_eval_run_id,

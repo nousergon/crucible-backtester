@@ -44,6 +44,7 @@ import time
 import pandas as pd
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 from synthetic.signal_generator import predictions_to_signals
 
@@ -97,7 +98,12 @@ def _log_rss(label: str) -> None:
             rss_bytes = rusage.ru_maxrss * 1024
         rss_mb = rss_bytes / (1024 * 1024)
         logger.info("MEM %s: RSS=%.0f MB", label, rss_mb)
-    except Exception as exc:
+    except (OSError, ValueError, ImportError, AttributeError) as exc:
+        # Pure observability — must never fail the caller. Narrowed to the real
+        # surface: OSError reading /proc, ValueError parsing the VmRSS line,
+        # ImportError on the resource fallback (non-Linux), AttributeError on
+        # the rusage attribute. Anything outside this set is a real bug and
+        # should propagate rather than be silently swallowed.
         logger.debug("MEM %s: failed to sample RSS: %s", label, exc)
 
 
@@ -246,7 +252,14 @@ def compute_all_features(
             else:
                 skip_reasons["empty_features"] += 1
                 logger.debug("Skip %s: empty_features after compute", ticker)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
+            # Intentionally broad per-ticker resilience boundary: compute_features
+            # is external predictor code (data.feature_engineer) that can raise a
+            # wide, unenumerable range (KeyError, ValueError, pandas/numpy errors,
+            # divide-by-zero on degenerate windows). A single bad ticker must not
+            # abort the whole ~900-ticker feature build — it is recorded as a
+            # computation_error and skipped. The failure type is captured in the
+            # warning so the surface is observable.
             logger.warning("Feature computation failed for %s: %s", ticker, type(e).__name__)
             skip_reasons["computation_error"] += 1
 
@@ -319,7 +332,11 @@ def _download_gbm_to_temp(s3, bucket: str, model_key: str, meta_key: str) -> str
     try:
         s3.download_file(bucket, model_key, model_tmp.name)
         logger.info("Downloaded Layer-1A momentum GBM from s3://%s/%s", bucket, model_key)
-    except Exception as exc:
+    except (ClientError, BotoCoreError, OSError) as exc:
+        # Hard-fail (re-raise as RuntimeError): a missing booster is a
+        # PredictorTraining-pipeline problem the caller must see. Narrowed to
+        # the real surface — S3/botocore download errors (missing key, auth,
+        # network) and the OSError a local temp-file write failure would raise.
         raise RuntimeError(
             f"Layer-1A momentum GBM not found at s3://{bucket}/{model_key}. "
             "Saturday PredictorTraining step must populate "
@@ -334,7 +351,11 @@ def _download_gbm_to_temp(s3, bucket: str, model_key: str, meta_key: str) -> str
     meta_path = model_tmp.name + ".meta.json"
     try:
         s3.download_file(bucket, meta_key, meta_path)
-    except Exception as exc:
+    except (ClientError, BotoCoreError, OSError) as exc:
+        # Same hard-fail discipline as the booster leg: a missing meta.json
+        # would crash the downstream feature_names alignment in a less useful
+        # place, so re-raise loudly. Narrowed to S3/botocore + local-write
+        # (OSError) errors.
         raise RuntimeError(
             f"Layer-1A momentum GBM metadata not found at s3://{bucket}/"
             f"{meta_key}. feature_names alignment will fail without it. "

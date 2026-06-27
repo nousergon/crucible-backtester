@@ -25,8 +25,8 @@ def test_check_lib_version_passes_when_installed_meets_minimum(monkeypatch):
     from preflight import BacktesterPreflight, MIN_LIB_VERSION
 
     # Force the installed version to be exactly the minimum — must pass.
-    import alpha_engine_lib
-    monkeypatch.setattr(alpha_engine_lib, "__version__", MIN_LIB_VERSION, raising=False)
+    import nousergon_lib
+    monkeypatch.setattr(nousergon_lib, "__version__", MIN_LIB_VERSION, raising=False)
     preflight = BacktesterPreflight(bucket="test-bucket", mode="backtest")
     preflight._check_lib_version()  # must not raise
 
@@ -34,8 +34,8 @@ def test_check_lib_version_passes_when_installed_meets_minimum(monkeypatch):
 def test_check_lib_version_passes_when_installed_exceeds_minimum(monkeypatch):
     from preflight import BacktesterPreflight
 
-    import alpha_engine_lib
-    monkeypatch.setattr(alpha_engine_lib, "__version__", "99.99.99", raising=False)
+    import nousergon_lib
+    monkeypatch.setattr(nousergon_lib, "__version__", "99.99.99", raising=False)
     preflight = BacktesterPreflight(bucket="test-bucket", mode="backtest")
     preflight._check_lib_version()  # must not raise
 
@@ -43,8 +43,8 @@ def test_check_lib_version_passes_when_installed_exceeds_minimum(monkeypatch):
 def test_check_lib_version_fails_when_installed_below_minimum(monkeypatch):
     from preflight import BacktesterPreflight
 
-    import alpha_engine_lib
-    monkeypatch.setattr(alpha_engine_lib, "__version__", "0.0.1", raising=False)
+    import nousergon_lib
+    monkeypatch.setattr(nousergon_lib, "__version__", "0.0.1", raising=False)
     preflight = BacktesterPreflight(bucket="test-bucket", mode="backtest")
 
     with pytest.raises(RuntimeError) as exc:
@@ -58,9 +58,9 @@ def test_check_lib_version_fails_when_installed_below_minimum(monkeypatch):
 def test_check_lib_version_fails_when_version_missing(monkeypatch):
     from preflight import BacktesterPreflight
 
-    import alpha_engine_lib
+    import nousergon_lib
     # Pretend __version__ isn't defined
-    monkeypatch.delattr(alpha_engine_lib, "__version__", raising=False)
+    monkeypatch.delattr(nousergon_lib, "__version__", raising=False)
     preflight = BacktesterPreflight(bucket="test-bucket", mode="backtest")
 
     with pytest.raises(RuntimeError, match="no __version__"):
@@ -176,7 +176,7 @@ def test_check_imports_inserts_executor_and_predictor_paths(monkeypatch, tmp_pat
     assert str(exec_root) in sys.path
     assert str(pred_root) in sys.path
     # Every critical module was import-attempted.
-    assert "alpha_engine_lib.arcticdb" in recorded
+    assert "nousergon_lib.arcticdb" in recorded
     assert "executor.main" in recorded
     assert "model.gbm_scorer" in recorded
 
@@ -206,7 +206,7 @@ def test_critical_imports_list_is_nonempty_and_stringy():
     assert all(isinstance(n, str) and "." in n for n in _CRITICAL_IMPORTS_BACKTEST)
     # These two are the specific modules we added after the 80-min burn
     # — test guards against accidental removal.
-    assert "alpha_engine_lib.arcticdb" in _CRITICAL_IMPORTS_BACKTEST
+    assert "nousergon_lib.arcticdb" in _CRITICAL_IMPORTS_BACKTEST
     assert "synthetic.predictor_backtest" in _CRITICAL_IMPORTS_BACKTEST
 
 

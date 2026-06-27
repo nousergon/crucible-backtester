@@ -40,6 +40,12 @@ _IC_STD_EPSILON = 1e-8
 # date). Re-exported here so the in-repo callers
 # (``from pipeline_common import resolve_trading_day``) stay unchanged.
 from krepis.dates import resolve_trading_day  # noqa: F401  (re-export)
+# Canonical experiment-package config resolver (alpha-engine-config#1157): the
+# lift of the five inline _find_config / load_config / config_loader copies into
+# the shared-lib chokepoint. The two backtester readers below (config.yaml,
+# predictor.yaml) delegate to it; their repo-specific tails (_validate_config,
+# the forward_days no-repo-local-fallback) are preserved here.
+from nousergon_lib.config import resolve_experiment_config
 
 
 # ── Predictor outcomes column-canonicalization helpers ───────────────────────
@@ -99,15 +105,21 @@ def _load_active_horizon_days(
         # alpha-engine-config/predictor/predictor.yaml. Mirrors load_config's
         # precedence exactly. Behavior-preserving: config#1159 made the package
         # copy byte-identical to legacy.
-        exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
-        config_roots = [
-            Path.home() / "alpha-engine-config",
-            Path(__file__).parent.parent / "alpha-engine-config",
-        ]
-        search_paths = [
-            r / "experiments" / exp / "predictor" / "predictor.yaml" for r in config_roots
-        ]
-        search_paths += [r / "predictor" / "predictor.yaml" for r in config_roots]
+        #
+        # Delegates to the canonical nousergon-lib resolver
+        # (resolve_experiment_config, alpha-engine-config#1157). This reader has
+        # NO repo-local fallback (the backtester ships no predictor.yaml — a
+        # missing file yields ``default``), so the lib's default repo-local
+        # candidate (``<repo>/predictor/predictor.yaml``) is dropped to keep the
+        # candidate set identical to the inline copy: the 4 config-repo paths
+        # only.
+        config_repo_candidates = resolve_experiment_config(
+            "predictor",
+            "predictor.yaml",
+            repo_root=Path(__file__).parent,
+            repo_local_fallback=Path(__file__).parent / "predictor" / "predictor.yaml",
+        )
+        search_paths = config_repo_candidates[:-1]
     for p in search_paths:
         if not p.exists():
             continue
@@ -889,18 +901,16 @@ def load_config(path: str) -> dict:
     # experiments/$ALPHA_ENGINE_EXPERIMENT_ID/backtester/config.yaml (default
     # experiment `reference`) ahead of the legacy top-level
     # alpha-engine-config/backtester/config.yaml, then the repo-local fallback.
-    # Mirrors alpha-engine-research/config.py + alpha-engine-data weekly_collector.
-    exp = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
-    config_roots = [
-        Path.home() / "alpha-engine-config",
-        Path(__file__).parent.parent / "alpha-engine-config",
-    ]
-    search_paths = [r / "experiments" / exp / "backtester" / "config.yaml" for r in config_roots]
-    search_paths += [r / "backtester" / "config.yaml" for r in config_roots]
-    search_paths.append(Path(path))
-    resolved = next((p for p in search_paths if p.exists()), None)
-    if resolved is None:
-        raise FileNotFoundError(f"Config not found. Searched: {[str(p) for p in search_paths]}")
+    # Delegates to the canonical nousergon-lib resolver
+    # (resolve_experiment_config, alpha-engine-config#1157); the backtester's
+    # repo-local fallback (``path``) and the _validate_config tail are preserved.
+    resolved = resolve_experiment_config(
+        "backtester",
+        "config.yaml",
+        repo_root=Path(__file__).parent,
+        repo_local_fallback=Path(path),
+        resolve=True,
+    )
     with open(resolved) as f:
         config = yaml.safe_load(f)
     _validate_config(config, str(resolved))

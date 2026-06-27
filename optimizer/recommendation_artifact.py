@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import logging
 
-from alpha_engine_lib.eval_artifacts import new_eval_run_id
+from nousergon_lib.eval_artifacts import new_eval_run_id
 from dataclasses import asdict, dataclass, field
 from datetime import date as _date
 from typing import Literal
@@ -92,7 +92,7 @@ class RecommendationArtifact:
     promotion_intent: PromotionIntent
     schema_version: int = 1
     # run_id is the canonical YYMMDDHHMM identifier per
-    # alpha_engine_lib.eval_artifacts (v0.8.0). Replaces the prior UUIDv4
+    # nousergon_lib.eval_artifacts (v0.8.0). Replaces the prior UUIDv4
     # convention — sortable lex, human-readable, encodes when-it-fired.
     # Same-minute collisions are by design (only one Sat-SF per
     # optimizer per cycle in production). Path shape preserved since

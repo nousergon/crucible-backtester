@@ -1,18 +1,37 @@
 """
-emailer.py — build + send the weekly backtest report.
+emailer.py — build + send each task's thin weekly digest email.
 
-SMTP/SES dispatch is delegated to ``alpha_engine_lib.email_sender.send_email``
-(L4356 chokepoint). This module owns the report-specific subject + HTML/MD
-body builders only.
+``send_digest_email`` sends ONE task's thin executive-summary email that
+deep-links to the console Analysis page for the full detail (mirroring the EOD
+and model-zoo digest patterns). The Backtester and the Evaluator are SEPARATE
+Saturday-SF tasks, so each sends its OWN digest (they are NOT bundled) — the
+former full-markdown bodies are replaced by a thin summary + console link.
+SMTP/SES dispatch is delegated to ``nousergon_lib.email_sender.send_email``
+(L4356 chokepoint); this module owns the subject + HTML/MD body building only.
 """
 
 from __future__ import annotations
 
 import logging
 
-from alpha_engine_lib.email_sender import send_email
+from nousergon_lib.email_sender import send_email
 
 logger = logging.getLogger(__name__)
+
+# Deep-link target for the consolidated digest email → the console Analysis
+# page (backtester + evaluation detail). The slug is pinned in
+# crucible-dashboard app.py (url_path="analysis") and guarded by
+# tests/test_analysis_page.py; the page honors ?date=YYYY-MM-DD keyed by the
+# backtest run_date (the last completed trading day), so the link opens the
+# exact run the digest describes.
+DEFAULT_CONSOLE_BASE_URL = "https://console.nousergon.ai"
+ANALYSIS_SLUG = "analysis"
+
+
+def analysis_report_url(run_date: str, console_base_url: str | None = None) -> str:
+    """Deep-link to the console Analysis page for ``run_date``."""
+    base = (console_base_url or DEFAULT_CONSOLE_BASE_URL).rstrip("/")
+    return f"{base}/{ANALYSIS_SLUG}?date={run_date}"
 
 _HTML = """\
 <!DOCTYPE html>
@@ -40,61 +59,10 @@ _HTML = """\
 """
 
 
-def send_report_email(
-    run_date: str,
-    report_md: str,
-    status: str,
-    sender: str,
-    recipients: list[str],
-    s3_bucket: str | None = None,
-    s3_prefix: str = "backtest",
-    region: str = "us-east-1",
-    product_name: str = "Backtester",
-) -> None:
-    """Build + send the weekly backtest/evaluator report.
-
-    Delegates SMTP/SES dispatch to ``alpha_engine_lib.email_sender.send_email``.
-    The legacy local ``_send_via_smtp`` used ``SMTP_SSL:465``; the lib uses
-    ``SMTP:587`` with STARTTLS — both are Gmail-supported, the latter is
-    the standard pattern across alpha-engine consumers and the one the lib
-    already exercises in production.
-
-    Args:
-        run_date:    Date string for subject line and footer.
-        report_md:   Markdown report string from reporter.build_report().
-        status:      "ok" | "insufficient_data" | "error" — shown in subject.
-        sender:      Explicit From address (overrides EMAIL_SENDER secret).
-        recipients:  Explicit recipient list (overrides EMAIL_RECIPIENTS secret).
-        s3_bucket:   If set, include S3 link to report in footer.
-        s3_prefix:   S3 prefix for report location (default "backtest").
-        region:      AWS region for SES fallback (overrides AWS_REGION).
-    """
-    subject = _build_subject(run_date, status, product_name)
-    html_body, plain_body = _build_body(run_date, report_md, s3_bucket, s3_prefix, product_name)
-    send_email(
-        subject, plain_body,
-        recipients=recipients, html=html_body,
-        sender=sender, region=region,
-    )
-
-
-def _build_subject(run_date: str, status: str, product_name: str = "Backtester") -> str:
-    label = {
-        "ok": "results ready",
-        "insufficient_data": "insufficient data (accumulating)",
-        "db_not_found": "ERROR — research.db not found",
-        "error": "ERROR",
-    }.get(status, status)
-    return f"Alpha Engine {product_name} | {run_date} | {label}"
-
-
-def _build_body(
-    run_date: str,
-    report_md: str,
-    s3_bucket: str | None,
-    s3_prefix: str,
-    product_name: str = "Backtester",
-) -> tuple[str, str]:
+def _md_to_html(report_md: str) -> str:
+    """Convert the minimal markdown subset (tables, headers, blockquotes, hr,
+    bold/italic) used by the report builders to an HTML fragment. Shared by the
+    full-report body and the consolidated digest body."""
     # Convert minimal markdown to HTML (tables, headers, blockquotes, hr)
     import re
     def _md_inline(text: str) -> str:
@@ -164,18 +132,80 @@ def _build_body(
     if in_code_block:
         html_lines.append("</pre>")
 
-    s3_link = ""
+    return "\n".join(html_lines)
+
+
+def send_digest_email(
+    run_date: str,
+    digest_md: str,
+    sender: str,
+    recipients: list[str],
+    *,
+    product_name: str,
+    report_prefix: str,
+    status: str = "ok",
+    console_base_url: str | None = None,
+    s3_bucket: str | None = None,
+    region: str = "us-east-1",
+) -> None:
+    """Send ONE task's thin digest email — a short executive summary that
+    deep-links to the console Analysis page for the full detail (mirroring the
+    EOD-email and model-zoo-digest patterns).
+
+    The Backtester and the Evaluator are SEPARATE Saturday-SF tasks, so each
+    sends its OWN digest via this function (they are NOT bundled): backtest.py
+    calls it with ``product_name="Backtester"``, ``report_prefix="backtest"``;
+    evaluate.py with ``product_name="Evaluator"``, ``report_prefix="evaluation"``.
+    Both land on the same console Analysis page (which has both a Backtester and
+    a Pipeline-Evaluation tab), keyed by run_date.
+
+    Args:
+        run_date:     The run_date (last completed trading day) — subject +
+                      console deep-link + the S3 report.md link.
+        digest_md:    Short executive-summary markdown from reporter.build_digest.
+        product_name: "Backtester" | "Evaluator" — subject + footer label.
+        report_prefix:S3 prefix of THIS task's report.md ("backtest"|"evaluation").
+        status:       "ok" | "insufficient_data" | "error" — shown in subject.
+        console_base_url: Override for the console base (tests); defaults to prod.
+        s3_bucket:    When set, footer links to this task's full report.md.
+    """
+    url = analysis_report_url(run_date, console_base_url)
+    label = {
+        "ok": "results ready",
+        "insufficient_data": "insufficient data (accumulating)",
+        "error": "ERROR",
+    }.get(status, status)
+    subject = f"Alpha Engine {product_name} | {run_date} | {label}"
+
+    cta_html = (
+        f'<p style="font-size:14px;margin:0 0 16px;">&#9654; '
+        f'<a href="{url}"><b>View the full {product_name} report on the '
+        f'console</b></a></p>'
+    )
+    foot_links = f' | <a href="{url}">console</a>'
+    plain_links = ""
     if s3_bucket:
-        url = f"https://{s3_bucket}.s3.amazonaws.com/{s3_prefix}/{run_date}/report.md"
-        s3_link = f' | <a href="{url}">S3 report</a>'
+        report_url = (
+            f"https://{s3_bucket}.s3.amazonaws.com/{report_prefix}/{run_date}/report.md"
+        )
+        foot_links += f' | <a href="{report_url}">report.md</a>'
+        plain_links = f"\nFull report: {report_url}\n"
 
     html_body = _HTML.format(
-        body="\n".join(html_lines),
+        body=cta_html + _md_to_html(digest_md),
         date=run_date,
-        s3_link=s3_link,
+        s3_link=foot_links,
         product_name=product_name,
     )
-    return html_body, report_md  # plain body is just the markdown
+    plain_body = (
+        f"View the full {product_name} report on the console:\n{url}\n\n"
+        f"{digest_md}\n{plain_links}"
+    )
+    send_email(
+        subject, plain_body,
+        recipients=recipients, html=html_body,
+        sender=sender, region=region,
+    )
 
 
 def _md_table_row(line: str, is_header: bool = False) -> str:

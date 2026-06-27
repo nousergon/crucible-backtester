@@ -63,8 +63,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # falls back to two-dirs-up for local dev. flow-doctor.yaml only
 # references EMAIL_* env vars populated by Lambda's `--environment`
 # block before the interpreter starts, so module-top init is safe.
-# Secrets load via alpha_engine_lib.secrets.get_secret() at use-site.
-from alpha_engine_lib.logging import setup_logging, monitor_handler
+# Secrets load via nousergon_lib.secrets.get_secret() at use-site.
+from nousergon_lib.logging import setup_logging, monitor_handler
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -89,7 +89,7 @@ def _ensure_init() -> None:
     """Run deferred init once, on the first handler invocation.
 
     Post-L2998-PR-9c (2026-05-14): secrets load via
-    alpha_engine_lib.secrets.get_secret() at use-site (per-process
+    nousergon_lib.secrets.get_secret() at use-site (per-process
     cached). No bulk SSM fetch on cold-start. Retained for the
     XDG_CACHE_HOME default needed for Lambda's read-only /var/task."""
     global _init_done

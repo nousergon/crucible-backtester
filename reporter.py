@@ -1289,6 +1289,88 @@ def build_report(
     return "\n".join(lines)
 
 
+def build_digest(
+    run_date: str,
+    *,
+    title: str = "Weekly Digest",
+    grading: dict | None = None,
+    production_stats: dict | None = None,
+    optimizer_param_sweep: dict | None = None,
+    weight_result: dict | None = None,
+    veto_result: dict | None = None,
+    executor_rec: dict | None = None,
+    regression_result: dict | None = None,
+    completeness: dict | None = None,
+    degraded_modules: list[str] | None = None,
+    failed_modules: list[str] | None = None,
+) -> str:
+    """Build a SHORT digest markdown — the executive summary that headlines a
+    task's thin weekly email (the Backtester and the Evaluator each build their
+    OWN; they are not bundled). Each section is omitted cleanly when its input is
+    absent, so a caller composes only the parts it owns:
+      • backtest.py → deployed-strategy headline + optimizer-param sweep.
+      • evaluate.py → System Report Card + What Changed + completeness counts.
+
+    Reuses the same ``_section_*`` renderers as ``build_report`` (DRY — the
+    digest is a curated SUBSET, never a divergent re-implementation), so a metric
+    reads identically in the email headline and the full console report. The
+    full detail (every diagnostic, ablation, attribution) stays in ``report.md``
+    on S3 + the console Analysis page the email deep-links to.
+    """
+    lines = [
+        f"# Alpha Engine — {title}",
+        f"_Run date: {run_date}_",
+        "",
+        "_Executive summary — the full detail is on the console "
+        "(linked below) and in the uploaded report.md artifact._",
+        "",
+        "---",
+        "",
+    ]
+
+    # Deployed-strategy headline — the number operators trust as live performance.
+    if production_stats is not None:
+        lines += _section_deployed_strategy(production_stats)
+        lines += [""]
+
+    # Optimizer-param sweep recommendation (the tuned MVO cell).
+    if optimizer_param_sweep is not None:
+        lines += _section_optimizer_param_sweep(optimizer_param_sweep)
+
+    # System Report Card — overall + per-module grades.
+    if grading and grading.get("status") in ("ok", "partial"):
+        lines += _section_scorecard(grading)
+
+    # What Changed This Week — config promotions + regression verdict.
+    lines += _section_what_changed(
+        weight_result=weight_result,
+        veto_result=veto_result,
+        executor_rec=executor_rec,
+        regression_result=regression_result,
+    )
+
+    # Evaluator completeness — make a degraded/partial run obvious in the inbox.
+    if completeness is not None:
+        lines += [
+            "",
+            "## Evaluator Completeness",
+            "",
+            "| Status | Count |",
+            "|--------|-------|",
+            f"| OK | {completeness.get('ok', 0)} |",
+            f"| Degraded | {completeness.get('degraded', 0)} |",
+            f"| Skipped | {completeness.get('skipped', 0)} |",
+            f"| Error | {completeness.get('error', 0)} |",
+            f"| **Total** | **{completeness.get('total', 0)}** |",
+        ]
+        if degraded_modules:
+            lines += ["", f"**Degraded modules:** {', '.join(degraded_modules)}"]
+        if failed_modules:
+            lines += ["", f"**Failed modules:** {', '.join(failed_modules)}"]
+
+    return "\n".join(lines)
+
+
 def save(
     report_md: str,
     signal_quality: dict,
@@ -1741,8 +1823,57 @@ def _section_attribution(attr: dict) -> list[str]:
     lines += [
         "",
         f"Analyzed {attr.get('rows_analyzed', 0)} signals.",
+    ]
+
+    # Headline: multivariate joint attribution (config#920). Standardized
+    # partial coefficients — each input's contribution holding the others
+    # fixed — supersede the independent pairwise Pearson correlations below.
+    mv = attr.get("multivariate") or {}
+    mv_targets = mv.get("targets") or {}
+    if mv.get("status") == "ok" and mv_targets:
+        b10 = mv_targets.get("beat_spy_10d", {})
+        lines += [
+            "",
+            "### Multivariate attribution (joint regression → beat_spy_10d)",
+            "",
+            "Standardized partial coefficients from a joint OLS on sub-scores "
+            "+ market_regime (each input held against the others).",
+            "",
+        ]
+        if b10.get("method") == "multivariate_ols":
+            lines += [
+                "| Input | Std. coefficient |",
+                "|-------|------------------|",
+            ]
+            for label, coef in (b10.get("coefficients") or {}).items():
+                lines.append(f"| {label} | {_fmt(coef)} |")
+            if b10.get("r_squared") is not None:
+                lines += ["", f"R² (10d): {_fmt(b10.get('r_squared'))}"]
+        else:
+            lines += [
+                f"> beat_spy_10d fell back to univariate: {b10.get('note', '')}",
+            ]
+        fell_back = mv.get("targets_fell_back_to_univariate")
+        if fell_back:
+            lines += [
+                "",
+                f"> Targets using univariate fallback (collinear/low-N): "
+                f"{', '.join(fell_back)}",
+            ]
+        mv_rank = mv.get("ranking_10d") or []
+        if mv_rank:
+            lines += ["", f"**Strongest joint driver (10d):** {mv_rank[0]}"]
+    elif mv.get("status") == "fallback":
+        lines += [
+            "",
+            "> Multivariate attribution deferred "
+            f"({mv.get('reason', 'fit not trustworthy')}); "
+            "univariate correlations shown below.",
+        ]
+
+    lines += [
         "",
-        "### Correlation with beat_spy_10d",
+        "### Univariate correlation with beat_spy (context / fallback)",
         "",
         "| Sub-score | Corr (10d) | Corr (30d) | FDR sig (10d) | FDR sig (30d) |",
         "|-----------|------------|------------|---------------|---------------|",
@@ -1756,7 +1887,7 @@ def _section_attribution(attr: dict) -> list[str]:
 
     ranking_10d = attr.get("ranking_10d", [])
     if ranking_10d:
-        lines += ["", f"**Strongest predictor (10d):** {ranking_10d[0]}"]
+        lines += ["", f"**Strongest univariate predictor (10d):** {ranking_10d[0]}"]
 
     fdr_ns = attr.get("fdr_non_significant")
     if fdr_ns:
