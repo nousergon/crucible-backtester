@@ -198,7 +198,7 @@ def _load_features_from_arctic(
     """Load feature DataFrames for specific tickers from ArcticDB."""
     try:
         from store.arctic_reader import OHLCV_COLS
-        from alpha_engine_lib.arcticdb import open_universe_lib
+        from nousergon_lib.arcticdb import open_universe_lib
     except ImportError:
         log.warning("ArcticDB reader not available — cannot load features")
         return {}

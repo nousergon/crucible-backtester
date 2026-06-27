@@ -159,7 +159,7 @@ def _write_artifact_to_s3(bucket: str, run_date: str, report: dict) -> str | Non
 
     Returns the S3 key on success, ``None`` on failure. Never raises — pit_parity
     is observational and a failed upload must not fail the spot run. The
-    fail-loud surface is ``alpha_engine_lib.alerts.publish`` at the
+    fail-loud surface is ``nousergon_lib.alerts.publish`` at the
     ``backtest.py::main`` outer handler (per ``feedback_no_silent_fails``
     secondary-observability carve-out: the primary deliverable is the
     weights archive + the spot run; pit_parity is the secondary record).

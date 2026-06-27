@@ -27,7 +27,7 @@ Pipeline:
   5. Persist per-target-model analysis JSON under the canonical
      eval_artifacts layout: ``decision_artifacts/_replay_summary/{run_id}_{target_model}.json``
      (flat, YYMMDDHHMM run_id) + a ``decision_artifacts/_replay_summary/latest.json``
-     sidecar. Key format owned by ``alpha_engine_lib.eval_artifacts``.
+     sidecar. Key format owned by ``nousergon_lib.eval_artifacts``.
 
 Cost discipline:
 
@@ -264,14 +264,14 @@ def _persist_batch_summary(
 
     The dated key is the forensic source of truth; the ``latest.json``
     sidecar is a pure mirror of the most-recently-written summary. Key
-    format is owned by ``alpha_engine_lib.eval_artifacts``.
+    format is owned by ``nousergon_lib.eval_artifacts``.
 
     Note: with multiple target_models in one batch run, each writes its
     own dated key (distinct basename) but they all mirror into the single
     shared ``latest.json`` — last writer wins, matching the per-pipeline
     "latest" semantic (operators inspect the dated keys for the full set).
     """
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key,
         eval_latest_key,
         new_eval_run_id,

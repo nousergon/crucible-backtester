@@ -19,7 +19,7 @@ production_health can later delegate to it.
 Pure-compute. Operates on parallel arrays; no I/O.
 
 The headline ECE scalar is **not** computed locally — it delegates to
-``alpha_engine_lib.quant.stats.calibration.expected_calibration_error``, the
+``nousergon_lib.quant.stats.calibration.expected_calibration_error``, the
 one canonical ECE implementation for the fleet (per the lift-to-chokepoint
 rule). A train-time ECE (predictor) and a production-time ECE (backtester) are
 only comparable if both bin the *same quantity the same way*; keeping a second
@@ -35,7 +35,7 @@ from typing import TypedDict
 
 import numpy as np
 import pandas as pd
-from alpha_engine_lib.quant.stats.calibration import expected_calibration_error
+from nousergon_lib.quant.stats.calibration import expected_calibration_error
 
 logger = logging.getLogger(__name__)
 

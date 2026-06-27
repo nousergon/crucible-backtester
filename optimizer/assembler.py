@@ -56,7 +56,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 import boto3
-from alpha_engine_lib.eval_artifacts import (
+from nousergon_lib.eval_artifacts import (
     eval_artifact_key,
     eval_latest_key,
     new_eval_run_id,
@@ -525,7 +525,7 @@ def _write_assembled_audit(
 ) -> str:
     """Write the assembler result to S3 as an audit artifact.
 
-    Canonical eval-style archive layout per ``alpha_engine_lib.eval_artifacts``
+    Canonical eval-style archive layout per ``nousergon_lib.eval_artifacts``
     (v0.8.0)::
 
         config/{config_type}/assembled/{run_id}.json    ← per-run audit

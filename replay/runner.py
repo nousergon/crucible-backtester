@@ -5,7 +5,7 @@ Pipeline:
 
   1. Load ``DecisionArtifact`` JSON from S3 by key.
   2. Resolve the canonical Pydantic schema for the ``agent_id`` via
-     ``alpha_engine_lib.agent_schemas.resolve_schema_for_agent``.
+     ``nousergon_lib.agent_schemas.resolve_schema_for_agent``.
      Skips replay for unknown agent families (no schema to validate
      against → no meaningful concordance signal).
   3. Invoke target model via
@@ -21,7 +21,7 @@ Pipeline:
   5. Persist side-by-side artifact under the canonical eval_artifacts
      layout: ``decision_artifacts/_replay/{run_id}_{original_model}_vs_{target_model}.json``
      (flat, YYMMDDHHMM run_id) + a ``decision_artifacts/_replay/latest.json``
-     sidecar. Key format owned by ``alpha_engine_lib.eval_artifacts``.
+     sidecar. Key format owned by ``nousergon_lib.eval_artifacts``.
 
 Why langchain_anthropic.with_structured_output (not bare SDK):
 
@@ -35,7 +35,7 @@ Why langchain_anthropic.with_structured_output (not bare SDK):
     silent-drift class where a target model emits a slightly different
     structure that would otherwise wash through the comparison stage
     as an unexplained low concordance score.
-  - **Schema portability.** Schemas live in ``alpha_engine_lib.agent_schemas``
+  - **Schema portability.** Schemas live in ``nousergon_lib.agent_schemas``
     (lifted 2026-05-05, lib v0.4.0) so backtester can validate against
     the canonical contract without a heavy cross-repo dep on research.
 
@@ -178,7 +178,7 @@ def _persist_replay(
 
     Migrated from the legacy nested ``{replay_prefix}/{original_run_id}/
     {orig}_vs_{target}.json`` layout (backtester #179 deferred this site;
-    config#792). The key format is owned by ``alpha_engine_lib.
+    config#792). The key format is owned by ``nousergon_lib.
     eval_artifacts`` — we mint a fresh ``run_id`` per replay invocation
     (``new_eval_run_id`` → ``YYMMDDHHMM``) and stamp it into the payload
     as ``replay_run_id`` so the dated artifact is self-describing, while
@@ -190,7 +190,7 @@ def _persist_replay(
     under distinct YYMMDDHHMM run_ids); the ``latest.json`` sidecar is a
     pure mirror of the most-recently-written replay for operator UX.
     """
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key,
         eval_latest_key,
         new_eval_run_id,
@@ -375,7 +375,7 @@ def replay_artifact(
 
     Schema resolution:
         Looks up the canonical Pydantic schema for the captured
-        ``agent_id`` via ``alpha_engine_lib.agent_schemas.
+        ``agent_id`` via ``nousergon_lib.agent_schemas.
         resolve_schema_for_agent``. Agents without a registered schema
         (or unknown families) are skipped — replay only runs against
         the 6 canonical agent types whose contracts live in the lib.
@@ -383,7 +383,7 @@ def replay_artifact(
         only when the canonical schema enforces what "the same answer"
         means.
     """
-    from alpha_engine_lib.agent_schemas import resolve_schema_for_agent
+    from nousergon_lib.agent_schemas import resolve_schema_for_agent
 
     s3 = s3_client or boto3.client("s3")
 
@@ -483,7 +483,7 @@ def replay_artifact(
             replay_error=(
                 f"no canonical schema registered for agent_id={agent_id!r} — "
                 "skipping replay (only the 6 canonical agent families have "
-                "schemas in alpha_engine_lib.agent_schemas)"
+                "schemas in nousergon_lib.agent_schemas)"
             ),
             comparison={
                 "agreement_score": 0.0,

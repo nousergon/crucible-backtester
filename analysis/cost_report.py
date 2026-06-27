@@ -66,7 +66,7 @@ _ANOMALY_BASELINE_WEEKS = 4  # rolling window per ROADMAP P5
 # moto-stubbed S3 paths.
 _ANOMALY_ALERT_DISABLED_ENV_VAR = "ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED"
 
-# Registry row id read from alpha_engine_lib.transparency_inventory.yaml
+# Registry row id read from nousergon_lib.transparency_inventory.yaml
 # to source the cost-telemetry effective_date (the floor of the
 # rolling baseline window). Keep in sync with the row id in lib's
 # inventory; missing-row → fallback to no-floor (legacy "all gaps
@@ -291,10 +291,10 @@ def _telemetry_first_capture_date(
     inv = inventory
     if inv is None:
         try:
-            from alpha_engine_lib.transparency import load_inventory
+            from nousergon_lib.transparency import load_inventory
         except ImportError as exc:
             logger.warning(
-                "[cost_report] alpha_engine_lib.transparency unavailable "
+                "[cost_report] nousergon_lib.transparency unavailable "
                 "(%s) — falling back to no-pre-telemetry-floor "
                 "classification. Bump the lib pin to >=0.7.1 to enable.",
                 exc,
@@ -785,7 +785,7 @@ def _anomaly_alert_dedup_key(run_date: str, anomaly: dict) -> str:
     re-run / mid-week evaluate.py round-trips all collapse to one
     publish.
 
-    Returns a string consumed by ``alpha_engine_lib.alerts.publish``'s
+    Returns a string consumed by ``nousergon_lib.alerts.publish``'s
     ``dedup_key`` parameter — the lib hashes it internally and writes
     its marker at ``s3://{bucket}/_alerts/_dedup/{sha1(...)[:16]}.json``.
     """
@@ -809,7 +809,7 @@ def _publish_anomaly_alert(
     s3_client: Optional[Any] = None,
 ) -> None:
     """Fan an anomaly out to the operator-facing surveillance channels
-    via ``alpha_engine_lib.alerts.publish`` (SNS → email + Telegram).
+    via ``nousergon_lib.alerts.publish`` (SNS → email + Telegram).
 
     Best-effort: any import failure or network exception is logged at
     WARN and swallowed. The WARN log + the rendered email anomaly
@@ -832,10 +832,10 @@ def _publish_anomaly_alert(
     ):
         return
     try:
-        from alpha_engine_lib import alerts  # noqa: PLC0415 — lazy import
+        from nousergon_lib import alerts  # noqa: PLC0415 — lazy import
     except ImportError as e:
         logger.warning(
-            "[cost_report] alerts publish skipped — alpha_engine_lib.alerts "
+            "[cost_report] alerts publish skipped — nousergon_lib.alerts "
             "unavailable (lib pin <v0.24.0?): %s", e,
         )
         return

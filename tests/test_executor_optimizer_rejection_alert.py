@@ -42,8 +42,8 @@ def test_publishes_warn_on_non_ok_status():
     result = {"status": "alpha_below_floor", "note": "All combos below floor"}
     config = {"run_date": "2026-05-24"}
     alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"alpha_engine_lib": MagicMock(alerts=alerts_mod),
-                                     "alpha_engine_lib.alerts": alerts_mod}):
+    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
+                                     "nousergon_lib.alerts": alerts_mod}):
         _publish_executor_opt_rejection_alert(result, config)
     alerts_mod.publish.assert_called_once()
     call_kwargs = alerts_mod.publish.call_args.kwargs
@@ -57,8 +57,8 @@ def test_no_publish_on_ok_status():
     result = {"status": "ok"}
     config = {"run_date": "2026-05-24"}
     alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"alpha_engine_lib": MagicMock(alerts=alerts_mod),
-                                     "alpha_engine_lib.alerts": alerts_mod}):
+    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
+                                     "nousergon_lib.alerts": alerts_mod}):
         _publish_executor_opt_rejection_alert(result, config)
     alerts_mod.publish.assert_not_called()
 
@@ -68,8 +68,8 @@ def test_dedup_key_includes_run_date_and_status():
     result = {"status": "insufficient_data", "note": "Only 5 valid combos"}
     config = {"run_date": "2026-05-30"}
     alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"alpha_engine_lib": MagicMock(alerts=alerts_mod),
-                                     "alpha_engine_lib.alerts": alerts_mod}):
+    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
+                                     "nousergon_lib.alerts": alerts_mod}):
         _publish_executor_opt_rejection_alert(result, config)
     call_kwargs = alerts_mod.publish.call_args.kwargs
     assert call_kwargs["dedup_key"] == "executor_optimizer_rejected_2026-05-30_insufficient_data"
@@ -82,14 +82,14 @@ def test_suppress_env_blocks_publish(monkeypatch):
     result = {"status": "alpha_below_floor"}
     config = {"run_date": "2026-05-24"}
     alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"alpha_engine_lib": MagicMock(alerts=alerts_mod),
-                                     "alpha_engine_lib.alerts": alerts_mod}):
+    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
+                                     "nousergon_lib.alerts": alerts_mod}):
         _publish_executor_opt_rejection_alert(result, config)
     alerts_mod.publish.assert_not_called()
 
 
 def test_alerts_import_error_is_best_effort(caplog):
-    """If `from alpha_engine_lib import alerts` fails (lib pin too old or
+    """If `from nousergon_lib import alerts` fails (lib pin too old or
     deps missing), the helper logs WARN and returns without raising.
     Narrow-scope import patch via meta_path finder to avoid clobbering
     unrelated imports (`os`, `logging`)."""
@@ -102,14 +102,14 @@ def test_alerts_import_error_is_best_effort(caplog):
 
     class _BlockAlertsFinder(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path, target=None):
-            if fullname == "alpha_engine_lib.alerts" or fullname == "alpha_engine_lib":
+            if fullname == "nousergon_lib.alerts" or fullname == "nousergon_lib":
                 raise ImportError(f"blocked for test: {fullname}")
             return None
 
     import sys
     blocker = _BlockAlertsFinder()
-    # Drop any cached `alpha_engine_lib*` so the import attempt actually runs.
-    cached = [k for k in list(sys.modules.keys()) if k.startswith("alpha_engine_lib")]
+    # Drop any cached `nousergon_lib*` so the import attempt actually runs.
+    cached = [k for k in list(sys.modules.keys()) if k.startswith("nousergon_lib")]
     saved = {k: sys.modules.pop(k) for k in cached}
     sys.meta_path.insert(0, blocker)
     try:
@@ -126,8 +126,8 @@ def test_publish_exception_is_best_effort():
     config = {"run_date": "2026-05-24"}
     alerts_mod = MagicMock()
     alerts_mod.publish.side_effect = RuntimeError("SNS unreachable")
-    with patch.dict("sys.modules", {"alpha_engine_lib": MagicMock(alerts=alerts_mod),
-                                     "alpha_engine_lib.alerts": alerts_mod}):
+    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
+                                     "nousergon_lib.alerts": alerts_mod}):
         # Should not raise
         _publish_executor_opt_rejection_alert(result, config)
     alerts_mod.publish.assert_called_once()
@@ -139,8 +139,8 @@ def test_run_executor_opt_publishes_on_degraded_short_circuit():
     from evaluate import _run_executor_opt
     config = {"run_date": "2026-05-24"}
     alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"alpha_engine_lib": MagicMock(alerts=alerts_mod),
-                                     "alpha_engine_lib.alerts": alerts_mod}):
+    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
+                                     "nousergon_lib.alerts": alerts_mod}):
         result = _run_executor_opt(config, sweep_df=None, freeze=False)
     assert result["status"] == "degraded"
     alerts_mod.publish.assert_called_once()
@@ -158,8 +158,8 @@ def test_run_executor_opt_publishes_when_recommend_returns_non_ok():
                              "note": "All 60 combos below floor"}), \
          patch("evaluate.read_params_pit_or_current",
                return_value=None), \
-         patch.dict("sys.modules", {"alpha_engine_lib": MagicMock(alerts=alerts_mod),
-                                     "alpha_engine_lib.alerts": alerts_mod}):
+         patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
+                                     "nousergon_lib.alerts": alerts_mod}):
         result = _run_executor_opt(config, sweep_df, freeze=False)
     assert result["status"] == "alpha_below_floor"
     alerts_mod.publish.assert_called_once()

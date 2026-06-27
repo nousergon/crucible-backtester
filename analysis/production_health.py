@@ -27,7 +27,7 @@ import boto3
 import numpy as np
 import pandas as pd
 
-from alpha_engine_lib.quant.stats.calibration import expected_calibration_error
+from nousergon_lib.quant.stats.calibration import expected_calibration_error
 
 from pipeline_common import (
     ACTIVE_HORIZON_DAYS,
@@ -588,7 +588,7 @@ def compute_calibration_validation(
     and, in each bin, compare its mean to the empirical UP frequency
     (``1[realized_log_alpha > 0]``). Both are probabilities on the same [0,1]
     scale, so the ECE is comparable to the predictor's own training-time ECE
-    (both call ``alpha_engine_lib.quant.stats.calibration``).
+    (both call ``nousergon_lib.quant.stats.calibration``).
 
     WHY NOT ``prediction_confidence``: that field is ``|p_up - 0.5| * 2`` — a
     *margin*, not a probability (since the 2026-05-12 convention flip,

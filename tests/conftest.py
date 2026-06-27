@@ -2,7 +2,7 @@
 plus centralized arcticdb stubbing for unit tests.
 
 Also pins ``ALPHA_ENGINE_SECRETS_SOURCE=env`` for the test process so
-``alpha_engine_lib.secrets.get_secret()`` (post 2026-05-12 .env→SSM
+``nousergon_lib.secrets.get_secret()`` (post 2026-05-12 .env→SSM
 migration, PR 5 of the arc) reads from monkeypatched env vars only —
 never real SSM. Set at module-import time so the toggle is in place
 before any test module imports emailer.py / analysis/retrain_alert.py.
@@ -42,7 +42,7 @@ def _isolate_secrets_from_ssm(monkeypatch):
     """
     monkeypatch.setenv("ALPHA_ENGINE_SECRETS_SOURCE", "env")
     try:
-        from alpha_engine_lib.secrets import clear_cache
+        from nousergon_lib.secrets import clear_cache
     except ImportError:
         yield
         return
@@ -53,7 +53,7 @@ def _isolate_secrets_from_ssm(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _block_real_alerts_publish(monkeypatch):
-    """Default-deny real ``alpha_engine_lib.alerts.publish`` for every test.
+    """Default-deny real ``nousergon_lib.alerts.publish`` for every test.
 
     History: 2026-05-21 a buggy monkeypatch in test_cost_report.py let the
     real publish through on a failing test run, firing a real Telegram
@@ -64,11 +64,11 @@ def _block_real_alerts_publish(monkeypatch):
     This autouse fixture closes the recurrence class: every test starts
     with publish replaced by a no-op that returns a synthetic success.
     Tests that want to assert on publish calls override this with their
-    own ``monkeypatch.setattr("alpha_engine_lib.alerts.publish", spy)``
+    own ``monkeypatch.setattr("nousergon_lib.alerts.publish", spy)``
     — which works because monkeypatch reverts in LIFO order at teardown.
     """
     try:
-        import alpha_engine_lib.alerts  # noqa: F401
+        import nousergon_lib.alerts  # noqa: F401
     except ImportError:
         # lib pin <v0.21.0 → no alerts module to block. Pre-v0.21.0
         # callers can't reach the channels anyway.
@@ -88,5 +88,5 @@ def _block_real_alerts_publish(monkeypatch):
     def _noop(*args, **kwargs):
         return _Result()
 
-    monkeypatch.setattr("alpha_engine_lib.alerts.publish", _noop)
+    monkeypatch.setattr("nousergon_lib.alerts.publish", _noop)
     yield

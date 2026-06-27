@@ -53,7 +53,7 @@ def _get_arctic(bucket: str) -> adb.Arctic:
     the same spot saw 0) can be diagnosed from the stream without a
     separate instrumentation pass.
     """
-    from alpha_engine_lib.arcticdb import open_arctic
+    from nousergon_lib.arcticdb import open_arctic
     try:
         arctic = open_arctic(bucket)
     except Exception as exc:
@@ -169,7 +169,7 @@ def load_universe_from_arctic(
     # Universe library opens via the shared lib helper (config#804). The
     # ``macro`` open and the #826 empty-universe diagnostic below still use
     # the local ``arctic`` handle and are intentionally left as-is.
-    from alpha_engine_lib.arcticdb import open_universe_lib
+    from nousergon_lib.arcticdb import open_universe_lib
     try:
         universe = open_universe_lib(bucket)
         macro_lib = arctic.get_library("macro")
