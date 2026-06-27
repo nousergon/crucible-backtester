@@ -1,7 +1,7 @@
 """
 emailer.py — build + send the weekly backtest report.
 
-SMTP/SES dispatch is delegated to ``alpha_engine_lib.email_sender.send_email``
+SMTP/SES dispatch is delegated to ``nousergon_lib.email_sender.send_email``
 (L4356 chokepoint). This module owns the report-specific subject + HTML/MD
 body builders only.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from alpha_engine_lib.email_sender import send_email
+from nousergon_lib.email_sender import send_email
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ def send_report_email(
 ) -> None:
     """Build + send the weekly backtest/evaluator report.
 
-    Delegates SMTP/SES dispatch to ``alpha_engine_lib.email_sender.send_email``.
+    Delegates SMTP/SES dispatch to ``nousergon_lib.email_sender.send_email``.
     The legacy local ``_send_via_smtp`` used ``SMTP_SSL:465``; the lib uses
     ``SMTP:587`` with STARTTLS — both are Gmail-supported, the latter is
     the standard pattern across alpha-engine consumers and the one the lib

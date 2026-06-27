@@ -2,7 +2,7 @@
 Backtester preflight: connectivity + freshness checks run at the top of
 each entrypoint before any real work starts.
 
-Primitives live in ``alpha_engine_lib.preflight.BasePreflight``; this
+Primitives live in ``nousergon_lib.preflight.BasePreflight``; this
 module only composes them into a mode-specific sequence. See the
 alpha-engine-lib README for the 2026-04-14 data-path failure mode that
 motivated the library.
@@ -19,7 +19,7 @@ Modes:
 
   2026-04-21 incident motivated the import/version/weights additions:
   a Saturday SF dry-run burned ~80 minutes of c5.large compute before
-  failing on ``No module named 'alpha_engine_lib.arcticdb'`` deep in
+  failing on ``No module named 'nousergon_lib.arcticdb'`` deep in
   ``_run_simulation_loop``. The three new preflight checks below all
   run in <2 seconds and would have caught the same bug at startup.
 - ``"evaluate"`` — ``evaluate.py`` entrypoint. Reads simulation
@@ -35,7 +35,7 @@ import os
 
 import yaml
 
-from alpha_engine_lib.preflight import BasePreflight
+from nousergon_lib.preflight import BasePreflight
 
 
 # Placeholder prefix convention used by every repo's *.yaml.example
@@ -47,7 +47,7 @@ _PLACEHOLDER_PREFIX = "your-"
 # Keep in sync with the ``@vX.Y.Z`` pin in ``requirements.txt``. Bump when
 # a new symbol from the lib is imported by any backtest call path.
 #
-# Current floor: 0.1.4 — introduces ``alpha_engine_lib.arcticdb`` which
+# Current floor: 0.1.4 — introduces ``nousergon_lib.arcticdb`` which
 # ``backtest._run_simulation_loop`` depends on to filter historical
 # signals against the current universe.
 MIN_LIB_VERSION = "0.1.4"
@@ -58,9 +58,9 @@ MIN_LIB_VERSION = "0.1.4"
 # seconds at preflight instead of ~80 minutes into a spot run.
 _CRITICAL_IMPORTS_BACKTEST = (
     # alpha-engine-lib submodules we directly call
-    "alpha_engine_lib.arcticdb",
-    "alpha_engine_lib.logging",
-    "alpha_engine_lib.preflight",
+    "nousergon_lib.arcticdb",
+    "nousergon_lib.logging",
+    "nousergon_lib.preflight",
     # executor modules — simulate path
     "executor.main",
     "executor.ibkr",
@@ -189,26 +189,26 @@ class BacktesterPreflight(BasePreflight):
     # ── Environment primitives (added 2026-04-21 post-80min-burn) ────────
 
     def _check_lib_version(self) -> None:
-        """Fail if the installed alpha_engine_lib is older than the
+        """Fail if the installed nousergon_lib is older than the
         minimum the backtester's call chain needs.
 
         Triggers when the spot's pip install silently fell back to a
         cached older version (or when requirements.txt was bumped but
         MIN_LIB_VERSION here wasn't — same bug in the other direction).
         """
-        import alpha_engine_lib
+        import nousergon_lib
         from packaging.version import Version
 
-        installed = getattr(alpha_engine_lib, "__version__", None)
+        installed = getattr(nousergon_lib, "__version__", None)
         if not installed:
             raise RuntimeError(
-                "Pre-flight: alpha_engine_lib has no __version__ "
+                "Pre-flight: nousergon_lib has no __version__ "
                 "attribute — likely a broken install. Re-run the pip "
                 "install step on this host."
             )
         if Version(installed) < Version(MIN_LIB_VERSION):
             raise RuntimeError(
-                f"Pre-flight: alpha_engine_lib {installed} < required "
+                f"Pre-flight: nousergon_lib {installed} < required "
                 f"{MIN_LIB_VERSION}. Spot's pip install may have pulled "
                 "a stale cached version, or requirements.txt drifted "
                 "from MIN_LIB_VERSION in preflight.py. The 2026-04-21 "

@@ -8,7 +8,7 @@ For each completed trade (with entry and exit), computes:
   - Stop efficiency: |realized loss| / MAE (are stops placed well?)
 
 Requires daily OHLCV price data during the hold period. Reads from the
-ArcticDB universe library (primary, via alpha_engine_lib), falling back to
+ArcticDB universe library (primary, via nousergon_lib), falling back to
 the predictor/price_cache (10y) parquets in S3 (no external API calls).
 Wave-4: the predictor/price_cache_slim leg was removed after the parity
 observation confirmed slim<->ArcticDB equivalence.
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from alpha_engine_lib.arcticdb import load_universe_ohlcv
+from nousergon_lib.arcticdb import load_universe_ohlcv
 
 logger = logging.getLogger(__name__)
 

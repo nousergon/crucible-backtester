@@ -2,7 +2,7 @@
 analysis/regime_stratified_sortino.py — regime-stratified pick-alpha Sortino.
 
 **Hybrid module (LV2-AE.b, 2026-06-03).** The pure metric core was lifted to the
-shared ``alpha_engine_lib.quant.stats.regime_sortino`` so the backtester and
+shared ``nousergon_lib.quant.stats.regime_sortino`` so the backtester and
 robodashboard consume one engine. This module:
   - keeps ``load_with_subscores_and_regime`` — the SQLite I/O that reads
     ``score_performance`` is storage-specific and stays here;
@@ -22,7 +22,7 @@ from pathlib import Path
 import pandas as pd
 
 # Pure metric core — implementation + unit tests live in the lib.
-from alpha_engine_lib.quant.stats.regime_sortino import (
+from nousergon_lib.quant.stats.regime_sortino import (
     DEFAULT_MIN_PICKS_PER_STRATUM,
     SUPPORTED_HORIZONS,
     StratumMetrics,
@@ -86,7 +86,7 @@ def load_with_subscores_and_regime(db_path: str) -> pd.DataFrame:
 
 __all__ = [
     "load_with_subscores_and_regime",
-    # Re-exported pure core (from alpha_engine_lib.quant.stats.regime_sortino)
+    # Re-exported pure core (from nousergon_lib.quant.stats.regime_sortino)
     "DEFAULT_MIN_PICKS_PER_STRATUM",
     "SUPPORTED_HORIZONS",
     "StratumMetrics",
