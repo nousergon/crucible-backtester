@@ -24,6 +24,9 @@ from optimizer.executor_optimizer import (
     init_config,
     produce_artifact,
     recommend,
+    validate_holdout,
+    validate_walk_forward,
+    _rolling_windows,
 )
 
 
@@ -1287,3 +1290,141 @@ class TestBaselineSignificanceGate:
         # baseline_insignificant status and the improvement_delta tiny
         # number (0.0001), which together correctly tell the story.
         assert abs(result["improvement_delta"] - 0.0001) < 1e-9
+
+
+# ── Walk-forward cross-validation (config#950) ───────────────────────────────
+
+
+class TestRollingWindows:
+    def test_rolling_windows_disjoint_test_sets_chronological(self):
+        dates = [f"d{i:02d}" for i in range(30)]
+        windows = _rolling_windows(dates, n_folds=3, test_frac=0.30)
+        assert len(windows) == 3
+        # Chronological (oldest fold first); test windows disjoint + advancing.
+        test_sets = [te for _tr, te in windows]
+        flat = [d for te in test_sets for d in te]
+        assert flat == sorted(flat)  # ascending, no overlap
+        # Anchored walk-forward: each train set is a prefix ending where its
+        # test set begins (no look-ahead).
+        for tr, te in windows:
+            assert tr == dates[: dates.index(te[0])]
+
+    def test_rolling_windows_last_fold_flush_to_end(self):
+        dates = [f"d{i:02d}" for i in range(30)]
+        windows = _rolling_windows(dates, n_folds=3, test_frac=0.30)
+        assert windows[-1][1][-1] == dates[-1]  # most-recent data validated
+
+
+def _date_aware_sim(stats_by_window):
+    """Return a date-aware sim_fn mapping a window-key → stats. The window key
+    is the test window's first+last date so each fold gets distinct stats."""
+    def sim_fn(combo_config, dates=None):
+        key = (dates[0], dates[-1]) if dates else "full"
+        return stats_by_window.get(key, {"sharpe_ratio": 1.0, "sortino_ratio": 1.0})
+    return sim_fn
+
+
+class TestWalkForward:
+    def _ok_result(self):
+        return {
+            "status": "ok",
+            "recommended_params": {"atr_multiplier": 3.0},
+            "fit_target": "sharpe_legacy",
+            "best_sharpe": 1.0,
+        }
+
+    def test_all_folds_pass_records_advisory_consistency(self):
+        dates = [f"d{i:02d}" for i in range(30)]
+        sim = _date_aware_sim({})  # every fold returns sharpe 1.0 == train → ratio 100%
+        result = validate_walk_forward(self._ok_result(), sim, dates, {})
+        # No daily_returns / pbo_top_combos in this synthetic sim → PSR/DSR/PBO
+        # all `insufficient` (non-blocking) → gate passes.
+        assert result["holdout_passed"] is True
+        assert result["status"] == "ok"
+        wf = result["walk_forward"]
+        # min_pass_fraction is now an ADVISORY secondary diagnostic.
+        assert wf["n_passed"] == wf["n_gradeable"]
+        assert wf["consistency_ok"] is True
+        assert "promotion_gate" in result
+
+    def test_failing_fold_is_advisory_not_blocking(self):
+        """min_pass_fraction is DEMOTED (config#950): a failing fold lowers the
+        advisory consistency flag but does NOT block promotion — the PSR/DSR/PBO
+        gate is the decision, and here it is non-blocking (insufficient data)."""
+        dates = [f"d{i:02d}" for i in range(30)]
+        windows = _rolling_windows(dates, n_folds=3, test_frac=0.30)
+        mid_key = (windows[1][1][0], windows[1][1][-1])
+        sim = _date_aware_sim({mid_key: {"sharpe_ratio": 0.2, "sortino_ratio": 0.2}})
+        result = validate_walk_forward(self._ok_result(), sim, dates, {})
+        # Advisory consistency reflects the fold failure...
+        assert result["walk_forward"]["consistency_ok"] is False
+        # ...but promotion is NOT blocked by it (gate sub-stats insufficient).
+        assert result["holdout_passed"] is True
+        assert result["status"] == "ok"
+
+    def test_promotion_gate_blocks_when_a_sub_gate_fails(self):
+        """A computable sub-gate failure (here DSR) blocks promotion regardless
+        of fold consistency."""
+        import numpy as np
+        import optimizer.executor_optimizer as eo
+        dates = pd.date_range("2025-01-01", periods=240, freq="B").strftime("%Y-%m-%d").tolist()
+
+        def sim(combo_config, dates=None):  # noqa: D401
+            rng = np.random.RandomState(7)
+            r = pd.Series(rng.normal(0.0003, 0.012, len(dates)), index=pd.to_datetime(dates))
+            sh = r.mean() / r.std() * np.sqrt(252)
+            return {"status": "ok", "daily_returns": r,
+                    "sharpe_ratio": float(sh), "sortino_ratio": float(sh)}
+
+        res = dict(self._ok_result())
+        res["n_combos_swept"] = 400  # heavy deflation → DSR well below 0.90
+        res["pbo_top_combos"] = [{"atr_multiplier": x} for x in (3.0, 2.5, 3.5, 2.0)]
+        out = validate_walk_forward(res, sim, dates, {}, n_folds=3, test_frac=0.30)
+        assert out["holdout_passed"] is False
+        assert out["status"] == "holdout_failed"
+        assert out["promotion_gate"]["sub_gates"]["dsr"]["status"] == "ok"
+
+    def test_non_date_aware_sim_falls_back_to_single_holdout(self):
+        dates = [f"d{i:02d}" for i in range(30)]
+
+        def legacy_sim(combo_config):  # no dates kwarg
+            return {"sharpe_ratio": 1.0, "sortino_ratio": 1.0}
+
+        result = validate_walk_forward(self._ok_result(), legacy_sim, dates, {})
+        assert "walk_forward_degraded" in result
+        # Fell back to single-window holdout, which still grades.
+        assert "holdout_passed" in result
+
+
+class TestHoldoutDateWindowing:
+    def test_holdout_runs_on_held_out_window_when_date_aware(self):
+        """Regression: the held-out 30% must actually be simulated, not the
+        full range (the pre-fix latent bug)."""
+        dates = [f"d{i:02d}" for i in range(30)]
+        seen = {}
+
+        def sim_fn(combo_config, dates=None):
+            seen["dates"] = dates
+            return {"sharpe_ratio": 1.0, "sortino_ratio": 1.0}
+
+        result = {
+            "status": "ok", "recommended_params": {"atr_multiplier": 3.0},
+            "fit_target": "sharpe_legacy", "best_sharpe": 1.0,
+        }
+        validate_holdout(result, sim_fn, dates, {})
+        # Only the last 30% (≈9 dates) should be simulated.
+        assert seen["dates"] == dates[int(len(dates) * 0.7):]
+        assert "holdout_degraded" not in result
+
+    def test_legacy_sim_marks_degraded(self):
+        dates = [f"d{i:02d}" for i in range(30)]
+
+        def legacy_sim(combo_config):
+            return {"sharpe_ratio": 1.0, "sortino_ratio": 1.0}
+
+        result = {
+            "status": "ok", "recommended_params": {"atr_multiplier": 3.0},
+            "fit_target": "sharpe_legacy", "best_sharpe": 1.0,
+        }
+        validate_holdout(result, legacy_sim, dates, {})
+        assert "holdout_degraded" in result
