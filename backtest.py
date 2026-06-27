@@ -4690,18 +4690,37 @@ def _run_simulation_pipeline(
                     if executor_rec.get("status") == "ok" and _sim_setup is not None:
                         executor_run_fn, SimClientCls, sim_dates, pm, _, ohlcv_data = _sim_setup
                         if pm is not None:
-                            def holdout_sim_fn(combo_config):
+                            # Date-aware sim_fn: validate_holdout / walk-forward
+                            # pass the out-of-sample window via `dates=`; default
+                            # to the full sim_dates when omitted. config#950 —
+                            # without this the "holdout" silently ran the full
+                            # range instead of the held-out window.
+                            def holdout_sim_fn(combo_config, dates=None):
                                 return _run_simulation_loop(
-                                    executor_run_fn, SimClientCls, sim_dates, pm, combo_config,
+                                    executor_run_fn, SimClientCls,
+                                    dates if dates is not None else sim_dates,
+                                    pm, combo_config,
                                     ohlcv_by_ticker=ohlcv_data,
                                     atr_by_ticker=atr_by_ticker,
                                     vwap_series_by_ticker=vwap_series_by_ticker,
                                     coverage_by_ticker=coverage_by_ticker,
                                 )
+                            # Walk-forward CV when enabled (config#950); else the
+                            # legacy single 70/30 holdout. Both now run true
+                            # out-of-sample via the date-aware sim_fn above.
+                            _wf_cfg = (config.get("executor_optimizer", {}) or {}).get("walk_forward", {})
                             with registry.phase("executor_holdout", mode=args.mode):
-                                executor_rec = executor_optimizer.validate_holdout(
-                                    executor_rec, holdout_sim_fn, sim_dates, config,
-                                )
+                                if _wf_cfg.get("enabled"):
+                                    executor_rec = executor_optimizer.validate_walk_forward(
+                                        executor_rec, holdout_sim_fn, sim_dates, config,
+                                        n_folds=int(_wf_cfg.get("n_folds", 3)),
+                                        test_frac=float(_wf_cfg.get("test_frac", 0.30)),
+                                        min_pass_fraction=float(_wf_cfg.get("min_pass_fraction", 1.0)),
+                                    )
+                                else:
+                                    executor_rec = executor_optimizer.validate_holdout(
+                                        executor_rec, holdout_sim_fn, sim_dates, config,
+                                    )
 
                     # Twin simulation: current vs proposed on same dates
                     if executor_rec.get("status") == "ok" and _sim_setup is not None:
