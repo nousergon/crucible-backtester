@@ -1733,8 +1733,57 @@ def _section_attribution(attr: dict) -> list[str]:
     lines += [
         "",
         f"Analyzed {attr.get('rows_analyzed', 0)} signals.",
+    ]
+
+    # Headline: multivariate joint attribution (config#920). Standardized
+    # partial coefficients — each input's contribution holding the others
+    # fixed — supersede the independent pairwise Pearson correlations below.
+    mv = attr.get("multivariate") or {}
+    mv_targets = mv.get("targets") or {}
+    if mv.get("status") == "ok" and mv_targets:
+        b10 = mv_targets.get("beat_spy_10d", {})
+        lines += [
+            "",
+            "### Multivariate attribution (joint regression → beat_spy_10d)",
+            "",
+            "Standardized partial coefficients from a joint OLS on sub-scores "
+            "+ market_regime (each input held against the others).",
+            "",
+        ]
+        if b10.get("method") == "multivariate_ols":
+            lines += [
+                "| Input | Std. coefficient |",
+                "|-------|------------------|",
+            ]
+            for label, coef in (b10.get("coefficients") or {}).items():
+                lines.append(f"| {label} | {_fmt(coef)} |")
+            if b10.get("r_squared") is not None:
+                lines += ["", f"R² (10d): {_fmt(b10.get('r_squared'))}"]
+        else:
+            lines += [
+                f"> beat_spy_10d fell back to univariate: {b10.get('note', '')}",
+            ]
+        fell_back = mv.get("targets_fell_back_to_univariate")
+        if fell_back:
+            lines += [
+                "",
+                f"> Targets using univariate fallback (collinear/low-N): "
+                f"{', '.join(fell_back)}",
+            ]
+        mv_rank = mv.get("ranking_10d") or []
+        if mv_rank:
+            lines += ["", f"**Strongest joint driver (10d):** {mv_rank[0]}"]
+    elif mv.get("status") == "fallback":
+        lines += [
+            "",
+            "> Multivariate attribution deferred "
+            f"({mv.get('reason', 'fit not trustworthy')}); "
+            "univariate correlations shown below.",
+        ]
+
+    lines += [
         "",
-        "### Correlation with beat_spy_10d",
+        "### Univariate correlation with beat_spy (context / fallback)",
         "",
         "| Sub-score | Corr (10d) | Corr (30d) | FDR sig (10d) | FDR sig (30d) |",
         "|-----------|------------|------------|---------------|---------------|",
@@ -1748,7 +1797,7 @@ def _section_attribution(attr: dict) -> list[str]:
 
     ranking_10d = attr.get("ranking_10d", [])
     if ranking_10d:
-        lines += ["", f"**Strongest predictor (10d):** {ranking_10d[0]}"]
+        lines += ["", f"**Strongest univariate predictor (10d):** {ranking_10d[0]}"]
 
     fdr_ns = attr.get("fdr_non_significant")
     if fdr_ns:
