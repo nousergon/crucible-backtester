@@ -374,15 +374,16 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
-        assert "@v0.60.2" in text, (
-            "nousergon-lib should pin to v0.60.2 — the alpha_engine_lib -> "
-            "nousergon_lib rename crossing (config#1245 / #1172). v0.60.x is "
-            "the first renamed line; the same PR migrates this repo's "
+        assert "@v0.70.0" in text, (
+            "nousergon-lib should pin to v0.70.0 — the lifted experiment "
+            "config resolver crossing (config#1157 / #396). v0.70.0 moves "
+            "config/predictor.yaml resolution into nousergon-lib's config "
+            "resolver, which this repo now delegates to instead of resolving "
+            "locally. "
+            "Prior: v0.60.2 — the alpha_engine_lib -> nousergon_lib rename "
+            "crossing (config#1245 / #1172), which migrated this repo's "
             "'python -m alpha_engine_lib.<mod>' invocations to "
             "'-m nousergon_lib.<mod>' (the old meta-path alias shim lacks "
             "runpy's get_code, so '-m' dies under runpy on crossed boxes). "
-            "Prior: v0.59.8 — quant.stats.calibration.expected_calibration_error "
-            "(ECE shared by predictor's calibrator fit + this repo's production "
-            "calibration monitor). Update this test if the pin moves further "
-            "forward."
+            "Update this test if the pin moves further forward."
         )
