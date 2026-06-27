@@ -148,8 +148,13 @@ def _read_prediction_tickers(
 ) -> set[str] | None:
     """Tickers that received a predictor output for ``date``.
 
-    ``predictor/predictions/{date}.json`` is a ``{ticker: alpha}`` map. Returns
-    ``None`` when absent/unreadable."""
+    The PRODUCTION ``predictor/predictions/{date}.json`` is a metadata-wrapped
+    envelope whose ``predictions`` field is a **list of per-ticker records**
+    (each ``{"ticker": ..., "predicted_alpha": ..., ...}``) — this is the daily
+    inference output's actual schema (verified live 2026-06-27). We also tolerate
+    the two flat-map forms (``{ticker: alpha}`` and
+    ``{"predictions": {ticker: alpha}}``) for robustness. Returns ``None`` when
+    absent/unreadable."""
     key = f"{PREDICTIONS_PREFIX}/{date}.json"
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
@@ -161,14 +166,31 @@ def _read_prediction_tickers(
         notes.append(f"predictions unreadable: s3://{bucket}/{key} ({e})")
         return None
 
-    # Tolerate both the flat ``{ticker: alpha}`` map and a wrapped
-    # ``{"predictions": {ticker: alpha}}`` envelope.
-    if isinstance(payload, dict) and isinstance(payload.get("predictions"), dict):
-        payload = payload["predictions"]
-    if not isinstance(payload, dict):
-        notes.append(f"predictions malformed (not a ticker map): s3://{bucket}/{key}")
-        return None
-    return set(payload.keys())
+    # Unwrap the ``predictions`` field when present (the production envelope).
+    inner = payload.get("predictions") if isinstance(payload, dict) else None
+    if inner is not None:
+        payload = inner
+
+    # Production schema: a list of per-ticker prediction records.
+    if isinstance(payload, list):
+        tickers = {
+            rec["ticker"]
+            for rec in payload
+            if isinstance(rec, dict) and rec.get("ticker")
+        }
+        if not tickers and payload:
+            notes.append(
+                f"predictions list has no 'ticker' keys: s3://{bucket}/{key}"
+            )
+            return None
+        return tickers
+
+    # Legacy flat ``{ticker: alpha}`` map.
+    if isinstance(payload, dict):
+        return set(payload.keys())
+
+    notes.append(f"predictions malformed (not a list or ticker map): s3://{bucket}/{key}")
+    return None
 
 
 def _read_fill_and_attribution(

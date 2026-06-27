@@ -353,6 +353,48 @@ def test_predictions_wrapped_envelope(tmp_path):
     assert out["predicted_count"] == 2
 
 
+def test_predictions_production_list_schema(tmp_path):
+    """The PRODUCTION predictions.json is a metadata envelope whose
+    ``predictions`` field is a LIST of per-ticker records — NOT a flat
+    ``{ticker: alpha}`` map. Verified against live S3 2026-06-27; the original
+    producer read the envelope's metadata keys and reported a false 0% coverage.
+    Regression guard for that contract bug (config#909)."""
+    s3 = _build_s3({
+        _signals_key(): _signals_payload(["AAA", "BBB", "CCC"]),
+        _predictions_key(): {
+            "date": DATE,
+            "model_version": "vX",
+            "n_predictions": 2,
+            "predictions": [
+                {"ticker": "AAA", "predicted_direction": "UP", "predicted_alpha": 0.11},
+                {"ticker": "BBB", "predicted_direction": "FLAT", "predicted_alpha": 0.01},
+            ],
+        },
+    })
+    db = _make_trades_db(tmp_path, [("AAA", "ENTER", DATE, 1.0, 0.2)])
+    out = compute_measurement_coverage(
+        bucket=BUCKET, run_date=DATE, trades_db_path=db, s3_client=s3
+    )
+    assert out["predicted_count"] == 2          # AAA, BBB (NOT the metadata keys)
+    assert out["coverage_ratios"]["predicted_of_signal"] == round(2 / 3, 4)
+    assert out["gaps_by_stage"]["signal_to_prediction"]["tickers"] == ["CCC"]
+
+
+def test_predictions_list_without_ticker_keys_is_unmeasured(tmp_path):
+    """A predictions list whose records carry no 'ticker' degrades the stage to
+    unmeasured (None) rather than reporting a fabricated 0% coverage."""
+    s3 = _build_s3({
+        _signals_key(): _signals_payload(["AAA", "BBB"]),
+        _predictions_key(): {"predictions": [{"foo": 1}, {"bar": 2}]},
+    })
+    db = _make_trades_db(tmp_path, [("AAA", "ENTER", DATE, 1.0, 0.2)])
+    out = compute_measurement_coverage(
+        bucket=BUCKET, run_date=DATE, trades_db_path=db, s3_client=s3
+    )
+    assert out["predicted_count"] is None
+    assert out["stage_availability"]["predictions"] is False
+
+
 # ── Pure-helper unit checks ──────────────────────────────────────────────────
 
 
