@@ -84,8 +84,8 @@ import yaml
 from analysis import param_sweep
 from optimizer import executor_optimizer
 from optimizer.config_archive import read_params_pit_or_current
-from emailer import send_report_email
-from reporter import build_report, save, upload_to_s3
+from emailer import send_digest_email
+from reporter import build_digest, build_report, save, upload_to_s3
 from pipeline_common import (
     PhaseOutcome,
     PhaseRegistry,
@@ -5611,30 +5611,37 @@ def _main_impl() -> None:
             )
             print(f"\nUploaded to s3://{config.get('output_bucket')}/{config.get('output_prefix')}/{args.date}/")
 
-        # Suppress email for smoke-phase runs and any run with --freeze
-        # set (freeze signals "don't promote / don't notify"; smoke-phase
-        # modes are test invocations with synthetic fixtures and their
-        # reports would pollute the operator inbox + risk being confused
-        # with real Saturday SF emails). Detection uses _is_smoke_phase
-        # (captured at main() entry, before args.mode was rewritten to
-        # the routed full mode) and args.freeze.
+        # Backtester email — now a THIN digest (deployed-strategy headline +
+        # optimizer-param sweep) that deep-links to the console Analysis page for
+        # the full detail, mirroring the EOD and model-zoo patterns. The full
+        # report.md is uploaded above for the console + the link. The Evaluator
+        # is a SEPARATE Saturday-SF task and sends its OWN digest from
+        # evaluate.py — the two are intentionally NOT bundled.
         suppress_email = _is_smoke_phase or args.freeze
         sender = config.get("email_sender")
         recipients = config.get("email_recipients", [])
         if suppress_email:
             logger.info(
-                "Email suppressed (mode=%s, freeze=%s) — skipping report email",
+                "Email suppressed (mode=%s, freeze=%s) — skipping backtester digest",
                 _original_mode, args.freeze,
             )
         elif sender and recipients:
-            send_report_email(
+            digest_md = build_digest(
                 run_date=args.date,
-                report_md=report_md,
-                status="simulation",
+                title="Backtest Digest",
+                production_stats=production_stats,
+                optimizer_param_sweep=optimizer_param_sweep,
+                executor_rec=executor_rec,
+            )
+            send_digest_email(
+                run_date=args.date,
+                digest_md=digest_md,
                 sender=sender,
                 recipients=recipients,
+                product_name="Backtester",
+                report_prefix=config.get("output_prefix", "backtest"),
+                status="ok" if (production_stats or {}).get("status") == "ok" else "error",
                 s3_bucket=config.get("output_bucket") if args.upload else None,
-                s3_prefix=config.get("output_prefix", "backtest"),
             )
         else:
             logger.warning("No email_sender/email_recipients in config — skipping email")
