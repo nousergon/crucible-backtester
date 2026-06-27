@@ -61,13 +61,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # risk_aversion × tcost_bps sweep verdict under backtest/{date}/ (sibling of
     # cov_sweep/gamma_sweep), OBSERVE-only, grandfathered like the other per-run
     # diagnostics rather than added to the freshness-SLA registry.
-    # +1 (11→12) 2026-06-27: production_stats.json — the deployed-strategy
-    # headline persisted under backtest/{date}/ so the consolidated weekly
-    # Backtest+Eval digest (sent by evaluate.py, a separate process) can source
-    # the live-performance number best-effort instead of re-parsing report.md.
-    # Same-run-only consumer (no external freshness SLA), so grandfathered like
-    # the other per-run diagnostics rather than added to the freshness registry.
-    "backtest.py": 12,
+    "backtest.py": 11,
     "health_status.py": 1,
     "optimizer/assembler.py": 5,
     "optimizer/barrier_sizing_optimizer.py": 1,

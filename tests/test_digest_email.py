@@ -47,15 +47,17 @@ def test_analysis_report_url_and_slug():
     ) == "https://stage.example.com/analysis?date=2026-06-26"
 
 
-def test_build_digest_what_changed_and_completeness():
+def test_build_digest_evaluator_what_changed_and_completeness():
+    # The Evaluator builds its OWN digest — report card + what-changed + counts.
     md = build_digest(
         "2026-06-26",
+        title="Evaluation Digest",
         weight_result={"status": "ok", "apply_result": {"applied": True}},
         regression_result=None,
         completeness={"ok": 20, "degraded": 1, "skipped": 2, "error": 0, "total": 23},
         degraded_modules=["macro_eval"],
     )
-    assert "Weekly Backtest + Evaluation Digest" in md
+    assert "Evaluation Digest" in md
     assert "2026-06-26" in md
     assert "PROMOTED" in md                       # what-changed reused builder
     assert "Evaluator Completeness" in md
@@ -64,13 +66,13 @@ def test_build_digest_what_changed_and_completeness():
     assert len(md) < 4000
 
 
-def test_build_digest_omits_absent_sections():
-    md = build_digest("2026-06-26")               # no inputs at all
-    assert "Weekly Backtest + Evaluation Digest" in md
+def test_build_digest_title_is_parameterized_and_omits_absent_sections():
+    md = build_digest("2026-06-26", title="Backtest Digest")  # no section inputs
+    assert "Backtest Digest" in md
     assert "Evaluator Completeness" not in md      # omitted when absent
 
 
-def test_send_digest_email_is_thin_with_console_and_report_links(monkeypatch):
+def _capture_send(monkeypatch):
     captured = {}
 
     def _fake_send(subject, plain, *, recipients, html, sender, region):
@@ -78,15 +80,34 @@ def test_send_digest_email_is_thin_with_console_and_report_links(monkeypatch):
                         recipients=recipients, sender=sender)
 
     monkeypatch.setattr(emailer, "send_email", _fake_send)
+    return captured
+
+
+def test_send_digest_email_backtester_is_thin_with_console_and_report_link(monkeypatch):
+    captured = _capture_send(monkeypatch)
     emailer.send_digest_email(
-        "2026-06-26", "# Digest\n\nGrade: A", "s@x", ["o@x"],
+        "2026-06-26", "# Digest\n\nDeployed: +1.2%", "s@x", ["o@x"],
+        product_name="Backtester", report_prefix="backtest",
         status="ok", s3_bucket="alpha-engine-research",
     )
-    assert "Backtest+Eval | 2026-06-26 | results ready" in captured["subject"]
+    assert "Alpha Engine Backtester | 2026-06-26 | results ready" in captured["subject"]
     url = "https://console.nousergon.ai/analysis?date=2026-06-26"
     assert url in captured["plain"]
     assert f'href="{url}"' in captured["html"]
-    # Both full report.md artifacts are one click away.
+    # Links to ITS OWN report.md only (not the evaluator's) — the two are separate.
     assert "backtest/2026-06-26/report.md" in captured["html"]
-    assert "evaluation/2026-06-26/report.md" in captured["html"]
+    assert "evaluation/2026-06-26/report.md" not in captured["html"]
     assert captured["recipients"] == ["o@x"]
+
+
+def test_send_digest_email_evaluator_is_separate_with_own_subject_and_report(monkeypatch):
+    captured = _capture_send(monkeypatch)
+    emailer.send_digest_email(
+        "2026-06-26", "# Digest\n\nGrade: A", "s@x", ["o@x"],
+        product_name="Evaluator", report_prefix="evaluation",
+        status="ok", s3_bucket="alpha-engine-research",
+    )
+    assert "Alpha Engine Evaluator | 2026-06-26 | results ready" in captured["subject"]
+    # Separate task → links to the evaluation report.md, not the backtest one.
+    assert "evaluation/2026-06-26/report.md" in captured["html"]
+    assert "backtest/2026-06-26/report.md" not in captured["html"]

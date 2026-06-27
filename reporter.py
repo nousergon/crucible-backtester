@@ -1292,6 +1292,7 @@ def build_report(
 def build_digest(
     run_date: str,
     *,
+    title: str = "Weekly Digest",
     grading: dict | None = None,
     production_stats: dict | None = None,
     optimizer_param_sweep: dict | None = None,
@@ -1303,28 +1304,25 @@ def build_digest(
     degraded_modules: list[str] | None = None,
     failed_modules: list[str] | None = None,
 ) -> str:
-    """Build the SHORT consolidated digest markdown — the executive summary that
-    headlines the single weekly backtester+evaluation email.
+    """Build a SHORT digest markdown — the executive summary that headlines a
+    task's thin weekly email (the Backtester and the Evaluator each build their
+    OWN; they are not bundled). Each section is omitted cleanly when its input is
+    absent, so a caller composes only the parts it owns:
+      • backtest.py → deployed-strategy headline + optimizer-param sweep.
+      • evaluate.py → System Report Card + What Changed + completeness counts.
 
     Reuses the same ``_section_*`` renderers as ``build_report`` (DRY — the
     digest is a curated SUBSET, never a divergent re-implementation), so a metric
     reads identically in the email headline and the full console report. The
     full detail (every diagnostic, ablation, attribution) stays in ``report.md``
     on S3 + the console Analysis page the email deep-links to.
-
-    Sections (each omitted cleanly when its input is absent):
-      • Deployed-strategy headline (the live-trading risk-matched performance).
-      • Optimizer-param sweep recommendation (the auto-tuned MVO cell).
-      • System Report Card (overall + per-module grades).
-      • What Changed This Week (config promotions + regression verdict).
-      • Evaluator completeness counts (so a degraded run is visible at a glance).
     """
     lines = [
-        "# Alpha Engine — Weekly Backtest + Evaluation Digest",
+        f"# Alpha Engine — {title}",
         f"_Run date: {run_date}_",
         "",
         "_Executive summary — the full detail is on the console "
-        "(linked below) and in the uploaded report.md artifacts._",
+        "(linked below) and in the uploaded report.md artifact._",
         "",
         "---",
         "",

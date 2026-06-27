@@ -1,13 +1,13 @@
 """
-emailer.py — build + send the ONE consolidated weekly Backtest+Eval digest.
+emailer.py — build + send each task's thin weekly digest email.
 
-``send_digest_email`` sends a single thin executive-summary email that
+``send_digest_email`` sends ONE task's thin executive-summary email that
 deep-links to the console Analysis page for the full detail (mirroring the EOD
-and model-zoo digest patterns) — replacing the two former full-markdown emails
-(the simulation email from backtest.py and the evaluator email from
-evaluate.py). SMTP/SES dispatch is delegated to
-``nousergon_lib.email_sender.send_email`` (L4356 chokepoint); this module owns
-the subject + HTML/MD body building only.
+and model-zoo digest patterns). The Backtester and the Evaluator are SEPARATE
+Saturday-SF tasks, so each sends its OWN digest (they are NOT bundled) — the
+former full-markdown bodies are replaced by a thin summary + console link.
+SMTP/SES dispatch is delegated to ``nousergon_lib.email_sender.send_email``
+(L4356 chokepoint); this module owns the subject + HTML/MD body building only.
 """
 
 from __future__ import annotations
@@ -141,29 +141,33 @@ def send_digest_email(
     sender: str,
     recipients: list[str],
     *,
+    product_name: str,
+    report_prefix: str,
     status: str = "ok",
     console_base_url: str | None = None,
     s3_bucket: str | None = None,
-    sim_prefix: str = "backtest",
-    eval_prefix: str = "evaluation",
     region: str = "us-east-1",
 ) -> None:
-    """Send the ONE consolidated weekly backtester+evaluation digest.
+    """Send ONE task's thin digest email — a short executive summary that
+    deep-links to the console Analysis page for the full detail (mirroring the
+    EOD-email and model-zoo-digest patterns).
 
-    This REPLACES the two separate full-markdown emails (the simulation email
-    from ``backtest.py`` and the evaluator email from ``evaluate.py``). The
-    digest is a thin executive summary; the full backtest + evaluation detail
-    lives on the console Analysis page (deep-linked here, keyed by run_date)
-    and in the uploaded ``report.md`` artifacts — mirroring the EOD-email and
-    model-zoo-digest patterns.
+    The Backtester and the Evaluator are SEPARATE Saturday-SF tasks, so each
+    sends its OWN digest via this function (they are NOT bundled): backtest.py
+    calls it with ``product_name="Backtester"``, ``report_prefix="backtest"``;
+    evaluate.py with ``product_name="Evaluator"``, ``report_prefix="evaluation"``.
+    Both land on the same console Analysis page (which has both a Backtester and
+    a Pipeline-Evaluation tab), keyed by run_date.
 
     Args:
-        run_date:    The backtest run_date (last completed trading day) — used
-                     in the subject, the console deep-link, and the S3 links.
-        digest_md:   Short executive-summary markdown from reporter.build_digest.
-        status:      "ok" | "insufficient_data" | "error" — shown in subject.
+        run_date:     The run_date (last completed trading day) — subject +
+                      console deep-link + the S3 report.md link.
+        digest_md:    Short executive-summary markdown from reporter.build_digest.
+        product_name: "Backtester" | "Evaluator" — subject + footer label.
+        report_prefix:S3 prefix of THIS task's report.md ("backtest"|"evaluation").
+        status:       "ok" | "insufficient_data" | "error" — shown in subject.
         console_base_url: Override for the console base (tests); defaults to prod.
-        s3_bucket:   When set, footer links to both the sim + eval report.md.
+        s3_bucket:    When set, footer links to this task's full report.md.
     """
     url = analysis_report_url(run_date, console_base_url)
     label = {
@@ -171,32 +175,30 @@ def send_digest_email(
         "insufficient_data": "insufficient data (accumulating)",
         "error": "ERROR",
     }.get(status, status)
-    subject = f"Alpha Engine Backtest+Eval | {run_date} | {label}"
+    subject = f"Alpha Engine {product_name} | {run_date} | {label}"
 
     cta_html = (
         f'<p style="font-size:14px;margin:0 0 16px;">&#9654; '
-        f'<a href="{url}"><b>View the full backtest + evaluation report on the '
+        f'<a href="{url}"><b>View the full {product_name} report on the '
         f'console</b></a></p>'
     )
     foot_links = f' | <a href="{url}">console</a>'
     plain_links = ""
     if s3_bucket:
-        sim_url = f"https://{s3_bucket}.s3.amazonaws.com/{sim_prefix}/{run_date}/report.md"
-        eval_url = f"https://{s3_bucket}.s3.amazonaws.com/{eval_prefix}/{run_date}/report.md"
-        foot_links += (
-            f' | <a href="{sim_url}">sim report.md</a>'
-            f' | <a href="{eval_url}">eval report.md</a>'
+        report_url = (
+            f"https://{s3_bucket}.s3.amazonaws.com/{report_prefix}/{run_date}/report.md"
         )
-        plain_links = f"\nSim report:  {sim_url}\nEval report: {eval_url}\n"
+        foot_links += f' | <a href="{report_url}">report.md</a>'
+        plain_links = f"\nFull report: {report_url}\n"
 
     html_body = _HTML.format(
         body=cta_html + _md_to_html(digest_md),
         date=run_date,
         s3_link=foot_links,
-        product_name="Backtest+Eval",
+        product_name=product_name,
     )
     plain_body = (
-        f"View the full backtest + evaluation report on the console:\n{url}\n\n"
+        f"View the full {product_name} report on the console:\n{url}\n\n"
         f"{digest_md}\n{plain_links}"
     )
     send_email(

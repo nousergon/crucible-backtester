@@ -1696,35 +1696,19 @@ def _main_impl() -> None:
                 except Exception as e:
                     logger.warning("Grade history update failed (non-fatal): %s", e)
 
-        # Email — ONE consolidated Backtest+Eval digest (config: single-email
-        # consolidation). Replaces BOTH the simulation email (retired in
-        # backtest.py) and the former full-markdown evaluator email. The digest
-        # is a thin executive summary; the full backtest + evaluation detail
-        # lives on the console Analysis page (deep-linked, keyed by run_date) +
-        # the uploaded report.md artifacts — mirroring the EOD + model-zoo
-        # patterns. Sim-side headlines (deployed-strategy performance, optimizer
-        # sweep) are produced by backtest.py and read back here best-effort from
-        # S3; their absence degrades the digest gracefully (the console link
-        # still carries the full detail).
+        # Evaluator email — now a THIN digest (System Report Card + What Changed
+        # + completeness) that deep-links to the console Analysis page for the
+        # full detail, mirroring the EOD and model-zoo patterns. The full
+        # report.md is still built + uploaded for the console + the link. The
+        # Backtester is a SEPARATE Saturday-SF task and sends its OWN digest from
+        # backtest.py — the two are intentionally NOT bundled.
         sender = config.get("email_sender")
         recipients = config.get("email_recipients", [])
         if sender and recipients:
-            _bucket = config.get("output_bucket", "alpha-engine-research")
-
-            def _read_sim_json(name):
-                try:
-                    obj = boto3.client("s3").get_object(
-                        Bucket=_bucket, Key=f"backtest/{args.date}/{name}")
-                    return json.loads(obj["Body"].read())
-                except Exception as _e:  # noqa: BLE001 — best-effort digest enrichment
-                    logger.info("digest: %s unavailable (non-fatal): %s", name, _e)
-                    return None
-
             digest_md = build_digest(
                 run_date=args.date,
+                title="Evaluation Digest",
                 grading=grading_result,
-                production_stats=_read_sim_json("production_stats.json"),
-                optimizer_param_sweep=_read_sim_json("optimizer_param_sweep.json"),
                 weight_result=opt_results.get("weight_result"),
                 veto_result=opt_results.get("veto_result"),
                 executor_rec=opt_results.get("executor_rec"),
@@ -1738,8 +1722,10 @@ def _main_impl() -> None:
                 digest_md=digest_md,
                 sender=sender,
                 recipients=recipients,
+                product_name="Evaluator",
+                report_prefix=config.get("output_prefix", "evaluation"),
                 status=sq_result.get("status", "ok"),
-                s3_bucket=_bucket if args.upload else None,
+                s3_bucket=config.get("output_bucket") if args.upload else None,
             )
 
         report_ok = True
