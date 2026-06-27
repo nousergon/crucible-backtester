@@ -51,7 +51,7 @@ from pathlib import Path
 # simple repo-root path resolution works.
 #
 # exclude_patterns starts empty by deliberate convention.
-from alpha_engine_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.logging import setup_logging, guard_entrypoint
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
 setup_logging(
@@ -88,8 +88,8 @@ from optimizer import (
 )
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
 from optimizer.config_archive import read_params_pit_or_current
-from emailer import send_report_email
-from reporter import build_report, save, upload_to_s3
+from emailer import send_digest_email
+from reporter import build_digest, build_report, save, upload_to_s3
 from completeness import CompletenessTracker
 from pipeline_common import (
     load_config,
@@ -577,7 +577,7 @@ def _run_diagnostics(
     # (attractiveness-pillars-260520.md). Compares this week's
     # predictor/predictions/{date}.json stance counts to the prior 4 ISO
     # weeks' mean ± 2σ; fires a Telegram + SNS alert via
-    # alpha_engine_lib.alerts.publish on FAIL. Defense-in-depth against
+    # nousergon_lib.alerts.publish on FAIL. Defense-in-depth against
     # the pillar-aware classify_stance code path collapsing the
     # distribution into a single stance without surfacing through NAV
     # for weeks. ROADMAP L1614.
@@ -1097,7 +1097,7 @@ def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
     Post-fix: status ∈ {``alpha_below_floor``, ``insufficient_data``,
     ``no_params``, ``no_improvement``, ``insufficient_trades``,
     ``insufficient_psr_confidence``, ``degraded``, ...} → publish a WARN
-    alert via ``alpha_engine_lib.alerts.publish`` with dedup_key keyed on
+    alert via ``nousergon_lib.alerts.publish`` with dedup_key keyed on
     ``(run_date, status)`` so a recurring class doesn't N-spam the operator.
     Mirrors the stance_distribution + cost_report patterns.
     """
@@ -1110,10 +1110,10 @@ def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
     if status == "ok":
         return
     try:
-        from alpha_engine_lib import alerts  # noqa: PLC0415
+        from nousergon_lib import alerts  # noqa: PLC0415
     except ImportError as e:
         logger.warning(
-            "[executor_optimizer] alerts publish skipped — alpha_engine_lib.alerts "
+            "[executor_optimizer] alerts publish skipped — nousergon_lib.alerts "
             "unavailable (lib pin <v0.21.0?): %s", e,
         )
         return
@@ -1255,7 +1255,7 @@ def _main_impl() -> None:
         logger.info("Normalized run-date %s (calendar) → %s (trading day)", _orig_date, args.date)
 
     # setup_logging already ran at module-top (see comment near the
-    # alpha_engine_lib.logging import). Apply the user-requested level here.
+    # nousergon_lib.logging import). Apply the user-requested level here.
     # Note: get_flow_doctor() retrieval was dropped — every fd.report()
     # call site lived in backtest.py, never in this module's body.
     # ERROR-level escalation still flows through the root-attached
@@ -1696,19 +1696,36 @@ def _main_impl() -> None:
                 except Exception as e:
                     logger.warning("Grade history update failed (non-fatal): %s", e)
 
-        # Email
+        # Evaluator email — now a THIN digest (System Report Card + What Changed
+        # + completeness) that deep-links to the console Analysis page for the
+        # full detail, mirroring the EOD and model-zoo patterns. The full
+        # report.md is still built + uploaded for the console + the link. The
+        # Backtester is a SEPARATE Saturday-SF task and sends its OWN digest from
+        # backtest.py — the two are intentionally NOT bundled.
         sender = config.get("email_sender")
         recipients = config.get("email_recipients", [])
         if sender and recipients:
-            send_report_email(
+            digest_md = build_digest(
                 run_date=args.date,
-                report_md=report_md,
-                status=sq_result.get("status", "unknown"),
+                title="Evaluation Digest",
+                grading=grading_result,
+                weight_result=opt_results.get("weight_result"),
+                veto_result=opt_results.get("veto_result"),
+                executor_rec=opt_results.get("executor_rec"),
+                regression_result=regression_result,
+                completeness=tracker.summary(),
+                degraded_modules=tracker.degraded_modules(),
+                failed_modules=tracker.failed_modules(),
+            )
+            send_digest_email(
+                run_date=args.date,
+                digest_md=digest_md,
                 sender=sender,
                 recipients=recipients,
-                s3_bucket=config.get("output_bucket") if args.upload else None,
-                s3_prefix=config.get("output_prefix", "evaluation"),
                 product_name="Evaluator",
+                report_prefix=config.get("output_prefix", "evaluation"),
+                status=sq_result.get("status", "ok"),
+                s3_bucket=config.get("output_bucket") if args.upload else None,
             )
 
         report_ok = True

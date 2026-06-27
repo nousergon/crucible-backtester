@@ -246,7 +246,7 @@ def test_alert_publish_called_on_fail(monkeypatch):
     fake_result.telegram.ok = True
     fake_result.any_ok = True
 
-    with patch("alpha_engine_lib.alerts.publish", return_value=fake_result) as mock_publish:
+    with patch("nousergon_lib.alerts.publish", return_value=fake_result) as mock_publish:
         report = sd.compute_stance_distribution_drift(
             bucket="test-bucket", current_date="2026-05-15", s3_client=s3,
         )
@@ -262,7 +262,7 @@ def test_alert_publish_skipped_on_ok():
     """Status ok → no alert publish."""
     file_map = {d: _make_pred_response(_healthy_distribution()) for d in _FRIDAYS}
     s3 = _make_s3_client(file_map)
-    with patch("alpha_engine_lib.alerts.publish") as mock_publish:
+    with patch("nousergon_lib.alerts.publish") as mock_publish:
         report = sd.compute_stance_distribution_drift(
             bucket="test-bucket", current_date="2026-05-15", s3_client=s3,
         )
@@ -278,12 +278,12 @@ def test_alert_publish_swallows_import_error():
     file_map["2026-05-15"] = _make_pred_response(collapsed)
     s3 = _make_s3_client(file_map)
 
-    # Force ImportError on `from alpha_engine_lib import alerts`
+    # Force ImportError on `from nousergon_lib import alerts`
     import builtins
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
-        if name == "alpha_engine_lib":
+        if name == "nousergon_lib":
             raise ImportError("simulated old lib pin")
         return real_import(name, *args, **kwargs)
 

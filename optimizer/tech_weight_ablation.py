@@ -653,7 +653,7 @@ def apply(result: dict, bucket: str) -> dict:
     ``executor_optimizer.apply()`` so the evaluator wiring is uniform.
     """
     import boto3
-    from alpha_engine_lib.eval_artifacts import (
+    from nousergon_lib.eval_artifacts import (
         eval_artifact_key, eval_latest_key, new_eval_run_id,
     )
 

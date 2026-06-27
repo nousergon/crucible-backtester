@@ -34,7 +34,7 @@ from email.mime.text import MIMEText
 
 import boto3
 
-from alpha_engine_lib.secrets import get_secret
+from nousergon_lib.secrets import get_secret
 
 log = logging.getLogger(__name__)
 

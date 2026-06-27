@@ -39,7 +39,7 @@ from datetime import date
 
 import boto3
 import pandas as pd
-from alpha_engine_lib.eval_artifacts import (
+from nousergon_lib.eval_artifacts import (
     eval_artifact_key,
     eval_latest_key,
     new_eval_run_id,
@@ -1618,7 +1618,7 @@ def apply(result: dict, bucket: str, run_date: str | None = None) -> dict:
     body = json.dumps(payload, indent=2)
 
     if shadow_only:
-        # Canonical eval-style archive layout per alpha_engine_lib.eval_artifacts
+        # Canonical eval-style archive layout per nousergon_lib.eval_artifacts
         # (v0.8.0). Flat {prefix}/{run_id}.json + latest.json sidecar with
         # YYMMDDHHMM run_id. Replaces the prior {prefix}/{date}.json shape so
         # same-day re-runs preserve forensic capture instead of overwriting.

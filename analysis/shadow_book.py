@@ -141,7 +141,13 @@ def compute_shadow_book_analysis(
                 )
                 if not traded_merged.empty:
                     traded_returns = traded_merged
-        except Exception as e:
+        except (sqlite3.Error, pd.errors.DatabaseError, pd.errors.MergeError, KeyError, ValueError) as e:
+            # Fail-soft: forward-return enrichment is optional. Narrowed to the
+            # real failure surface here — sqlite/read_sql errors (missing
+            # universe_returns table or unreadable research.db) and the
+            # merge/key/value errors a schema mismatch in the joined columns
+            # would raise. The analysis proceeds without blocked/traded
+            # forward returns and reports "insufficient_return_data".
             logger.debug("Could not join universe_returns: %s", e)
 
     if blocked_returns is not None and not blocked_returns.empty:

@@ -20,7 +20,7 @@ This module adds the missing alarm layer:
   level is still inside its band (catches a parity gap that is rapidly widening).
 - **observe → paging** — defaults to OBSERVE (compute the verdict, log, return it;
   page nobody). When ``paging_enabled=True`` a breach fans out to SNS + Telegram
-  via the canonical ``alpha_engine_lib.alerts.publish`` primitive (mirrors
+  via the canonical ``nousergon_lib.alerts.publish`` primitive (mirrors
   ``analysis.stance_distribution._publish_drift_alert``). This is the graduation
   path: soak in observe, flip to paging once the band thresholds are validated
   against live Saturday cadence.
@@ -126,7 +126,7 @@ def evaluate_parity_alarms(
                         nobody. When True, a breach fans out an alert (suppressed
                         by env ``ALPHA_ENGINE_PARITY_ALARM_DISABLED``).
         publish_fn:     injectable ``callable(message, severity, source)`` for tests;
-                        defaults to ``alpha_engine_lib.alerts.publish`` (lazy import).
+                        defaults to ``nousergon_lib.alerts.publish`` (lazy import).
 
     Returns a verdict dict: ``{mode, status, band_breaches, step_breaches,
     n_breaches, breached_metrics, paged}``. ``status`` is ``"ok"`` or ``"breach"``.
@@ -196,10 +196,10 @@ def _publish_parity_alarm(
 
     if publish_fn is None:
         try:
-            from alpha_engine_lib import alerts  # noqa: PLC0415 — lazy import
+            from nousergon_lib import alerts  # noqa: PLC0415 — lazy import
         except ImportError as e:
             logger.warning(
-                "[parity_alarms] paging skipped — alpha_engine_lib.alerts "
+                "[parity_alarms] paging skipped — nousergon_lib.alerts "
                 "unavailable: %s", e,
             )
             return False

@@ -16,7 +16,7 @@ import logging
 import sqlite3
 from datetime import date
 
-from alpha_engine_lib.eval_artifacts import (
+from nousergon_lib.eval_artifacts import (
     eval_artifact_key,
     eval_latest_key,
     new_eval_run_id,

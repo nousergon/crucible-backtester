@@ -259,7 +259,7 @@ def gate_signal_inputs(
 
     ``signal_loader`` must expose ``load(bucket, date) -> dict`` (the repo's
     ``loaders.signal_loader``). ``alert_publisher`` is an optional
-    ``callable(message, severity, source)`` (``alpha_engine_lib.alerts.publish``
+    ``callable(message, severity, source)`` (``nousergon_lib.alerts.publish``
     in production) — best-effort observability; a publish failure never alters
     the gate decision. Returns the verdict on pass.
     """

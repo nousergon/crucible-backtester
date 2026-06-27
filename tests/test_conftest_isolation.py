@@ -6,7 +6,7 @@ History — both fixtures exist as recurrence-class fixes:
   tests could silently fetch real secrets from real SSM if AWS creds
   were present in the venv.
 - ``_block_real_alerts_publish``: 2026-05-21 a buggy monkeypatch in
-  test_cost_report.py let the real ``alpha_engine_lib.alerts.publish``
+  test_cost_report.py let the real ``nousergon_lib.alerts.publish``
   through on a failing test run, firing a real Telegram alert + (likely)
   SNS publish to the operator. Default-deny via autouse fixture closes
   the class — a future test bug can never again reach production
@@ -24,7 +24,7 @@ def test_alerts_publish_is_blocked_without_explicit_setattr():
     explicitly stub publish should still NOT reach the production channels.
     """
     try:
-        from alpha_engine_lib import alerts
+        from nousergon_lib import alerts
     except ImportError:
         # Pre-v0.21.0 lib pin → nothing to block.
         return
@@ -51,7 +51,7 @@ def test_per_test_setattr_overrides_conftest_default(monkeypatch):
     the per-test override wins for the duration of the test.
     """
     try:
-        from alpha_engine_lib import alerts
+        from nousergon_lib import alerts
     except ImportError:
         return
 
@@ -65,7 +65,7 @@ def test_per_test_setattr_overrides_conftest_default(monkeypatch):
             "any_ok": True, "all_ok": True,
         })
 
-    monkeypatch.setattr("alpha_engine_lib.alerts.publish", _spy)
+    monkeypatch.setattr("nousergon_lib.alerts.publish", _spy)
     alerts.publish("intercepted by per-test spy", severity="info")
     assert len(calls) == 1
     assert calls[0]["message"] == "intercepted by per-test spy"
