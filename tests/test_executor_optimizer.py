@@ -1333,34 +1333,56 @@ class TestWalkForward:
             "best_sharpe": 1.0,
         }
 
-    def test_all_folds_pass_promotes(self):
+    def test_all_folds_pass_records_advisory_consistency(self):
         dates = [f"d{i:02d}" for i in range(30)]
         sim = _date_aware_sim({})  # every fold returns sharpe 1.0 == train → ratio 100%
         result = validate_walk_forward(self._ok_result(), sim, dates, {})
+        # No daily_returns / pbo_top_combos in this synthetic sim → PSR/DSR/PBO
+        # all `insufficient` (non-blocking) → gate passes.
         assert result["holdout_passed"] is True
         assert result["status"] == "ok"
-        assert result["walk_forward"]["n_passed"] == result["walk_forward"]["n_gradeable"]
+        wf = result["walk_forward"]
+        # min_pass_fraction is now an ADVISORY secondary diagnostic.
+        assert wf["n_passed"] == wf["n_gradeable"]
+        assert wf["consistency_ok"] is True
+        assert "promotion_gate" in result
 
-    def test_one_failing_fold_blocks_under_all_pass_policy(self):
+    def test_failing_fold_is_advisory_not_blocking(self):
+        """min_pass_fraction is DEMOTED (config#950): a failing fold lowers the
+        advisory consistency flag but does NOT block promotion — the PSR/DSR/PBO
+        gate is the decision, and here it is non-blocking (insufficient data)."""
         dates = [f"d{i:02d}" for i in range(30)]
         windows = _rolling_windows(dates, n_folds=3, test_frac=0.30)
-        # Make the MIDDLE fold fail (holdout sharpe well under 50% of train=1.0).
         mid_key = (windows[1][1][0], windows[1][1][-1])
         sim = _date_aware_sim({mid_key: {"sharpe_ratio": 0.2, "sortino_ratio": 0.2}})
         result = validate_walk_forward(self._ok_result(), sim, dates, {})
-        assert result["holdout_passed"] is False
-        assert result["status"] == "holdout_failed"
-
-    def test_min_pass_fraction_allows_one_failure(self):
-        dates = [f"d{i:02d}" for i in range(30)]
-        windows = _rolling_windows(dates, n_folds=3, test_frac=0.30)
-        mid_key = (windows[1][1][0], windows[1][1][-1])
-        sim = _date_aware_sim({mid_key: {"sharpe_ratio": 0.2, "sortino_ratio": 0.2}})
-        result = validate_walk_forward(
-            self._ok_result(), sim, dates, {}, min_pass_fraction=0.66,
-        )
-        # 2/3 folds pass → 0.66 policy clears.
+        # Advisory consistency reflects the fold failure...
+        assert result["walk_forward"]["consistency_ok"] is False
+        # ...but promotion is NOT blocked by it (gate sub-stats insufficient).
         assert result["holdout_passed"] is True
+        assert result["status"] == "ok"
+
+    def test_promotion_gate_blocks_when_a_sub_gate_fails(self):
+        """A computable sub-gate failure (here DSR) blocks promotion regardless
+        of fold consistency."""
+        import numpy as np
+        import optimizer.executor_optimizer as eo
+        dates = pd.date_range("2025-01-01", periods=240, freq="B").strftime("%Y-%m-%d").tolist()
+
+        def sim(combo_config, dates=None):  # noqa: D401
+            rng = np.random.RandomState(7)
+            r = pd.Series(rng.normal(0.0003, 0.012, len(dates)), index=pd.to_datetime(dates))
+            sh = r.mean() / r.std() * np.sqrt(252)
+            return {"status": "ok", "daily_returns": r,
+                    "sharpe_ratio": float(sh), "sortino_ratio": float(sh)}
+
+        res = dict(self._ok_result())
+        res["n_combos_swept"] = 400  # heavy deflation → DSR well below 0.90
+        res["pbo_top_combos"] = [{"atr_multiplier": x} for x in (3.0, 2.5, 3.5, 2.0)]
+        out = validate_walk_forward(res, sim, dates, {}, n_folds=3, test_frac=0.30)
+        assert out["holdout_passed"] is False
+        assert out["status"] == "holdout_failed"
+        assert out["promotion_gate"]["sub_gates"]["dsr"]["status"] == "ok"
 
     def test_non_date_aware_sim_falls_back_to_single_holdout(self):
         dates = [f"d{i:02d}" for i in range(30)]

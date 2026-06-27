@@ -148,6 +148,49 @@ _MIN_TRADES_TO_PROMOTE = 50
 # veto skill-composite cutover (alpha-engine-backtester #166).
 _MIN_PSR = 0.95
 
+# ── SOTA promotion gate (config#950) — López de Prado selection-bias battery ──
+# The executor optimizer runs a 50–400-trial random search and auto-applies the
+# winning risk params to LIVE trading (config/executor_params.json). Picking the
+# best-of-N Sharpe/Sortino and validating it on a few folds without a
+# multiple-testing correction is the canonical backtest-overfitting trap. The
+# promotion gate (computed in validate_walk_forward on the winner's true
+# out-of-sample return stream) is therefore the institutional battery already
+# used elsewhere in the fleet (predictor W1.3, portfolio-optimizer PSR gate):
+#   • PSR  ≥ _MIN_PSR  — P(true Sharpe > 0) on the OOS stream (Bailey-LdP 2012).
+#   • DSR  ≥ _MIN_DSR  — PSR deflated for n_trials = combos swept; "significant
+#     even after cherry-picking the best of N" (Bailey-LdP 2014).
+#   • PBO  ≤ _MAX_PBO  — CSCV Probability of Backtest Overfitting across the
+#     top-K combos (Bailey-Borwein-LdP-Zhu 2014, mirrored from predictor L4582).
+# A statistic that cannot be computed (too few OOS obs / blocks / combos) is
+# reported as `insufficient` and is NON-blocking — you cannot gate on a number
+# you could not measure (the same honest-N/A posture as the PSR <30-obs skip,
+# and it avoids the predictor's "insufficient → never promotes" deadlock).
+# min_pass_fraction (fold-consistency) is retained but DEMOTED to an advisory
+# secondary diagnostic — it is no longer the promotion decision.
+#
+# DSR-threshold calibration (config#950): DSR ≤ PSR by construction, and the
+# deflation is steep — a genuinely strong strategy (OOS Sharpe ~1.5) over ~220
+# OOS days deflated for a 60-combo sweep lands near DSR≈0.81, and lower for
+# 400-combo sweeps. A 0.95 DSR bar (the publication-grade "significant after
+# selection bias" threshold) would therefore freeze weekly auto-promotion
+# entirely — the predictor's "insufficient/over-strict gate → never promotes"
+# deadlock. The promotion gate is NOT a publishable-alpha certification; it
+# exists to block overfit param sets from reaching live trading. 0.90 is the
+# defensible default for that purpose ("≥90% confident the OOS Sharpe beats the
+# expected-max-under-null after best-of-N selection"), and it composes with the
+# PBO ≤ 0.50 generalization check + PSR ≥ 0.95 confidence check. The threshold
+# is config-tunable and MUST be confirmed against a live sweep before the gate
+# is trusted (see the PR validate command) — raise toward 0.95 only if live
+# DSRs show real edges clearing it.
+_MIN_DSR = 0.90
+_MAX_PBO = 0.50
+# Top-K swept combos re-evaluated across CSCV blocks to build the PBO matrix,
+# and the number of chronological evaluation blocks (cscv_pbo needs ≥4 clean
+# rows). Compute cost of the PBO step is roughly pbo_n_blocks × pbo_top_k extra
+# simulations — bounded + config-tunable for the Saturday SF holdout phase.
+_PBO_TOP_K = 20
+_PBO_N_BLOCKS = 6
+
 # Floor for the |baseline| denominator in improvement_pct, preventing
 # blow-ups when the baseline rank metric (Sortino / Sharpe / risk-matched
 # alpha) is near zero. Without this, baseline≈0 produced inf or 9828×
@@ -579,8 +622,19 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     else:
         baseline_dist = 0.0
 
+    # Top-K swept combos (by the same _combined_score ranking used to pick the
+    # winner), carried into the result so validate_walk_forward can build the
+    # CSCV-PBO matrix without re-deriving the ranking. config#950.
+    _pbo_top_k = int(_cfg.get("pbo_top_k", _PBO_TOP_K))
+    pbo_top_combos = [
+        {c: _to_native(row[c]) for c in param_cols if pd.notna(row[c])}
+        for _, row in valid.head(_pbo_top_k).iterrows()
+    ]
+
     common_fields = {
         "fit_target": fit_target,
+        "n_combos_swept": int(len(valid)),
+        "pbo_top_combos": pbo_top_combos,
         "rank_metric": (
             "alpha_vs_ew_high_vol" if (use_skill_composite and prefer_risk_matched_alpha)
             else ("sortino_ratio" if use_skill_composite else "sharpe_drawdown")
@@ -940,6 +994,168 @@ def _grade_fold(
     }
 
 
+def _chronological_blocks(dates: list[str], n_blocks: int) -> list[list[str]]:
+    """Partition ``dates`` into ``n_blocks`` contiguous chronological blocks —
+    the CSCV evaluation splits for the PBO matrix. Blocks are as even as
+    possible; the last absorbs the remainder. Blocks shorter than 3 dates are
+    too small to produce a stable metric and are dropped by the caller."""
+    n = len(dates)
+    if n_blocks < 1 or n == 0:
+        return []
+    size = max(1, n // n_blocks)
+    blocks = [dates[i * size:(i + 1) * size] for i in range(n_blocks - 1)]
+    blocks.append(dates[(n_blocks - 1) * size:])  # remainder into the last block
+    return [b for b in blocks if b]
+
+
+def _compute_pbo(
+    top_combos: list, sim_fn, dates: list[str], config: dict, fit_target: str,
+    *, n_blocks: int, max_pbo: float, top_k: int,
+) -> dict:
+    """CSCV Probability of Backtest Overfitting across the sweep's top-K combos.
+
+    Builds an ``(n_blocks, K)`` matrix by evaluating each of the top-K combos on
+    each chronological CSCV block (metric = Sortino for skill-composite, Sharpe
+    for legacy), then runs :func:`analysis.pbo.cscv_pbo`. Answers "when we pick
+    the best of N combos, how often does the pick land in the bottom half
+    out-of-sample?". Returns ``status="insufficient"`` (NON-blocking) when the
+    matrix is too small to be meaningful — never a fabricated pass.
+
+    Cost: up to ``n_blocks × K`` extra simulations; bounded + config-tunable.
+    """
+    from analysis.pbo import cscv_pbo
+
+    metric_key = "sortino_ratio" if fit_target == "skill_composite" else "sharpe_ratio"
+    combos = list(top_combos)[:top_k]
+    if len(combos) < 2:
+        return {"status": "insufficient", "reason": "needs >=2 top combos",
+                "max_pbo": max_pbo, "blocking": False}
+
+    blocks = [b for b in _chronological_blocks(dates, n_blocks) if len(b) >= 3]
+    if len(blocks) < 4:
+        return {"status": "insufficient",
+                "reason": f"{len(blocks)} usable blocks < 4 (cscv min_splits)",
+                "max_pbo": max_pbo, "blocking": False}
+
+    matrix: list[list[float]] = []
+    for block in blocks:
+        row: list[float] = []
+        for combo in combos:
+            combo_config = {**config, **combo}
+            try:
+                stats = _call_sim_fn(sim_fn, combo_config, block)
+                val = stats.get(metric_key)
+                row.append(float(val) if val is not None and not pd.isna(val) else float("nan"))
+            except Exception as e:
+                logger.warning("PBO block sim failed (combo on %d-date block): %s", len(block), e)
+                row.append(float("nan"))
+        matrix.append(row)
+
+    pbo_res = cscv_pbo(matrix, spec_ids=list(range(len(combos))))
+    if pbo_res.get("status") != "ok":
+        return {**pbo_res, "metric": metric_key, "max_pbo": max_pbo, "blocking": False}
+    pbo = pbo_res["pbo"]
+    return {
+        "status": "ok",
+        "metric": metric_key,
+        "pbo": pbo,
+        "max_pbo": max_pbo,
+        "n_blocks": pbo_res["n_splits"],
+        "n_combos": pbo_res["n_specs"],
+        "passed": bool(pbo <= max_pbo),
+        "blocking": True,
+    }
+
+
+def _evaluate_promotion_gate(
+    oos_returns, n_trials: int, result: dict, sim_fn, dates: list[str],
+    config: dict, fit_target: str,
+) -> dict:
+    """SOTA promotion gate — PSR + DSR (on the winner's OOS return stream) + PBO
+    (cross-combo overfitting). config#950.
+
+    Each sub-gate is BLOCKING when it can be computed and NON-blocking
+    (``insufficient``) when it cannot — you cannot gate on a statistic you could
+    not measure, and a hard fail on insufficient data would deadlock promotion
+    on short samples (the predictor's W1.x ``insufficient → never promotes``
+    trap). The gate PASSES iff no computable sub-gate fails.
+    """
+    from analysis.dsr import compute_dsr, compute_psr
+
+    min_psr = float(_cfg.get("min_psr", _MIN_PSR))
+    min_dsr = float(_cfg.get("min_dsr", _MIN_DSR))
+    max_pbo = float(_cfg.get("max_pbo", _MAX_PBO))
+    n_blocks = int(_cfg.get("pbo_n_blocks", _PBO_N_BLOCKS))
+    top_k = int(_cfg.get("pbo_top_k", _PBO_TOP_K))
+
+    sub: dict = {}
+    failures: list[str] = []
+    notes: list[str] = []
+
+    # PSR + DSR on the concatenated out-of-sample return stream.
+    n_oos = 0 if oos_returns is None else int(len(oos_returns))
+    if n_oos < 30:
+        sub["psr"] = {"status": "insufficient", "n": n_oos,
+                      "min_psr": min_psr, "blocking": False}
+        sub["dsr"] = {"status": "insufficient", "n": n_oos,
+                      "n_trials": n_trials, "min_dsr": min_dsr, "blocking": False}
+        notes.append("PSR/DSR: insufficient OOS observations (<30) — skipped")
+    else:
+        psr_res = compute_psr(oos_returns, sharpe_benchmark=0.0)
+        if psr_res.get("status") == "ok":
+            psr = float(psr_res["psr"])
+            ok = psr >= min_psr
+            sub["psr"] = {"status": "ok", "psr": round(psr, 4), "min_psr": min_psr,
+                          "passed": ok, "blocking": True}
+            if not ok:
+                failures.append(f"PSR={psr:.3f} < {min_psr:.2f}")
+            notes.append(f"PSR={psr:.3f} ({'PASS' if ok else 'FAIL'})")
+        else:
+            sub["psr"] = {**psr_res, "min_psr": min_psr, "blocking": False}
+            notes.append(f"PSR: {psr_res.get('status')} — skipped")
+
+        dsr_res = compute_dsr(oos_returns, n_trials=max(1, n_trials))
+        if dsr_res.get("status") == "ok":
+            dsr = float(dsr_res["dsr"])
+            ok = dsr >= min_dsr
+            sub["dsr"] = {"status": "ok", "dsr": round(dsr, 4), "n_trials": n_trials,
+                          "min_dsr": min_dsr, "passed": ok, "blocking": True}
+            if not ok:
+                failures.append(f"DSR={dsr:.3f} < {min_dsr:.2f} (deflated for {n_trials} trials)")
+            notes.append(f"DSR={dsr:.3f} ({'PASS' if ok else 'FAIL'})")
+        else:
+            sub["dsr"] = {**dsr_res, "min_dsr": min_dsr, "blocking": False}
+            notes.append(f"DSR: {dsr_res.get('status')} — skipped")
+
+    # PBO across the top-K swept combos.
+    top_combos = result.get("pbo_top_combos") or []
+    pbo_res = _compute_pbo(
+        top_combos, sim_fn, dates, config, fit_target,
+        n_blocks=n_blocks, max_pbo=max_pbo, top_k=top_k,
+    )
+    sub["pbo"] = pbo_res
+    if pbo_res.get("status") == "ok":
+        pbo = pbo_res["pbo"]
+        if not pbo_res["passed"]:
+            failures.append(f"PBO={pbo:.3f} > {max_pbo:.2f}")
+        notes.append(f"PBO={pbo:.3f} ({'PASS' if pbo_res['passed'] else 'FAIL'})")
+    else:
+        notes.append(f"PBO: {pbo_res.get('status')} — skipped")
+
+    passed = not failures
+    if passed:
+        note = "Promotion gate PASS — " + "; ".join(notes)
+    else:
+        note = "Promotion gate FAIL — " + "; ".join(failures)
+    return {
+        "passed": passed,
+        "sub_gates": sub,
+        "n_trials": n_trials,
+        "n_oos_obs": int(len(oos_returns)) if oos_returns is not None else 0,
+        "note": note,
+    }
+
+
 def _rolling_windows(
     dates: list[str], n_folds: int, test_frac: float,
 ) -> list[tuple[list[str], list[str]]]:
@@ -1024,6 +1240,7 @@ def validate_walk_forward(
         return validate_holdout(result, sim_fn, dates, config)
 
     fold_results = []
+    oos_return_chunks: list = []
     for i, (_train_dates, test_dates) in enumerate(windows):
         try:
             stats = _call_sim_fn(sim_fn, holdout_config, test_dates)
@@ -1034,6 +1251,12 @@ def validate_walk_forward(
                 "note": f"fold {i} simulation error: {e}", "skipped": True,
             })
             continue
+        # Capture the winner's OOS daily-return series for this fold — the
+        # concatenation across folds is the true out-of-sample return stream the
+        # PSR/DSR gate is computed on (config#950).
+        dr = stats.get("daily_returns")
+        if dr is not None and len(dr) > 0:
+            oos_return_chunks.append(pd.Series(dr).astype(float))
         graded = _grade_fold(stats, result, fit_target)
         graded["fold"] = i
         graded["n_test_dates"] = len(test_dates)
@@ -1042,47 +1265,59 @@ def validate_walk_forward(
     gradeable = [f for f in fold_results if f.get("ratio") is not None and not f.get("skipped")]
     n_pass = sum(1 for f in gradeable if f["passed"])
     n_grade = len(gradeable)
+    pass_fraction = (n_pass / n_grade) if n_grade else None
 
-    result["walk_forward"] = {
+    # min_pass_fraction is DEMOTED to an advisory secondary diagnostic
+    # (config#950): the promotion decision is the PSR/DSR/PBO battery below, not
+    # the fold pass-count. We still record fold consistency for operators.
+    secondary = {
         "n_folds": len(fold_results),
         "n_gradeable": n_grade,
         "n_passed": n_pass,
-        "test_frac": test_frac,
+        "pass_fraction": round(pass_fraction, 4) if pass_fraction is not None else None,
         "min_pass_fraction": min_pass_fraction,
+        "consistency_ok": (
+            (pass_fraction + 1e-9 >= min_pass_fraction) if pass_fraction is not None else None
+        ),
+    }
+    result["walk_forward"] = {
+        **secondary,
+        "test_frac": test_frac,
         "folds": fold_results,
     }
-
-    if n_grade == 0:
-        result["holdout_passed"] = True
-        result["holdout_note"] = "Walk-forward: no gradeable folds — skipped validation"
-        return result
-
-    pass_fraction = n_pass / n_grade
-    worst_ratio = min((f["ratio"] for f in gradeable if f["ratio"] is not None), default=0.0)
-    result["holdout_ratio"] = round(worst_ratio, 4)
-    metric_name = gradeable[0]["metric_name"]
-    result[f"holdout_{metric_name.lower()}"] = min(
-        (f["holdout_value"] for f in gradeable if f["holdout_value"] is not None),
-        default=None,
-    )
-
-    if pass_fraction + 1e-9 >= min_pass_fraction:
-        result["holdout_passed"] = True
-        result["holdout_note"] = (
-            f"Walk-forward {n_pass}/{n_grade} folds PASS "
-            f"(worst-fold ratio {worst_ratio:.0%}) — PASS"
+    if n_grade:
+        worst_ratio = min((f["ratio"] for f in gradeable if f["ratio"] is not None), default=0.0)
+        result["holdout_ratio"] = round(worst_ratio, 4)
+        metric_name = gradeable[0]["metric_name"]
+        result[f"holdout_{metric_name.lower()}"] = min(
+            (f["holdout_value"] for f in gradeable if f["holdout_value"] is not None),
+            default=None,
         )
-        logger.info("Executor optimizer walk-forward passed: %s", result["holdout_note"])
+
+    # ── SOTA promotion gate: PSR + DSR (on the winner's OOS stream) + PBO ──────
+    oos_returns = (
+        pd.concat(oos_return_chunks).sort_index()
+        if oos_return_chunks else pd.Series(dtype="float64")
+    )
+    # Dedup any overlapping index labels (rolling test windows are disjoint by
+    # construction, but guard against a sim returning a shared boundary date).
+    if not oos_returns.empty:
+        oos_returns = oos_returns[~oos_returns.index.duplicated(keep="last")]
+    n_trials = int(result.get("n_combos_swept") or result.get("n_combos_tested") or 1)
+    gate = _evaluate_promotion_gate(
+        oos_returns, n_trials, result, sim_fn, dates, config, fit_target,
+    )
+    result["promotion_gate"] = gate
+
+    if gate["passed"]:
+        result["holdout_passed"] = True
+        result["holdout_note"] = gate["note"]
+        logger.info("Executor optimizer promotion gate passed: %s", gate["note"])
     else:
         result["holdout_passed"] = False
         result["status"] = "holdout_failed"
-        failing = [f"fold {f['fold']}: {f['note']}" for f in gradeable if not f["passed"]]
-        result["holdout_note"] = (
-            f"Walk-forward {n_pass}/{n_grade} folds pass "
-            f"(need {min_pass_fraction:.0%}) — "
-            + "; ".join(failing[:3])
-        )
-        logger.warning("Executor optimizer walk-forward failed: %s", result["holdout_note"])
+        result["holdout_note"] = gate["note"]
+        logger.warning("Executor optimizer promotion gate failed: %s", gate["note"])
     return result
 
 
