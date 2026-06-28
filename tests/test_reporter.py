@@ -764,12 +764,54 @@ class TestAlwaysEmitDecisionCapture:
         assert not (out / "coverage.json").exists()
 
     def test_ok_only_artifact_skips_error_status(self, tmp_path):
-        """A non-always-emit artifact (barrier_coherence) keeps ok-only."""
+        """portfolio_excursion.json stays OK-only: a non-ok body is NOT
+        written. (It has no freshness-monitor / absence-vs-no-data consumer
+        requiring always-emit — see config#726.)"""
         out = self._save(
             tmp_path,
-            barrier_coherence={"status": "error", "error": "boom"},
+            excursion_summary={"status": "error", "error": "boom"},
         )
-        assert not (out / "barrier_coherence.json").exists()
+        assert not (out / "portfolio_excursion.json").exists()
+
+    @pytest.mark.parametrize(
+        "arg,filename",
+        [
+            ("grading", "grading.json"),
+            ("trigger_scorecard", "trigger_scorecard.json"),
+            ("shadow_book", "shadow_book.json"),
+            ("exit_timing", "exit_timing.json"),
+            ("e2e_lift", "e2e_lift.json"),
+            ("veto_result", "veto_analysis.json"),
+            ("confusion_matrix", "confusion_matrix.json"),
+            ("provenance_grounding", "provenance_grounding.json"),
+            ("quant_rank_quality", "quant_rank_quality.json"),
+            ("agent_justification", "agent_justification.json"),
+            ("barrier_coherence", "barrier_coherence.json"),
+        ],
+    )
+    def test_phase0b_artifact_always_emits_nonok_body(self, tmp_path, arg, filename):
+        """config#726 Phase 0b: the 11 swept observational artifacts must now
+        write on a non-ok producer body so absence means "producer never ran"
+        (infra failure), not "ran, no data". Consumers were verified to
+        graceful-degrade on a non-ok body before this flip."""
+        import json
+        out = self._save(tmp_path, **{arg: {"status": "insufficient_data"}})
+        f = out / filename
+        assert f.exists(), f"{filename} must always-emit a non-ok body (config#726)"
+        assert json.loads(f.read_text())["status"] == "insufficient_data"
+
+    @pytest.mark.parametrize(
+        "arg,filename",
+        [
+            ("grading", "grading.json"),
+            ("barrier_coherence", "barrier_coherence.json"),
+            ("provenance_grounding", "provenance_grounding.json"),
+        ],
+    )
+    def test_phase0b_artifact_none_is_not_written(self, tmp_path, arg, filename):
+        """None still means the producer was never invoked → absence is correct."""
+        out = self._save(tmp_path, **{arg: None})
+        assert not (out / filename).exists()
 
 
 # ── save() — Phase B1a artifact persistence ──────────────────────────────────
