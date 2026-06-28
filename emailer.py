@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 
+from krepis.console import console_url
 from nousergon_lib.email_sender import send_email
 
 logger = logging.getLogger(__name__)
@@ -24,14 +25,18 @@ logger = logging.getLogger(__name__)
 # tests/test_analysis_page.py; the page honors ?date=YYYY-MM-DD keyed by the
 # backtest run_date (the last completed trading day), so the link opens the
 # exact run the digest describes.
-DEFAULT_CONSOLE_BASE_URL = "https://console.nousergon.ai"
 ANALYSIS_SLUG = "analysis"
 
 
 def analysis_report_url(run_date: str, console_base_url: str | None = None) -> str:
-    """Deep-link to the console Analysis page for ``run_date``."""
-    base = (console_base_url or DEFAULT_CONSOLE_BASE_URL).rstrip("/")
-    return f"{base}/{ANALYSIS_SLUG}?date={run_date}"
+    """Deep-link to the console Analysis page for ``run_date``.
+
+    Thin wrapper over the lifted :func:`krepis.console.console_url` chokepoint
+    (config#1300) — the base-URL literal now lives once in krepis. The
+    ``ANALYSIS_SLUG`` stays local (cross-repo contract with the dashboard
+    ``url_path``).
+    """
+    return console_url(ANALYSIS_SLUG, date=run_date, base=console_base_url)
 
 _HTML = """\
 <!DOCTYPE html>
