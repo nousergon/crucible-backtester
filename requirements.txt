@@ -51,8 +51,10 @@ cvxpy>=1.4,<1.8
 nousergon-lib[arcticdb,flow-doctor,quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
 
 # krepis (MIT foundation) — direct dep for krepis.dates.resolve_trading_day
-# (pipeline_common re-exports it). Kept as a direct pin: PyPI dep (krepis is
-# published) — NOT a git pin, so it is outside the nousergon-lib lockstep guard
-# (which tracks only the lib git-tag pins). nousergon-lib >= v0.66.0 also pulls
-# krepis transitively, but the direct pin documents the minimum.
-krepis>=0.3.0
+# (pipeline_common re-exports it) and, as of config#1300, krepis.console.console_url
+# (emailer.py's analysis-page deep-link builder). Kept as a direct pin: PyPI dep
+# (krepis is published) — NOT a git pin, so it is outside the nousergon-lib
+# lockstep guard (which tracks only the lib git-tag pins). nousergon-lib >=
+# v0.66.0 also pulls krepis transitively, but the direct pin documents the
+# minimum. Bumped to >=0.4.0 for console_url.
+krepis>=0.4.0
