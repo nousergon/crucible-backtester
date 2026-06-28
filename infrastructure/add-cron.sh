@@ -9,22 +9,16 @@
 # Schedule: Saturdays at 08:00 UTC (2 hours after research pipeline starts at 06:00)
 # Saturday gives a weekend buffer to fix pipeline issues before Monday trading.
 #
-# Secrets sourced from ~/.alpha-engine.env (shared with executor).
+# Secrets: the spot workload resolves every secret via
+# alpha_engine_lib.secrets.get_secret() (SSM Parameter Store) at Python startup
+# on the spot instance (see spot_backtest.sh) — NOT from a sourced
+# ~/.alpha-engine.env. This dispatcher cron therefore sources no .env, so it does
+# not block the config#890 .env-deprecation `rm ~/.alpha-engine.env`.
 #
 # Usage:
 #   bash infrastructure/add-cron.sh
 
 set -euo pipefail
-
-ENV_FILE="/home/ec2-user/.alpha-engine.env"
-
-if [ ! -f "$ENV_FILE" ]; then
-    echo "ERROR: ${ENV_FILE} not found."
-    echo "Create it with GMAIL_APP_PASSWORD, then chmod 600."
-    exit 1
-fi
-
-SOURCE_ENV=". ${ENV_FILE} &&"
 
 # Path to the alpha-engine-config checkout on the dispatcher. The backtester's
 # config.yaml is a symlink into this checkout and spot_backtest.sh also stages
@@ -39,7 +33,7 @@ CONFIG_REPO="/home/ec2-user/alpha-engine-config"
 # pull is fail-LOUD but non-blocking: a failed pull logs a warning and the backtest
 # still runs on the last-good config (better than skipping the weekly run entirely),
 # rather than silently lagging.
-CRON_LINE="0 8 * * 6  { git -C ${CONFIG_REPO} pull --ff-only || echo 'WARN(add-cron): alpha-engine-config pull failed — backtest may run on STALE config (config#822)'; } >> /var/log/backtester.log 2>&1 && cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && ${SOURCE_ENV} bash infrastructure/spot_backtest.sh >> /var/log/backtester.log 2>&1"
+CRON_LINE="0 8 * * 6  { git -C ${CONFIG_REPO} pull --ff-only || echo 'WARN(add-cron): alpha-engine-config pull failed — backtest may run on STALE config (config#822)'; } >> /var/log/backtester.log 2>&1 && cd /home/ec2-user/alpha-engine-backtester && git pull --ff-only >> /var/log/backtester.log 2>&1 && bash infrastructure/spot_backtest.sh >> /var/log/backtester.log 2>&1"
 
 # Remove existing backtester entry, then add new one
 EXISTING=$(crontab -l 2>/dev/null || true)
@@ -52,7 +46,7 @@ FILTERED=$(echo "$EXISTING" | grep -v "alpha-engine-backtester" || true)
 
 echo "Backtester cron job registered: Saturdays 08:00 UTC"
 echo "  Mode: spot instance (launched from always-on EC2)"
-echo "  Secrets: sourced from ${ENV_FILE}"
+echo "  Secrets: resolved on the spot instance via get_secret() / SSM (no .env)"
 echo ""
 echo "Current crontab:"
 crontab -l
