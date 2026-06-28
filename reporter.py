@@ -1645,16 +1645,23 @@ def save(
         # object) from "ran, gated on thin data" (present, status-tagged body)
         # — same rationale as the freshness-monitored artifacts above.
         ("cio_rule_tag_precision.json", cio_rule_tag_precision),
-    ]:
-        if data is not None:
-            (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
-            logger.info("Wrote %s (status=%s)", out_dir / filename, data.get("status"))
-            _persist(out_dir / filename)
-
-    # OK-ONLY contract (dashboard panels): write only on a meaningful result.
-    # Migrating the rest of these to the always-emit contract is a filed
-    # follow-up — each needs its consumer's None/non-ok tolerance verified.
-    for filename, data in [
+        # Phase 0b sweep (config#726): the remaining 11 observational artifacts
+        # migrated from the OK-ONLY block to always-emit. Each consumer was
+        # verified to graceful-degrade on a non-ok body before flipping:
+        #  - grading.json: dash report_card.py / s3_loader.py read any dict,
+        #    gate on `.get("overall")`/`.get(letter,"N/A")`.
+        #  - trigger_scorecard / shadow_book / exit_timing: dash 6_Execution.py
+        #    + eval tiles/executor.py gate on `status=="ok"` → N/A otherwise.
+        #  - e2e_lift / veto_analysis: eval tiles/research.py + predictor.py
+        #    `.get()`-guard every field → N/A on a non-ok body.
+        #  - provenance_grounding: dash 8_Eval_Quality.py `if prov is None or
+        #    prov.get("status")!="ok": st.info(...)`.
+        #  - confusion_matrix / quant_rank_quality / agent_justification /
+        #    barrier_coherence: no downstream S3 consumer (embedded in the
+        #    markdown report only) — flip is inert downstream.
+        # Absence now unambiguously means "producer never ran" (an infra
+        # failure) rather than "ran, no data" — same rationale as the
+        # freshness-monitored artifacts above.
         ("grading.json", grading),
         ("trigger_scorecard.json", trigger_scorecard),
         ("shadow_book.json", shadow_book),
@@ -1666,10 +1673,22 @@ def save(
         ("quant_rank_quality.json", quant_rank_quality),
         ("agent_justification.json", agent_justification),
         ("barrier_coherence.json", barrier_coherence),
-        # NOTE: score_calibration.json / macro_eval.json / portfolio_calibration.json
-        # were moved to the ALWAYS-EMIT block above (config#1189) — they were
-        # silently absent from birth here because the OK-ONLY gate dropped the
-        # producer's normal insufficient_data/error graceful-degrade.
+    ]:
+        if data is not None:
+            (out_dir / filename).write_text(json.dumps(data, indent=2, default=str))
+            logger.info("Wrote %s (status=%s)", out_dir / filename, data.get("status"))
+            _persist(out_dir / filename)
+
+    # OK-ONLY contract (dashboard panels): write only on a meaningful result.
+    for filename, data in [
+        # NOTE: grading / trigger_scorecard / shadow_book / exit_timing /
+        # e2e_lift / veto_analysis / confusion_matrix / provenance_grounding /
+        # quant_rank_quality / agent_justification / barrier_coherence were
+        # moved to the ALWAYS-EMIT block above (config#726, Phase 0b sweep).
+        # score_calibration.json / macro_eval.json / portfolio_calibration.json
+        # were moved there earlier (config#1189). portfolio_excursion.json stays
+        # OK-only: its `excursion_summary` producer has no freshness monitor /
+        # absence-vs-no-data consumer requiring the always-emit contract.
         ("portfolio_excursion.json", excursion_summary),
     ]:
         if data and data.get("status") in ("ok", "partial", "insufficient_lift"):
