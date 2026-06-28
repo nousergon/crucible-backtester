@@ -71,6 +71,7 @@ from analysis.action_entropy import compute_action_entropy_artifact
 from analysis.optimizer_churn import compute_optimizer_churn
 from analysis.walk_forward_stability import compute_walk_forward_stability
 from analysis import factor_blend_sensitivity
+from analysis import factor_blend_counterfactual_replay
 from analysis import veto_analysis
 from analysis import decision_capture_coverage, executor_decision_capture_coverage, measurement_coverage, provenance_grounding, quant_rank_quality
 from analysis import cio_rule_tag_precision
@@ -519,6 +520,21 @@ def _run_diagnostics(
         skip_if_missing=["df_base"],
     )
 
+    # Factor-blend COUNTERFACTUAL REPLAY (config#749) — the "real" optimizer
+    # signal companion to factor_blend_sensitivity above. Where the sensitivity
+    # analyzer reads realized outcomes, this RE-SCORES the candidate universe
+    # under alternate factor_blend weight tuples and replays each through the
+    # vectorbt simulator. It is heavy (loads a price matrix + runs the sim) and
+    # OPT-IN: it only runs when ``factor_blend_counterfactual.enabled`` is truthy
+    # AND the caller has supplied the cycles + price matrix (the live weekly
+    # evaluator is DB-only and does not, so this stays a no-op there — same
+    # default-OFF convention as the other heavy counterfactual analyses).
+    results["factor_blend_counterfactual_replay"] = tracker.run_module(
+        "factor_blend_counterfactual_replay",
+        lambda: _run_factor_blend_counterfactual_replay(config),
+        required_inputs={},
+    )
+
     # Macro multiplier evaluation
     results["macro_eval"] = tracker.run_module(
         "macro_eval",
@@ -704,6 +720,63 @@ def _run_confusion_matrix(db_path: str) -> dict:
 def _run_post_trade(trades_db: str) -> dict:
     from analysis.post_trade import compute_post_trade_analysis
     return compute_post_trade_analysis(trades_db)
+
+
+def _run_factor_blend_counterfactual_replay(config: dict | None) -> dict:
+    """Opt-in factor-blend counterfactual replay producer (config#749).
+
+    Default-OFF: returns ``{"status": "skipped"}`` unless
+    ``config["factor_blend_counterfactual"]["enabled"]`` is truthy AND the caller
+    has injected the replay inputs (``cycles`` + ``price_matrix``) into that same
+    config block. The live weekly evaluator runs DB-only and never injects these,
+    so this is a no-op there — keeping the heavy vectorbt replay out of the live
+    path while exposing a single, tested entry point a focused backtest run (or a
+    future S3-loader wire-in) can call once the inputs are assembled.
+
+    Expected config shape (all under ``factor_blend_counterfactual``):
+        enabled: bool
+        cycles: [{"date": str, "candidates": DataFrame}, ...]
+        price_matrix: DataFrame
+        weight_variants: [{momentum_score: .., ...}, ...]   # optional
+        baseline_weights / spy_prices / picks_per_cycle / hold_days /
+        init_cash / fees                                    # all optional
+    """
+    cfg = (config or {}).get("factor_blend_counterfactual") or {}
+    if not cfg.get("enabled"):
+        return {"status": "skipped", "reason": "opt-in; disabled by default"}
+
+    cycles = cfg.get("cycles")
+    price_matrix = cfg.get("price_matrix")
+    if not cycles or price_matrix is None:
+        return {
+            "status": "skipped",
+            "reason": "enabled but no cycles/price_matrix supplied",
+        }
+
+    weight_variants = cfg.get("weight_variants")
+    if not weight_variants:
+        # Default grid: the canonical per-regime blends from the sensitivity
+        # analyzer (so "what if we always ran the BULL/BEAR/NEUTRAL blend").
+        weight_variants = list(
+            factor_blend_sensitivity.DEFAULT_REGIME_WEIGHTS.values()
+        )
+
+    return factor_blend_counterfactual_replay.build_counterfactual_replay_report(
+        cycles,
+        weight_variants,
+        price_matrix,
+        baseline_weights=cfg.get("baseline_weights"),
+        spy_prices=cfg.get("spy_prices"),
+        picks_per_cycle=cfg.get(
+            "picks_per_cycle",
+            factor_blend_counterfactual_replay.DEFAULT_PICKS_PER_CYCLE,
+        ),
+        hold_days=cfg.get(
+            "hold_days", factor_blend_counterfactual_replay.DEFAULT_HOLD_DAYS
+        ),
+        init_cash=float(cfg.get("init_cash", 1_000_000.0)),
+        fees=float(cfg.get("fees", 0.001)),
+    )
 
 
 def _run_barrier_coherence(config: dict, trades_db: str) -> dict:
@@ -1538,6 +1611,9 @@ def _main_impl() -> None:
             post_trade=diagnostics.get("post_trade"),
             monte_carlo=diagnostics.get("monte_carlo"),
             factor_blend_sensitivity=diagnostics.get("factor_blend_sensitivity"),
+            factor_blend_counterfactual_replay=diagnostics.get(
+                "factor_blend_counterfactual_replay"
+            ),
             barrier_coherence=diagnostics.get("barrier_coherence"),
         )
 
