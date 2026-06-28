@@ -374,12 +374,13 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
-        assert "@v0.70.0" in text, (
-            "nousergon-lib should pin to v0.70.0 — the lifted experiment "
-            "config resolver crossing (config#1157 / #396). v0.70.0 moves "
-            "config/predictor.yaml resolution into nousergon-lib's config "
-            "resolver, which this repo now delegates to instead of resolving "
-            "locally. "
+        assert "@v0.72.0" in text, (
+            "nousergon-lib should pin to v0.72.0 — the cscv_pbo lift into "
+            "nousergon_lib.quant.stats.pbo (config#1318 / nousergon-lib#140), "
+            "which analysis/pbo.py now re-exports. "
+            "Prior: v0.70.0 — the lifted experiment config resolver crossing "
+            "(config#1157 / #396), which moved config/predictor.yaml resolution "
+            "into nousergon-lib's config resolver. "
             "Prior: v0.60.2 — the alpha_engine_lib -> nousergon_lib rename "
             "crossing (config#1245 / #1172), which migrated this repo's "
             "'python -m alpha_engine_lib.<mod>' invocations to "
