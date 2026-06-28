@@ -48,7 +48,16 @@ cvxpy>=1.4,<1.8
 # NOTE: flow-doctor extra is HYPHENATED — setuptools normalizes the lib's
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
 # normalize underscore->hyphen, so `[flow_doctor]` silently drops it (config#1178).
-nousergon-lib[arcticdb,flow-doctor,quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
+#
+# The `contracts` extra pulls jsonschema, required by
+# tests/test_predictions_consumer_contract.py to validate the predictions.json
+# envelope the measurement-coverage reader consumes against the SHARED versioned
+# Slot M schema in nousergon_lib.contracts — the M0 consumer half of config#1321
+# (the predictor side already pins `contracts` for its producer conformance
+# test). Without it the test's `pytest.importorskip` would not skip but ERROR at
+# first validate() (module imports; jsonschema missing) — so the shared-schema
+# gate would never actually run in backtester CI, defeating the cross-repo pin.
+nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.70.0
 
 # krepis (MIT foundation) — direct dep for krepis.dates.resolve_trading_day
 # (pipeline_common re-exports it). Kept as a direct pin: PyPI dep (krepis is
