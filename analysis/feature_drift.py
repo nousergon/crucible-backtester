@@ -223,13 +223,19 @@ def _load_features_from_arctic(
                     feat_cols = [c for c in df.columns if c not in OHLCV_COLS]
                     if feat_cols:
                         result[ticker] = df[feat_cols]
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 # Intentionally broad per-ticker resilience boundary: one
                 # corrupt / unreadable symbol must not abort the whole feature
                 # load. ArcticDB read raises library-specific exceptions whose
                 # hierarchy is not statically importable here (arcticdb is an
                 # optional, lazily-imported dep), so we cannot enumerate a
                 # precise type set — skip the bad ticker and continue.
+                # config#806 silent-fail hardening: log the skip so a corrupt
+                # symbol is observable in run logs instead of vanishing.
+                log.warning(
+                    "Feature drift: skipping ticker %s — ArcticDB read failed: %s: %s",
+                    ticker, type(exc).__name__, exc,
+                )
                 continue
 
         log.info("Feature drift: loaded features for %d/%d tickers from ArcticDB", len(result), len(tickers))
