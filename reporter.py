@@ -5,6 +5,7 @@ Consumes output from signal_quality, regime_analysis, score_analysis, attributio
 and (when available) vectorbt portfolio stats. Writes:
     - results/{date}/report.md
     - results/{date}/signal_quality.csv
+    - results/{date}/all_orders.csv   (trade-by-trade export, config#806)
     - results/{date}/metrics.json
     - s3://alpha-engine-research/backtest/{date}/report.md  (if upload=True)
 """
@@ -1376,6 +1377,64 @@ def build_digest(
     return "\n".join(lines)
 
 
+# ── Trade-by-trade order export (config#806) ─────────────────────────────────
+#
+# Preferred leading-column order for all_orders.csv. These are the core trade
+# identity + signal-linkage fields the executor's decide_entries /
+# decide_exits_and_reduces stamp onto every order dict in ``all_orders``
+# (see crucible-executor deciders.py). Any extra keys present on the order
+# dicts are appended after these in sorted order so the export never silently
+# drops a field. We do NOT invent columns: every name here is a key the
+# executor actually emits.
+_ALL_ORDERS_PREFERRED_COLUMNS = [
+    # Trade identity
+    "date",
+    "ticker",
+    "action",
+    "shares",
+    "price_at_order",
+    "portfolio_nav_at_order",
+    "position_pct",
+    # Signal linkage — the research signal / score that drove the order
+    "research_score",
+    "research_conviction",
+    "research_rating",
+    "sector",
+    "sector_rating",
+    "market_regime",
+    "price_target_upside",
+    "exit_reason",
+    "thesis_summary",
+]
+
+
+def all_orders_to_dataframe(all_orders: list[dict]) -> pd.DataFrame:
+    """Normalize the simulator's ``all_orders`` list into a stable-column
+    DataFrame for CSV export.
+
+    Columns lead with ``_ALL_ORDERS_PREFERRED_COLUMNS`` (trade identity +
+    signal linkage), then any additional keys present on the order dicts in
+    sorted order — so a future executor field is exported, not dropped.
+    Missing keys on a given order become empty cells. Returns an empty frame
+    (no rows, preferred columns only) when ``all_orders`` is empty/None.
+    """
+    if not all_orders:
+        return pd.DataFrame(columns=_ALL_ORDERS_PREFERRED_COLUMNS)
+
+    present_keys: set[str] = set()
+    for order in all_orders:
+        present_keys.update(order.keys())
+
+    extra = sorted(present_keys - set(_ALL_ORDERS_PREFERRED_COLUMNS))
+    leading = [c for c in _ALL_ORDERS_PREFERRED_COLUMNS if c in present_keys]
+    columns = leading + extra
+
+    df = pd.DataFrame(all_orders)
+    # Reindex enforces the column order AND fills any order-dict missing a
+    # preferred key with NaN rather than raising.
+    return df.reindex(columns=columns)
+
+
 def save(
     report_md: str,
     signal_quality: dict,
@@ -1415,6 +1474,7 @@ def save(
     action_entropy: dict | None = None,
     optimizer_churn: dict | None = None,
     walk_forward_stability: dict | None = None,
+    all_orders: list[dict] | None = None,
     *,
     upload_bucket: str | None = None,
     upload_prefix: str = "backtest",
@@ -1493,6 +1553,19 @@ def save(
         sweep_df.to_csv(out_dir / "param_sweep.csv", index=False)
         logger.info("Wrote %s", out_dir / "param_sweep.csv")
         _persist(out_dir / "param_sweep.csv")
+
+    # Trade-by-trade order export (config#806). Mirrors the signal_quality /
+    # param_sweep CSV convention: written to results/{date}/ and persisted to
+    # S3 via _persist when uploads are enabled. Columns carry trade identity
+    # (date/ticker/action/qty/price) + signal linkage (research_score and the
+    # other signal fields the executor stamped onto each order).
+    if all_orders:
+        orders_df = all_orders_to_dataframe(all_orders)
+        orders_df.to_csv(out_dir / "all_orders.csv", index=False)
+        logger.info(
+            "Wrote %s (%d orders)", out_dir / "all_orders.csv", len(orders_df),
+        )
+        _persist(out_dir / "all_orders.csv")
 
     # Attribution JSON
     if attribution and attribution.get("status") == "ok":

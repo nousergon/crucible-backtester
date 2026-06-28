@@ -272,3 +272,39 @@ def test_compute_feature_drift_stable(mock_boto, mock_arctic, mock_training_ics,
     assert "drifted_features" in result, f"Expected successful result, got: {result}"
     assert len(result["drifted_features"]) == 0
     assert result["recommendation"] == "stable"
+
+
+# ── config#806 silent-fail hardening ─────────────────────────────────────────
+
+
+def test_load_features_from_arctic_logs_per_ticker_read_failure(caplog):
+    """A corrupt / unreadable per-ticker ArcticDB read must NOT abort the whole
+    feature load (fail-soft preserved) but MUST be logged loudly — the prior
+    code skipped silently (config#806 silent-fail hardening)."""
+    import logging
+
+    dates = pd.to_datetime(["2026-04-01", "2026-04-02"])
+    lib = MagicMock()
+    lib.list_symbols.return_value = ["AAPL", "MSFT"]
+
+    good = MagicMock()
+    good.data = pd.DataFrame({"rsi_14": [50.0, 55.0]}, index=dates)
+
+    def _read(symbol):
+        if symbol == "MSFT":
+            raise RuntimeError("arcticdb: corrupt segment")
+        return good
+
+    lib.read.side_effect = _read
+
+    with patch("nousergon_lib.arcticdb.open_universe_lib", return_value=lib), \
+         caplog.at_level(logging.WARNING, logger="analysis.feature_drift"):
+        result = _load_features_from_arctic("alpha-engine-research", ["AAPL", "MSFT"])
+
+    # Fail-soft: the good ticker still loads, the bad one is skipped.
+    assert "AAPL" in result
+    assert "MSFT" not in result
+    # Loud: the skip is logged with the ticker + the failure type, not swallowed.
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "MSFT" in msgs
+    assert "RuntimeError" in msgs

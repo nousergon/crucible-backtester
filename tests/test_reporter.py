@@ -1238,3 +1238,128 @@ class TestWriteAsYouCompute:
             assert key == "evaluation/2026-06-26/metrics.json"
             body = s3.get_object(Bucket="alpha-engine-research", Key=key)["Body"].read()
             assert body == b'{"run_date": "2026-06-26"}'
+
+
+# ── all_orders.csv trade-by-trade export (config#806) ────────────────────────
+
+
+class TestAllOrdersExport:
+    """The simulator's per-trade ``all_orders`` records are serialized to
+    ``results/{date}/all_orders.csv`` with trade-identity + signal-linkage
+    columns (config#806 trade-by-trade export)."""
+
+    def _sample_orders(self):
+        # Mirrors the real executor order schema (crucible-executor
+        # deciders.py decide_entries / decide_exits_and_reduces). ENTER and
+        # EXIT carry a different field subset — the export must union them.
+        return [
+            {
+                "date": "2026-06-01",
+                "ticker": "AAPL",
+                "action": "ENTER",
+                "shares": 100,
+                "price_at_order": 195.50,
+                "portfolio_nav_at_order": 1_000_000.0,
+                "position_pct": 0.02,
+                "research_score": 82.0,
+                "research_conviction": "high",
+                "research_rating": "BUY",
+                "sector": "Technology",
+                "sector_rating": "overweight",
+                "market_regime": 1,
+                "price_target_upside": 0.18,
+                "thesis_summary": "earnings momentum",
+            },
+            {
+                "date": "2026-06-05",
+                "ticker": "AAPL",
+                "action": "EXIT",
+                "shares": 100,
+                "price_at_order": 205.00,
+                "portfolio_nav_at_order": 1_010_000.0,
+                "position_pct": 0.0,
+                "research_score": 60.0,
+                "research_conviction": "medium",
+                "research_rating": "HOLD",
+                "sector_rating": "neutral",
+                "market_regime": 1,
+                "exit_reason": "research_signal",
+            },
+        ]
+
+    def test_all_orders_to_dataframe_columns_and_linkage(self):
+        from reporter import all_orders_to_dataframe
+
+        df = all_orders_to_dataframe(self._sample_orders())
+
+        # Trade identity columns present.
+        for col in ("date", "ticker", "action", "shares", "price_at_order"):
+            assert col in df.columns, f"missing trade-identity column {col}"
+        # Signal-linkage columns present.
+        for col in ("research_score", "research_conviction", "sector", "market_regime"):
+            assert col in df.columns, f"missing signal-linkage column {col}"
+        # EXIT-only field is unioned in (not dropped).
+        assert "exit_reason" in df.columns
+        # Two trade rows, one per order.
+        assert len(df) == 2
+        # Linkage value survives the round-trip for the ENTER row.
+        enter = df[df["action"] == "ENTER"].iloc[0]
+        assert enter["research_score"] == 82.0
+        assert enter["ticker"] == "AAPL"
+        # Preferred columns lead the frame in the declared order.
+        assert list(df.columns)[:5] == [
+            "date", "ticker", "action", "shares", "price_at_order",
+        ]
+
+    def test_all_orders_to_dataframe_empty(self):
+        from reporter import all_orders_to_dataframe, _ALL_ORDERS_PREFERRED_COLUMNS
+
+        df = all_orders_to_dataframe([])
+        assert df.empty
+        assert list(df.columns) == _ALL_ORDERS_PREFERRED_COLUMNS
+
+    def test_all_orders_to_dataframe_unknown_field_not_dropped(self):
+        from reporter import all_orders_to_dataframe
+
+        orders = [{
+            "date": "2026-06-01", "ticker": "MSFT", "action": "ENTER",
+            "shares": 10, "price_at_order": 400.0,
+            "future_executor_field": "keepme",
+        }]
+        df = all_orders_to_dataframe(orders)
+        assert "future_executor_field" in df.columns
+        assert df.iloc[0]["future_executor_field"] == "keepme"
+
+    def test_save_writes_all_orders_csv(self, tmp_path):
+        import pandas as pd
+        from reporter import save
+
+        out_dir = save(
+            report_md="# report",
+            signal_quality={"status": "ok", "overall": {}},
+            score_analysis=[],
+            all_orders=self._sample_orders(),
+            run_date="2026-06-01",
+            results_dir=str(tmp_path),
+        )
+        csv_path = out_dir / "all_orders.csv"
+        assert csv_path.exists(), "all_orders.csv was not written"
+        df = pd.read_csv(csv_path)
+        assert len(df) == 2
+        assert "research_score" in df.columns
+        assert "exit_reason" in df.columns
+        assert set(df["ticker"]) == {"AAPL"}
+
+    def test_save_skips_all_orders_csv_when_empty(self, tmp_path):
+        from reporter import save
+
+        out_dir = save(
+            report_md="# report",
+            signal_quality={"status": "ok", "overall": {}},
+            score_analysis=[],
+            all_orders=[],
+            run_date="2026-06-01",
+            results_dir=str(tmp_path),
+        )
+        # No orders → no CSV (mirrors signal_quality/param_sweep "skip when empty").
+        assert not (out_dir / "all_orders.csv").exists()

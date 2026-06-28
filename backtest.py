@@ -1214,6 +1214,7 @@ def _run_simulation_loop(
     signal_lookups: dict | None = None,
     feature_lookup=None,
     resilience_ctx: dict | None = None,
+    export_orders: bool = False,
 ) -> dict:
     """
     Run one full simulation pass with the given config and pre-built price matrix.
@@ -1540,6 +1541,17 @@ def _run_simulation_loop(
     stats["dates_expected"] = dates_expected
     stats["coverage"] = round(coverage, 3)
     stats["total_orders"] = len(all_orders)
+    # Carry the per-trade order records out of the loop ONLY when explicitly
+    # requested (export_orders=True — the standalone simulate phase). The
+    # per-combo param-sweep calls leave it False: param_sweep.sweep flattens
+    # each combo's stats dict into a DataFrame row (``{**params, **stats}``),
+    # so attaching a full order list there would balloon param_sweep.csv with
+    # one giant cell per combo. The reporter serializes this to all_orders.csv
+    # with signal-linkage columns (config#806 trade-by-trade export); the list
+    # is popped out before portfolio_stats.json is persisted so it never bloats
+    # the JSON artifact (see the simulate phase in main()).
+    if export_orders:
+        stats["all_orders"] = all_orders
     if skipped:
         stats["skip_reasons"] = skipped
     # Pass through price data quality metadata for reporting
@@ -2289,6 +2301,10 @@ def run_simulate(config: dict) -> dict:
         ohlcv_by_ticker=ohlcv,
         ew_high_vol_basket_returns=ew_basket,
         resilience_ctx=resilience_ctx,
+        # Standalone simulate phase — emit per-trade order records so the
+        # reporter can serialize all_orders.csv (config#806). Param-sweep
+        # combos never set this (would bloat param_sweep.csv).
+        export_orders=True,
     )
 
 
@@ -4541,6 +4557,10 @@ def _run_simulation_pipeline(
     # (L4513). Running the simulate phase in param-sweep mode restores it.
     bucket = config.get("signals_bucket", "alpha-engine-research")
     s3 = registry.s3_client
+    # Per-trade order records from the standalone simulate phase, routed to the
+    # reporter for all_orders.csv (config#806). Defaults to [] so the later
+    # save() call is safe even if simulate is skipped / errors / not run.
+    sim_all_orders: list[dict] = []
     if args.mode in ("simulate", "param-sweep", "all"):
         from phase_artifacts import save_json, load_json
         try:
@@ -4574,7 +4594,17 @@ def _run_simulation_pipeline(
                             atr_by_ticker=atr_by_ticker,
                             vwap_series_by_ticker=vwap_series_by_ticker,
                             coverage_by_ticker=coverage_by_ticker,
+                            # Standalone simulate phase — collect per-trade
+                            # order records for the all_orders.csv export
+                            # (config#806). Popped out below before the
+                            # portfolio_stats JSON artifact is persisted so the
+                            # order list never bloats portfolio_stats.json.
+                            export_orders=True,
                         )
+                    # Pop the per-trade order records OUT of portfolio_stats
+                    # before JSON persistence — they are routed to the reporter
+                    # for all_orders.csv (config#806), not into the stats blob.
+                    sim_all_orders = portfolio_stats.pop("all_orders", None) or []
                     ctx.record_artifact(save_json(
                         bucket, args.date, "simulate", "portfolio_stats", portfolio_stats,
                         s3_client=s3,
@@ -5603,6 +5633,7 @@ def _main_impl() -> None:
             signal_quality={"status": "skipped"},
             score_analysis=[],
             sweep_df=save_sweep_df,
+            all_orders=sim_all_orders,
             run_date=args.date,
             results_dir=config.get("results_dir", "results"),
             # Write-as-you-compute (config#1190): upload each artifact as it
