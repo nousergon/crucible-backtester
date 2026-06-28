@@ -47,8 +47,10 @@ def compute_sample_size_adequacy(
     Args:
         signal_quality: the ``compute_accuracy`` result ({status, overall:{n_10d,
             n_30d, ...}}). The realized-outcome count the accuracy grade used.
-        attribution: optional ``attribution`` result; its sample count (``n`` /
-            ``n_samples``) is compared to ``ATTRIBUTION_SAMPLE_FLOOR`` when present.
+        attribution: optional ``attribution`` result; its finalized-row count
+            (``rows_analyzed`` — the key ``compute_attribution`` actually emits;
+            ``n`` / ``n_samples`` accepted as fallbacks) is compared to
+            ``ATTRIBUTION_SAMPLE_FLOOR`` when present.
 
     Returns a dict with the per-analysis breakdown and the WEAKEST-LINK headline
     ``adequacy_ratio`` (min n/floor across analyses) + ``adequate`` bool. Status
@@ -70,7 +72,13 @@ def compute_sample_size_adequacy(
 
     attr = attribution or {}
     if attr.get("status") == "ok":
-        n_attr = attr.get("n", attr.get("n_samples"))
+        # `compute_attribution` emits its finalized-row count as `rows_analyzed`;
+        # accept `n` / `n_samples` as fallbacks for any alternate caller. Reading
+        # only `n`/`n_samples` (the prior behavior) silently dropped attribution
+        # from the adequacy breakdown on every real cycle, since the producer key
+        # is `rows_analyzed` — so the weakest-link headline ignored attribution's
+        # (larger) floor entirely (config#946).
+        n_attr = attr.get("rows_analyzed", attr.get("n", attr.get("n_samples")))
         if n_attr is not None:
             per_analysis["attribution"] = {
                 "n": int(n_attr), "floor": ATTRIBUTION_SAMPLE_FLOOR,
