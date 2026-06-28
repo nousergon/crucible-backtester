@@ -1042,6 +1042,7 @@ def build_report(
     post_trade: dict | None = None,
     monte_carlo: dict | None = None,
     factor_blend_sensitivity: dict | None = None,
+    factor_blend_counterfactual_replay: dict | None = None,
     barrier_coherence: dict | None = None,
     lookahead_disclosure: dict | None = None,
 ) -> str:
@@ -1165,6 +1166,10 @@ def build_report(
     # one-line "deferred" banner inside the section.
     if factor_blend_sensitivity:
         lines += _section_factor_blend_sensitivity(factor_blend_sensitivity)
+    if factor_blend_counterfactual_replay:
+        lines += _section_factor_blend_counterfactual_replay(
+            factor_blend_counterfactual_replay
+        )
         lines += [""]
 
     # Alpha magnitude distribution
@@ -2046,6 +2051,74 @@ def _section_factor_blend_sensitivity(report: dict) -> list[str]:
                 f"{_alpha_pp(row.get('mean_alpha'))} | {sortino_str} | "
                 f"{hit_str} | {trust} |"
             )
+
+    return lines
+
+
+def _section_factor_blend_counterfactual_replay(report: dict) -> list[str]:
+    """Render the factor-blend counterfactual replay (config#749).
+
+    The "real" optimizer signal companion to ``_section_factor_blend_
+    sensitivity``: where the sensitivity analyzer reads realized outcomes, this
+    section reports the simulated Sortino / alpha / maxDD of the candidate
+    universe RE-SCORED under alternate ``factor_blend`` weight tuples and run
+    through the vectorbt simulator — i.e. "Sortino *would have been* X under
+    weights W."
+    """
+    lines = ["## Counterfactual blend weights"]
+    if not report or report.get("status") != "ok":
+        reason = (report or {}).get("reason", "")
+        lines += [
+            "",
+            "> Deferred — counterfactual factor-blend replay did not run"
+            + (f" ({reason})." if reason else " (opt-in; disabled by default)."),
+        ]
+        return lines
+
+    baseline = report.get("baseline") or {}
+    variants = report.get("variants") or []
+    n_cycles = report.get("n_cycles", 0)
+    picks = report.get("picks_per_cycle", 0)
+    hold = report.get("hold_days", 0)
+
+    lines += [
+        "",
+        f"Re-scored {n_cycles} cycle(s) under each weight tuple "
+        f"(top-{picks}/cycle, {hold}d hold) and replayed through the vectorbt "
+        "simulator. Lift is vs the baseline blend.",
+        "",
+        "| Weights | Sortino | Sortino lift | Total α | α lift | MaxDD | Orders |",
+        "|---------|---------|--------------|---------|--------|-------|--------|",
+    ]
+
+    def _row(label_prefix: str, r: dict) -> str:
+        def _f(v, pct=False):
+            if v is None:
+                return "—"
+            return f"{100 * v:.1f}%" if pct else f"{v:.2f}"
+        return (
+            f"| {label_prefix}{r.get('label', '?')} | "
+            f"{_f(r.get('sortino_ratio'))} | "
+            f"{_f(r.get('sortino_lift'))} | "
+            f"{_f(r.get('total_alpha'), pct=True)} | "
+            f"{_f(r.get('alpha_lift'), pct=True)} | "
+            f"{_f(r.get('max_drawdown'), pct=True)} | "
+            f"{int(r.get('n_orders', 0))} |"
+        )
+
+    lines.append(_row("baseline: ", baseline))
+    for r in variants:
+        lines.append(_row("", r))
+
+    best = report.get("best")
+    if best:
+        lines += [
+            "",
+            f"**Top variant by Sortino lift:** `{best.get('label')}` "
+            f"(+{best.get('sortino_lift'):.2f} Sortino vs baseline).",
+        ]
+    else:
+        lines += ["", "No alternate weighting beat the baseline on Sortino."]
 
     return lines
 
