@@ -139,6 +139,59 @@ def _load_active_horizon_days(
     return default
 
 
+def _load_label_barrier_config(
+    search_paths: list[Path] | None = None,
+) -> dict | None:
+    """Read the predictor ``triple_barrier`` label-barrier block.
+
+    Single source of truth: ``alpha-engine-config/predictor/predictor.yaml``
+    ``triple_barrier`` block — the SAME file (and the SAME experiment-package
+    resolution) the predictor itself parses in ``config.py`` to build its
+    triple-barrier LABELS. The barrier-coherence diagnostic (config#723, Task A)
+    must compare the executor's live execution policy against the predictor's
+    live LABEL barriers, not a hardcoded copy that silently drifts from this
+    file. This reader is the label-side analog of the executor-side live read in
+    ``evaluate._run_barrier_coherence`` (which reads the sweep-tuned
+    ``executor_params.json`` from S3).
+
+    Returns the parsed ``triple_barrier`` dict, or ``None`` when no path on
+    ``search_paths`` exists or carries the block (the caller falls back to the
+    diagnostic's documented defaults and records the fallback in
+    ``label_config_source``). Mirrors ``_load_active_horizon_days``:
+    experiment-package-first resolution via the canonical nousergon-lib
+    resolver, no repo-local fallback (the backtester ships no predictor.yaml).
+    ``search_paths`` is exposed for tests so they don't need to stub pathlib.
+    """
+    if search_paths is None:
+        # Experiment-package first (config#1042); delegates to the canonical
+        # nousergon-lib resolver. No repo-local fallback — see
+        # ``_load_active_horizon_days`` for the candidate-set rationale.
+        config_repo_candidates = resolve_experiment_config(
+            "predictor",
+            "predictor.yaml",
+            repo_root=Path(__file__).parent,
+            repo_local_fallback=Path(__file__).parent / "predictor" / "predictor.yaml",
+        )
+        search_paths = config_repo_candidates[:-1]
+    for p in search_paths:
+        if not p.exists():
+            continue
+        try:
+            with open(p) as f:
+                cfg = yaml.safe_load(f) or {}
+            tb = cfg.get("triple_barrier")
+            if not tb:
+                continue
+            return dict(tb)
+        except (OSError, yaml.YAMLError, TypeError, ValueError) as exc:
+            logger.warning(
+                "pipeline_common: could not read triple_barrier from %s: %s — "
+                "falling back to diagnostic defaults", p, exc,
+            )
+            continue
+    return None
+
+
 ACTIVE_HORIZON_DAYS = _load_active_horizon_days()
 # Strict equality (NOT `COALESCE(horizon_days, 5) = N`): legacy pre-cutover
 # rows have `horizon_days IS NULL` and must be EXCLUDED, not silently
