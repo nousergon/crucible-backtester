@@ -67,6 +67,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "optimizer/barrier_sizing_optimizer.py": 1,
     "optimizer/config_archive.py": 1,
     "optimizer/executor_optimizer.py": 5,
+    # config#748 factor_blend_optimizer — 3 PUTs (live config/factor_blend_params.json
+    # + shadow_history/{run_id}.json + latest.json sidecar), same config-write /
+    # shadow-archive shape as optimizer/tech_weight_ablation.py; live write is
+    # enforce-gated + reproduction-gated, default-off. Config writes, not
+    # freshness-SLA artifacts: the live key is registered as config_factor_blend_params
+    # and the shadow_history/ prefix is grandfathered in ARTIFACT_REGISTRY.yaml.
+    "optimizer/factor_blend_optimizer.py": 3,
     "optimizer/pipeline_optimizer.py": 2,
     # config#1057 inc 2: MVO optimizer-param auto-apply — 5 PUTs (live + shadow×2
     # + history×2), same config-write shape as optimizer/executor_optimizer.py;

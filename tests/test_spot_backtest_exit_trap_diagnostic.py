@@ -114,7 +114,7 @@ def test_cleanup_still_terminates():
 def test_cleanup_fans_out_via_lib_alerts_cli():
     """L2246 SOTA upgrade per the CLAUDE.md sub-sub-rule (lift-to-lib for
     ≥2 consumers): the dispatcher cleanup must publish the diagnostic via
-    `python -m alpha_engine_lib.alerts publish` so the operator gets an
+    `python -m krepis.alerts publish` so the operator gets an
     independent-channel alert (SNS + Telegram) regardless of whether the
     SF wrapper's own NotifyComplete/HandleFailure path fired. Pins the
     full invocation contract."""
@@ -122,14 +122,26 @@ def test_cleanup_fans_out_via_lib_alerts_cli():
     m = re.search(r"^cleanup\(\) \{.*?^\}", text, re.MULTILINE | re.DOTALL)
     assert m, "no cleanup() function found — spot_backtest.sh structure changed"
     body = m.group(0)
-    assert "nousergon_lib.alerts publish" in body, (
-        "cleanup() must fan out the diagnostic via the lib alerts CLI "
+    assert "krepis.alerts publish" in body, (
+        "cleanup() must fan out the diagnostic via the krepis alerts CLI "
         "(L2246 SOTA upgrade — see CLAUDE.md sub-sub-rule). Mirrors the "
         "L117 'Lambda CI canary rollback should Telegram/email the "
         "operator on rollback' pattern via the canonical primitive. "
-        "Package renamed alpha_engine_lib -> nousergon_lib at lib 0.60.0 "
-        "(config#1245); '-m alpha_engine_lib.alerts' breaks under runpy "
-        "on crossed boxes."
+        "Target is krepis.alerts, NOT nousergon_lib.alerts (config#1339): "
+        "the alerts module relocated to krepis (MIT) at nousergon-lib "
+        "v0.66.0 and nousergon_lib.alerts is now a sys.modules re-export "
+        "shim with no runpy __main__, so '-m nousergon_lib.alerts publish' "
+        "is a SILENT no-op (exits 0, publishes nothing)."
+    )
+    # Guard the EXECUTED command (not comment text): the `python -m <mod>`
+    # the dispatcher actually runs must be krepis.alerts, never the
+    # runpy-silent nousergon_lib.alerts shim (config#1339).
+    invoke = re.search(r'"\$_alert_python"\s+-m\s+(\S+)\s+publish', body)
+    assert invoke, "no `\"$_alert_python\" -m <mod> publish` invocation in cleanup()"
+    assert invoke.group(1) == "krepis.alerts", (
+        f"cleanup() invokes `-m {invoke.group(1)}` — must be krepis.alerts; "
+        f"'-m nousergon_lib.alerts' is a silent runpy no-op since the krepis "
+        f"relocation at nousergon-lib v0.66.0 (config#1339)."
     )
     # L4485-b: severity is now variable — defaults to "error" (Telegram push),
     # downgraded to "warning" only on a recoverable spot reclaim about to relaunch.
@@ -174,4 +186,23 @@ def test_lib_pin_at_least_v0_21_0():
         f"alpha-engine-lib pin v{major}.{minor}.{patch} is below the "
         f"v0.21.0 floor required by the dispatcher's alerts.publish call. "
         f"Re-pin or remove the alerts call."
+    )
+
+
+def test_krepis_pinned_for_alerts_cli():
+    """The alerts CLI the dispatcher invokes is now `python -m krepis.alerts`
+    (config#1339): the module relocated to krepis (MIT) at nousergon-lib
+    v0.66.0, and `nousergon_lib.alerts` is a runpy-silent re-export shim.
+    krepis must therefore be a direct requirements pin so the CLI is present
+    in the dispatcher venv — relying on the transitive nousergon-lib pull
+    would leave the alert one un-pinned hop from silently disappearing."""
+    from pathlib import Path
+
+    reqs = (
+        Path(__file__).resolve().parent.parent / "requirements.txt"
+    ).read_text()
+    assert re.search(r"^\s*krepis\b", reqs, re.MULTILINE), (
+        "requirements.txt must pin `krepis` directly — it provides the "
+        "`python -m krepis.alerts` CLI the dispatcher's cleanup fan-out "
+        "invokes (config#1339)."
     )

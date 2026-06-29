@@ -2743,6 +2743,39 @@ def _section_veto_analysis(result: dict) -> list[str]:
                 f"| {s['sector']} | {s['n_down']} | {s['n_vetoes']} | {p} | {r} |"
             )
 
+    # Per-sector veto thresholds (config#921): fitted per-sector optima +
+    # the sparse override map (sectors whose optimum materially beats global).
+    pst = result.get("per_sector_thresholds")
+    if pst and pst.get("by_sector"):
+        global_rec = pst.get("global_recommended")
+        lines += ["", "### Per-sector veto thresholds (config#921)", ""]
+        lines += [
+            f"_Global recommendation: "
+            f"{global_rec:.2f}. A sector earns an OVERRIDE when its own fitted "
+            f"optimum clears the gates and differs by "
+            f"{pst.get('min_threshold_change')}+._"
+            if global_rec is not None else
+            "_Per-sector fitted optima._",
+            "",
+            "| Sector | DOWN preds | Fitted threshold | Δ vs global | Status | Override |",
+            "|--------|-----------|------------------|-------------|--------|----------|",
+        ]
+        for sector, s in sorted(pst["by_sector"].items()):
+            rec = s.get("recommended_threshold")
+            rec_str = f"{rec:.2f}" if rec is not None else "—"
+            delta = s.get("delta_vs_global")
+            delta_str = f"{delta:+.2f}" if delta is not None else "—"
+            override = "✅" if s.get("is_override") else "—"
+            lines.append(
+                f"| {sector} | {s.get('n_down', 0)} | {rec_str} | {delta_str} "
+                f"| {s.get('status', '?')} | {override} |"
+            )
+        overrides = pst.get("overrides", {})
+        if overrides:
+            lines += ["", f"> **Per-sector overrides:** {overrides}"]
+        else:
+            lines += ["", "> No per-sector override met the gate — global threshold applies to all sectors."]
+
     return lines
 
 
@@ -3165,7 +3198,12 @@ def _section_barrier_coherence(result: dict) -> list[str]:
         "_Do the triple-barrier LABELS the predictor trains on match the OCO "
         "exits the executor REALIZES? Read-only diagnostic (Task A)._",
         "",
+        f"_Label barriers source: {result.get('label_config_source', 'unknown')}_",
         f"_Executor params source: {result.get('exec_params_source', 'unknown')}_",
+        "",
+        f"**Monitor verdict: divergence is {div.get('divergence_status', 'unknown').upper()}** "
+        f"(material when vertical gap > {div.get('divergence_threshold_days', '?')} trading days "
+        "OR horizontal geometry incoherent — config#723 resolution (iii)).",
         "",
         "### Definition divergence",
         "",

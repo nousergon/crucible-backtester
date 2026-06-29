@@ -606,11 +606,17 @@ cleanup() {
             _alert_sev="warning"
         fi
         # Independent-channel surveillance: fan out the diagnostic via
-        # alpha_engine_lib.alerts (SNS + Telegram). Mirrors the L117
-        # "Lambda CI canary rollback should Telegram/email the operator
-        # on rollback" pattern and the CLAUDE.md SOTA rule sub-sub-rule
-        # (lift-to-lib for ≥2 consumers; this is consumer #1 of the new
-        # `python -m nousergon_lib.alerts publish` CLI primitive).
+        # krepis.alerts (SNS + Telegram). Mirrors the L117 "Lambda CI
+        # canary rollback should Telegram/email the operator on rollback"
+        # pattern and the CLAUDE.md SOTA rule sub-sub-rule (lift-to-lib
+        # for ≥2 consumers) via the `python -m krepis.alerts publish` CLI
+        # primitive. Target is `krepis.alerts`, NOT `nousergon_lib.alerts`
+        # (config#1339): the alerts module relocated to krepis (MIT) at
+        # nousergon-lib v0.66.0, and `nousergon_lib.alerts` is now a
+        # `sys.modules` re-export shim with NO runpy `__main__` — so
+        # `python -m nousergon_lib.alerts publish` is a SILENT no-op
+        # (exits 0, publishes nothing). krepis is a direct requirements
+        # pin, so `-m krepis.alerts` runs the real CLI under runpy.
         # Best-effort: ``|| true`` keeps cleanup running even if Python /
         # the lib / SNS / Telegram are all unreachable — the local stdout
         # diagnostic above is the primary surface; the alert is the
@@ -621,7 +627,7 @@ cleanup() {
         else
             _alert_python="$(command -v python3 || command -v python || echo python)"
         fi
-        "$_alert_python" -m nousergon_lib.alerts publish \
+        "$_alert_python" -m krepis.alerts publish \
             --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_reason_code='$reason_code' spot_transition_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>} will_relaunch=$_will_relaunch" \
             --severity "$_alert_sev" \
             --source alpha-engine-backtester/spot_backtest.sh \
