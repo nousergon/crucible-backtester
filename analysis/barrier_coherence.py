@@ -52,15 +52,35 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# Predictor triple-barrier LABEL defaults. Source of truth: ``predictor.yaml``
-# ``triple_barrier`` block (alpha-engine-predictor/config.py:199-209). The
-# backtester is read-only wrt the predictor, so these documented defaults are
-# the fallback when an explicit ``label_config`` is not injected.
+# Predictor triple-barrier LABEL fallback defaults. SINGLE SOURCE OF TRUTH is
+# ``alpha-engine-config/predictor/predictor.yaml`` ``triple_barrier`` block —
+# the SAME file the predictor parses in ``config.py`` to build its labels. The
+# ``evaluate.py`` wrapper injects that live block as ``label_config`` (via
+# ``pipeline_common._load_label_barrier_config``), so these values are ONLY a
+# fallback for when the config repo is not on disk (recorded in
+# ``label_config_source``). They mirror the predictor.yaml defaults verbatim and
+# must be kept in lockstep with it (config#723). ``vol_multiplier`` is the
+# half-width in σ units; the predictor caps the realized first-touch label at
+# the touched ±pct barrier (``up/down_barrier_pct``, default 0.05) — included so
+# the fallback config is complete rather than silently dropping the pct cap.
 _LABEL_DEFAULTS: dict = {
-    "forward_window": 21,    # trading-day vertical (time) barrier
-    "vol_window": 20,        # lookback for σ estimation
-    "vol_multiplier": 2.0,   # horizontal barrier half-width = vol_multiplier·σ
+    "forward_window": 21,     # trading-day vertical (time) barrier
+    "vol_window": 20,         # lookback for σ estimation
+    "vol_multiplier": 2.0,    # horizontal barrier half-width = vol_multiplier·σ
+    "up_barrier_pct": 0.05,   # profit-take pct cap on the first-touch label
+    "down_barrier_pct": 0.05, # stop-loss pct cap (symmetric) on the label
 }
+
+# Recorded divergence threshold for the standing coherence MONITOR (config#723,
+# resolution (iii): keep label/execution barriers separate + monitor, act only
+# when divergence is material). The monitor flags ``divergence_status="material"``
+# when the vertical (time) barrier gap exceeds this many trading days OR the
+# horizontal geometry is incoherent. This is the explicit threshold the issue's
+# "Closes when … explicitly parked on the coherence-monitor with the divergence
+# threshold recorded" condition asks for. Tunable in one place; surfaced in the
+# rendered artifact so a future couple-and-retrain decision (resolution (i)) has
+# a recorded trigger rather than an ad-hoc judgement call.
+_VERTICAL_DIVERGENCE_MATERIAL_DAYS: int = 5
 
 # Executor execution-barrier defaults. Source of truth: the LIVE, sweep-tuned
 # ``config/executor_params.json`` on S3; static fallbacks from
@@ -128,6 +148,7 @@ def compute_barrier_coherence(
     trades_db_path: str,
     *,
     label_config: dict | None = None,
+    label_config_source: str = "defaults (predictor.yaml fallback)",
     exec_params: dict | None = None,
     exec_params_source: str = "defaults (executor/strategies/config.py)",
     min_trades: int = 3,
@@ -135,13 +156,19 @@ def compute_barrier_coherence(
     """Predictor↔executor triple-barrier coherence diagnostic.
 
     Pure-compute given an (optional) injected ``label_config`` / ``exec_params``;
-    the S3 read of the live executor params lives in the ``evaluate.py`` wrapper
-    so this function stays unit-testable without network I/O.
+    the live reads (predictor.yaml ``triple_barrier`` block on the label side,
+    sweep-tuned ``executor_params.json`` from S3 on the execution side) live in
+    the ``evaluate.py`` wrapper so this function stays unit-testable without
+    network/filesystem I/O. ``label_config_source`` / ``exec_params_source``
+    record whether each side reflects the LIVE config or the documented
+    fallback, so a stale-default comparison is visible in the rendered artifact
+    rather than masquerading as a real divergence.
 
     Returns dict with:
         status: "ok"  (always — the definition leg needs no trades)
-        label_config / exec_params / exec_params_source
-        definition_divergence: {vertical, horizontal}   (always present)
+        label_config / exec_params / label_config_source / exec_params_source
+        definition_divergence: {vertical, horizontal, divergence_status}
+                                                       (always present)
         horizon_coherence: {status, ...}                (trade-based)
         barrier_touch_mix: {status, ...}                (trade-based)
         trades_status: "ok" | "error"
@@ -153,6 +180,7 @@ def compute_barrier_coherence(
         "status": "ok",
         "label_config": label_cfg,
         "exec_params": exec_cfg,
+        "label_config_source": label_config_source,
         "exec_params_source": exec_params_source,
         "definition_divergence": _definition_divergence(label_cfg, exec_cfg),
     }
@@ -198,13 +226,27 @@ def _definition_divergence(label_cfg: dict, exec_cfg: dict) -> dict:
     """Static label-barrier vs execution-barrier comparison (no trades needed)."""
     fw = int(label_cfg["forward_window"])
     exit_days = int(exec_cfg["time_decay_exit_days"])
+    vertical_coherent = exit_days == fw
+    horizontal_coherent = False  # asymmetric reduce-only TP + trailing stop
+    # Standing-monitor verdict (config#723 resolution (iii)). "material" when the
+    # vertical gap clears the recorded threshold OR the horizontal geometry is
+    # incoherent — the recorded trigger for revisiting couple-and-retrain.
+    horizon_gap = abs(fw - exit_days)
+    if not horizontal_coherent or horizon_gap > _VERTICAL_DIVERGENCE_MATERIAL_DAYS:
+        divergence_status = "material"
+    elif not vertical_coherent:
+        divergence_status = "minor"
+    else:
+        divergence_status = "coherent"
     return {
+        "divergence_status": divergence_status,
+        "divergence_threshold_days": _VERTICAL_DIVERGENCE_MATERIAL_DAYS,
         "vertical": {
             "label_horizon_trading_days": fw,
             "exec_time_barrier_trading_days": exit_days,
             "exec_time_barrier_conditional": "fires only on a Research HOLD signal",
             "horizon_gap_days": fw - exit_days,
-            "coherent": exit_days == fw,
+            "coherent": vertical_coherent,
             "note": (
                 f"Label assumes a fixed {fw}-trading-day vertical barrier for "
                 f"every name; the executor's time barrier is {exit_days}d AND "
@@ -225,7 +267,7 @@ def _definition_divergence(label_cfg: dict, exec_cfg: dict) -> dict:
                 f"ATR trailing stop at {exec_cfg['atr_multiplier']}×ATR "
                 "(TRAILS the high-water mark, not fixed at entry)"
             ),
-            "coherent": False,
+            "coherent": horizontal_coherent,
             "note": (
                 "Label barriers are symmetric, fixed-at-entry and vol-scaled. "
                 "Execution barriers are asymmetric (profit-take only REDUCES; "
