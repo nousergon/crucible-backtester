@@ -108,6 +108,94 @@ EXTENDED_GRID = {
     # See [[feedback_no_silent_fails]].
 }
 
+# ── Extended-grid data gate (config#947) ──────────────────────────────────────
+# The EXTENDED_GRID adds low-frequency params (reduce_fraction, earnings_*,
+# momentum/correlation thresholds, …) whose effect only shows across regimes.
+# Sweeping them on a short (~3-month) production window over-fits in-sample:
+# there is not enough out-of-sample history to holdout-validate the extra
+# degrees of freedom. So the extended grid is GATED on the signal-date window
+# spanning at least EXTENDED_GRID_MIN_DAYS of history — the "6+ months of data"
+# condition from the issue title made into a real code gate rather than an
+# undocumented manual config flip.
+EXTENDED_GRID_MIN_DAYS = 183  # ~6 calendar months (config#947 data gate)
+
+
+def _window_span_days(dates: list[str] | None) -> int:
+    """Calendar-day span between the first and last signal date.
+
+    ``dates`` are sorted ``YYYY-MM-DD`` strings (loaders.signal_loader.list_dates).
+    Returns 0 if fewer than 2 valid dates are present.
+    """
+    from datetime import date as _date
+
+    if not dates:
+        return 0
+    parsed: list[_date] = []
+    for d in dates:
+        try:
+            parsed.append(_date.fromisoformat(str(d)[:10]))
+        except (ValueError, TypeError):
+            continue
+    if len(parsed) < 2:
+        return 0
+    return (max(parsed) - min(parsed)).days
+
+
+def select_grid(
+    dates: list[str] | None,
+    config: dict | None = None,
+) -> dict:
+    """Choose the parameter grid for a sweep, gating EXTENDED_GRID on data.
+
+    Resolution order (config#947):
+      1. An explicit ``config["param_sweep"]`` always wins — operators can pin
+         any grid (e.g. force EXTENDED_GRID for an offline study) and that
+         override is honored verbatim, unchanged from prior behavior.
+      2. Otherwise auto-select: EXTENDED_GRID only when the signal-date window
+         spans >= EXTENDED_GRID_MIN_DAYS (~6 months) of history, so the extra
+         low-frequency degrees of freedom can be holdout-validated; else the
+         conservative DEFAULT_GRID (core 6 params).
+
+    The ``param_sweep_settings.force_extended_grid`` escape hatch (bool) lets an
+    operator opt into the extended grid without hand-copying the dict into
+    config — but it STILL respects the data gate (falls back to DEFAULT_GRID and
+    warns if <6 months), and only applies when no explicit ``param_sweep`` grid
+    is set.
+    """
+    config = config or {}
+    explicit = config.get("param_sweep")
+    if explicit:
+        return explicit
+
+    settings = config.get("param_sweep_settings", {}) or {}
+    span = _window_span_days(dates)
+    gate_met = span >= EXTENDED_GRID_MIN_DAYS
+
+    if settings.get("force_extended_grid") and not gate_met:
+        logger.warning(
+            "param_sweep: force_extended_grid requested but data gate NOT met "
+            "(%dd < %dd of history) — falling back to DEFAULT_GRID to avoid "
+            "over-fitting the extended grid in-sample (config#947)",
+            span, EXTENDED_GRID_MIN_DAYS,
+        )
+        return DEFAULT_GRID
+
+    if gate_met:
+        logger.info(
+            "param_sweep: data gate met (%dd >= %dd of history) — using "
+            "EXTENDED_GRID (%d params, config#947)",
+            span, EXTENDED_GRID_MIN_DAYS, len(EXTENDED_GRID),
+        )
+        return EXTENDED_GRID
+
+    logger.info(
+        "param_sweep: data gate not met (%dd < %dd of history) — using "
+        "DEFAULT_GRID (core %d params, config#947)",
+        span, EXTENDED_GRID_MIN_DAYS, len(DEFAULT_GRID),
+    )
+    return DEFAULT_GRID
+
+
 # ── Defaults for sweep mode (override via param_sweep_settings in config.yaml) ──
 _DEFAULT_SWEEP_MODE = "random"
 _DEFAULT_TOP_FRACTION = 0.05      # target top 5% of parameter space

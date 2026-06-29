@@ -2355,7 +2355,11 @@ def run_param_sweep(config: dict) -> pd.DataFrame | None:
             coverage_by_ticker=coverage_by_ticker,
         )
 
-    grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
+    # config#947: gate EXTENDED_GRID on >=6 months of signal history. An
+    # explicit config["param_sweep"] still wins; otherwise the grid auto-selects
+    # DEFAULT (short window) vs EXTENDED (>=6mo) so the extra low-frequency
+    # params are only swept when there is enough history to holdout-validate them.
+    grid = param_sweep.select_grid(dates, config)
     sweep_settings = config.get("param_sweep_settings", {})
 
     logger.info("Running param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
@@ -4652,7 +4656,8 @@ def _run_simulation_pipeline(
                                 vwap_series_by_ticker=vwap_series_by_ticker,
                                 coverage_by_ticker=coverage_by_ticker,
                             )
-                        grid = config.get("param_sweep", param_sweep.DEFAULT_GRID)
+                        # config#947: data-gated grid selection (see run_param_sweep).
+                        grid = param_sweep.select_grid(dates, config)
                         grid = _seed_grid_with_current(grid, current_executor_params)
                         sweep_settings = config.get("param_sweep_settings", {})
                         logger.info("Running param sweep (%s): %s", sweep_settings.get("mode", "random"), {k: len(v) for k, v in grid.items()})
