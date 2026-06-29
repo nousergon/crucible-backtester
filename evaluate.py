@@ -88,6 +88,7 @@ from optimizer import (
     stance_sizing_optimizer,
 )
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
+from optimizer import factor_blend_optimizer
 from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_digest_email
 from reporter import build_digest, build_report, save, upload_to_s3
@@ -99,6 +100,7 @@ from pipeline_common import (
     find_trades_db,
     push_predictor_rolling_metrics,
     resolve_trading_day,
+    _load_label_barrier_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -782,14 +784,31 @@ def _run_factor_blend_counterfactual_replay(config: dict | None) -> dict:
 def _run_barrier_coherence(config: dict, trades_db: str) -> dict:
     """Predictor↔executor triple-barrier coherence diagnostic.
 
-    Reads the LIVE, sweep-tuned executor barriers from
-    ``config/executor_params.json`` on S3 so leg (a) compares against the real
-    execution policy, not stale defaults. On any S3 failure we fall back to the
-    documented defaults but record the fallback in ``exec_params_source`` and
+    Reads BOTH sides live so the comparison is real, not stale-default vs
+    stale-default:
+      - LABEL side: the predictor ``triple_barrier`` block from
+        ``alpha-engine-config/predictor/predictor.yaml`` (the same file the
+        predictor parses to build its labels) via
+        ``pipeline_common._load_label_barrier_config`` — config#723's
+        single-source-of-truth for label barriers.
+      - EXECUTION side: the LIVE, sweep-tuned executor barriers from
+        ``config/executor_params.json`` on S3.
+    On any read failure we fall back to the diagnostic's documented defaults but
+    record the fallback in ``label_config_source`` / ``exec_params_source`` and
     WARN-log it — not a silent swallow (the diagnostic still runs; the source is
     visible in the rendered artifact).
     """
     from analysis.barrier_coherence import compute_barrier_coherence
+
+    label_config = _load_label_barrier_config()
+    if label_config:
+        label_source = "live predictor.yaml triple_barrier (config repo)"
+    else:
+        label_source = "defaults (predictor.yaml fallback)"
+        logger.warning(
+            "barrier_coherence: predictor.yaml triple_barrier block not found "
+            "on disk; using documented label-barrier defaults"
+        )
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
     exec_params: dict | None = None
@@ -820,7 +839,11 @@ def _run_barrier_coherence(config: dict, trades_db: str) -> dict:
         )
 
     return compute_barrier_coherence(
-        trades_db, exec_params=exec_params, exec_params_source=exec_source
+        trades_db,
+        label_config=label_config,
+        label_config_source=label_source,
+        exec_params=exec_params,
+        exec_params_source=exec_source,
     )
 
 
@@ -1004,6 +1027,25 @@ def _run_optimizers(
         skip_if_missing=["research_db"],
     )
 
+    # Factor-blend optimizer (config#748) — auto-apply companion to the
+    # observability-only factor_blend_sensitivity diagnostic. Consumes the
+    # already-computed sensitivity report (no recomputation) and recommends
+    # per-regime stance-weight reorderings where a trustworthy mismatch
+    # persists. Two-flag activation (use_factor_blend_target +
+    # enforce_factor_blend) + reproduction gate; default-off in
+    # alpha-engine-config/backtester/config.yaml so it shadows safely while the
+    # (regime, stance) cells mature past the 20-sample trustworthy threshold.
+    fb_sensitivity = diagnostics.get("factor_blend_sensitivity")
+    fb_has_data = (
+        fb_sensitivity is not None and bool(fb_sensitivity.get("has_data"))
+    )
+    results["factor_blend_opt"] = tracker.run_module(
+        "factor_blend_optimizer",
+        lambda: _run_factor_blend_optimizer(config, fb_sensitivity, freeze),
+        required_inputs={"factor_blend_sensitivity": fb_has_data},
+        skip_if_missing=["factor_blend_sensitivity"],
+    )
+
     # Executor optimizer (needs sweep_df from simulation)
     sweep_df = config.get("_sweep_df")
     predictor_sweep_df = config.get("_predictor_sweep_df")
@@ -1174,6 +1216,35 @@ def _run_tech_weight_ablation(config: dict, freeze: bool) -> dict:
         }
     else:
         result["apply_result"] = tech_weight_ablation.apply(result, bucket)
+    return result
+
+
+def _run_factor_blend_optimizer(
+    config: dict, sensitivity_report: dict | None, freeze: bool
+) -> dict:
+    """Run factor_blend_optimizer compute + apply path (config#748).
+
+    Consumes the already-computed factor_blend_sensitivity report (passed in
+    from diagnostics — no recomputation). Apply contract mirrors
+    tech_weight_ablation / executor_optimizer: compute the recommendation, then
+    call ``apply()`` to (optionally) write shadow + live S3 artifacts.
+    ``freeze=True`` short-circuits apply() so ``--freeze`` evaluator runs
+    produce zero S3 side effects.
+    """
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    fb_cfg = (config or {}).get("factor_blend") or {}
+    regime_weights = fb_cfg.get(
+        "regime_weights", factor_blend_sensitivity.DEFAULT_REGIME_WEIGHTS
+    )
+    result = factor_blend_optimizer.recommend(
+        sensitivity_report or {}, regime_weights
+    )
+    if freeze:
+        result["apply_result"] = {
+            "applied": False, "reason": "frozen (--freeze flag)",
+        }
+    else:
+        result["apply_result"] = factor_blend_optimizer.apply(result, bucket)
     return result
 
 
@@ -1375,6 +1446,7 @@ def _main_impl() -> None:
     veto_analysis.init_config(config)
     research_optimizer.init_config(config)
     tech_weight_ablation.init_config(config)
+    factor_blend_optimizer.init_config(config)
 
     # Set the assembler-cutover flag from config — when true, individual
     # optimizers' apply() skip their legacy live-key writes and the

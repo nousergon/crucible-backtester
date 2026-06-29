@@ -3198,7 +3198,12 @@ def _section_barrier_coherence(result: dict) -> list[str]:
         "_Do the triple-barrier LABELS the predictor trains on match the OCO "
         "exits the executor REALIZES? Read-only diagnostic (Task A)._",
         "",
+        f"_Label barriers source: {result.get('label_config_source', 'unknown')}_",
         f"_Executor params source: {result.get('exec_params_source', 'unknown')}_",
+        "",
+        f"**Monitor verdict: divergence is {div.get('divergence_status', 'unknown').upper()}** "
+        f"(material when vertical gap > {div.get('divergence_threshold_days', '?')} trading days "
+        "OR horizontal geometry incoherent — config#723 resolution (iii)).",
         "",
         "### Definition divergence",
         "",

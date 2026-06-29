@@ -91,6 +91,48 @@ class TestDefinitionDivergence:
         assert vert["horizon_gap_days"] == 7
         assert vert["coherent"] is False
 
+    def test_label_fallback_defaults_complete(self):
+        # The fallback label config must carry the pct caps too (config#723):
+        # silently dropping up/down_barrier_pct made the comparison incomplete.
+        result = compute_barrier_coherence("/nonexistent/trades.db")
+        lc = result["label_config"]
+        assert lc["up_barrier_pct"] == 0.05
+        assert lc["down_barrier_pct"] == 0.05
+        assert result["label_config_source"].startswith("defaults")
+
+    def test_injected_label_config_reflected(self):
+        # Live label config from predictor.yaml overrides the fallback and is
+        # surfaced in both the rendered values and the source string.
+        result = compute_barrier_coherence(
+            "/nonexistent/trades.db",
+            label_config={"forward_window": 10, "vol_multiplier": 3.0},
+            label_config_source="live predictor.yaml triple_barrier (config repo)",
+        )
+        vert = result["definition_divergence"]["vertical"]
+        assert vert["label_horizon_trading_days"] == 10
+        assert "3.0·σ" in result["definition_divergence"]["horizontal"]["label_geometry"]
+        assert result["label_config_source"].startswith("live predictor.yaml")
+
+    def test_divergence_status_material_on_default(self):
+        # 21d label vs 14d exec (7d gap > 5d threshold) AND incoherent geometry
+        # → the recorded standing-monitor verdict is "material".
+        result = compute_barrier_coherence("/nonexistent/trades.db")
+        div = result["definition_divergence"]
+        assert div["divergence_status"] == "material"
+        assert div["divergence_threshold_days"] == 5
+
+    def test_divergence_status_material_even_when_horizons_align(self):
+        # Closing the vertical gap does NOT make barriers coherent: the
+        # horizontal geometry (reduce-only TP + trailing stop) is still
+        # asymmetric, so the monitor still flags "material".
+        result = compute_barrier_coherence(
+            "/nonexistent/trades.db",
+            exec_params={"time_decay_exit_days": 21},
+        )
+        div = result["definition_divergence"]
+        assert div["vertical"]["coherent"] is True
+        assert div["divergence_status"] == "material"
+
 
 # ---------------------------------------------------------------------------
 # compute_barrier_coherence — trade-based legs
