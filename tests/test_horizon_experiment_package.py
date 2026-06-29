@@ -75,3 +75,33 @@ def test_horizon_default_when_nothing_resolves(tmp_path, monkeypatch):
     monkeypatch.delenv("ALPHA_ENGINE_EXPERIMENT_ID", raising=False)
 
     assert pipeline_common._load_active_horizon_days(default=99) == 99
+
+
+# ── pipeline_common._load_label_barrier_config (config#723) ───────────────────
+
+
+def test_label_barrier_config_reads_triple_barrier_block(tmp_path):
+    p = tmp_path / "predictor.yaml"
+    _write(p, {"triple_barrier": {"forward_window": 21, "vol_multiplier": 2.0}})
+    tb = pipeline_common._load_label_barrier_config(search_paths=[p])
+    assert tb == {"forward_window": 21, "vol_multiplier": 2.0}
+
+
+def test_label_barrier_config_first_existing_path_wins(tmp_path):
+    pkg = tmp_path / "pkg" / "predictor.yaml"
+    legacy = tmp_path / "legacy" / "predictor.yaml"
+    _write(pkg, {"triple_barrier": {"forward_window": 10}})
+    _write(legacy, {"triple_barrier": {"forward_window": 21}})
+    tb = pipeline_common._load_label_barrier_config(search_paths=[pkg, legacy])
+    assert tb["forward_window"] == 10
+
+
+def test_label_barrier_config_none_when_block_absent(tmp_path):
+    p = tmp_path / "predictor.yaml"
+    _write(p, {"labeling": {"forward_days": 21}})  # no triple_barrier block
+    assert pipeline_common._load_label_barrier_config(search_paths=[p]) is None
+
+
+def test_label_barrier_config_none_when_no_path_exists(tmp_path):
+    missing = tmp_path / "nope" / "predictor.yaml"
+    assert pipeline_common._load_label_barrier_config(search_paths=[missing]) is None

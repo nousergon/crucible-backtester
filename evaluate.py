@@ -99,6 +99,7 @@ from pipeline_common import (
     find_trades_db,
     push_predictor_rolling_metrics,
     resolve_trading_day,
+    _load_label_barrier_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -782,14 +783,31 @@ def _run_factor_blend_counterfactual_replay(config: dict | None) -> dict:
 def _run_barrier_coherence(config: dict, trades_db: str) -> dict:
     """Predictor↔executor triple-barrier coherence diagnostic.
 
-    Reads the LIVE, sweep-tuned executor barriers from
-    ``config/executor_params.json`` on S3 so leg (a) compares against the real
-    execution policy, not stale defaults. On any S3 failure we fall back to the
-    documented defaults but record the fallback in ``exec_params_source`` and
+    Reads BOTH sides live so the comparison is real, not stale-default vs
+    stale-default:
+      - LABEL side: the predictor ``triple_barrier`` block from
+        ``alpha-engine-config/predictor/predictor.yaml`` (the same file the
+        predictor parses to build its labels) via
+        ``pipeline_common._load_label_barrier_config`` — config#723's
+        single-source-of-truth for label barriers.
+      - EXECUTION side: the LIVE, sweep-tuned executor barriers from
+        ``config/executor_params.json`` on S3.
+    On any read failure we fall back to the diagnostic's documented defaults but
+    record the fallback in ``label_config_source`` / ``exec_params_source`` and
     WARN-log it — not a silent swallow (the diagnostic still runs; the source is
     visible in the rendered artifact).
     """
     from analysis.barrier_coherence import compute_barrier_coherence
+
+    label_config = _load_label_barrier_config()
+    if label_config:
+        label_source = "live predictor.yaml triple_barrier (config repo)"
+    else:
+        label_source = "defaults (predictor.yaml fallback)"
+        logger.warning(
+            "barrier_coherence: predictor.yaml triple_barrier block not found "
+            "on disk; using documented label-barrier defaults"
+        )
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
     exec_params: dict | None = None
@@ -820,7 +838,11 @@ def _run_barrier_coherence(config: dict, trades_db: str) -> dict:
         )
 
     return compute_barrier_coherence(
-        trades_db, exec_params=exec_params, exec_params_source=exec_source
+        trades_db,
+        label_config=label_config,
+        label_config_source=label_source,
+        exec_params=exec_params,
+        exec_params_source=exec_source,
     )
 
 
