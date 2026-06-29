@@ -1776,6 +1776,40 @@ def _main_impl() -> None:
                 "",
             ])
 
+        # Attribution sample-adequacy PERSISTENCE section (config#946 part 2).
+        # sample_size_adequacy grades the per-cycle snapshot; this watches the
+        # cross-cycle trailing run of attribution `insufficient_data` and warns
+        # once it persists past the threshold (structural under-powering vs a
+        # transient early-cohort gap). Appends to S3 history only when uploading
+        # (matches write-as-you-compute gating). Guarded + always-emit, same
+        # contract as the cost / calibration sections above.
+        try:
+            from analysis.attribution_persistence import (
+                record_and_evaluate,
+                render_attribution_persistence_section,
+            )
+            _attr_persistence = record_and_evaluate(
+                attr_result,
+                run_date=args.date,
+                bucket=config.get("output_bucket", "alpha-engine-research"),
+                upload=bool(getattr(args, "upload", False)),
+            )
+            report_md = report_md + "\n" + render_attribution_persistence_section(_attr_persistence)
+        except Exception as ap_err:  # noqa: BLE001 — see cost section above
+            logger.error(
+                "[attribution_persistence] section render failed: %s — emitting "
+                "error placeholder so operators see the regression",
+                ap_err,
+            )
+            report_md = report_md + "\n" + "\n".join([
+                "## Attribution sample adequacy (persistence)",
+                "",
+                f"- _Attribution persistence section render failed: `{ap_err}`._",
+                "  Investigate `analysis/attribution_persistence.py` + the history at "
+                "`s3://alpha-engine-research/decision_artifacts/_attribution_adequacy/history.jsonl`.",
+                "",
+            ])
+
         # Report-card Batch C producers (config#1151) — backtester self-grade
         # inputs. Pure-compute over the weight optimizer's already-computed
         # result (no new data read); ALWAYS-EMIT so the evaluator's backtester
