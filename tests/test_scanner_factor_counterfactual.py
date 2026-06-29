@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analysis.end_to_end import (  # noqa: E402
+    _ATTRACTIVENESS_PILLARS,
     SCANNER_RAW_FACTORS,
     _scanner_factor_counterfactual,
 )
@@ -148,6 +149,76 @@ def test_reconciliation_two_axes_present(tmp_path):
     bs = r["breadth_stratified"]
     assert bs is not None and "median_breadth" in bs, bs
     assert "momentum_sleeve_topN" in bs and "actual_scanner_pass" in bs, bs
+
+
+def _db_and_pillar_profiles(tmp_path):
+    """Fixture for the EXACT live-attractiveness counterfactual (config#1398).
+    The 6 sector-neutral pillar percentiles all favour the winners (low i) while
+    the live scanner passes the losers — so ``attractiveness_topN`` must beat the
+    actual scanner pass. Returns (conn, pillar_profiles)."""
+    conn = sqlite3.connect(str(tmp_path / "ra.db"))
+    conn.execute(
+        "CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT, quant_filter_pass INTEGER)"
+    )
+    conn.execute(
+        "CREATE TABLE universe_returns (ticker TEXT, eval_date TEXT, sector TEXT, "
+        "log_return_21d REAL, log_spy_return_21d REAL)"
+    )
+    dates = ["2026-01-02", "2026-01-09", "2026-01-16", "2026-01-23"]
+    profiles: dict = {}
+    for d in dates:
+        for i in range(10):
+            alpha = 0.03 if i < 5 else -0.03
+            qpass = 1 if i >= 5 else 0  # live scanner passes the losers
+            conn.execute("INSERT INTO scanner_evaluations VALUES (?,?,?)", (f"T{i}", d, qpass))
+            conn.execute(
+                "INSERT INTO universe_returns VALUES (?,?,?,?,?)", (f"T{i}", d, "Tech", alpha, 0.0)
+            )
+            # every pillar percentile higher for winners (low i) -> 100 - i*10
+            profiles[(d, f"T{i}")] = {p: float(100 - i * 10) for p in _ATTRACTIVENESS_PILLARS}
+    conn.commit()
+    return conn, profiles
+
+
+def test_attractiveness_beats_scanner(tmp_path):
+    conn, profiles = _db_and_pillar_profiles(tmp_path)
+    r = _scanner_factor_counterfactual(conn, loadings=None, pillar_profiles=profiles)
+    assert r["status"] == "ok", r
+    assert r["n_cycles"] == 4, r
+    assert r["attractiveness_profile_cohorts"] == 4, r
+    mset = r["methods"]
+    assert mset["actual_scanner_pass"]["mean_alpha_21d"] < 0, r
+    # the live attractiveness composite picks the winners -> positive, beats scanner
+    assert mset["attractiveness_topN"]["mean_alpha_21d"] > 0, r
+    assert mset["attractiveness_topN"]["lift_vs_actual_scanner"] > 0, r
+    # count-matched to the live pass count (5/cycle x 4 = 20)
+    assert mset["attractiveness_topN"]["n_picks"] == 20, r
+    # objective axes carry both axes for the attractiveness method
+    assert set(r["objective_axes"]["attractiveness_topN"]["longonly_topn_alpha"]) == {"mean", "p", "n"}, r
+
+
+def test_attractiveness_runs_without_arctic_loadings(tmp_path):
+    """Pillar profiles alone (no ArcticDB loadings) still produce the
+    attractiveness method; the raw-factor multifactor method is simply empty."""
+    conn, profiles = _db_and_pillar_profiles(tmp_path)
+    r = _scanner_factor_counterfactual(conn, loadings=None, pillar_profiles=profiles)
+    assert r["status"] == "ok", r
+    assert "attractiveness_topN" in r["methods"], r
+    assert r["methods"]["attractiveness_topN"]["n_picks"] > 0, r
+    # multifactor has no ArcticDB input -> no picks (but must not error)
+    assert r["methods"]["multifactor_topN"]["n_picks"] == 0, r
+
+
+def test_attractiveness_partial_profile_coverage(tmp_path):
+    """When profiles exist for only some matured cohorts, the cohort count
+    reflects the real overlap (the live data-maturation reality, config#1398)."""
+    conn, profiles = _db_and_pillar_profiles(tmp_path)
+    # drop two of the four cohorts' profiles
+    profiles = {k: v for k, v in profiles.items() if k[0] in ("2026-01-02", "2026-01-09")}
+    r = _scanner_factor_counterfactual(conn, loadings=None, pillar_profiles=profiles)
+    assert r["status"] == "ok", r
+    assert r["n_cycles"] == 4, r  # scanner cycles unchanged
+    assert r["attractiveness_profile_cohorts"] == 2, r  # only 2 have profiles
 
 
 def test_skipped_without_loadings(tmp_path):

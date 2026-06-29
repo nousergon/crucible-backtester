@@ -369,6 +369,7 @@ def _run_diagnostics(
     # downstream team/CIO cycles too). Fail-soft: any error -> {} and each
     # counterfactual reports status 'skipped'.
     factor_loadings: dict = {}
+    pillar_profiles: dict = {}
     if avail.get("research_db"):
         try:
             import sqlite3 as _sqlite3
@@ -389,6 +390,11 @@ def _run_diagnostics(
             factor_loadings = end_to_end.load_historical_factor_loadings(
                 bucket, eval_dates, factors=end_to_end.ALL_LOADING_FACTORS
             )
+            # Live 6-pillar attractiveness profiles for the exact-attractiveness
+            # counterfactual (config#1398) — same eval-date set, fail-soft.
+            pillar_profiles = end_to_end.load_historical_pillar_profiles(
+                bucket, eval_dates
+            )
         except Exception as _fl:  # fail-soft — never block diagnostics
             logger.warning("factor-loadings load skipped (non-fatal): %s", _fl)
 
@@ -397,7 +403,7 @@ def _run_diagnostics(
         "end_to_end_lift",
         lambda: end_to_end.compute_lift_metrics(
             research_db_path=db_path, trades_db_path=trades_db,
-            factor_loadings=factor_loadings,
+            factor_loadings=factor_loadings, pillar_profiles=pillar_profiles,
         ),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
