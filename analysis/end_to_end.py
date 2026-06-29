@@ -387,6 +387,7 @@ def compute_lift_metrics(
     eval_date: str | None = None,
     factor_loadings: dict | None = None,
     pillar_profiles: dict | None = None,
+    trajectory_scores: dict | None = None,
 ) -> dict:
     """
     Compute lift at each decision boundary for the given eval_date(s).
@@ -500,6 +501,21 @@ def compute_lift_metrics(
         except Exception as _nlf:  # pragma: no cover - defensive
             logger.warning("neutralization_live_forward_ic failed (non-fatal): %s", _nlf)
             result["neutralization_live_forward_ic"] = {"status": "error", "reason": str(_nlf)}
+
+        # 1e. OBSERVE-mode rolling forward-IC of the attractiveness-trajectory
+        # signal (crucible-research #337 / config#1392). Joins the persisted
+        # weekly trajectory artifact scores (pre_repricing_score, attr_slope_z)
+        # to realized 21d alpha and reports the rolling weekly Spearman rank-IC +
+        # n_cohorts, so the observe->cutover gate (the console's
+        # ``provisional_ic: accruing``) is decidable. Pure measurement: does NOT
+        # auto-promote. Fail-soft like 1b-1d.
+        try:
+            result["trajectory_forward_ic"] = _trajectory_forward_ic(
+                conn, trajectory_scores or None
+            )
+        except Exception as _tfi:  # pragma: no cover - defensive
+            logger.warning("trajectory_forward_ic failed (non-fatal): %s", _tfi)
+            result["trajectory_forward_ic"] = {"status": "error", "reason": str(_tfi)}
 
         # 2. Team lift
         result["team_lift"] = _team_lift(conn, ur, date_filter, params)
@@ -960,6 +976,22 @@ DEFAULT_NEUTRALIZE_FACTORS: tuple[str, ...] = (
 # report card otherwise lacks (config#1187; the live cutover only rewrites
 # signals.json score, which no IC producer reads back).
 NEUTRALIZATION_LIVE_CUTOVER_DATE: str = "2026-06-22"
+
+# Observe-mode forward-IC gate for the attractiveness-trajectory signal
+# (crucible-research #337 / config#1392). The signal is written weekly to the
+# trajectory artifact but its forward predictive power has never been measured.
+# ``_trajectory_forward_ic`` joins the persisted per-name ``pre_repricing_score``
+# and ``attr_slope_z`` to realized 21d log market-relative alpha and reports the
+# rolling weekly Spearman rank-IC. Fewer than this many mature weekly cohorts ->
+# status ``accruing`` (honest None IC, NOT a crash): the observe->cutover gate is
+# not yet decidable. This is the SAME maturity floor the live console header
+# (``provisional_ic: accruing``) is waiting on. Crossing it does NOT auto-promote
+# the signal — the observe->cutover decision is the operator's; this producer only
+# computes + surfaces the IC and the n_cohorts so the gate is decidable.
+TRAJECTORY_FORWARD_IC_MIN_COHORTS: int = 4
+# Minimum names per weekly cross-section for a stable per-week IC (matches the
+# >=10 floor _neutralized_live_forward_ic uses for its weekly Spearman).
+TRAJECTORY_FORWARD_IC_MIN_NAMES_PER_WEEK: int = 10
 
 # ArcticDB raw column -> (exposure key, transform). The loader reads these raw
 # columns from the universe feature history and emits the exposure keys above.
@@ -1724,6 +1756,221 @@ def load_historical_pillar_profiles(bucket: str, eval_dates) -> dict:
     except Exception as e:  # fail-soft — never break the diagnostics run
         logger.warning("load_historical_pillar_profiles failed (non-fatal): %s", e)
         return {}
+
+
+def load_historical_trajectory_scores(bucket: str, eval_dates) -> dict:
+    """Build ``{(eval_date, ticker): {"pre_repricing_score": .., "attr_slope_z": ..}}``
+    from the persisted attractiveness-trajectory artifacts, for the observe-mode
+    forward-IC gate (crucible-research #337 / config#1392).
+
+    Reads ``s3://{bucket}/scanner/universe/trajectory/{eval_date}/trajectory.json``
+    — the exact weekly artifact ``crucible-research`` writes (see
+    ``scoring/attractiveness_trajectory.compute_and_write_trajectory``). Each name
+    in the artifact's ``stocks`` list carries ``pre_repricing_score`` (the OLS
+    residual of ``attr_slope_z`` on sector-relative price momentum — rising
+    attractiveness the market has NOT yet repriced) and ``attr_slope_z`` (the
+    cross-sectional z of the Theil-Sen attractiveness slope).
+
+    A research-cycle ``eval_date`` is matched EXACTLY (like
+    :func:`load_historical_pillar_profiles`, NOT as-of ffill): the trajectory
+    artifacts are research-keyed weekly snapshots, not a trading-day series, so an
+    as-of match would attribute a stale cohort's scores to a date that never
+    produced them. A date with no artifact is simply absent (reduced cohort
+    coverage). Fail-soft: any error returns ``{}`` so the e2e_lift contract is
+    never broken.
+    """
+    try:
+        import json as _json
+
+        import boto3
+
+        s3 = boto3.client("s3")
+        out: dict = {}
+        for d_str in sorted(set(eval_dates)):
+            key = f"scanner/universe/trajectory/{d_str}/trajectory.json"
+            try:
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            except Exception:
+                continue  # no trajectory artifact for this cohort -> reduced coverage
+            try:
+                art = _json.loads(body)
+            except Exception:
+                continue
+            if not isinstance(art, dict):
+                continue
+            for rec in art.get("stocks", []) or []:
+                if not isinstance(rec, dict):
+                    continue
+                ticker = rec.get("ticker")
+                if not ticker:
+                    continue
+                scores = {
+                    k: float(rec[k])
+                    for k in ("pre_repricing_score", "attr_slope_z")
+                    if rec.get(k) is not None and isinstance(rec.get(k), (int, float))
+                }
+                if scores:
+                    out[(d_str, str(ticker))] = scores
+        return out
+    except Exception as e:  # fail-soft — never break the diagnostics run
+        logger.warning("load_historical_trajectory_scores failed (non-fatal): %s", e)
+        return {}
+
+
+def _trajectory_forward_ic(conn, trajectory_scores: dict | None = None) -> dict:
+    """OBSERVE-mode rolling forward-IC of the attractiveness-trajectory signal
+    (crucible-research #337 / config#1392).
+
+    The trajectory signal (``scoring/attractiveness_trajectory.py``) is written
+    weekly but has been pure OBSERVE-mode: the artifact schema hard-codes
+    ``provisional_ic: None`` and the console shows ``provisional_ic: accruing``
+    because nothing ever measured its forward predictive power. This producer is
+    the missing measurement. It joins the PERSISTED per-name trajectory scores
+    (``pre_repricing_score`` and ``attr_slope_z``, injected via
+    :func:`load_historical_trajectory_scores`) to realized 21d log
+    market-relative alpha (``universe_returns``: ``log_return_21d -
+    log_spy_return_21d``) on ``(eval_date, ticker)`` — the SAME realized-return
+    source and join key ``_neutralized_live_forward_ic`` uses — and computes the
+    per-week cross-sectional Spearman rank-IC of EACH score vs forward alpha via
+    the shared quant engine (``analysis.information_coefficient.compute_ic``,
+    re-export of ``nousergon_lib.quant.stats.information_coefficient`` — one shared
+    IC, not per-repo Spearman). Each mature week is ONE cohort observation; the
+    reported IC is the mean of the per-week ICs and ``n_cohorts`` = effective N.
+
+    Maturity gate (mirrors how ``_neutralized_live_forward_ic`` treats immature
+    cohorts as an HONEST None rather than a crash): a week counts only when it has
+    >= ``TRAJECTORY_FORWARD_IC_MIN_NAMES_PER_WEEK`` names with both a trajectory
+    score and a realized 21d outcome. With fewer than
+    ``TRAJECTORY_FORWARD_IC_MIN_COHORTS`` mature weeks the status is ``accruing``
+    and the mean ICs are None — the value the console header surfaces in place of
+    ``provisional_ic: accruing``, and the value that makes the observe->cutover
+    gate decidable WITHOUT this producer ever auto-promoting the signal (that
+    decision is the operator's).
+
+    Fail-soft: any precondition miss / error -> status skipped / insufficient_data
+    / accruing / error, never breaking the e2e_lift contract.
+    """
+    try:
+        from analysis.information_coefficient import compute_ic
+
+        if not trajectory_scores:
+            # No injected artifacts (loader returned {} — no trajectory artifacts
+            # in the bucket yet, or evaluate had no bucket). Honest accruing, NOT
+            # an error: the measurement only becomes possible once weekly
+            # trajectory artifacts accrue and are read.
+            return {
+                "status": "accruing",
+                "reason": "no persisted trajectory artifacts available",
+                "n_cohorts": 0,
+                "min_cohorts": TRAJECTORY_FORWARD_IC_MIN_COHORTS,
+            }
+        tabs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "universe_returns" not in tabs:
+            return {"status": "skipped", "reason": "universe_returns absent"}
+        ur_cols = {r[1] for r in conn.execute("PRAGMA table_info(universe_returns)")}
+        if not {"log_return_21d", "log_spy_return_21d"}.issubset(ur_cols):
+            return {"status": "skipped", "reason": "universe_returns lacks log_return_21d / log_spy_return_21d"}
+
+        ur = pd.read_sql_query(
+            "SELECT ticker, eval_date, "
+            "(log_return_21d - log_spy_return_21d) AS log_alpha_21d "
+            "FROM universe_returns "
+            "WHERE log_return_21d IS NOT NULL AND log_spy_return_21d IS NOT NULL",
+            conn,
+        )
+        if ur.empty:
+            return {"status": "insufficient_data", "reason": "no universe_returns rows with realized 21d outcomes"}
+
+        # Join persisted trajectory scores to realized forward alpha on
+        # (eval_date, ticker) — exact match, the artifacts are research-keyed.
+        recs = []
+        for (d_str, ticker), scores in trajectory_scores.items():
+            recs.append({
+                "eval_date": d_str,
+                "ticker": str(ticker),
+                "pre_repricing_score": scores.get("pre_repricing_score"),
+                "attr_slope_z": scores.get("attr_slope_z"),
+            })
+        if not recs:
+            return {
+                "status": "accruing",
+                "reason": "trajectory artifacts carried no scored names",
+                "n_cohorts": 0,
+                "min_cohorts": TRAJECTORY_FORWARD_IC_MIN_COHORTS,
+            }
+        traj = pd.DataFrame.from_records(recs)
+        m = traj.merge(ur, on=["eval_date", "ticker"], how="inner")
+        if m.empty:
+            return {
+                "status": "accruing",
+                "reason": "no trajectory names have a realized 21d outcome yet",
+                "n_cohorts": 0,
+                "min_cohorts": TRAJECTORY_FORWARD_IC_MIN_COHORTS,
+            }
+
+        signals = ("pre_repricing_score", "attr_slope_z")
+        # per-signal lists of mature weekly ICs
+        weekly: dict = {s: [] for s in signals}
+        n_mature_weeks = 0
+        n_join_rows = int(len(m))
+        for _d, g in m.groupby("eval_date"):
+            g = g[g["log_alpha_21d"].notna()]
+            if len(g) < TRAJECTORY_FORWARD_IC_MIN_NAMES_PER_WEEK:
+                continue
+            week_counted = False
+            for s in signals:
+                sub = g[g[s].notna()]
+                if len(sub) < TRAJECTORY_FORWARD_IC_MIN_NAMES_PER_WEEK:
+                    continue
+                # Shared quant engine: Spearman rank-IC. min_samples is the
+                # per-week names floor (compute_ic's default 20 is tuned for the
+                # whole-sample p-value, not a single weekly cross-section).
+                res = compute_ic(
+                    sub[s], sub["log_alpha_21d"],
+                    min_samples=TRAJECTORY_FORWARD_IC_MIN_NAMES_PER_WEEK,
+                )
+                if res.get("status") == "ok":
+                    weekly[s].append(float(res["ic"]))
+                    week_counted = True
+            if week_counted:
+                n_mature_weeks += 1
+
+        def _summary(ics: list) -> dict:
+            n = len(ics)
+            mature = n >= TRAJECTORY_FORWARD_IC_MIN_COHORTS
+            return {
+                "n_cohorts": n,
+                "mean_weekly_ic": round(float(sum(ics) / n), 4) if (n and mature) else None,
+                "positive": bool(mature and (sum(ics) / n) > 0),
+                "status": "ok" if mature else "accruing",
+            }
+
+        per_signal = {s: _summary(weekly[s]) for s in signals}
+        # Overall maturity is gated on the primary signal (pre_repricing_score,
+        # the orthogonalized headline metric); n_cohorts is its mature-week count.
+        primary = per_signal["pre_repricing_score"]
+        overall_status = "ok" if primary["n_cohorts"] >= TRAJECTORY_FORWARD_IC_MIN_COHORTS else "accruing"
+
+        return {
+            "status": overall_status,
+            "horizon": "21d",
+            "source": "persisted scanner/universe/trajectory/{date}/trajectory.json (config#1392)",
+            "signal": "attractiveness_trajectory (crucible-research #337, observe-mode)",
+            "min_cohorts": TRAJECTORY_FORWARD_IC_MIN_COHORTS,
+            "min_names_per_week": TRAJECTORY_FORWARD_IC_MIN_NAMES_PER_WEEK,
+            "n_join_rows": n_join_rows,
+            "n_mature_weeks": n_mature_weeks,
+            # headline for the console "Attractiveness Trends" header (replaces
+            # the hard-coded ``provisional_ic: accruing``).
+            "n_cohorts": primary["n_cohorts"],
+            "provisional_ic": primary["mean_weekly_ic"],
+            "pre_repricing_score": per_signal["pre_repricing_score"],
+            "attr_slope_z": per_signal["attr_slope_z"],
+        }
+    except sqlite3.OperationalError:
+        return {"status": "skipped", "reason": "universe_returns table not found"}
+    except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
+        return {"status": "error", "reason": str(e)}
 
 
 def _scanner_factor_counterfactual(
