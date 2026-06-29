@@ -386,6 +386,7 @@ def compute_lift_metrics(
     trades_db_path: str | None = None,
     eval_date: str | None = None,
     factor_loadings: dict | None = None,
+    pillar_profiles: dict | None = None,
 ) -> dict:
     """
     Compute lift at each decision boundary for the given eval_date(s).
@@ -462,7 +463,7 @@ def compute_lift_metrics(
         # momentum-only scanner? Fail-soft; needs injected ArcticDB loadings.
         try:
             result["scanner_factor_counterfactual"] = _scanner_factor_counterfactual(
-                conn, factor_loadings or None
+                conn, factor_loadings or None, pillar_profiles or None
             )
         except Exception as _sfc:  # pragma: no cover - defensive
             logger.warning("scanner_factor_counterfactual failed (non-fatal): %s", _sfc)
@@ -1658,8 +1659,76 @@ SCANNER_RAW_FACTORS: tuple = tuple(
     f for sl in _SCANNER_FACTOR_SLEEVES.values() for f, _ in sl
 )
 
+# The LIVE universe-board attractiveness composite's pillar set (config#1398 /
+# ARCHITECTURE §43). These are the 6 sector-neutral pillar percentiles persisted
+# by crucible-research to ``factors/profiles/{date}/by_ticker.json`` — the exact
+# inputs to ``scoring/universe_board.py::compute_cross_sectional_attractiveness``
+# (each already 0-100, higher = better). The counterfactual ranks the scanned
+# universe by the SAME blend (cross-sectional winsorized-z per pillar, clip ±3,
+# coverage-renormalized equal-weight mean) the live board uses; the board's
+# terminal cross-sectional PERCENTILE step is a monotone transform, so the
+# top-N SELECTION this test makes is identical to ranking by the board's
+# ``attractiveness_score``. This measures the EXACT live attractiveness feed (vs
+# the deep-history ``multifactor_topN`` raw-factor proxy), so it matures to robust
+# N only as profile history accrues (~7 weekly snapshots at birth, 2026-06).
+_ATTRACTIVENESS_PILLARS: tuple = (
+    "quality_score", "value_score", "momentum_score",
+    "growth_score", "stewardship_score", "low_vol_score",
+)
 
-def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
+
+def load_historical_pillar_profiles(bucket: str, eval_dates) -> dict:
+    """Build ``{(eval_date, ticker): {pillar_score_key: value}}`` from the
+    persisted research factor-profile artifacts for the attractiveness
+    counterfactual (config#1398).
+
+    Reads ``s3://{bucket}/factors/profiles/{eval_date}/by_ticker.json`` (the
+    exact 6-pillar sector-neutral percentile scores the live universe board
+    consumes). A research-cycle ``eval_date`` is matched EXACTLY — unlike the raw
+    ArcticDB loader these are research-keyed artifacts, not a trading-day series,
+    so an as-of ffill would silently attribute a stale cohort's pillars to a date
+    that never produced them. A date with no profile artifact is simply absent
+    (the method reports reduced cohort coverage). Fail-soft: any error returns
+    ``{}`` so the e2e_lift contract is never broken.
+    """
+    try:
+        import json as _json
+
+        import boto3
+
+        s3 = boto3.client("s3")
+        out: dict = {}
+        for d_str in sorted(set(eval_dates)):
+            key = f"factors/profiles/{d_str}/by_ticker.json"
+            try:
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            except Exception:
+                continue  # no profile for this cohort -> reduced coverage
+            try:
+                prof = _json.loads(body)
+            except Exception:
+                continue
+            if not isinstance(prof, dict):
+                continue
+            for ticker, rec in prof.items():
+                if not isinstance(rec, dict):
+                    continue
+                pillars = {
+                    p: float(rec[p])
+                    for p in _ATTRACTIVENESS_PILLARS
+                    if rec.get(p) is not None and isinstance(rec.get(p), (int, float))
+                }
+                if pillars:
+                    out[(d_str, ticker)] = pillars
+        return out
+    except Exception as e:  # fail-soft — never break the diagnostics run
+        logger.warning("load_historical_pillar_profiles failed (non-fatal): %s", e)
+        return {}
+
+
+def _scanner_factor_counterfactual(
+    conn, loadings: dict | None = None, pillar_profiles: dict | None = None
+) -> dict:
     """Would a MULTI-FACTOR candidate-generation beat the momentum-only scanner?
     (config#1186 — the candidate-generation / scanner-edge test + reconciliation
     with the live momentum-neutralization #1142.)
@@ -1678,8 +1747,8 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
     {raw_factor: value}} from ArcticDB — empty -> status skipped. Pure read.
     """
     try:
-        if not loadings:
-            return {"status": "skipped", "reason": "no factor loadings provided"}
+        if not loadings and not pillar_profiles:
+            return {"status": "skipped", "reason": "no factor loadings or pillar profiles provided"}
         tabs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "scanner_evaluations" not in tabs or "universe_returns" not in tabs:
             return {"status": "skipped", "reason": "scanner_evaluations / universe_returns absent"}
@@ -1704,11 +1773,14 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
 
         sleeve_names = list(_SCANNER_FACTOR_SLEEVES)
         methods = ["actual_scanner_pass", "multifactor_topN"] + [s + "_sleeve_topN" for s in sleeve_names]
+        if pillar_profiles:
+            methods = methods + ["attractiveness_topN"]
         picked: dict = {k: [] for k in methods}
         picked_sn: dict = {k: [] for k in methods}
         universe_alpha: list = []
         n_pass_total = 0
         n_cycles = 0
+        n_attr_cycles = 0  # cycles where the live attractiveness composite was computable
         # Per-cycle records for the objective-asymmetry reconciliation (config#1186
         # vs #1142). Each cycle contributes ONE observation per variant on two
         # axes: (a) ``topn`` — mean realized 21d alpha of the count-matched top-N
@@ -1744,26 +1816,54 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
             else:
                 g["alpha_sn"] = g["alpha21"]
 
-            exrows = {t: (loadings.get((d, t)) or {}) for t in g["ticker"]}
-            fac = pd.DataFrame.from_dict(exrows, orient="index")
-            z = pd.DataFrame(index=fac.index)
-            for col in SCANNER_RAW_FACTORS:
-                if col in fac.columns:
-                    s = pd.to_numeric(fac[col], errors="coerce")
-                    sd = s.std(ddof=0)
-                    z[col] = (s - s.mean()) / sd if sd and sd > 1e-12 else 0.0
-            sleeve_score = {}
-            for sl, facs in _SCANNER_FACTOR_SLEEVES.items():
-                cols = [(f, sign) for f, sign in facs if f in z.columns]
-                if cols:
-                    sleeve_score[sl] = pd.concat([sign * z[f] for f, sign in cols], axis=1).mean(axis=1)
-            if not sleeve_score:
+            sleeve_score: dict = {}
+            composite = None
+            if loadings:
+                exrows = {t: (loadings.get((d, t)) or {}) for t in g["ticker"]}
+                fac = pd.DataFrame.from_dict(exrows, orient="index")
+                z = pd.DataFrame(index=fac.index)
+                for col in SCANNER_RAW_FACTORS:
+                    if col in fac.columns:
+                        s = pd.to_numeric(fac[col], errors="coerce")
+                        sd = s.std(ddof=0)
+                        z[col] = (s - s.mean()) / sd if sd and sd > 1e-12 else 0.0
+                for sl, facs in _SCANNER_FACTOR_SLEEVES.items():
+                    cols = [(f, sign) for f, sign in facs if f in z.columns]
+                    if cols:
+                        sleeve_score[sl] = pd.concat([sign * z[f] for f, sign in cols], axis=1).mean(axis=1)
+                if sleeve_score:
+                    composite = pd.concat(sleeve_score.values(), axis=1).mean(axis=1)
+
+            # Exact live attractiveness composite (config#1398): cross-sectional
+            # winsorized-z per pillar (clip ±3, matching universe_board) then a
+            # coverage-renormalized equal-weight blend == row-mean of the present
+            # pillar z's. Top-N selection is invariant to the board's terminal
+            # cross-sectional percentile, so this IS the live attractiveness feed.
+            attractiveness = None
+            if pillar_profiles:
+                prows = {t: (pillar_profiles.get((d, t)) or {}) for t in g["ticker"]}
+                pdf = pd.DataFrame.from_dict(prows, orient="index")
+                if not pdf.empty:
+                    pz = pd.DataFrame(index=pdf.index)
+                    for p in _ATTRACTIVENESS_PILLARS:
+                        if p in pdf.columns:
+                            s = pd.to_numeric(pdf[p], errors="coerce")
+                            sd = s.std(ddof=0)
+                            zz = (s - s.mean()) / sd if sd and sd > 1e-12 else s * 0.0
+                            pz[p] = zz.clip(-3.0, 3.0)
+                    if pz.shape[1] > 0 and bool(pz.notna().any().any()):
+                        attractiveness = pz.mean(axis=1)
+
+            if composite is None and attractiveness is None:
                 continue
-            composite = pd.concat(sleeve_score.values(), axis=1).mean(axis=1)
             g = g.set_index("ticker")
-            g["_composite"] = composite
+            if composite is not None:
+                g["_composite"] = composite
             for sl, sc in sleeve_score.items():
                 g["_sleeve_" + sl] = sc
+            if attractiveness is not None:
+                g["_attractiveness"] = attractiveness.reindex(g.index)
+                n_attr_cycles += 1
 
             def _topN_alpha(score_col):
                 sub = g[g[score_col].notna()]
@@ -1775,10 +1875,12 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
             actual = g[g["quant_filter_pass"] == 1]
             picked["actual_scanner_pass"].extend(actual["alpha21"].tolist())
             picked_sn["actual_scanner_pass"].extend(actual["alpha_sn"].tolist())
-            mf_a, mf_sn = _topN_alpha("_composite")
-            if mf_a:
-                picked["multifactor_topN"].extend(mf_a)
-                picked_sn["multifactor_topN"].extend(mf_sn)
+            mf_a = mf_sn = None
+            if "_composite" in g.columns:
+                mf_a, mf_sn = _topN_alpha("_composite")
+                if mf_a:
+                    picked["multifactor_topN"].extend(mf_a)
+                    picked_sn["multifactor_topN"].extend(mf_sn)
             for sl in sleeve_names:
                 col = "_sleeve_" + sl
                 if col in g.columns:
@@ -1786,6 +1888,12 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
                     if a:
                         picked[sl + "_sleeve_topN"].extend(a)
                         picked_sn[sl + "_sleeve_topN"].extend(sn)
+            at_a = None
+            if "_attractiveness" in g.columns:
+                at_a, at_sn = _topN_alpha("_attractiveness")
+                if at_a:
+                    picked["attractiveness_topN"].extend(at_a)
+                    picked_sn["attractiveness_topN"].extend(at_sn)
 
             # --- per-cycle records for the two-axis reconciliation ---
             rec_topn: dict = {}
@@ -1798,9 +1906,16 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
                     rec_ic["actual_scanner_pass"] = ic_ts
             if mf_a:
                 rec_topn["multifactor_topN"] = float(sum(mf_a) / len(mf_a))
-            ic_mf = _xs_ic(g["_composite"], g["alpha21"])
-            if ic_mf is not None:
-                rec_ic["multifactor_topN"] = ic_mf
+            if "_composite" in g.columns:
+                ic_mf = _xs_ic(g["_composite"], g["alpha21"])
+                if ic_mf is not None:
+                    rec_ic["multifactor_topN"] = ic_mf
+            if at_a:
+                rec_topn["attractiveness_topN"] = float(sum(at_a) / len(at_a))
+            if "_attractiveness" in g.columns:
+                ic_at = _xs_ic(g["_attractiveness"], g["alpha21"])
+                if ic_at is not None:
+                    rec_ic["attractiveness_topN"] = ic_at
             for sl in sleeve_names:
                 col = "_sleeve_" + sl
                 if col not in g.columns:
@@ -1948,6 +2063,12 @@ def _scanner_factor_counterfactual(conn, loadings: dict | None = None) -> dict:
             "n_cycles": n_cycles,
             "n_pass_total": n_pass_total,
             "composite": "equal-weight z(momentum,value,quality,low_vol)",
+            "attractiveness_composite": (
+                "equal-weight winsorized-z of 6 live pillars "
+                "(quality,value,momentum,growth,stewardship,low_vol) — the live "
+                "universe-board attractiveness feed (config#1398)"
+            ),
+            "attractiveness_profile_cohorts": n_attr_cycles,
             "selection_count_basis": "per-cycle top-N matched to the live scanner pass count",
             "universe_mean_alpha_21d": _mean(universe_alpha),
             "methods": out_methods,
