@@ -39,6 +39,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # Per-file PUT-site counts. Pinning enforces operator attention on
 # every new producer addition. Captured 2026-05-27.
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
+    # config#946 attribution-persistence monitor — 1 PUT of an append-only
+    # history (decision_artifacts/_attribution_adequacy/history.jsonl), gated on
+    # --upload (default off), idempotent per run_date. Explicitly mirrors
+    # analysis/retrain_alert.py's _write_alert_to_s3 (an alert/monitor producer
+    # grandfathered here, NOT freshness-SLA registered): a default-off diagnostic
+    # whose absence does not break trading, so grandfathered rather than added to
+    # ARTIFACT_REGISTRY.yaml (a freshness SLA on a default-off monitor would
+    # false-alarm; and the producer is not yet live).
+    "analysis/attribution_persistence.py": 1,
     "analysis/cost_report.py": 1,
     "analysis/feature_drift.py": 1,
     # L4471 L2 within-run sim checkpoint — transient (deleted on success), not a
