@@ -265,7 +265,120 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             })
         result["by_sector"] = by_sector
 
+        # Per-sector veto thresholds (config#921). The by_sector block above
+        # only *measures* precision at the GLOBAL recommended threshold. This
+        # block answers the issue: where veto precision varies by sector, fit a
+        # SEPARATE threshold per sector by running the same sweep + gate machinery
+        # on that sector's DOWN-prediction sub-corpus.
+        result["per_sector_thresholds"] = compute_per_sector_thresholds(
+            down_df,
+            base_rate,
+            thresholds,
+            cost_weight,
+            current_default,
+            min_veto_dec,
+            global_recommended=result.get("recommended_threshold", current_default),
+        )
+
     return result
+
+
+def compute_per_sector_thresholds(
+    down_df: pd.DataFrame,
+    base_rate: float,
+    thresholds: list[float],
+    cost_weight: float,
+    current_default: float,
+    min_veto_dec: int,
+    *,
+    global_recommended: float,
+) -> dict:
+    """Fit a per-sector veto confidence threshold (config#921).
+
+    For each sector with a DOWN-prediction sub-corpus, run the SAME
+    ``_sweep_thresholds`` + ``_select_best_threshold`` pipeline the global
+    analysis uses (so per-sector recommendations inherit the lift gate, the
+    confidence-bounded DSR gate, and the cost-sensitivity logic). A sector only
+    earns an OVERRIDE when its recommendation:
+
+      * has ``status == "ok"`` (cleared all gates on its own data), AND
+      * differs from the global recommendation by at least the configured
+        ``min_threshold_change`` (otherwise the global threshold is fine).
+
+    Returns::
+
+        {
+          "status": "ok" | "no_sector_column" | "insufficient_sector_data",
+          "global_recommended": float,
+          "min_threshold_change": float,
+          "min_veto_decisions": int,
+          "by_sector": {sector: {recommended_threshold, status, n_down,
+                                 precision, lift, is_override, delta_vs_global,
+                                 recommendation_reason}},
+          "overrides": {sector: threshold},   # only sectors that earned one
+        }
+
+    The ``overrides`` map is the actionable output — the per-sector confidence
+    thresholds the predictor's veto gate would consume. It is deliberately
+    sparse: sectors without enough data or without a materially different
+    optimum fall back to the global threshold.
+    """
+    out: dict = {
+        "status": "ok",
+        "global_recommended": global_recommended,
+        "min_threshold_change": _cfg.get("min_threshold_change", _MIN_THRESHOLD_CHANGE),
+        "min_veto_decisions": min_veto_dec,
+        "by_sector": {},
+        "overrides": {},
+    }
+    if "sector" not in down_df.columns or not down_df["sector"].notna().any():
+        out["status"] = "no_sector_column"
+        return out
+
+    min_change = out["min_threshold_change"]
+    any_sector_fit = False
+
+    for sector in sorted(down_df["sector"].dropna().unique()):
+        s_df = down_df[down_df["sector"] == sector]
+        n_down = len(s_df)
+        # Base rate is global on purpose: the lift gate measures a sector's veto
+        # precision against the SAME baseline the global gate uses, so a sector
+        # override must beat the portfolio-wide hit rate, not just its own.
+        sweep = _sweep_thresholds(s_df, base_rate, thresholds)
+        sel = _select_best_threshold(
+            sweep, base_rate, cost_weight, current_default,
+            min_veto_dec, n_down, n_preds_loaded=n_down,
+        )
+        rec = sel.get("recommended_threshold")
+        status = sel.get("status", "ok")
+        if status == "ok":
+            any_sector_fit = True
+        best = next(
+            (t for t in sweep if t.get("confidence") == rec), {}
+        ) if rec is not None else {}
+        delta = abs(rec - global_recommended) if rec is not None else None
+        is_override = bool(
+            status == "ok"
+            and rec is not None
+            and delta is not None
+            and delta >= min_change
+        )
+        out["by_sector"][sector] = {
+            "recommended_threshold": rec,
+            "status": status,
+            "n_down": n_down,
+            "precision": best.get("precision"),
+            "lift": best.get("lift"),
+            "delta_vs_global": round(delta, 4) if delta is not None else None,
+            "is_override": is_override,
+            "recommendation_reason": sel.get("recommendation_reason"),
+        }
+        if is_override:
+            out["overrides"][sector] = rec
+
+    if not any_sector_fit:
+        out["status"] = "insufficient_sector_data"
+    return out
 
 
 def _sweep_thresholds(
