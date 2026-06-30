@@ -93,12 +93,17 @@ def analyze(research_db_path: str) -> dict:
                     "realized outcomes (L300 activation prerequisite)."
                 ),
             }
+        # config#1452 + config#1451: the prior query selected `prediction_date`
+        # (which score_performance does NOT have — it has `score_date`) AND the
+        # retired 10d outcome (`return_10d`/`spy_10d_return`, dark since April).
+        # Use the canonical `log_alpha_21d` (21d log-domain market-relative alpha)
+        # keyed by `score_date`.
         df = pd.read_sql_query(
-            "SELECT prediction_date, symbol, stance, return_10d, spy_10d_return "
+            "SELECT score_date, symbol, stance, log_alpha_21d "
             "FROM score_performance "
             "WHERE stance IS NOT NULL "
-            "  AND return_10d IS NOT NULL AND spy_10d_return IS NOT NULL "
-            "ORDER BY prediction_date",
+            "  AND log_alpha_21d IS NOT NULL "
+            "ORDER BY score_date",
             conn,
         )
         conn.close()
@@ -108,11 +113,11 @@ def analyze(research_db_path: str) -> dict:
     if df.empty:
         return {"status": "insufficient_stance_history", "n_samples": 0}
 
-    df["alpha_10d"] = df["return_10d"].astype(float) - df["spy_10d_return"].astype(float)
-    overall_alpha = float(df["alpha_10d"].mean())
+    df["alpha_21d"] = df["log_alpha_21d"].astype(float)
+    overall_alpha = float(df["alpha_21d"].mean())
     df["year_week"] = (
-        pd.to_datetime(df["prediction_date"]).dt.year.astype(str) + "-W"
-        + pd.to_datetime(df["prediction_date"]).dt.isocalendar().week.astype(int).astype(str).str.zfill(2)
+        pd.to_datetime(df["score_date"]).dt.year.astype(str) + "-W"
+        + pd.to_datetime(df["score_date"]).dt.isocalendar().week.astype(int).astype(str).str.zfill(2)
     )
 
     defaults = _factory_defaults()
@@ -125,10 +130,10 @@ def analyze(research_db_path: str) -> dict:
             per_stance[stance] = {"n": 0, "qualifies": False, "mean_alpha": None,
                                   "recent_positive_weeks": 0}
             continue
-        mean_alpha = float(sub["alpha_10d"].mean())
-        stance_alpha_samples[stance] = sub["alpha_10d"].to_numpy()
+        mean_alpha = float(sub["alpha_21d"].mean())
+        stance_alpha_samples[stance] = sub["alpha_21d"].to_numpy()
         weekly = [
-            float(g["alpha_10d"].mean())
+            float(g["alpha_21d"].mean())
             for _, g in sub.groupby("year_week") if len(g) >= 3
         ]
         rolling = _cfg.get("rolling_weeks", _ROLLING_WEEKS)
@@ -197,7 +202,7 @@ def analyze(research_db_path: str) -> dict:
     return {
         "status": "ok",
         "n_samples": len(df),
-        "overall_alpha_10d": round(overall_alpha, 6),
+        "overall_alpha_21d": round(overall_alpha, 6),
         "per_stance": per_stance,
         "stance_alpha_spread": round(spread, 6),
         "recommended_multipliers": recommended,
@@ -235,7 +240,7 @@ def produce_artifact(
 
         diagnostic = {
             k: result.get(k)
-            for k in ("status", "recommendation", "n_samples", "overall_alpha_10d",
+            for k in ("status", "recommendation", "n_samples", "overall_alpha_21d",
                       "stance_alpha_spread", "per_stance", "recommended_multipliers")
             if result.get(k) is not None
         }

@@ -36,8 +36,8 @@ def _make_score_perf_df(n: int = 50, beat_rate: float = 0.5) -> pd.DataFrame:
         rows.append({
             "symbol": f"STOCK{i % 10}",
             "score_date": f"2026-01-{day:02d}",
-            "beat_spy_10d": beat,
-            "return_10d": ret,
+            "beat_spy_21d": beat,
+            "return_21d": ret,
         })
     return pd.DataFrame(rows)
 
@@ -197,7 +197,7 @@ class TestVetoAnalysis:
 
     @patch("analysis.veto_analysis._load_all_predictions")
     def test_base_rate_computed_correctly(self, mock_load):
-        """Base rate should match mean of beat_spy_10d in populated data."""
+        """Base rate should match mean of beat_spy_21d in populated data."""
         beat_rate = 0.6
         df = _make_score_perf_df(n=100, beat_rate=beat_rate)
         preds = _make_predictions_by_date(df, down_fraction=0.3)
@@ -206,5 +206,5 @@ class TestVetoAnalysis:
         result = analyze_veto_effectiveness(df, bucket="test-bucket")
 
         if "base_rate" in result:
-            expected_base = float(df["beat_spy_10d"].mean())
+            expected_base = float(df["beat_spy_21d"].mean())
             assert abs(result["base_rate"] - round(expected_base, 4)) < 0.01
