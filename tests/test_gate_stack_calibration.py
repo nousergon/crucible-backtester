@@ -58,8 +58,8 @@ def null_report():
 class TestGeneratorIsNull:
     def test_subscores_independent_of_outcomes(self):
         df = build_null_subscore_df(seed=1, n_rows=400)
-        c_q = abs(np.corrcoef(df["quant_score"], df["beat_spy_10d"])[0, 1])
-        c_l = abs(np.corrcoef(df["qual_score"], df["beat_spy_30d"])[0, 1])
+        c_q = abs(np.corrcoef(df["quant_score"], df["beat_spy_21d"])[0, 1])
+        c_l = abs(np.corrcoef(df["qual_score"], df["beat_spy_5d"])[0, 1])
         assert c_q < 0.15 and c_l < 0.15
 
 
@@ -102,8 +102,8 @@ class TestGateHasTeeth:
             "score_date": pd.bdate_range("2025-01-06", periods=n).astype(str),
             "quant_score": quant,
             "qual_score": rng.uniform(0.0, 100.0, n),
-            "beat_spy_10d": (rng.uniform(0, 1, n) < prob).astype(float),
-            "beat_spy_30d": (rng.uniform(0, 1, n) < prob).astype(float),
+            "beat_spy_21d": (rng.uniform(0, 1, n) < prob).astype(float),
+            "beat_spy_5d": (rng.uniform(0, 1, n) < prob).astype(float),
         })
 
     def test_optimizer_shifts_toward_predictive_subscore(self):

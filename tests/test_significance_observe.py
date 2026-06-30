@@ -157,10 +157,11 @@ class TestObserveIsNonEnforcing:
         df = pd.DataFrame({
             "symbol": [f"T{i}" for i in range(n)],
             "score_date": pd.date_range("2025-01-01", periods=n, freq="D"),
-            "beat_spy_10d": rng.integers(0, 2, size=n).astype(float),
-            "beat_spy_30d": rng.integers(0, 2, size=n).astype(float),
-            "return_10d": rng.normal(size=n),
-            "return_30d": rng.normal(size=n),
+            # canonical post-cutover outcome columns (config#1451)
+            "beat_spy_21d": rng.integers(0, 2, size=n).astype(float),
+            "beat_spy_5d": rng.integers(0, 2, size=n).astype(float),
+            "log_alpha_21d": rng.normal(size=n),
+            "return_5d": rng.normal(size=n),
             "quant_score": rng.normal(size=n),
             "qual_score": rng.normal(size=n),
         })

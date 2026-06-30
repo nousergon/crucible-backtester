@@ -30,25 +30,32 @@ def _reset():
 
 
 def _make_db(*, with_stance: bool, rows: list[tuple] | None = None) -> str:
-    """rows: (prediction_date, symbol, stance, return_10d, spy_10d_return)."""
+    """rows: (date, symbol, stance, return, spy_return).
+
+    config#1451/#1452: the optimizer now reads the canonical `log_alpha_21d`
+    keyed by `score_date` (the retired 10d horizon is dark). We keep the
+    (return, spy_return) tuple interface and store alpha = return − spy_return
+    as `log_alpha_21d`, so the test-data builders are unchanged.
+    """
     f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     conn = sqlite3.connect(f.name)
-    cols = "prediction_date TEXT, symbol TEXT, return_10d REAL, spy_10d_return REAL"
+    cols = "score_date TEXT, symbol TEXT, log_alpha_21d REAL"
     if with_stance:
         cols += ", stance TEXT"
     conn.execute(f"CREATE TABLE score_performance ({cols})")
     for r in (rows or []):
         d, sym, stance, r10, spy10 = r
+        alpha = (r10 - spy10) if (r10 is not None and spy10 is not None) else None
         if with_stance:
             conn.execute(
                 "INSERT INTO score_performance "
-                "(prediction_date, symbol, return_10d, spy_10d_return, stance) "
-                "VALUES (?,?,?,?,?)", (d, sym, r10, spy10, stance))
+                "(score_date, symbol, log_alpha_21d, stance) "
+                "VALUES (?,?,?,?)", (d, sym, alpha, stance))
         else:
             conn.execute(
                 "INSERT INTO score_performance "
-                "(prediction_date, symbol, return_10d, spy_10d_return) "
-                "VALUES (?,?,?,?)", (d, sym, r10, spy10))
+                "(score_date, symbol, log_alpha_21d) "
+                "VALUES (?,?,?)", (d, sym, alpha))
     conn.commit()
     conn.close()
     return f.name

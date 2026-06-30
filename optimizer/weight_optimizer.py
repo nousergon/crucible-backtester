@@ -37,7 +37,24 @@ _MIN_MEANINGFUL_CHANGE = 0.03
 _BLEND_FACTOR = 0.20
 _CONFIDENCE_LOW = 100
 _CONFIDENCE_MEDIUM = 300
-_HORIZON_BLEND = {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50}
+
+# ── Outcome horizons (config#1451) ──────────────────────────────────────────
+# The canonical-alpha cutover (2026-05-09) RETIRED the 10d/30d outcome horizons
+# in score_performance; resolution now writes 5d (short) + 21d (canonical
+# market-relative alpha). These optimizers previously gated on the now-dead
+# beat_spy_10d/30d columns → starved since April. Centralized here so a future
+# horizon change is one edit, not a scatter. The dict keys are the binary
+# beat-SPY columns (legacy Pearson path); the skill-composite path maps each to
+# its continuous target — `log_alpha_21d` (the canonical market-relative alpha)
+# for the long horizon, `return_5d` for the short.
+_SHORT_OUTCOME = "beat_spy_5d"
+_LONG_OUTCOME = "beat_spy_21d"
+# Column whose non-null-ness marks a resolved (canonical) outcome — the gate.
+_RESOLVED_OUTCOME = _LONG_OUTCOME
+_HORIZON_BLEND = {_SHORT_OUTCOME: 0.50, _LONG_OUTCOME: 0.50}
+_SKILL_TARGET = {_SHORT_OUTCOME: "return_5d", _LONG_OUTCOME: "log_alpha_21d"}
+# Minimum resolved-outcome rows before a starvation WARN fires (fail-loud).
+_STARVATION_MIN_ROWS = 10
 
 # Module-level config ref — set by init_config() from backtest.py
 _cfg: dict = {}
@@ -206,7 +223,24 @@ def _validate_and_split(
     Returns early-exit dict on validation failure, or
     (train_set, test_set, sub_cols, n) on success.
     """
-    populated = df[df["beat_spy_10d"].notna()].copy()
+    # Fail-loud starvation tripwire (config#1451): if the canonical resolved
+    # outcome column is near-empty, WARN distinctly — a silent "insufficient_data"
+    # is exactly how the 10d-horizon retirement starved this optimizer for
+    # months. A missing column (schema drift) is the loudest case.
+    if _RESOLVED_OUTCOME not in df.columns:
+        logger.warning(
+            "weight_optimizer STARVED: resolved-outcome column %r absent from "
+            "score_performance — schema drift / horizon retirement?", _RESOLVED_OUTCOME,
+        )
+        populated = df.iloc[0:0].copy()
+    else:
+        populated = df[df[_RESOLVED_OUTCOME].notna()].copy()
+        if len(populated) < _STARVATION_MIN_ROWS:
+            logger.warning(
+                "weight_optimizer STARVED: only %d rows with resolved %r "
+                "(of %d) — check the outcome backfill / horizon.",
+                len(populated), _RESOLVED_OUTCOME, len(df),
+            )
     n = len(populated)
 
     if n < min_samples:
@@ -216,7 +250,7 @@ def _validate_and_split(
             "min_required": min_samples,
             "current_weights": current_weights,
             "note": (
-                f"Only {n} rows with beat_spy_10d populated "
+                f"Only {n} rows with resolved {_RESOLVED_OUTCOME} populated "
                 f"(need {min_samples}). Weight recommendation deferred."
             ),
         }
@@ -275,7 +309,7 @@ def _compute_correlations(
     correlations: dict[str, dict] = {}
     for label, col in sub_cols.items():
         corr: dict[str, float | None] = {}
-        for target in ("beat_spy_10d", "beat_spy_30d"):
+        for target in (_SHORT_OUTCOME, _LONG_OUTCOME):
             valid = data[[col, target]].dropna()
             if len(valid) >= 10 and valid[col].std() > 1e-10 and valid[target].std() > 1e-10:
                 r = float(valid[col].corr(valid[target]))
@@ -298,12 +332,14 @@ def _compute_ic_correlations(
     Same shape as ``_compute_correlations`` for drop-in substitution
     upstream.
 
-    Targets ``return_10d`` and ``return_30d`` are continuous; the result
-    dict still keys by ``beat_spy_10d`` / ``beat_spy_30d`` so the rest
-    of the pipeline (`_validate_oos`, blend, write) treats it uniformly.
+    Targets are continuous; for the canonical (long) horizon this is
+    ``log_alpha_21d`` — the 21-day log-domain market-relative alpha the system
+    actually predicts — not a raw return (config#1451). The result dict keys by
+    the beat-SPY horizon columns so the rest of the pipeline (`_validate_oos`,
+    blend, write) treats it uniformly.
     """
     correlations: dict[str, dict] = {}
-    target_map = {"beat_spy_10d": "return_10d", "beat_spy_30d": "return_30d"}
+    target_map = dict(_SKILL_TARGET)
     for label, col in sub_cols.items():
         corr: dict[str, float | None] = {}
         for legacy_key, return_col in target_map.items():
@@ -331,14 +367,14 @@ def _validate_oos(
     train_correlations: dict,
     test_correlations: dict,
     sub_cols: dict[str, str],
-    w10: float,
-    w30: float,
+    w_short: float,
+    w_long: float,
 ) -> tuple[bool, float]:
     """Compare train vs test correlations and return (oos_passed, degradation)."""
     train_total = 0.0
     test_total = 0.0
     for label in sub_cols:
-        for target, weight in [("beat_spy_10d", w10), ("beat_spy_30d", w30)]:
+        for target, weight in [(_SHORT_OUTCOME, w_short), (_LONG_OUTCOME, w_long)]:
             train_val = train_correlations.get(label, {}).get(target) or 0.0
             test_val = test_correlations.get(label, {}).get(target) or 0.0
             train_total += weight * abs(train_val)
@@ -361,7 +397,8 @@ def compute_weights(
         df:               score_performance DataFrame with quant_score,
                           qual_score columns (from load_with_subscores).
         current_weights:  Current weights dict. Defaults to DEFAULT_WEIGHTS.
-        min_samples:      Minimum rows with beat_spy_10d populated to proceed.
+        min_samples:      Minimum rows with the canonical beat_spy_21d outcome
+                          populated to proceed.
 
     Returns:
         {
@@ -401,13 +438,13 @@ def compute_weights(
 
     # Derive suggested weights from horizon-blended correlations
     horizon = _cfg.get("horizon_blend", _HORIZON_BLEND)
-    w10 = horizon.get("beat_spy_10d", 0.50)
-    w30 = horizon.get("beat_spy_30d", 0.50)
+    w_short = horizon.get(_SHORT_OUTCOME, 0.50)
+    w_long = horizon.get(_LONG_OUTCOME, 0.50)
     weighted_corrs: dict[str, float] = {}
     for label, corr in correlations.items():
-        c10 = corr.get("beat_spy_10d") or 0.0
-        c30 = corr.get("beat_spy_30d") or 0.0
-        weighted_corrs[label] = max(0.0, w10 * c10 + w30 * c30)
+        c_short = corr.get(_SHORT_OUTCOME) or 0.0
+        c_long = corr.get(_LONG_OUTCOME) or 0.0
+        weighted_corrs[label] = max(0.0, w_short * c_short + w_long * c_long)
 
     total_corr = sum(weighted_corrs.values())
     if total_corr == 0:
@@ -447,7 +484,7 @@ def compute_weights(
     else:
         test_correlations = _compute_correlations(test_set, sub_cols)
     oos_passed, oos_degradation = _validate_oos(
-        correlations, test_correlations, sub_cols, w10, w30,
+        correlations, test_correlations, sub_cols, w_short, w_long,
     )
 
     stability = _check_stability(suggested, bucket=bucket)
@@ -464,7 +501,11 @@ def compute_weights(
     if bool(_cfg.get("significance_observe_enabled", True)):
         try:
             from optimizer.significance_observe import observe_weight_optimizer
-            significance_observe = observe_weight_optimizer(test_set, sub_cols, cfg=_cfg)
+            significance_observe = observe_weight_optimizer(
+                test_set, sub_cols,
+                return_cols=(_SKILL_TARGET[_SHORT_OUTCOME], _SKILL_TARGET[_LONG_OUTCOME]),
+                cfg=_cfg,
+            )
         except Exception as e:  # observe-only: must not break the optimizer
             logger.warning(
                 "weight_optimizer significance_observe failed (non-fatal, observe-only): %s", e,
@@ -492,7 +533,7 @@ def compute_weights(
             f"Confidence: {confidence}. Blend factor: {blend:.2f}. "
             f"OOS degradation: {oos_degradation:.1%} "
             f"({'PASS' if oos_passed else 'FAIL — weights not applied'}). "
-            f"Fit target: {'IC vs return_10d/30d (skill composite)' if use_skill_composite else 'Pearson vs beat_spy (legacy)'}."
+            f"Fit target: {'IC vs canonical log_alpha_21d + return_5d (skill composite)' if use_skill_composite else 'Pearson vs beat_spy_5d/21d (legacy)'}."
         ),
     }
 

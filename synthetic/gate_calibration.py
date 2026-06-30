@@ -55,8 +55,8 @@ def build_null_subscore_df(
     of the beat-SPY outcomes (and of the continuous returns).
 
     Columns match what ``compute_weights`` / ``_validate_and_split`` read:
-    ``score_date``, ``quant_score``, ``qual_score``, ``beat_spy_10d``,
-    ``beat_spy_30d`` (binary), plus ``return_10d`` / ``return_30d`` (continuous,
+    ``score_date``, ``quant_score``, ``qual_score``, ``beat_spy_21d``,
+    ``beat_spy_5d`` (binary), plus ``log_alpha_21d`` / ``return_5d`` (continuous,
     used only if the skill-composite fit target is enabled). Under this null any
     weight shift the optimizer derives is sampling noise.
     """
@@ -68,10 +68,10 @@ def build_null_subscore_df(
         "score_date": dates,
         "quant_score": rng.uniform(0.0, 100.0, n_rows),
         "qual_score": rng.uniform(0.0, 100.0, n_rows),
-        "beat_spy_10d": rng.integers(0, 2, n_rows).astype(float),
-        "beat_spy_30d": rng.integers(0, 2, n_rows).astype(float),
-        "return_10d": rng.normal(0.0, 4.0, n_rows),
-        "return_30d": rng.normal(0.0, 4.0, n_rows),
+        "beat_spy_21d": rng.integers(0, 2, n_rows).astype(float),
+        "beat_spy_5d": rng.integers(0, 2, n_rows).astype(float),
+        "log_alpha_21d": rng.normal(0.0, 4.0, n_rows),
+        "return_5d": rng.normal(0.0, 4.0, n_rows),
     })
 
 

@@ -19,7 +19,7 @@ def _make_df(n: int = 100, quant_corr: float = 0.1, qual_corr: float = 0.2):
     """Create a synthetic score_performance DataFrame with sub-scores.
 
     Generates data where quant_score and qual_score have approximate
-    correlations with beat_spy_10d and beat_spy_30d outcomes.
+    correlations with beat_spy_21d and beat_spy_5d outcomes.
     """
     import random
     random.seed(42)
@@ -40,8 +40,8 @@ def _make_df(n: int = 100, quant_corr: float = 0.1, qual_corr: float = 0.2):
             "score_date": score_date,
             "quant_score": quant,
             "qual_score": qual,
-            "beat_spy_10d": beat_10d,
-            "beat_spy_30d": beat_30d,
+            "beat_spy_21d": beat_10d,
+            "beat_spy_5d": beat_30d,
         })
     return pd.DataFrame(rows)
 
@@ -56,7 +56,7 @@ def _init_default_config():
             "blend_factor": 0.20,
             "confidence_low": 100,
             "confidence_medium": 300,
-            "horizon_blend": {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50},
+            "horizon_blend": {"beat_spy_21d": 0.50, "beat_spy_5d": 0.50},
             "blend_factor_min": 0.20,
             "blend_factor_max": 0.50,
             "blend_ramp_samples": 500,
@@ -217,7 +217,7 @@ class TestApplyWeights:
 def _make_df_with_continuous_returns(n: int = 200, signal_strength: float = 0.5):
     """Synthetic score_performance with both binary beat_spy + continuous return cols.
 
-    Higher quant_score → higher return_10d (signal). qual_score is noise.
+    Higher quant_score → higher log_alpha_21d (signal). qual_score is noise.
     Used to verify the IC-on-continuous-returns fit target picks up
     quant > qual when only the continuous channel carries the signal.
     """
@@ -237,10 +237,10 @@ def _make_df_with_continuous_returns(n: int = 200, signal_strength: float = 0.5)
             "score_date": score_date,
             "quant_score": quant,
             "qual_score": qual,
-            "return_10d": ret_10d,
-            "return_30d": ret_30d,
-            "beat_spy_10d": int(ret_10d > 0),
-            "beat_spy_30d": int(ret_30d > 0),
+            "log_alpha_21d": ret_10d,
+            "return_5d": ret_30d,
+            "beat_spy_21d": int(ret_10d > 0),
+            "beat_spy_5d": int(ret_30d > 0),
         })
     return pd.DataFrame(rows)
 
@@ -264,7 +264,7 @@ class TestSkillCompositeFitTarget:
                 "blend_factor": 0.20,
                 "confidence_low": 100,
                 "confidence_medium": 300,
-                "horizon_blend": {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50},
+                "horizon_blend": {"beat_spy_21d": 0.50, "beat_spy_5d": 0.50},
                 "blend_factor_min": 0.20,
                 "blend_factor_max": 0.50,
                 "blend_ramp_samples": 500,
@@ -278,8 +278,8 @@ class TestSkillCompositeFitTarget:
         # IC path should pick up that quant carries the signal → suggested
         # quant weight > qual weight (or at least correlations[quant] >
         # correlations[qual] on a return horizon).
-        c_quant = result["correlations"]["quant"]["beat_spy_10d"] or 0.0
-        c_qual = result["correlations"]["qual"]["beat_spy_10d"] or 0.0
+        c_quant = result["correlations"]["quant"]["beat_spy_21d"] or 0.0
+        c_qual = result["correlations"]["qual"]["beat_spy_21d"] or 0.0
         assert c_quant > c_qual
 
     def test_skill_composite_continuous_returns_when_binary_signal_drowns_in_noise(self):
@@ -296,7 +296,7 @@ class TestSkillCompositeFitTarget:
                 "blend_factor": 0.20,
                 "confidence_low": 100,
                 "confidence_medium": 300,
-                "horizon_blend": {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50},
+                "horizon_blend": {"beat_spy_21d": 0.50, "beat_spy_5d": 0.50},
                 "blend_factor_min": 0.20,
                 "blend_factor_max": 0.50,
                 "blend_ramp_samples": 500,
@@ -308,8 +308,8 @@ class TestSkillCompositeFitTarget:
         _init_default_config()  # reset to legacy
         legacy_result = compute_weights(df, current_weights={"quant": 0.50, "qual": 0.50})
 
-        ic_quant = ic_result["correlations"]["quant"]["beat_spy_10d"] or 0.0
-        legacy_quant = legacy_result["correlations"]["quant"]["beat_spy_10d"] or 0.0
+        ic_quant = ic_result["correlations"]["quant"]["beat_spy_21d"] or 0.0
+        legacy_quant = legacy_result["correlations"]["quant"]["beat_spy_21d"] or 0.0
         # IC should detect the quant signal more strongly than Pearson-on-binary.
         assert abs(ic_quant) >= abs(legacy_quant)
 
@@ -325,7 +325,7 @@ class TestShadowMode:
                 "blend_factor": 0.20,
                 "confidence_low": 100,
                 "confidence_medium": 300,
-                "horizon_blend": {"beat_spy_10d": 0.50, "beat_spy_30d": 0.50},
+                "horizon_blend": {"beat_spy_21d": 0.50, "beat_spy_5d": 0.50},
                 "blend_factor_min": 0.20,
                 "blend_factor_max": 0.50,
                 "blend_ramp_samples": 500,
@@ -429,9 +429,9 @@ class TestLoadWithSubscoresCanonicalSource:
         returned columns are quant_score/qual_score (not _x/_y)."""
         df = pd.DataFrame([
             {"symbol": "AAPL", "score_date": "2026-05-01",
-             "quant_score": 72.0, "qual_score": 65.0, "beat_spy_10d": 1},
+             "quant_score": 72.0, "qual_score": 65.0, "beat_spy_21d": 1},
             {"symbol": "MSFT", "score_date": "2026-05-01",
-             "quant_score": 80.0, "qual_score": 70.0, "beat_spy_10d": 0},
+             "quant_score": 80.0, "qual_score": 70.0, "beat_spy_21d": 0},
         ])
         mock_s3 = MagicMock()
         mock_boto3.client.return_value = mock_s3
@@ -453,9 +453,9 @@ class TestLoadWithSubscoresCanonicalSource:
 
         df = pd.DataFrame([
             {"symbol": "AAPL", "score_date": "2026-05-01",
-             "quant_score": 72.0, "qual_score": 65.0, "beat_spy_10d": 1},
+             "quant_score": 72.0, "qual_score": 65.0, "beat_spy_21d": 1},
             {"symbol": "MSFT", "score_date": "2026-05-01",
-             "quant_score": None, "qual_score": None, "beat_spy_10d": 0},
+             "quant_score": None, "qual_score": None, "beat_spy_21d": 0},
         ])
         signals_json = {
             "signals": {
@@ -489,7 +489,7 @@ class TestLoadWithSubscoresCanonicalSource:
         import json
 
         df = pd.DataFrame([
-            {"symbol": "AAPL", "score_date": "2026-05-01", "beat_spy_10d": 1},
+            {"symbol": "AAPL", "score_date": "2026-05-01", "beat_spy_21d": 1},
         ])
         signals_json = {
             "signals": {
