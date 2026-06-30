@@ -27,7 +27,7 @@ def _init_cfg(min_change=0.10):
 
 def _row(sector, conf, beat, ret):
     return {"sector": sector, "prediction_confidence": conf,
-            "beat_spy_10d": beat, "return_10d": ret}
+            "beat_spy_21d": beat, "return_21d": ret}
 
 
 def _build_down_df():
@@ -57,8 +57,8 @@ def _build_down_df():
 class TestComputePerSectorThresholds:
     def test_returns_no_sector_column(self):
         _init_cfg()
-        df = pd.DataFrame([{"prediction_confidence": 0.7, "beat_spy_10d": 0,
-                            "return_10d": -0.1}])
+        df = pd.DataFrame([{"prediction_confidence": 0.7, "beat_spy_21d": 0,
+                            "return_21d": -0.1}])
         out = compute_per_sector_thresholds(
             df, base_rate=0.5, thresholds=[0.6, 0.7],
             cost_weight=0.3, current_default=0.6, min_veto_dec=3,
