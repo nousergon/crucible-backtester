@@ -536,6 +536,17 @@ def compute_lift_metrics(
             logger.warning("cio_consolidation_counterfactual failed (non-fatal): %s", _ccf)
             result["cio_consolidation_counterfactual"] = {"status": "error", "reason": str(_ccf)}
 
+        # 3d. Scanner -> research-free predictor direct (arm 4, config#1405): does
+        # ranking the scanner-passing pool by a research-free predicted_alpha beat
+        # the live agentic CIO path? Reads predictor_outcomes_research_free (the
+        # Saturday spot-box backfill); skips until that table is populated.
+        # Fail-soft so it can never break the existing e2e_lift contract.
+        try:
+            result["scanner_then_predictor_counterfactual"] = _scanner_then_predictor_topN(conn)
+        except Exception as _stp:  # pragma: no cover - defensive
+            logger.warning("scanner_then_predictor_topN failed (non-fatal): %s", _stp)
+            result["scanner_then_predictor_counterfactual"] = {"status": "error", "reason": str(_stp)}
+
         # 4. Predictor lift
         result["predictor_lift"] = _predictor_lift(conn, ur, date_filter, params)
 
@@ -2325,6 +2336,200 @@ def _scanner_factor_counterfactual(
             "objective_axes": axes,
             "breadth_stratified": breadth_strat,
             "reconciliation": reconciliation,
+        }
+    except sqlite3.OperationalError as e:
+        return {"status": "skipped", "reason": f"sqlite: {e}"}
+    except Exception as e:  # pragma: no cover - defensive; never break e2e_lift
+        return {"status": "error", "reason": str(e)}
+
+
+def _scanner_then_predictor_topN(conn) -> dict:
+    """Arm-4 counterfactual (config#1405): scanner -> research-free predictor direct.
+
+    Bypasses the research/agentic layer entirely. Among the scanner-passing
+    universe (``scanner_evaluations.quant_filter_pass=1``), rank by the
+    research-free predictor's ``predicted_alpha`` (table
+    ``predictor_outcomes_research_free`` — the meta-ensemble's
+    ``canonical_predicted_alpha`` run with the 4 research meta-features omitted ->
+    0.0, per the issue's research-free definition) and take the count-matched
+    top-N, then compare realized 21d log-alpha against:
+
+      * ``actual_scanner_pass``  — the full live scanner pass pool (the input the
+        arm re-ranks), and
+      * ``agentic_cio_advance``  — the live CIO ADVANCE selection (the agentic
+        path this arm would REPLACE).
+
+    Answers config#1405's question: *does the research layer add anything over
+    the ML predictor on scanner candidates?* Count basis: per cycle, N = the live
+    CIO ADVANCE count (``ADVANCE`` + ``ADVANCE_FORCED``) so the predictor selects
+    the same NUMBER of names the agentic stack ultimately holds — an
+    apples-to-apples selection-size match (mirrors the count-matched top-N of
+    ``_scanner_factor_counterfactual``). Cycles with no CIO advance are skipped
+    (no agentic baseline to match). Sector(+cycle)-neutral residual = alpha minus
+    its per-``sector`` group mean WITHIN the cycle. Pure read; fail-soft to
+    ``status="skipped"`` so it can never break the e2e_lift contract — and it
+    stays ``skipped`` until the Saturday spot-box backfill populates
+    ``predictor_outcomes_research_free``.
+    """
+    try:
+        tabs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        need = {
+            "scanner_evaluations",
+            "universe_returns",
+            "predictor_outcomes_research_free",
+            "cio_evaluations",
+        }
+        missing = need - tabs
+        if missing:
+            return {"status": "skipped", "reason": f"missing tables: {sorted(missing)}"}
+        se_cols = {r[1] for r in conn.execute("PRAGMA table_info(scanner_evaluations)")}
+        if "quant_filter_pass" not in se_cols:
+            return {"status": "skipped", "reason": "scanner_evaluations has no quant_filter_pass"}
+        prf_cols = {r[1] for r in conn.execute("PRAGMA table_info(predictor_outcomes_research_free)")}
+        if "predicted_alpha" not in prf_cols:
+            return {"status": "skipped", "reason": "predictor_outcomes_research_free has no predicted_alpha"}
+        has_nmiss = "n_research_features_missing" in prf_cols
+        nmiss_sel = "prf.n_research_features_missing, " if has_nmiss else ""
+
+        # Scanner-passing universe x realized 21d x research-free predicted_alpha.
+        # LEFT JOIN so the actual-scanner-pass pool is the FULL passing set even
+        # where the backfill lacks a prediction (predictor ranks only the scored
+        # subset, but the scanner baseline must reflect every name it passed).
+        passing = pd.read_sql_query(
+            "SELECT se.ticker, se.eval_date, u.sector, "
+            "(u.log_return_21d - u.log_spy_return_21d) AS alpha21, "
+            f"prf.predicted_alpha, {nmiss_sel}"
+            "se.quant_filter_pass "
+            "FROM scanner_evaluations se "
+            "JOIN universe_returns u ON u.ticker=se.ticker AND u.eval_date=se.eval_date "
+            "LEFT JOIN predictor_outcomes_research_free prf "
+            "  ON prf.ticker=se.ticker AND prf.prediction_date=se.eval_date "
+            "WHERE se.quant_filter_pass=1 "
+            "  AND u.log_return_21d IS NOT NULL AND u.log_spy_return_21d IS NOT NULL",
+            conn,
+        )
+        if passing.empty:
+            return {"status": "insufficient_data", "reason": "no scanner-passing rows with realized 21d"}
+
+        # Live agentic CIO ADVANCE selection x realized 21d (the path replaced).
+        cio = pd.read_sql_query(
+            "SELECT ce.ticker, ce.eval_date, ce.cio_decision, u.sector, "
+            "(u.log_return_21d - u.log_spy_return_21d) AS alpha21 "
+            "FROM cio_evaluations ce "
+            "JOIN universe_returns u ON u.ticker=ce.ticker AND u.eval_date=ce.eval_date "
+            "WHERE u.log_return_21d IS NOT NULL AND u.log_spy_return_21d IS NOT NULL",
+            conn,
+        )
+        cio_adv = cio[cio["cio_decision"].isin(("ADVANCE", "ADVANCE_FORCED"))]
+
+        methods = ["actual_scanner_pass", "scanner_then_predictor_topN", "agentic_cio_advance"]
+        picked: dict = {k: [] for k in methods}
+        picked_sn: dict = {k: [] for k in methods}
+        n_cycles = 0
+        n_scored_total = 0
+        nmiss_vals: list = []
+
+        def _sector_neutral(frame: pd.DataFrame) -> pd.Series:
+            if frame["sector"].notna().any():
+                return frame["alpha21"] - frame.groupby("sector")["alpha21"].transform("mean")
+            return frame["alpha21"]
+
+        for d, g in passing.groupby("eval_date"):
+            g = g[g["alpha21"].notna()].copy()
+            if g.empty:
+                continue
+            adv = cio_adv[cio_adv["eval_date"] == d].copy()
+            adv = adv[adv["alpha21"].notna()]
+            n_adv = len(adv)
+            if n_adv == 0:
+                continue  # no agentic baseline to count-match against this cycle
+            n_cycles += 1
+            g["alpha_sn"] = _sector_neutral(g)
+
+            # actual scanner pass pool (full passing set)
+            picked["actual_scanner_pass"].extend(g["alpha21"].tolist())
+            picked_sn["actual_scanner_pass"].extend(g["alpha_sn"].tolist())
+
+            # research-free predictor: rank the SCORED passing names, count-matched
+            scored = g[g["predicted_alpha"].notna()]
+            n_scored_total += len(scored)
+            if has_nmiss:
+                nmiss_vals.extend(scored["n_research_features_missing"].dropna().tolist())
+            if not scored.empty:
+                top = scored.sort_values("predicted_alpha", ascending=False).head(min(n_adv, len(scored)))
+                picked["scanner_then_predictor_topN"].extend(top["alpha21"].tolist())
+                picked_sn["scanner_then_predictor_topN"].extend(top["alpha_sn"].tolist())
+
+            # agentic CIO advance picks this cycle
+            adv["alpha_sn"] = _sector_neutral(adv)
+            picked["agentic_cio_advance"].extend(adv["alpha21"].tolist())
+            picked_sn["agentic_cio_advance"].extend(adv["alpha_sn"].tolist())
+
+        if n_cycles < 1:
+            return {"status": "insufficient_data", "reason": "no cycles with both scanner pass + CIO advance"}
+        if not picked["scanner_then_predictor_topN"]:
+            return {"status": "skipped", "reason": "no research-free predictions matched the scanner-passing universe"}
+
+        def _mean(xs):
+            return round(float(sum(xs) / len(xs)), 5) if xs else None
+
+        scanner_mean = _mean(picked["actual_scanner_pass"])
+        scanner_sn = _mean(picked_sn["actual_scanner_pass"])
+        cio_mean = _mean(picked["agentic_cio_advance"])
+        cio_sn = _mean(picked_sn["agentic_cio_advance"])
+
+        out_methods: dict = {}
+        for k in methods:
+            out_methods[k] = {
+                "mean_alpha_21d": _mean(picked[k]),
+                "sector_neutral_mean_alpha_21d": _mean(picked_sn[k]),
+                "n_picks": len(picked[k]),
+            }
+        pred = out_methods["scanner_then_predictor_topN"]
+        pm, psn = pred["mean_alpha_21d"], pred["sector_neutral_mean_alpha_21d"]
+        pred["lift_vs_actual_scanner"] = (
+            round(pm - scanner_mean, 5) if (pm is not None and scanner_mean is not None) else None
+        )
+        pred["sn_lift_vs_actual_scanner"] = (
+            round(psn - scanner_sn, 5) if (psn is not None and scanner_sn is not None) else None
+        )
+        pred["lift_vs_agentic_cio"] = (
+            round(pm - cio_mean, 5) if (pm is not None and cio_mean is not None) else None
+        )
+        pred["sn_lift_vs_agentic_cio"] = (
+            round(psn - cio_sn, 5) if (psn is not None and cio_sn is not None) else None
+        )
+
+        predictor_beats_agentic = bool(
+            pred["lift_vs_agentic_cio"] is not None and pred["lift_vs_agentic_cio"] > 0
+        )
+        predictor_beats_scanner = bool(
+            pred["lift_vs_actual_scanner"] is not None and pred["lift_vs_actual_scanner"] > 0
+        )
+        nmiss_mode = None
+        if nmiss_vals:
+            from collections import Counter
+
+            nmiss_mode = Counter(int(x) for x in nmiss_vals).most_common(1)[0][0]
+
+        return {
+            "status": "ok",
+            "horizon": "21d",
+            "n_cycles": n_cycles,
+            "selection_count_basis": "per-cycle top-N matched to the live CIO ADVANCE count",
+            "n_predictor_scored": n_scored_total,
+            # Expect 4 (the 4 research meta-features omitted) — a guard that the
+            # backfill ran truly research-free, not with research features present.
+            "research_features_missing_mode": nmiss_mode,
+            "methods": out_methods,
+            "predictor_beats_agentic_cio": predictor_beats_agentic,
+            "predictor_beats_actual_scanner": predictor_beats_scanner,
+            "interpretation": (
+                "scanner_then_predictor_topN > agentic_cio_advance => the research/agentic layer "
+                "subtracts value vs a research-free predictor on scanner candidates; <= => the "
+                "agentic layer adds selection skill the predictor alone lacks. Directional until "
+                "enough 21d cohorts mature (config#1405)."
+            ),
         }
     except sqlite3.OperationalError as e:
         return {"status": "skipped", "reason": f"sqlite: {e}"}
