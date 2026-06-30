@@ -452,6 +452,24 @@ def compute_weights(
 
     stability = _check_stability(suggested, bucket=bucket)
 
+    # Observe-first significance verdict (config#1426 Phase 2). NON-ENFORCING:
+    # computes whether the OOS sub-score↔return IC that justifies the weight
+    # shift is statistically distinguishable from noise (the L4593 leg-f bug
+    # class — promoting ~10% of the time on pure-null sub-scores). It NEVER
+    # changes the promote/reject decision; that flip is Phase 4 (human gate).
+    # Swallow rationale (per "fail loud" carve-out): (a) failure mode = observe
+    # instrumentation error on a SECONDARY path; the primary weight
+    # recommendation below is unaffected; (c) recorded surface = WARN log.
+    significance_observe = None
+    if bool(_cfg.get("significance_observe_enabled", True)):
+        try:
+            from optimizer.significance_observe import observe_weight_optimizer
+            significance_observe = observe_weight_optimizer(test_set, sub_cols, cfg=_cfg)
+        except Exception as e:  # observe-only: must not break the optimizer
+            logger.warning(
+                "weight_optimizer significance_observe failed (non-fatal, observe-only): %s", e,
+            )
+
     return {
         "status": "ok",
         "n_samples": n,
@@ -467,6 +485,7 @@ def compute_weights(
         "changes": changes,
         "blend_factor": round(blend, 3),
         "stability": stability,
+        "significance_observe": significance_observe,
         "fit_target": "skill_composite_ic" if use_skill_composite else "beat_spy_pearson",
         "note": (
             f"Based on {n} signals (train={len(train_set)}, test={len(test_set)}). "
