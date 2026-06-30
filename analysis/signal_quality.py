@@ -75,19 +75,22 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
         - status: "insufficient_data" if not enough rows are populated yet
     """
     populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
-    populated_10d = df[df["beat_spy_10d"].notna()]
-    populated_30d = df[df["beat_spy_30d"].notna()]
+    populated_10d = df[df["beat_spy_10d"].notna()] if "beat_spy_10d" in df.columns else pd.DataFrame()
+    populated_30d = df[df["beat_spy_30d"].notna()] if "beat_spy_30d" in df.columns else pd.DataFrame()
+    # config#1456: gate on the canonical 21d horizon. The 10d/30d horizons were
+    # retired in the canonical-alpha cutover (dark since April) — gating on
+    # beat_spy_10d left the whole signal-quality tile insufficient/dark.
+    populated_21d = df[df["beat_spy_21d"].notna()] if "beat_spy_21d" in df.columns else pd.DataFrame()
 
-    if len(populated_10d) < min_samples:
+    if len(populated_21d) < min_samples:
         logger.warning(
-            "Only %d rows with beat_spy_10d populated (need %d). "
-            "Results will be available after Week 4.",
-            len(populated_10d),
-            min_samples,
+            "Only %d rows with canonical beat_spy_21d populated (need %d).",
+            len(populated_21d), min_samples,
         )
         return {
             "status": "insufficient_data",
             "rows_5d_populated": len(populated_5d),
+            "rows_21d_populated": len(populated_21d),
             "rows_10d_populated": len(populated_10d),
             "rows_30d_populated": len(populated_30d),
             "rows_needed": min_samples,
@@ -96,9 +99,10 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
     result = {
         "status": "ok",
         "rows_5d_populated": len(populated_5d),
+        "rows_21d_populated": len(populated_21d),
         "rows_10d_populated": len(populated_10d),
         "rows_30d_populated": len(populated_30d),
-        "overall": _compute_slice_metrics(populated_5d, populated_10d, populated_30d),
+        "overall": _compute_slice_metrics(populated_5d, populated_10d, populated_30d, populated_21d),
         "by_score_bucket": _accuracy_by_score_bucket(populated_5d, populated_10d, populated_30d),
     }
 
@@ -137,39 +141,57 @@ def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (round(max(0.0, centre - spread), 4), round(min(1.0, centre + spread), 4))
 
 
-def _compute_slice_metrics(df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd.DataFrame) -> dict:
+def _compute_slice_metrics(
+    df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd.DataFrame,
+    df_21d: pd.DataFrame | None = None,
+) -> dict:
+    if df_21d is None:
+        df_21d = pd.DataFrame()
     n_5d = len(df_5d)
     n_10d = len(df_10d)
     n_30d = len(df_30d)
+    n_21d = len(df_21d)
 
     acc_5d = float(df_5d["beat_spy_5d"].mean()) if n_5d > 0 else None
     acc_10d = float(df_10d["beat_spy_10d"].mean()) if n_10d > 0 else None
     acc_30d = float(df_30d["beat_spy_30d"].mean()) if n_30d > 0 else None
+    # config#1456: canonical 21d horizon (the system's prediction target).
+    acc_21d = float(df_21d["beat_spy_21d"].mean()) if n_21d > 0 else None
 
     # Wilson score 95% confidence intervals
     ci_5d = _wilson_ci(int(df_5d["beat_spy_5d"].sum()), n_5d) if n_5d > 0 else None
     ci_10d = _wilson_ci(int(df_10d["beat_spy_10d"].sum()), n_10d) if n_10d > 0 else None
     ci_30d = _wilson_ci(int(df_30d["beat_spy_30d"].sum()), n_30d) if n_30d > 0 else None
+    ci_21d = _wilson_ci(int(df_21d["beat_spy_21d"].sum()), n_21d) if n_21d > 0 else None
 
-    # Classification metrics at 10d horizon
-    # For BUY signals: precision = % that beat SPY (same as accuracy)
-    # Recall is not computable here (requires universe-level data from end_to_end.py)
+    # Classification metrics at the canonical 21d horizon.
+    # For BUY signals: precision = % that beat SPY (same as accuracy).
+    # Recall is not computable here (requires universe-level data from end_to_end.py).
+    tp_21d = int(df_21d["beat_spy_21d"].sum()) if n_21d > 0 else 0
+    fp_21d = n_21d - tp_21d
     tp_10d = int(df_10d["beat_spy_10d"].sum()) if n_10d > 0 else 0
     fp_10d = n_10d - tp_10d
 
     return {
         "accuracy_5d": acc_5d,
+        "accuracy_21d": acc_21d,
         "accuracy_10d": acc_10d,
         "accuracy_30d": acc_30d,
         "ci_95_5d": ci_5d,
+        "ci_95_21d": ci_21d,
         "ci_95_10d": ci_10d,
         "ci_95_30d": ci_30d,
         "avg_alpha_5d": float((df_5d["return_5d"] - df_5d["spy_5d_return"]).mean()) if n_5d > 0 else None,
+        "avg_alpha_21d": float((df_21d["return_21d"] - df_21d["spy_21d_return"]).mean()) if n_21d > 0 else None,
         "avg_alpha_10d": float((df_10d["return_10d"] - df_10d["spy_10d_return"]).mean()) if n_10d > 0 else None,
         "avg_alpha_30d": float((df_30d["return_30d"] - df_30d["spy_30d_return"]).mean()) if n_30d > 0 else None,
         "n_5d": n_5d,
+        "n_21d": n_21d,
         "n_10d": n_10d,
         "n_30d": n_30d,
+        "precision_21d": round(tp_21d / n_21d, 4) if n_21d > 0 else None,
+        "tp_21d": tp_21d,
+        "fp_21d": fp_21d,
         "precision_10d": round(tp_10d / n_10d, 4) if n_10d > 0 else None,
         "tp_10d": tp_10d,
         "fp_10d": fp_10d,
