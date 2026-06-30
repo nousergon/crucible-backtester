@@ -2015,6 +2015,7 @@ def _main_impl() -> None:
                 completeness=tracker.summary(),
                 degraded_modules=tracker.degraded_modules(),
                 failed_modules=tracker.failed_modules(),
+                significance_observe=_collect_significance_observe(opt_results),
             )
             send_digest_email(
                 run_date=args.date,
