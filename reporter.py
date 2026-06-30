@@ -1295,6 +1295,43 @@ def build_report(
     return "\n".join(lines)
 
 
+_SIG_NO_VERDICT_STATUSES = {
+    "insufficient_data", "no_variance", "insufficient_stances", "missing_column",
+}
+
+
+def _section_significance_observe(sig: dict) -> list[str]:
+    """One-line promotion-gate significance headline for the thin digest.
+
+    Counts how many auto-apply optimizers are promoting on statistically
+    -undefended evidence this run (config#1426 observe-mode). The per-optimizer
+    detail lives on the console Analysis page the email deep-links to.
+    """
+    undefended = 0
+    with_verdict = 0
+    for rec in sig.values():
+        if not isinstance(rec, dict):
+            continue
+        detail = rec.get("detail")
+        if not (isinstance(detail, dict) and detail.get("status") in _SIG_NO_VERDICT_STATUSES):
+            with_verdict += 1
+        if rec.get("promotes_on_undefended_evidence"):
+            undefended += 1
+    if undefended:
+        headline = (
+            f"⚠ **{undefended} of {with_verdict}** optimizers with a verdict are "
+            "promoting on statistically-undefended evidence (observe-only — not enforced)."
+        )
+    elif with_verdict:
+        headline = (
+            f"All **{with_verdict}** optimizers with a verdict cleared the significance "
+            "bar (observe-only)."
+        )
+    else:
+        headline = "No significance verdicts computable yet (insufficient data)."
+    return ["", "## Promotion-Gate Significance (observe)", "", headline]
+
+
 def build_digest(
     run_date: str,
     *,
@@ -1309,6 +1346,7 @@ def build_digest(
     completeness: dict | None = None,
     degraded_modules: list[str] | None = None,
     failed_modules: list[str] | None = None,
+    significance_observe: dict | None = None,
 ) -> str:
     """Build a SHORT digest markdown — the executive summary that headlines a
     task's thin weekly email (the Backtester and the Evaluator each build their
@@ -1354,6 +1392,12 @@ def build_digest(
         executor_rec=executor_rec,
         regression_result=regression_result,
     )
+
+    # Promotion-gate significance headline (config#1426 / config#1444 item 1).
+    # The undefended count is the at-a-glance soak signal; the per-optimizer
+    # detail lives on the console Analysis page the email deep-links to.
+    if significance_observe:
+        lines += _section_significance_observe(significance_observe)
 
     # Evaluator completeness — make a degraded/partial run obvious in the inbox.
     if completeness is not None:
