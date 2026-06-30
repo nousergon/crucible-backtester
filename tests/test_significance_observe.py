@@ -168,3 +168,120 @@ class TestObserveIsNonEnforcing:
         result = weight_optimizer.compute_weights(df, min_samples=20)
         assert result["status"] == "ok"  # optimizer unaffected by observe failure
         assert result["significance_observe"] is None  # swallowed, recorded as None
+
+
+# ── Phase 3: additional verdicts ─────────────────────────────────────────────
+
+from optimizer.significance_observe import (  # noqa: E402
+    mean_diff_significance_verdict,
+    observe_ic_gate,
+    observe_stance_spread,
+    observe_veto,
+    proportion_lift_significance_verdict,
+)
+
+
+class TestProportionLiftVerdict:
+    def test_clear_lift_is_significant(self):
+        # 90/100 precision vs 0.50 base rate — Wilson lower bound well above base.
+        v = proportion_lift_significance_verdict(90, 100, 0.50)
+        assert v["status"] == "ok"
+        assert v["significant"] is True
+        assert v["ci_low"] > 0.50
+
+    def test_no_lift_is_not_significant(self):
+        # 11/20 ≈ 0.55 vs 0.50 base rate — small N, CI brackets the base rate.
+        v = proportion_lift_significance_verdict(11, 20, 0.50)
+        assert v["significant"] is False
+
+    def test_invalid_counts(self):
+        assert proportion_lift_significance_verdict(0, 0, 0.5)["significant"] is False
+        assert proportion_lift_significance_verdict(5, 3, 0.5)["significant"] is False
+
+
+class TestMeanDiffVerdict:
+    def test_clear_difference_is_significant(self):
+        rng = np.random.default_rng(2)
+        a = rng.normal(1.0, 0.5, size=120)
+        b = rng.normal(-1.0, 0.5, size=120)
+        v = mean_diff_significance_verdict(a, b)
+        assert v["status"] == "ok"
+        assert v["significant"] is True
+        assert v["ci_low"] > 0
+
+    def test_same_distribution_not_significant(self):
+        rng = np.random.default_rng(5)
+        a = rng.normal(0.0, 1.0, size=150)
+        b = rng.normal(0.0, 1.0, size=150)
+        v = mean_diff_significance_verdict(a, b)
+        assert v["significant"] is False
+        assert v["ci_low"] <= 0 <= v["ci_high"]
+
+    def test_insufficient(self):
+        v = mean_diff_significance_verdict([1.0] * 5, [2.0] * 5, min_samples=20)
+        assert v["status"] == "insufficient_data"
+        assert v["significant"] is False
+
+
+class TestObserveICGate:
+    def test_strong_signal_not_blocked(self):
+        rng = np.random.default_rng(1)
+        conv = np.arange(120, dtype=float)
+        ret = conv + rng.normal(0, 5, size=120)
+        rec = observe_ic_gate(conv, ret, gate="predictor_sizing")
+        assert rec["gate"] == "predictor_sizing"
+        assert rec["would_block"] is False
+        assert rec["enforced"] is False
+
+    def test_null_signal_blocked(self):
+        rng = np.random.default_rng(42)
+        rec = observe_ic_gate(rng.normal(size=150), rng.normal(size=150), gate="barrier_sizing")
+        assert rec["would_block"] is True
+
+
+class TestObserveVeto:
+    THRESHOLDS = [
+        {"confidence": 0.60, "true_negatives": 11, "n_vetoes": 20},
+        {"confidence": 0.70, "true_negatives": 90, "n_vetoes": 100},
+    ]
+
+    def test_significant_threshold_not_blocked(self):
+        rec = observe_veto(self.THRESHOLDS, 0.70, 0.50)
+        assert rec["gate"] == "veto_analysis"
+        assert rec["would_block"] is False
+
+    def test_weak_threshold_blocked(self):
+        rec = observe_veto(self.THRESHOLDS, 0.60, 0.50)
+        assert rec["would_block"] is True
+
+    def test_missing_threshold_row_is_insufficient(self):
+        rec = observe_veto(self.THRESHOLDS, 0.99, 0.50)
+        assert rec["would_block"] is True
+        assert rec["detail"]["status"] == "insufficient_data"
+
+
+class TestObserveStanceSpread:
+    def test_distinct_stances_not_blocked(self):
+        rng = np.random.default_rng(3)
+        samples = {
+            "momentum": rng.normal(0.02, 0.01, size=120),
+            "value": rng.normal(-0.02, 0.01, size=120),
+        }
+        rec = observe_stance_spread(samples)
+        assert rec["gate"] == "stance_sizing"
+        assert rec["would_block"] is False
+        assert rec["detail"]["best_stance"] == "momentum"
+
+    def test_indistinct_stances_blocked(self):
+        rng = np.random.default_rng(8)
+        samples = {
+            "momentum": rng.normal(0.0, 0.02, size=120),
+            "value": rng.normal(0.0, 0.02, size=120),
+        }
+        rec = observe_stance_spread(samples)
+        assert rec["would_block"] is True
+
+    def test_single_stance_insufficient(self):
+        rec = observe_stance_spread({"momentum": np.zeros(30)})
+        assert rec["would_block"] is True
+        assert rec["detail"]["status"] == "insufficient_stances"

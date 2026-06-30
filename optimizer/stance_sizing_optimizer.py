@@ -117,6 +117,7 @@ def analyze(research_db_path: str) -> dict:
 
     defaults = _factory_defaults()
     per_stance: dict[str, dict] = {}
+    stance_alpha_samples: dict[str, list] = {}
     for stance in _STANCES:
         sub = df[df["stance"] == stance]
         n = len(sub)
@@ -125,6 +126,7 @@ def analyze(research_db_path: str) -> dict:
                                   "recent_positive_weeks": 0}
             continue
         mean_alpha = float(sub["alpha_10d"].mean())
+        stance_alpha_samples[stance] = sub["alpha_10d"].to_numpy()
         weekly = [
             float(g["alpha_10d"].mean())
             for _, g in sub.groupby("year_week") if len(g) >= 3
@@ -170,6 +172,28 @@ def analyze(research_db_path: str) -> dict:
         else:
             recommended[stance] = round(base, 4)
 
+    # Observe-first significance verdict (config#1426 Phase 3). NON-ENFORCING:
+    # the gate enables stance multipliers on a per-stance alpha SPREAD >= 0.005
+    # with no significance test; this asks whether the best vs worst QUALIFYING
+    # stance's mean alpha is statistically distinguishable (two-sample bootstrap
+    # CI of the mean difference excludes zero). NEVER changes the recommendation.
+    # Swallow rationale ("fail loud" carve-out): (a) failure = observe
+    # instrumentation error on a SECONDARY path; the recommendation is
+    # unaffected; (c) recorded surface = WARN log.
+    significance_observe = None
+    if bool(_cfg.get("significance_observe_enabled", True)):
+        try:
+            from optimizer.significance_observe import observe_stance_spread
+            qualifying_samples = {
+                s: stance_alpha_samples[s]
+                for s in qualifying if s in stance_alpha_samples
+            }
+            significance_observe = observe_stance_spread(qualifying_samples, cfg=_cfg)
+        except Exception as e:  # observe-only: must not break the optimizer
+            logger.warning(
+                "stance_sizing significance_observe failed (non-fatal, observe-only): %s", e,
+            )
+
     return {
         "status": "ok",
         "n_samples": len(df),
@@ -178,6 +202,7 @@ def analyze(research_db_path: str) -> dict:
         "stance_alpha_spread": round(spread, 6),
         "recommended_multipliers": recommended,
         "recommendation": "enable" if should_enable else "keep_disabled",
+        "significance_observe": significance_observe,
     }
 
 
