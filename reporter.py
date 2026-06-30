@@ -1474,6 +1474,7 @@ def save(
     action_entropy: dict | None = None,
     optimizer_churn: dict | None = None,
     walk_forward_stability: dict | None = None,
+    significance_observe: dict | None = None,
     all_orders: list[dict] | None = None,
     *,
     upload_bucket: str | None = None,
@@ -1544,6 +1545,12 @@ def save(
     }
     if grading and grading.get("status") in ("ok", "partial"):
         metrics["report_card"] = grading
+    # Observe-first significance verdicts (config#1426). Persist the per-optimizer
+    # would-promote-vs-did records into the durable per-Saturday metrics.json so
+    # the observe→enforce soak (Phase 4) has a reviewable history at a stable S3
+    # path — otherwise the verdict lives only in ephemeral spot-instance logs.
+    if significance_observe:
+        metrics["significance_observe"] = significance_observe
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
     logger.info("Wrote %s", out_dir / "metrics.json")
     _persist(out_dir / "metrics.json")

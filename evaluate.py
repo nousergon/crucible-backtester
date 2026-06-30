@@ -1132,6 +1132,31 @@ def _emit_significance_observe(record: dict | None, *, did_promote: bool, gate_l
         logger.info(msg, *args)
 
 
+_SIGNIFICANCE_OBSERVE_KEYS = (
+    "weight_result", "veto_result", "predictor_sizing",
+    "barrier_sizing", "stance_sizing",
+)
+
+
+def _collect_significance_observe(opt_results: dict) -> dict | None:
+    """Gather the per-optimizer observe verdicts (config#1426) for durable
+    persistence into metrics.json.
+
+    Each `_run_*` seam stamps its optimizer result's `significance_observe`
+    record with the live gate's decision; this collects them into one block so
+    the observe→enforce soak (Phase 4) has a reviewable per-Saturday history at a
+    stable S3 path. Returns None when no verdict is present (nothing to persist).
+    """
+    out: dict = {}
+    for key in _SIGNIFICANCE_OBSERVE_KEYS:
+        res = opt_results.get(key)
+        if isinstance(res, dict):
+            rec = res.get("significance_observe")
+            if rec:
+                out[key] = rec
+    return out or None
+
+
 def _run_veto_opt(config: dict, df_base, freeze: bool) -> dict:
     bucket = config.get("signals_bucket", "alpha-engine-research")
     result = veto_analysis.analyze_veto_effectiveness(df_base, bucket)
@@ -1905,6 +1930,7 @@ def _main_impl() -> None:
             action_entropy=action_entropy_result,
             optimizer_churn=optimizer_churn_result,
             walk_forward_stability=walk_forward_stability_result,
+            significance_observe=_collect_significance_observe(opt_results),
             e2e_lift=diagnostics.get("e2e_lift"),
             veto_result=opt_results.get("veto_result"),
             confusion_matrix=diagnostics.get("confusion_matrix"),
