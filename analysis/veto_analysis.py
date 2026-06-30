@@ -280,6 +280,29 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             global_recommended=result.get("recommended_threshold", current_default),
         )
 
+    # Observe-first significance verdict (config#1426 Phase 3). NON-ENFORCING:
+    # the legacy gate promotes a veto threshold on a 5pp POINT lift over base
+    # rate; this asks whether the recommended threshold's precision lift is
+    # statistically significant (Wilson lower bound > base rate — the same shape
+    # already enforced in skill-composite mode, computed uniformly here). It
+    # NEVER changes the recommendation. Swallow rationale ("fail loud"
+    # carve-out): (a) failure = observe instrumentation error on a SECONDARY
+    # path; the recommendation is unaffected; (c) recorded surface = WARN log.
+    if result.get("status") == "ok" and bool(_cfg.get("significance_observe_enabled", True)):
+        try:
+            from optimizer.significance_observe import observe_veto
+            result["significance_observe"] = observe_veto(
+                result.get("thresholds", []),
+                result.get("recommended_threshold"),
+                result.get("base_rate", 0.0),
+                cfg=_cfg,
+            )
+        except Exception as e:  # observe-only: must not break the optimizer
+            logger.warning(
+                "veto_analysis significance_observe failed (non-fatal, observe-only): %s", e,
+            )
+            result["significance_observe"] = None
+
     return result
 
 

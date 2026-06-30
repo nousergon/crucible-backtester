@@ -49,7 +49,7 @@ from typing import Sequence
 import numpy as np
 
 from analysis.information_coefficient import compute_ic
-from analysis.intervals import bootstrap_ci
+from analysis.intervals import bootstrap_ci, wilson_score_interval
 
 logger = logging.getLogger(__name__)
 
@@ -251,4 +251,195 @@ def observe_weight_optimizer(
         significant=any_significant,
         did_promote=None,
         detail={"per_subscore": per_subscore, "n_test": int(len(test_set))},
+    )
+
+
+# ── Phase 3: additional significance primitives ──────────────────────────────
+
+
+def proportion_lift_significance_verdict(
+    successes: int,
+    n: int,
+    base_rate: float,
+    *,
+    ci_level: float = _DEFAULT_CI_LEVEL,
+) -> dict:
+    """Is a hit-rate (e.g. veto precision) significantly ABOVE a base rate?
+
+    Reuses the lib's Wilson score interval (the small-N-robust binomial CI).
+    ``significant`` iff the Wilson lower bound exceeds ``base_rate`` — i.e. the
+    lift over the baseline is statistically distinguishable from zero. This is
+    the same shape veto_analysis already enforces in skill-composite mode; here
+    it is computed uniformly for the observe verdict.
+    """
+    if n <= 0 or successes < 0 or successes > n:
+        return {"status": "insufficient_data", "n": int(max(n, 0)), "significant": False}
+    ci = wilson_score_interval(successes, n, ci_level=ci_level)
+    if ci.get("status") != "ok":
+        return {"status": ci.get("status", "insufficient_data"), "n": int(n), "significant": False}
+    ci_low = float(ci["ci_low"])
+    rate = float(ci["rate"])
+    significant = bool(ci_low > base_rate)
+    return {
+        "status": "ok",
+        "n": int(n),
+        "rate": round(rate, 6),
+        "base_rate": round(float(base_rate), 6),
+        "ci_low": round(ci_low, 6),
+        "ci_high": round(float(ci["ci_high"]), 6),
+        "ci_level": float(ci_level),
+        "lift": round(rate - float(base_rate), 6),
+        "significant": significant,
+        "method": "wilson_lower_bound_vs_base_rate",
+    }
+
+
+def mean_diff_significance_verdict(
+    sample_a: Sequence[float] | np.ndarray,
+    sample_b: Sequence[float] | np.ndarray,
+    *,
+    ci_level: float = _DEFAULT_CI_LEVEL,
+    n_resamples: int = _DEFAULT_N_RESAMPLES,
+    seed: int = _DEFAULT_SEED,
+    min_samples: int = _DEFAULT_MIN_SAMPLES,
+) -> dict:
+    """Is mean(a) − mean(b) significantly non-zero (seeded two-sample bootstrap)?
+
+    Same seeded percentile-bootstrap method as the lib's ``bootstrap_ci``, in the
+    two-independent-sample shape it doesn't cover (each group resampled
+    independently with replacement). ``significant`` iff the CI of the mean
+    difference excludes zero. Used for the stance-sizing gate, whose promotion
+    rests on a per-stance alpha *spread* rather than a correlation.
+    """
+    a = np.asarray(sample_a, dtype=np.float64)
+    b = np.asarray(sample_b, dtype=np.float64)
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    na, nb = int(a.size), int(b.size)
+    base = {"n_a": na, "n_b": nb, "method": "two_sample_mean_diff_bootstrap"}
+    if na < min_samples or nb < min_samples:
+        return {**base, "status": "insufficient_data", "significant": False}
+
+    estimate = float(a.mean() - b.mean())
+    rng = np.random.default_rng(seed)
+    ia = rng.integers(0, na, size=(n_resamples, na))
+    ib = rng.integers(0, nb, size=(n_resamples, nb))
+    boot = a[ia].mean(axis=1) - b[ib].mean(axis=1)
+    boot = boot[np.isfinite(boot)]
+    if boot.size == 0:
+        return {**base, "status": "insufficient_data", "significant": False}
+
+    tail = (1.0 - ci_level) / 2.0
+    ci_low = float(np.percentile(boot, 100.0 * tail))
+    ci_high = float(np.percentile(boot, 100.0 * (1.0 - tail)))
+    significant = bool(ci_low > 0.0 or ci_high < 0.0)
+    return {
+        **base,
+        "status": "ok",
+        "estimate": round(estimate, 6),
+        "ci_low": round(ci_low, 6),
+        "ci_high": round(ci_high, 6),
+        "ci_level": float(ci_level),
+        "significant": significant,
+    }
+
+
+def _opt_cfg(cfg: dict | None) -> tuple[float, int, int]:
+    """Resolve (alpha, n_resamples, seed) from an optimizer's config section."""
+    cfg = cfg or {}
+    return (
+        float(cfg.get("significance_alpha", _DEFAULT_ALPHA)),
+        int(cfg.get("significance_n_resamples", _DEFAULT_N_RESAMPLES)),
+        int(cfg.get("significance_seed", _DEFAULT_SEED)),
+    )
+
+
+def observe_ic_gate(
+    conviction,
+    forward_return,
+    *,
+    gate: str,
+    cfg: dict | None = None,
+) -> dict:
+    """Observe verdict for a rank-IC promotion gate (predictor/barrier sizing).
+
+    The optimizer promotes when an IC (signal vs realized alpha) clears 0.05 with
+    no significance test. This asks whether that IC's bootstrap CI excludes zero.
+    """
+    alpha, n_resamples, seed = _opt_cfg(cfg)
+    verdict = ic_significance_verdict(
+        conviction, forward_return, alpha=alpha, n_resamples=n_resamples, seed=seed,
+    )
+    return build_observe_record(
+        gate=gate, significant=verdict.get("significant", False),
+        did_promote=None, detail=verdict,
+    )
+
+
+def observe_veto(
+    thresholds: list[dict],
+    recommended_threshold,
+    base_rate: float,
+    *,
+    cfg: dict | None = None,
+) -> dict:
+    """Observe verdict for the predictor-veto gate.
+
+    The gate promotes a veto threshold on a 5pp point lift over base rate. This
+    asks whether the recommended threshold's precision lift is statistically
+    significant (Wilson lower bound > base rate).
+    """
+    row = next(
+        (t for t in (thresholds or []) if t.get("confidence") == recommended_threshold),
+        None,
+    )
+    if not row or row.get("true_negatives") is None or not row.get("n_vetoes"):
+        return build_observe_record(
+            gate="veto_analysis", significant=False, did_promote=None,
+            detail={"status": "insufficient_data", "recommended_threshold": recommended_threshold},
+        )
+    verdict = proportion_lift_significance_verdict(
+        int(row["true_negatives"]), int(row["n_vetoes"]), float(base_rate),
+    )
+    verdict["recommended_threshold"] = recommended_threshold
+    return build_observe_record(
+        gate="veto_analysis", significant=verdict.get("significant", False),
+        did_promote=None, detail=verdict,
+    )
+
+
+def observe_stance_spread(
+    stance_alpha_samples: dict[str, Sequence[float]],
+    *,
+    cfg: dict | None = None,
+) -> dict:
+    """Observe verdict for the stance-sizing gate.
+
+    The gate promotes on a per-stance alpha *spread* ≥ 0.005 with no significance
+    test. This asks whether the best vs worst qualifying stance's mean alpha is
+    statistically distinguishable (two-sample mean-difference bootstrap excludes
+    zero). ``stance_alpha_samples`` maps stance → its per-name alpha samples.
+    """
+    _, n_resamples, seed = _opt_cfg(cfg)
+    means = {
+        s: float(np.nanmean(np.asarray(v, dtype=np.float64)))
+        for s, v in (stance_alpha_samples or {}).items()
+        if v is not None and len(v) > 0
+    }
+    if len(means) < 2:
+        return build_observe_record(
+            gate="stance_sizing", significant=False, did_promote=None,
+            detail={"status": "insufficient_stances", "n_stances": len(means)},
+        )
+    best = max(means, key=means.get)
+    worst = min(means, key=means.get)
+    verdict = mean_diff_significance_verdict(
+        stance_alpha_samples[best], stance_alpha_samples[worst],
+        n_resamples=n_resamples, seed=seed,
+    )
+    verdict["best_stance"] = best
+    verdict["worst_stance"] = worst
+    return build_observe_record(
+        gate="stance_sizing", significant=verdict.get("significant", False),
+        did_promote=None, detail=verdict,
     )

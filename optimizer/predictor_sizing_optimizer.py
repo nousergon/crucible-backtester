@@ -116,9 +116,29 @@ def analyze(research_db_path: str) -> dict:
     equal_weight_return = df["canonical_actual"].mean()
     sizing_lift = weighted_return - equal_weight_return
 
+    # Observe-first significance verdict (config#1426 Phase 3). NON-ENFORCING:
+    # the promotion gate enables sizing on rank-IC >= 0.05 with no significance
+    # test; this asks whether that IC's bootstrap CI excludes zero. It NEVER
+    # changes the recommendation. Swallow rationale ("fail loud" carve-out):
+    # (a) failure = observe instrumentation error on a SECONDARY path; the
+    # recommendation below is unaffected; (c) recorded surface = WARN log.
+    significance_observe = None
+    if bool(_cfg.get("significance_observe_enabled", True)):
+        try:
+            from optimizer.significance_observe import observe_ic_gate
+            significance_observe = observe_ic_gate(
+                df["p_up"], df["canonical_actual"],
+                gate="predictor_sizing", cfg=_cfg,
+            )
+        except Exception as e:  # observe-only: must not break the optimizer
+            logger.warning(
+                "predictor_sizing significance_observe failed (non-fatal, observe-only): %s", e,
+            )
+
     return {
         "status": "ok",
         "n_samples": len(df),
+        "significance_observe": significance_observe,
         "overall_rank_ic": round(overall_ic, 4),
         "recent_mean_ic": round(recent_mean_ic, 4),
         "recent_positive_weeks": recent_positive,
