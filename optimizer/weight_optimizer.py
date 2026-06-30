@@ -407,8 +407,8 @@ def compute_weights(
             "confidence": "low" | "medium" | "high",
             "current_weights": {"quant": 0.50, "qual": 0.50},
             "correlations": {
-                "quant":   {"beat_spy_10d": 0.11, "beat_spy_30d": 0.14},
-                "qual":    {"beat_spy_10d": 0.18, "beat_spy_30d": 0.22},
+                "quant":   {"beat_spy_5d": 0.11, "beat_spy_21d": 0.14},
+                "qual":    {"beat_spy_5d": 0.18, "beat_spy_21d": 0.22},
             },
             "suggested_weights": {"quant": 0.48, "qual": 0.52},
             "changes": {"quant": -0.02, "qual": +0.02},

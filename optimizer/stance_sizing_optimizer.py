@@ -15,7 +15,7 @@ against realized per-stance alpha (the ``by_stance`` cohort surfaced by
 realized outcomes — NOT a predictionless grid sweep.
 
 METHOD: read ``score_performance`` (research.db); per stance, compute realized
-mean alpha (``return_10d − spy_10d_return``) + rolling-week consistency. Anchor
+mean alpha (canonical ``log_alpha_21d``) + rolling-week consistency. Anchor
 on the executor's thesis-ordered FACTORY defaults (momentum 1.0 ≥ quality 0.8 ≥
 value 0.7 ≥ catalyst 0.6 — higher-uncertainty theses get smaller stakes) and
 NUDGE each qualifying stance toward/away by its realized alpha relative to the
