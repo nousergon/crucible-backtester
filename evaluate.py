@@ -1092,7 +1092,44 @@ def _run_weight_opt(config: dict, df_base, freeze: bool) -> dict:
         result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
     else:
         result["apply_result"] = weight_optimizer.apply_weights(result, bucket)
+
+    # Observe-first significance comparison (config#1426 Phase 2). Stamp what the
+    # LIVE gate actually did into the (non-enforcing) significance record and
+    # surface the would-promote-vs-did verdict for operator review.
+    _emit_significance_observe(
+        result.get("significance_observe"),
+        did_promote=bool(result.get("apply_result", {}).get("applied")),
+        gate_label="weight_optimizer",
+    )
     return result
+
+
+def _emit_significance_observe(record: dict | None, *, did_promote: bool, gate_label: str) -> None:
+    """Stamp the live gate's decision into an observe record and log the verdict.
+
+    NON-ENFORCING (config#1426 observe-first): logs only. ``did_promote`` is what
+    the currently-shipping gate decided; the record's ``would_block`` is what the
+    significance bar would have decided. The case to watch is
+    ``promotes_on_undefended_evidence`` — live promoted while significance would
+    have blocked (the leg-f failure mode).
+    """
+    if not record:
+        return
+    record["did_promote"] = did_promote
+    would_block = bool(record.get("would_block"))
+    record["promotes_on_undefended_evidence"] = bool(did_promote and would_block)
+    msg = (
+        "significance_observe [%s]: did_promote=%s would_block=%s "
+        "significant=%s promotes_on_undefended_evidence=%s (observe-only, not enforced)"
+    )
+    args = (
+        gate_label, did_promote, would_block, record.get("significant"),
+        record["promotes_on_undefended_evidence"],
+    )
+    if record["promotes_on_undefended_evidence"]:
+        logger.warning(msg, *args)
+    else:
+        logger.info(msg, *args)
 
 
 def _run_veto_opt(config: dict, df_base, freeze: bool) -> dict:
