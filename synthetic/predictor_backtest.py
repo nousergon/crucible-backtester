@@ -869,6 +869,38 @@ _WF_DEFAULTS = {
 }
 
 
+# Canonical Layer-1A momentum feature set — the raw inputs the deterministic
+# momentum baseline consumes by name. Mirrors
+# ``crucible-predictor/model/momentum_scorer.py::predict_array``
+# (``_W_M5·momentum_5d + _W_M20·momentum_20d + _W_MA50·price_vs_ma50
+# + _W_RSI·(rsi_14-50)/100``). ``predict_array`` reads by name — unknown names
+# are ignored and a missing name degrades to a neutral default — so if the
+# predictor's momentum formula ever gains or loses a raw input, update this list
+# to match (a stale list would silently feed a default rather than fail loud).
+_MOMENTUM_FEATURE_NAMES = ["momentum_5d", "momentum_20d", "price_vs_ma50", "rsi_14"]
+
+
+class _DeterministicMomentumScorer:
+    """Adapter presenting the ``GBMScorer`` surface (``feature_names`` +
+    ``predict(X)``) over crucible-predictor's deterministic momentum baseline.
+
+    The momentum L1 retired its LightGBM booster on 2026-05-09: across 16 weeks
+    of walk-forward validation it never beat its own named baseline (GBM val_IC
+    ~0.01 vs baseline val_IC ~0.31), so the component is now the fixed-coefficient
+    weighted average directly (``crucible-predictor/model/momentum_scorer.py``).
+    Wrapping ``predict_array`` in the scorer surface lets the walk-forward pass
+    reuse the existing tensor / :func:`_predict_from_tensor` machinery unchanged
+    while scoring every fold with the deterministic formula.
+    """
+
+    def __init__(self, predict_array):
+        self._predict_array = predict_array
+        self.feature_names = list(_MOMENTUM_FEATURE_NAMES)
+
+    def predict(self, X):
+        return self._predict_array(X, self.feature_names)
+
+
 def run_walk_forward_inference(
     features_by_ticker: dict[str, pd.DataFrame],
     trading_dates: list[str],
@@ -883,46 +915,50 @@ def run_walk_forward_inference(
 
     Slice C of PR 1, ROADMAP L2371 / Backtester Phase 2 (plan
     ``alpha-engine-docs/private/pit-discipline-260515.md``). The single-pass
-    path replays *all* history against the **current live** momentum GBM —
-    look-ahead contamination, since the optimizer's param sweep then selects
-    parameters on future-trained weights. This path instead, for each
-    purged + embargoed walk-forward fold, resolves the latest archived
-    momentum weights whose *knowledge time ≤ the fold's test-window start*
-    (:func:`synthetic.pit_weights.resolve_momentum_weights`) and scores only
-    that fold's test window with them.
+    path replays *all* history against the **current live** momentum leg —
+    look-ahead contamination when that leg is a *trained* model, since the
+    optimizer's param sweep then selects parameters on future-trained weights.
+    This path scores each purged + embargoed walk-forward fold's test window
+    independently.
 
-    No-future-fallback (plan invariant 3 / the central trap): a fold with no
-    archived weights on-or-before its decision date raises
-    :class:`~synthetic.pit_weights.ColdStartExclusion`; the fold is **skipped
-    and counted**, never resolved to the nearest / earliest-future snapshot.
-    The cold-start-excluded count is a first-class run-quality output (a high
-    count is itself a finding about archive coverage).
+    **Momentum is now a deterministic formula, not a trained model** (retired
+    2026-05-09 — see :class:`_DeterministicMomentumScorer`). A fixed-coefficient
+    baseline carries *zero* look-ahead risk from weight drift (nothing is trained
+    to leak future information), so the momentum leg no longer resolves a
+    per-fold archived booster (``synthetic.pit_weights.resolve_momentum_weights``
+    → ``predictor/weights/meta/archive/{date}/momentum_model.txt``, which the
+    predictor stopped writing on 2026-05-09). Instead every fold is scored with
+    the single deterministic scorer. This is strictly stronger than the original
+    archive-based design: the archive-maturity constraint (wait for a long-enough
+    dated-weight history) disappears entirely, so the full 10y synthetic dataset
+    is usable for the momentum leg immediately, and there is no longer a
+    cold-start exclusion attributable to missing momentum weights. (Warmup /
+    insufficient-history cold-start is still handled upstream by the fold
+    splitter's ``min_train`` and by per-(date, ticker) NaN masking in
+    :func:`_predict_from_tensor` — those rows are correctly absent, unchanged.)
 
-    Performance: the inference tensor is built once per *distinct scorer
-    feature signature* (one in practice — the momentum feature set is stable
-    across weekly retrains) and reused across every fold, so the cost stays
-    ≈ the single-pass path rather than O(n_folds × full-tensor). Distinct
-    archived boosters are downloaded once and cached by archive date.
+    Performance: the inference tensor is built once (the momentum feature set is
+    fixed) and reused across every fold, so the cost stays ≈ the single-pass
+    path rather than O(n_folds × full-tensor).
 
     Returns ``(predictions_by_date, wf_stats)`` where ``predictions_by_date``
     is the same ``{date: {ticker: alpha}}`` contract the single-pass path
-    returns (sparse: only scored test-window dates are present — warmup /
-    cold-start dates are "not investable yet" and correctly absent), and
-    ``wf_stats`` is the metadata block surfaced under
-    ``metadata["walk_forward"]``.
+    returns (sparse: only scored test-window dates are present — warmup dates
+    are "not investable yet" and correctly absent), and ``wf_stats`` is the
+    metadata block surfaced under ``metadata["walk_forward"]``.
+
+    ``bucket`` / ``region`` / ``s3_client`` are retained for signature stability
+    (callers still pass ``bucket``); the deterministic momentum leg reads no S3,
+    but a future dated-artifact PIT leg would resolve them via
+    :mod:`synthetic.pit_weights` again.
     """
-    from synthetic.pit_weights import (
-        ColdStartExclusion,
-        resolve_momentum_weights,
-    )
     from synthetic.pit_folds import build_walk_forward_folds
 
     if predictor_path not in sys.path:
         sys.path.insert(0, predictor_path)
-    from model.gbm_scorer import GBMScorer
+    from model.momentum_scorer import predict_array as _momentum_predict_array
 
     p = {**_WF_DEFAULTS, **(wf_params or {})}
-    s3 = s3_client if s3_client is not None else boto3.client("s3", region_name=region)
 
     # trading_dates is the sorted-unique axis from _resolve_trading_dates;
     # fold indices index straight back into it so date<->index stays aligned.
@@ -945,115 +981,70 @@ def run_walk_forward_inference(
         p["train_mode"],
     )
 
-    # Caches keyed so the expensive bits happen once: boosters by archive
-    # date, tensors by the scorer's feature signature (tuple of names).
-    scorer_by_archive: dict[_dt.date, object] = {}
-    model_path_by_archive: dict[_dt.date, str] = {}
-    tensor_by_sig: dict[tuple, tuple] = {}
+    # One deterministic scorer + one tensor for every fold — no per-fold archive
+    # resolution, no booster download, no cold-start-from-missing-weights.
+    scorer = _DeterministicMomentumScorer(_momentum_predict_array)
+    tensor, tickers, date_to_idx = build_inference_tensor(
+        features_by_ticker, scorer.feature_names,
+    )
+    logger.info(
+        "[walk_forward] deterministic momentum baseline over %d feature(s) %s; "
+        "tensor shape=%s usable_tickers=%d",
+        len(scorer.feature_names), scorer.feature_names, tensor.shape, len(tickers),
+    )
 
     predictions_by_date: dict[str, dict[str, float]] = {}
-    n_cold_start = 0
-    cold_start_test_starts: list[str] = []
-    archive_dates_used: set[_dt.date] = set()
     n_test_dates_scored = 0
 
-    try:
-        for fold in folds:
-            decision_date = fold.test_start_date
-            try:
-                resolved = resolve_momentum_weights(s3, bucket, decision_date)
-            except ColdStartExclusion as exc:
-                n_cold_start += 1
-                cold_start_test_starts.append(decision_date.isoformat())
-                logger.info(
-                    "[walk_forward] fold test_start=%s EXCLUDED (cold-start): %s",
-                    decision_date.isoformat(), exc,
+    for fold in folds:
+        decision_date = fold.test_start_date
+        fold_test_dates = trading_dates[
+            fold.test_start_idx : fold.test_end_idx + 1
+        ]
+        fold_preds = _predict_from_tensor(
+            tensor, tickers, date_to_idx, fold_test_dates,
+            scorer=scorer, heartbeat_every=50,
+            log_label=f"WF[{decision_date.isoformat()}]",
+        )
+        for d, row in fold_preds.items():
+            if d in predictions_by_date:
+                # Non-overlapping test windows is a fold-splitter
+                # invariant; a collision means the splitter regressed.
+                raise RuntimeError(
+                    f"[walk_forward] date {d} scored by >1 fold — "
+                    "fold splitter produced overlapping test windows"
                 )
-                continue
+            predictions_by_date[d] = row
+        n_test_dates_scored += len(fold_preds)
 
-            adate = resolved.archive_date
-            archive_dates_used.add(adate)
-
-            scorer = scorer_by_archive.get(adate)
-            if scorer is None:
-                mpath = _download_gbm_to_temp(
-                    s3, bucket, resolved.model_key, resolved.meta_key,
-                )
-                model_path_by_archive[adate] = mpath
-                scorer = GBMScorer.load(mpath)
-                if not scorer.feature_names:
-                    raise RuntimeError(
-                        f"Archived momentum model {resolved.model_key} has no "
-                        "feature_names metadata — cannot align input features. "
-                        "The archived meta.json predates feature_names "
-                        "persistence; exclude that archive date or refresh it."
-                    )
-                scorer_by_archive[adate] = scorer
-
-            sig = tuple(scorer.feature_names)
-            cached = tensor_by_sig.get(sig)
-            if cached is None:
-                logger.info(
-                    "[walk_forward] building inference tensor for %d-feature "
-                    "signature (archive %s)", len(sig), adate.isoformat(),
-                )
-                cached = build_inference_tensor(features_by_ticker, list(sig))
-                tensor_by_sig[sig] = cached
-            tensor, tickers, date_to_idx = cached
-
-            fold_test_dates = trading_dates[
-                fold.test_start_idx : fold.test_end_idx + 1
-            ]
-            fold_preds = _predict_from_tensor(
-                tensor, tickers, date_to_idx, fold_test_dates,
-                scorer=scorer, heartbeat_every=50,
-                log_label=f"WF[{decision_date.isoformat()}<-{adate.isoformat()}]",
-            )
-            for d, row in fold_preds.items():
-                if d in predictions_by_date:
-                    # Non-overlapping test windows is a fold-splitter
-                    # invariant; a collision means the splitter regressed.
-                    raise RuntimeError(
-                        f"[walk_forward] date {d} scored by >1 fold — "
-                        "fold splitter produced overlapping test windows"
-                    )
-                predictions_by_date[d] = row
-            n_test_dates_scored += len(fold_preds)
-    finally:
-        for mpath in model_path_by_archive.values():
-            for path in (mpath, mpath + ".meta.json"):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-
-    n_folds_scored = len(folds) - n_cold_start
     wf_stats = {
         "enabled": True,
+        # Momentum leg is the deterministic baseline (model/momentum_scorer.py),
+        # not a per-fold archived booster — no archive resolution, so no
+        # cold-start exclusion attributable to missing weights. Keys retained at
+        # 0 / [] so any consumer reading the old shape degrades gracefully.
+        "momentum_source": "deterministic_baseline",
         "n_folds": len(folds),
-        "n_folds_scored": n_folds_scored,
-        "n_cold_start_excluded": n_cold_start,
-        "cold_start_test_starts": cold_start_test_starts,
-        "archive_dates_used": sorted(d.isoformat() for d in archive_dates_used),
-        "n_distinct_archives": len(archive_dates_used),
+        "n_folds_scored": len(folds),
+        "n_cold_start_excluded": 0,
+        "cold_start_test_starts": [],
         "n_test_dates_scored": n_test_dates_scored,
         "params": p,
     }
     logger.info(
-        "[walk_forward] complete: %d/%d folds scored, %d cold-start-excluded, "
-        "%d distinct archive(s), %d test dates with predictions",
-        n_folds_scored, len(folds), n_cold_start,
-        len(archive_dates_used), n_test_dates_scored,
+        "[walk_forward] complete: %d fold(s) scored (deterministic momentum), "
+        "%d test dates with predictions",
+        len(folds), n_test_dates_scored,
     )
-    if n_cold_start and n_folds_scored == 0:
-        # Every fold cold-start-excluded → the run produced zero PIT signals.
-        # Loud, not silent (feedback_no_silent_fails): a parity run on this
-        # would compare against nothing.
+    if folds and n_test_dates_scored == 0:
+        # Folds exist but no test-window date produced a prediction → every
+        # scored row was NaN-masked. Loud, not silent (feedback_no_silent_fails):
+        # a parity run on this would compare against nothing.
         logger.error(
-            "[walk_forward] ALL %d folds cold-start-excluded — no archived "
-            "weights on-or-before any fold decision date. Archive coverage "
-            "(predictor/weights/meta/archive/) is the constraint, not a code "
-            "bug; the PIT run has no signals to simulate.", len(folds),
+            "[walk_forward] %d fold(s) built but ZERO test dates scored — every "
+            "(date, ticker) in every test window was NaN-masked. The feature "
+            "store, not the momentum leg, is the constraint; the PIT run has no "
+            "signals to simulate.", len(folds),
         )
     return predictions_by_date, wf_stats
 
@@ -1232,22 +1223,27 @@ def run(
     logger.info("Freed raw price data (memory optimization)")
 
     # 5 + 6. Inference. Two mutually-exclusive paths:
-    #   - walk_forward OFF (default): single pass over all dates against the
-    #     CURRENT LIVE momentum GBM. Look-ahead-contaminated but the
-    #     historical behavior — preserved byte-for-byte until PR 3's parity
-    #     report is reviewed and the default is flipped (plan §5 / S3-contract
-    #     caution: a new code path never silently changes optimizer inputs).
-    #   - walk_forward ON: per-fold point-in-time weight resolution
-    #     (run_walk_forward_inference). The model temp files are managed
-    #     inside that function; model_path stays None so the cleanup block
-    #     below no-ops on this path.
+    #   - walk_forward OFF (default): single pass over all dates via
+    #     download_gbm_model → predictor/weights/meta/momentum_model.txt. This is
+    #     the deliberately-frozen legacy baseline, preserved byte-for-byte until
+    #     PR 3's parity report is reviewed and the default is flipped (plan §5 /
+    #     S3-contract caution: a new code path never silently changes optimizer
+    #     inputs). SCOPED OUT of the momentum-deterministic repoint (config#1518)
+    #     for exactly that reason — repointing the default path would silently
+    #     change optimizer inputs. NOTE: momentum_model.txt is itself a
+    #     pre-2026-05-09 leftover (the momentum GBM was retired that day), so this
+    #     path is a retirement candidate once walk_forward becomes the default.
+    #   - walk_forward ON: purged + embargoed fold scoring against the
+    #     deterministic momentum baseline (run_walk_forward_inference; momentum
+    #     retired its per-fold archived booster on 2026-05-09). model_path stays
+    #     None so the cleanup block below no-ops on this path.
     n_feature_tickers = len(features_by_ticker)
     wf_enabled = bool(config.get("walk_forward", False))
     wf_params = pb_config.get("walk_forward_params", {})
     if wf_enabled:
         logger.info(
-            "[walk_forward] PIT-honest inference ON — archived weights "
-            "resolved per fold (knowledge-time ≤ decision-date)"
+            "[walk_forward] PIT-honest inference ON — deterministic momentum "
+            "baseline scored per fold (no archived-weight resolution)"
         )
         model_path = None
         predictions_by_date, wf_stats = run_walk_forward_inference(

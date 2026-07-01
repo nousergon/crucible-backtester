@@ -1,5 +1,15 @@
 """Point-in-time resolution of archived predictor weights for walk-forward backtesting.
 
+.. note::
+   **Currently unused by the momentum leg (config#1518, 2026-07-01).** The Layer-1A
+   momentum component retired its trained GBM on 2026-05-09 and is now a fixed
+   deterministic formula (``crucible-predictor/model/momentum_scorer.py``), which
+   carries zero look-ahead risk and needs no per-fold archived booster —
+   ``run_walk_forward_inference`` no longer calls :func:`resolve_momentum_weights`.
+   This module is retained (not deleted) as the tested reference implementation of
+   the no-future-fallback PIT invariant, so any *future* dated-weight artifact that
+   genuinely needs point-in-time resolution can reuse it. Do not repurpose silently.
+
 Enforces the cardinal PIT invariant: at simulated decision date ``D``, only weights
 whose *knowledge time* <= ``D`` may be used. Plan:
 ``alpha-engine-docs/private/pit-discipline-260515.md`` (ROADMAP L2349 / Backtester
