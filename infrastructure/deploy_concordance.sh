@@ -149,7 +149,11 @@ if [ "$CANARY_STATUS" != "OK" ] && [ "$CANARY_STATUS" != "PARTIAL" ]; then
   # an image-wide rebuild that breaks N Lambdas' canaries within the
   # hour into one alert per (Lambda, version). Best-effort; trailing
   # || true never overrides exit 1.
-  python3 -m nousergon_lib.alerts publish \
+  # krepis.alerts (config#1339/config#1545) — this script is operator-run
+  # only (not wired into GHA CI), so the operator's local venv must have
+  # krepis installed (already a repo dependency, requirements.txt) for
+  # this alert to fire; no separate runner-install step applies here.
+  python3 -m krepis.alerts publish \
     --severity error \
     --source "alpha-engine-backtester/infrastructure/deploy_concordance.sh" \
     --dedup-key "canary-fail-${LAMBDA_FUNCTION}-v${VERSION}" \
