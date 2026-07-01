@@ -29,26 +29,25 @@ def accuracy_by_threshold(
     For each threshold T in thresholds, compute accuracy for signals with score >= T.
 
     Returns list of dicts:
-        [{"threshold": 70, "accuracy_10d": 0.58, "n_10d": 120, ...}, ...]
+        [{"threshold": 70, "accuracy_21d": 0.58, "n_21d": 120, ...}, ...]
 
     Use this to find the score cutoff that maximises accuracy while maintaining
     a meaningful sample size.
     """
     populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
-    populated_10d = df[df["beat_spy_10d"].notna()]
-    populated_30d = df[df["beat_spy_30d"].notna()]
+    # config#1456: canonical 21d horizon (10d/30d outcomes retired).
+    populated_21d = df[df["beat_spy_21d"].notna()] if "beat_spy_21d" in df.columns else pd.DataFrame()
 
     results = []
     for t in sorted(thresholds):
         slice_5d = populated_5d[populated_5d["score"] >= t] if not populated_5d.empty else pd.DataFrame()
-        slice_10d = populated_10d[populated_10d["score"] >= t]
-        slice_30d = populated_30d[populated_30d["score"] >= t]
+        slice_21d = populated_21d[populated_21d["score"] >= t]
 
-        if len(slice_10d) < min_samples:
-            logger.debug("Skipping threshold %d — only %d samples", t, len(slice_10d))
+        if len(slice_21d) < min_samples:
+            logger.debug("Skipping threshold %d — only %d samples", t, len(slice_21d))
             continue
 
-        metrics = _compute_slice_metrics(slice_5d, slice_10d, slice_30d)
+        metrics = _compute_slice_metrics(slice_5d, slice_21d)
         results.append({"threshold": t, **metrics})
 
     if not results:
@@ -64,7 +63,7 @@ def optimal_threshold(
     df: pd.DataFrame,
     thresholds: list[int] = DEFAULT_THRESHOLDS,
     min_samples: int = MIN_SAMPLES,
-    target: str = "accuracy_10d",
+    target: str = "accuracy_21d",
     min_n: int = 20,
 ) -> dict | None:
     """
@@ -73,7 +72,7 @@ def optimal_threshold(
     Returns None if insufficient data.
     """
     rows = accuracy_by_threshold(df, thresholds, min_samples=1)
-    eligible = [r for r in rows if r.get("n_10d", 0) >= min_n and r.get(target) is not None]
+    eligible = [r for r in rows if r.get("n_21d", 0) >= min_n and r.get(target) is not None]
 
     if not eligible:
         return None

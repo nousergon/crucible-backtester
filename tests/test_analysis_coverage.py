@@ -83,13 +83,13 @@ class TestAccuracyByThreshold:
         result = accuracy_by_threshold(df, thresholds=[60, 70], min_samples=5)
         for row in result:
             assert "threshold" in row
-            assert "accuracy_10d" in row
+            assert "accuracy_21d" in row
 
     def test_higher_threshold_fewer_samples(self):
         df = self._make_df(100)
         result = accuracy_by_threshold(df, thresholds=[60, 80], min_samples=1)
         if len(result) == 2:
-            assert result[0].get("n_10d", 0) >= result[1].get("n_10d", 0)
+            assert result[0].get("n_21d", 0) >= result[1].get("n_21d", 0)
 
     def test_insufficient_data(self):
         df = self._make_df(5)
@@ -137,13 +137,13 @@ class TestComputeAccuracy:
     def test_overall_accuracy_range(self):
         df = self._make_df()
         result = compute_accuracy(df, min_samples=5)
-        acc = result["overall"]["accuracy_10d"]
+        acc = result["overall"]["accuracy_21d"]
         assert 0.0 <= acc <= 1.0
 
     def test_precision_field(self):
         df = self._make_df()
         result = compute_accuracy(df, min_samples=5)
-        assert "precision_10d" in result["overall"]
+        assert "precision_21d" in result["overall"]
 
     def test_by_sector(self):
         df = self._make_df()
@@ -188,7 +188,7 @@ class TestRegimeAnalysis:
         assert len(result) == 3
         for r in result:
             assert "market_regime" in r
-            assert "accuracy_10d" in r
+            assert "accuracy_21d" in r
 
     def test_insufficient_data(self):
         from analysis.regime_analysis import accuracy_by_regime

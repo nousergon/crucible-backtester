@@ -14,18 +14,18 @@ from analysis.alpha_distribution import compute_score_calibration
 
 
 def _build_db(tmp_path, rows):
-    """rows = list of (symbol, score, return_10d, spy_10d_return, score_date)."""
+    """rows = list of (symbol, score, return_21d, spy_21d_return, score_date)."""
     db = tmp_path / "research.db"
     conn = sqlite3.connect(db)
     conn.execute(
         "CREATE TABLE score_performance ("
         "symbol TEXT, score REAL, return_5d REAL, spy_5d_return REAL, "
-        "return_10d REAL, spy_10d_return REAL, return_30d REAL, spy_30d_return REAL, "
+        "return_21d REAL, spy_21d_return REAL, "
         "score_date TEXT)"
     )
     conn.executemany(
         "INSERT INTO score_performance "
-        "(symbol, score, return_10d, spy_10d_return, score_date) VALUES (?,?,?,?,?)",
+        "(symbol, score, return_21d, spy_21d_return, score_date) VALUES (?,?,?,?,?)",
         rows,
     )
     conn.commit()

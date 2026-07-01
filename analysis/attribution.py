@@ -34,7 +34,9 @@ logger = logging.getLogger(__name__)
 
 SUB_SCORES = ["quant", "qual"]
 PREDICTOR_COLS = ["p_up", "p_down", "prediction_confidence", "predicted_direction"]
-REGRESSION_TARGETS = ["beat_spy_10d", "beat_spy_30d", "return_10d", "return_30d"]
+# config#1456: canonical 5d/21d horizons. The 10d/30d outcomes were retired in
+# the canonical-alpha cutover — attribution now regresses on the 21d target only.
+REGRESSION_TARGETS = ["beat_spy_21d", "return_21d"]
 
 # Multivariate-fit guards. A joint regression needs enough rows relative to
 # the number of regressors before its partial coefficients are stable, and
@@ -57,15 +59,14 @@ def compute_attribution(df: pd.DataFrame) -> dict:
         {
             "status": "ok" | "insufficient_data",
             "correlations": {
-                "quant": {"beat_spy_10d": 0.12, "beat_spy_30d": 0.09, ...},
+                "quant": {"beat_spy_21d": 0.12, "return_21d": 0.09, ...},
                 "qual": {...},
             },
-            "ranking_10d": ["qual", "quant"],  # descending by correlation
-            "ranking_30d": [...],
+            "ranking_21d": ["qual", "quant"],  # descending by correlation
             "note": "..."
         }
     """
-    populated = df[df["beat_spy_10d"].notna()].copy()
+    populated = df[df["beat_spy_21d"].notna()].copy()
 
     if len(populated) < 100:
         return {
@@ -94,7 +95,7 @@ def compute_attribution(df: pd.DataFrame) -> dict:
     for label, col in sub_score_cols.items():
         corr_row = {}
         pval_row = {}
-        for target in ["beat_spy_10d", "beat_spy_30d", "return_10d", "return_30d"]:
+        for target in ["beat_spy_21d", "return_21d"]:
             valid = populated[[col, target]].dropna()
             if len(valid) >= 10:
                 r, p = pearsonr(valid[col], valid[target])
@@ -106,14 +107,9 @@ def compute_attribution(df: pd.DataFrame) -> dict:
         correlations[label] = corr_row
         p_values[label] = pval_row
 
-    ranking_10d = sorted(
+    ranking_21d = sorted(
         correlations.keys(),
-        key=lambda k: correlations[k].get("beat_spy_10d") or 0,
-        reverse=True,
-    )
-    ranking_30d = sorted(
-        correlations.keys(),
-        key=lambda k: correlations[k].get("beat_spy_30d") or 0,
+        key=lambda k: correlations[k].get("beat_spy_21d") or 0,
         reverse=True,
     )
 
@@ -127,7 +123,7 @@ def compute_attribution(df: pd.DataFrame) -> dict:
             pd.to_numeric(populated["p_up"], errors="coerce").fillna(0)
             - pd.to_numeric(populated["p_down"], errors="coerce").fillna(0)
         )
-        for outcome_col in ["beat_spy_10d", "beat_spy_30d"]:
+        for outcome_col in ["beat_spy_21d"]:
             if outcome_col in populated.columns:
                 valid = populated[["_net_pred", outcome_col]].dropna()
                 if len(valid) >= 10:
@@ -189,8 +185,7 @@ def compute_attribution(df: pd.DataFrame) -> dict:
         "multivariate": multivariate,
         "correlations": correlations,
         "p_values": p_values,
-        "ranking_10d": ranking_10d,
-        "ranking_30d": ranking_30d,
+        "ranking_21d": ranking_21d,
         "predictor_correlation": predictor_corr,
         "predictor_p_values": predictor_pvals,
         "predictor_hit_rate": predictor_hit_rate,
@@ -391,12 +386,12 @@ def _compute_multivariate_attribution(
             "fallback_to": "univariate_pearson",
         }
 
-    # Ranking: order inputs by |standardized coefficient| on beat_spy_10d
+    # Ranking: order inputs by |standardized coefficient| on beat_spy_21d
     # when that target was fit jointly (the headline horizon).
-    ranking_10d: list[str] = []
-    head = targets.get("beat_spy_10d", {})
+    ranking_21d: list[str] = []
+    head = targets.get("beat_spy_21d", {})
     if head.get("method") == "multivariate_ols":
-        ranking_10d = sorted(
+        ranking_21d = sorted(
             head["coefficients"],
             key=lambda k: abs(head["coefficients"][k] or 0.0),
             reverse=True,
@@ -408,7 +403,7 @@ def _compute_multivariate_attribution(
         "feature_labels": feature_labels,
         "regime_levels": regime_levels,
         "targets": targets,
-        "ranking_10d": ranking_10d,
+        "ranking_21d": ranking_21d,
         "targets_fell_back_to_univariate": fallbacks or None,
         "note": (
             "Standardized partial coefficients from a joint OLS of each target "

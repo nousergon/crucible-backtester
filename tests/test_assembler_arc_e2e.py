@@ -166,7 +166,7 @@ class TestAssemblerArcEndToEnd:
         return {
             "sortino_ratio": 1.0,       # baseline (primary risk-adjusted gate)
             "sharpe_ratio": 1.0,
-            "accuracy_10d": 0.62,
+            "accuracy_21d": 0.62,
             "saved_at": "2026-05-05",
         }
 
@@ -177,7 +177,7 @@ class TestAssemblerArcEndToEnd:
         return {
             "sortino_ratio": 0.241,      # 75% drop from baseline
             "sharpe_ratio": 0.241,
-            "accuracy_10d": 0.60,
+            "accuracy_21d": 0.60,
             "total_trades": 80,
             "n_signals": 80,
         }
@@ -378,8 +378,8 @@ class TestAssemblerArcEndToEnd:
             executor_apply(self._make_recommendation_result(), bucket=self.BUCKET)
 
         # Today's metrics ~= baseline → no regression
-        baseline = {"sharpe_ratio": 0.7, "accuracy_10d": 0.61}
-        stable_metrics = {"sharpe_ratio": 0.69, "accuracy_10d": 0.60}
+        baseline = {"sharpe_ratio": 0.7, "accuracy_21d": 0.61}
+        stable_metrics = {"sharpe_ratio": 0.69, "accuracy_21d": 0.60}
         with patch("optimizer.regression_monitor.boto3") as reg_boto3, \
              patch("optimizer.rollback.boto3") as rb_boto3, \
              patch("optimizer.regression_monitor._load_baseline",

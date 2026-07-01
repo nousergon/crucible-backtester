@@ -31,7 +31,7 @@ _ALPHA_BUCKETS = [
 
 def compute_alpha_distribution(
     db_path: str,
-    horizons: tuple[str, ...] = ("5d", "10d", "30d"),
+    horizons: tuple[str, ...] = ("5d", "21d"),
     min_samples: int = 5,
 ) -> dict:
     """
@@ -63,8 +63,7 @@ def compute_alpha_distribution(
 
     horizon_cols = {
         "5d": ("return_5d", "spy_5d_return"),
-        "10d": ("return_10d", "spy_10d_return"),
-        "30d": ("return_30d", "spy_30d_return"),
+        "21d": ("return_21d", "spy_21d_return"),
     }
 
     for h in horizons:
@@ -117,7 +116,7 @@ def compute_alpha_distribution(
 
 def compute_score_calibration(
     db_path: str,
-    horizon: str = "10d",
+    horizon: str = "21d",
     n_buckets: int = 5,
     min_per_bucket: int = 3,
 ) -> dict:
@@ -137,8 +136,7 @@ def compute_score_calibration(
 
     horizon_cols = {
         "5d": ("return_5d", "spy_5d_return", "beat_spy_5d"),
-        "10d": ("return_10d", "spy_10d_return", "beat_spy_10d"),
-        "30d": ("return_30d", "spy_30d_return", "beat_spy_30d"),
+        "21d": ("return_21d", "spy_21d_return", "beat_spy_21d"),
     }
     if horizon not in horizon_cols:
         return {"status": "error", "error": f"unsupported horizon: {horizon}"}

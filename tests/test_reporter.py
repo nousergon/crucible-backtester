@@ -239,7 +239,7 @@ class TestReporterCleanupBundle:
             run_date="2026-05-09",
             signal_quality={
                 "status": "ok",
-                "overall": {"accuracy_10d": 0.62, "n_10d": 80},
+                "overall": {"accuracy_21d": 0.62, "n_21d": 80},
             },
             regime_analysis=[],
             score_analysis=[],

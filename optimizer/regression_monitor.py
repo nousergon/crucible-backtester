@@ -99,14 +99,13 @@ def extract_metrics(portfolio_stats: dict | None, signal_quality: dict | None) -
 
     if signal_quality and isinstance(signal_quality, dict):
         overall = signal_quality.get("overall", {})
-        for key in ("accuracy_10d", "accuracy_30d"):
-            if key in overall:
-                metrics[key] = overall[key]
-        # n_10d is the resolved-signal sample size backing accuracy_10d —
+        if "accuracy_21d" in overall:
+            metrics["accuracy_21d"] = overall["accuracy_21d"]
+        # n_21d is the resolved-signal sample size backing accuracy_21d —
         # used by the min-sample guard. Persisted as n_signals for a stable
         # cross-version key independent of the accuracy horizon.
-        if "n_10d" in overall:
-            metrics["n_signals"] = overall["n_10d"]
+        if "n_21d" in overall:
+            metrics["n_signals"] = overall["n_21d"]
 
     return metrics
 
@@ -442,9 +441,9 @@ def check_regression(
     details: dict = {}
     regression_detected = False
 
-    # Accuracy check (10d) — secondary gate (retained)
-    base_acc = baseline.get("accuracy_10d")
-    curr_acc = current_metrics.get("accuracy_10d")
+    # Accuracy check (21d canonical horizon) — secondary gate (retained)
+    base_acc = baseline.get("accuracy_21d")
+    curr_acc = current_metrics.get("accuracy_21d")
     if base_acc is not None and curr_acc is not None:
         # Accuracy is 0-1 (proportion), threshold is in percentage points
         drop_pp = (base_acc - curr_acc) * 100
@@ -452,7 +451,7 @@ def check_regression(
         if drop_pp > acc_threshold:
             regression_detected = True
             logger.warning(
-                "Regression: accuracy_10d dropped %.1fpp (%.1f%% -> %.1f%%), threshold=%.1fpp",
+                "Regression: accuracy_21d dropped %.1fpp (%.1f%% -> %.1f%%), threshold=%.1fpp",
                 drop_pp, base_acc * 100, curr_acc * 100, acc_threshold,
             )
 
