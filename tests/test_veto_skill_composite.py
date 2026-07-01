@@ -254,6 +254,68 @@ class TestApplyShadowVsProduction:
         assert S3_PARAMS_KEY in keys_written
         assert not any(S3_SHADOW_PREFIX in k for k in keys_written)
 
+    # ── config#1426 Phase 4 — significance ENFORCE (default OFF) ─────────────
+
+    def _ok_result_with_verdict(self, verdict) -> dict:
+        r = self._ok_result("precision_minus_alpha_cost_legacy")
+        r["significance_observe"] = verdict
+        return r
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_enforce_default_off_applies_even_when_would_block(self, mock_boto3):
+        """CRITICAL non-enforcement guarantee: default (no enforce flag) leaves
+        the live promotion untouched even when the verdict is would_block."""
+        _init_config()  # no enforce_significance → defaults False
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(
+                self._ok_result_with_verdict({"would_block": True, "significant": False}),
+                bucket="test-bucket",
+            )
+        assert outcome["applied"] is True
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_enforce_blocks_insignificant(self, mock_boto3):
+        _init_config({"enforce_significance": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(
+                self._ok_result_with_verdict({"would_block": True, "significant": False}),
+                bucket="test-bucket",
+            )
+        assert outcome["applied"] is False
+        assert "significance enforce" in outcome["reason"]
+        assert S3_PARAMS_KEY not in [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_enforce_allows_significant(self, mock_boto3):
+        _init_config({"enforce_significance": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(
+                self._ok_result_with_verdict({"would_block": False, "significant": True}),
+                bucket="test-bucket",
+            )
+        assert outcome["applied"] is True
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_enforce_missing_verdict_blocks_conservatively(self, mock_boto3):
+        _init_config({"enforce_significance": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(
+                self._ok_result_with_verdict(None), bucket="test-bucket",
+            )
+        assert outcome["applied"] is False
+
     @patch("analysis.veto_analysis.boto3")
     def test_apply_payload_includes_fit_target(self, mock_boto3):
         _init_config({

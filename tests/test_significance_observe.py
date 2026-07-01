@@ -137,6 +137,17 @@ class TestBuildObserveRecord:
         rec = build_observe_record(gate="g", significant=False, did_promote=None)
         assert rec["promotes_on_undefended_evidence"] is None
 
+    def test_enforced_defaults_false(self):
+        rec = build_observe_record(gate="g", significant=True, did_promote=None)
+        assert rec["enforced"] is False
+
+    def test_enforced_true_when_passed(self):
+        """config#1426 Phase 4 — the record reflects the enforce MODE."""
+        rec = build_observe_record(
+            gate="g", significant=True, did_promote=None, enforced=True,
+        )
+        assert rec["enforced"] is True
+
 
 # ── non-enforcement guarantees ───────────────────────────────────────────────
 

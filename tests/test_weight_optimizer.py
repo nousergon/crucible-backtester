@@ -413,6 +413,173 @@ class TestShadowMode:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# config#1426 Phase 4 — significance ENFORCE wiring (default OFF)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _init_enforce_config(enforce: bool):
+    """Init weight_optimizer config with the enforce_significance flag set."""
+    init_config({
+        "weight_optimizer": {
+            "default_weights": {"quant": 0.50, "qual": 0.50},
+            "max_single_change": 0.10,
+            "min_meaningful_change": 0.03,
+            "enforce_significance": enforce,
+        }
+    })
+
+
+def _enforce_result(verdict: dict) -> dict:
+    """A result that clears every LIVE guardrail (would apply without enforce)."""
+    return {
+        "status": "ok",
+        "confidence": "medium",
+        "oos_passed": True,
+        "suggested_weights": {"quant": 0.45, "qual": 0.55},
+        "changes": {"quant": -0.05, "qual": 0.05},
+        "n_samples": 200,
+        "fit_target": "beat_spy_pearson",
+        "significance_observe": verdict,
+    }
+
+
+def _wverdict(would_block: bool, canonical: dict, five_d: dict | None = None) -> dict:
+    """Build a weight observe verdict with a single 'quant' sub-score carrying
+    per-horizon return_5d + canonical log_alpha_21d IC verdicts."""
+    horizons = {"log_alpha_21d": canonical}
+    if five_d is not None:
+        horizons["return_5d"] = five_d
+    return {
+        "gate": "weight_optimizer", "would_block": would_block,
+        "significant": not would_block, "enforced": True,
+        "detail": {"per_subscore": {"quant": {"significant": not would_block,
+                                              "horizons": horizons}},
+                   "n_test": 100},
+    }
+
+
+# Nothing significant on any horizon ⇒ would_block ⇒ BLOCK.
+_VERDICT_WOULD_BLOCK = _wverdict(
+    True,
+    canonical={"significant": False, "ic": 0.0},
+    five_d={"significant": False, "ic": 0.01},
+)
+# Significant + POSITIVE canonical IC ≥ 0.03 ⇒ DEFENDED ⇒ proceeds.
+_VERDICT_SIG_POSITIVE_CANONICAL = _wverdict(
+    False,
+    canonical={"significant": True, "ic": 0.08},
+    five_d={"significant": False, "ic": 0.02},
+)
+# The re-replay bug: significant driven by a large NEGATIVE 5d IC; canonical null.
+# An absolute |IC| floor would wrongly defend it — signed+canonical floor BLOCKS.
+_VERDICT_SIG_NEGATIVE_5D = _wverdict(
+    False,
+    canonical={"significant": False, "ic": 0.0},
+    five_d={"significant": True, "ic": -0.254},
+)
+# Significant ONLY on return_5d (positive), canonical null ⇒ BLOCK (wrong horizon).
+_VERDICT_SIG_ONLY_5D = _wverdict(
+    False,
+    canonical={"significant": False, "ic": 0.0},
+    five_d={"significant": True, "ic": 0.12},
+)
+# Significant on canonical but a TRIVIAL positive IC (< 0.03) ⇒ BLOCK (below floor).
+_VERDICT_SIG_TRIVIAL_CANONICAL = _wverdict(
+    False,
+    canonical={"significant": True, "ic": 0.01},
+    five_d={"significant": False, "ic": 0.0},
+)
+
+
+class TestApplyWeightsSignificanceEnforce:
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.weight_optimizer.save_previous", create=True)
+    def test_default_off_applies_even_when_would_block(self, _mock_save, mock_boto3):
+        """CRITICAL non-enforcement guarantee: with enforce_significance unset
+        (default False), a promotion the live gate allows STILL applies even
+        when the significance verdict is would_block. This PR ships the
+        capability only — the default path is byte-for-byte unchanged."""
+        _init_default_config()  # no enforce_significance key → defaults False
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_boto3.client.return_value = MagicMock()
+            outcome = apply_weights(_enforce_result(_VERDICT_WOULD_BLOCK), bucket="b")
+        assert outcome["applied"] is True
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.weight_optimizer.save_previous", create=True)
+    def test_enforce_blocks_insignificant(self, _mock_save, mock_boto3):
+        _init_enforce_config(True)
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_s3 = MagicMock()
+            mock_boto3.client.return_value = mock_s3
+            outcome = apply_weights(_enforce_result(_VERDICT_WOULD_BLOCK), bucket="b")
+        assert outcome["applied"] is False
+        assert "significance enforce" in outcome["reason"]
+        assert outcome["observe_verdict"] is _VERDICT_WOULD_BLOCK
+        # No live write happened.
+        assert mock_s3.put_object.call_args_list == []
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.weight_optimizer.save_previous", create=True)
+    def test_enforce_allows_significant_positive_canonical(self, _mock_save, mock_boto3):
+        """Significant + POSITIVE canonical log_alpha_21d IC ≥ 0.03 ⇒ proceeds."""
+        _init_enforce_config(True)
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_boto3.client.return_value = MagicMock()
+            outcome = apply_weights(
+                _enforce_result(_VERDICT_SIG_POSITIVE_CANONICAL), bucket="b")
+        assert outcome["applied"] is True
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.weight_optimizer.save_previous", create=True)
+    def test_enforce_blocks_significant_negative_5d_ic(self, _mock_save, mock_boto3):
+        """The re-replay bug: significance driven by a large NEGATIVE 5d IC with a
+        null canonical horizon MUST block — a signed canonical floor refuses it
+        where an absolute |IC| floor would have wrongly 'defended' it."""
+        _init_enforce_config(True)
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_s3 = MagicMock()
+            mock_boto3.client.return_value = mock_s3
+            outcome = apply_weights(
+                _enforce_result(_VERDICT_SIG_NEGATIVE_5D), bucket="b")
+        assert outcome["applied"] is False
+        assert "significance enforce" in outcome["reason"]
+        assert mock_s3.put_object.call_args_list == []
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.weight_optimizer.save_previous", create=True)
+    def test_enforce_blocks_significant_only_on_5d_horizon(self, _mock_save, mock_boto3):
+        """Significant positive IC but only on the legacy return_5d horizon (null
+        canonical) ⇒ block — the floor is canonical-horizon-only."""
+        _init_enforce_config(True)
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_boto3.client.return_value = MagicMock()
+            outcome = apply_weights(_enforce_result(_VERDICT_SIG_ONLY_5D), bucket="b")
+        assert outcome["applied"] is False
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.weight_optimizer.save_previous", create=True)
+    def test_enforce_blocks_trivial_positive_canonical(self, _mock_save, mock_boto3):
+        """Significant on canonical but a trivial positive IC (< 0.03) ⇒ block."""
+        _init_enforce_config(True)
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_boto3.client.return_value = MagicMock()
+            outcome = apply_weights(
+                _enforce_result(_VERDICT_SIG_TRIVIAL_CANONICAL), bucket="b")
+        assert outcome["applied"] is False
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.weight_optimizer.save_previous", create=True)
+    def test_enforce_missing_verdict_blocks_conservatively(self, _mock_save, mock_boto3):
+        _init_enforce_config(True)
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            mock_boto3.client.return_value = MagicMock()
+            outcome = apply_weights(_enforce_result(None), bucket="b")
+        assert outcome["applied"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # load_with_subscores — canonical (score_performance) vs S3 backfill paths.
 # Regression for the 2026-05-09 P0: research.db migration #12 added
 # quant_score/qual_score to score_performance, so df arrives carrying those

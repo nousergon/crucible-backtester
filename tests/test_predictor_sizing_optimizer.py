@@ -248,6 +248,62 @@ class TestApplyDualWrite:
         assert len(artifact_writes) == 1
 
 
+class TestApplySignificanceEnforce:
+    """config#1426 Phase 4 — significance ENFORCE wiring (default OFF)."""
+
+    def _enable_result(self, verdict):
+        return {
+            "status": "ok",
+            "recommendation": "enable",
+            "overall_rank_ic": 0.10,
+            "significance_observe": verdict,
+        }
+
+    @patch("optimizer.predictor_sizing_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_default_off_applies_even_when_would_block(self, mock_art, mock_apply):
+        """CRITICAL non-enforcement guarantee: default path unchanged."""
+        _set_module_cfg()  # no enforce_significance → defaults False
+        legacy_s3 = MagicMock()
+        legacy_s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_apply.client.return_value = legacy_s3
+        mock_art.client.return_value = MagicMock()
+        outcome = apply(self._enable_result({"would_block": True}), bucket="b")
+        assert outcome["applied"] is True
+
+    @patch("optimizer.predictor_sizing_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_enforce_blocks_insignificant(self, mock_art, mock_apply):
+        _set_module_cfg(extra={"enforce_significance": True})
+        legacy_s3 = MagicMock()
+        mock_apply.client.return_value = legacy_s3
+        mock_art.client.return_value = MagicMock()
+        outcome = apply(self._enable_result({"would_block": True}), bucket="b")
+        assert outcome["applied"] is False
+        assert "significance enforce" in outcome["reason"]
+        assert legacy_s3.put_object.call_args_list == []  # no live write
+
+    @patch("optimizer.predictor_sizing_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_enforce_allows_significant(self, mock_art, mock_apply):
+        _set_module_cfg(extra={"enforce_significance": True})
+        legacy_s3 = MagicMock()
+        legacy_s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_apply.client.return_value = legacy_s3
+        mock_art.client.return_value = MagicMock()
+        outcome = apply(self._enable_result({"would_block": False}), bucket="b")
+        assert outcome["applied"] is True
+
+    @patch("optimizer.predictor_sizing_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_enforce_missing_verdict_blocks_conservatively(self, mock_art, mock_apply):
+        _set_module_cfg(extra={"enforce_significance": True})
+        mock_apply.client.return_value = MagicMock()
+        mock_art.client.return_value = MagicMock()
+        outcome = apply(self._enable_result(None), bucket="b")
+        assert outcome["applied"] is False
+
+
 class TestApplyCutoverSkip:
     """When assembler cutover is enabled, predictor_sizing_optimizer's
     legacy read-modify-write of executor_params.json is skipped — the

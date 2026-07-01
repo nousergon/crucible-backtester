@@ -38,6 +38,15 @@ _BLEND_FACTOR = 0.20
 _CONFIDENCE_LOW = 100
 _CONFIDENCE_MEDIUM = 300
 
+# Signed, canonical-horizon effect-size floor for the significance-enforce gate
+# (config#1426 Phase 4; refined 2026-07-01). The weight promotion is DEFENDED
+# only if some sub-score's OOS IC on the CANONICAL log_alpha_21d horizon is both
+# significant AND positive AND ≥ this value. Signed (not |IC|) and canonical-only
+# because a significant NEGATIVE IC (or one only on the legacy 5d horizon) means
+# "down-weight", not a promotable reweight. Only consulted when
+# enforce_significance=True.
+_WEIGHT_MIN_SIGNED_IC = 0.03
+
 # ── Outcome horizons (config#1451) ──────────────────────────────────────────
 # The canonical-alpha cutover (2026-05-09) RETIRED the 10d/30d outcome horizons
 # in score_performance; resolution now writes 5d (short) + 21d (canonical
@@ -698,6 +707,30 @@ def apply_weights(result: dict, bucket: str) -> dict:
             "shadow_key": shadow_key,
             "fit_target": fit_target,
         }
+
+    # Significance ENFORCE gate (config#1426 Phase 4) — default OFF.
+    # Only when enforce_significance=True does the observe verdict become
+    # load-bearing; it can only BLOCK a promotion the live guardrails already
+    # allowed (reached here), never enable one. The weight promotion is DEFENDED
+    # (not blocked) only if some sub-score's IC on the CANONICAL log_alpha_21d
+    # horizon is significant AND positive AND ≥ _WEIGHT_MIN_SIGNED_IC — otherwise
+    # block. This subsumes the "nothing significant" case and correctly REFUSES a
+    # promotion defended only by a significant NEGATIVE / legacy-5d-horizon IC.
+    if bool(_cfg.get("enforce_significance", False)):
+        from optimizer.significance_observe import weight_canonical_signed_floor_fails
+        verdict = result.get("significance_observe")
+        if weight_canonical_signed_floor_fails(verdict, _WEIGHT_MIN_SIGNED_IC):
+            logger.info(
+                "weight_optimizer: significance enforce BLOCKED promotion "
+                "(config#1426) — no significant positive canonical-horizon IC ≥ %.3f",
+                _WEIGHT_MIN_SIGNED_IC,
+            )
+            return {
+                "applied": False,
+                "reason": "weight_optimizer: blocked by significance enforce "
+                          "(config#1426) — undefended evidence",
+                "observe_verdict": verdict,
+            }
 
     from optimizer.rollback import save_previous
     save_previous(bucket, "scoring_weights")

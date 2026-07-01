@@ -147,3 +147,56 @@ class TestApply:
         assert "stance_size_momentum" in body
         assert body["min_score"] == 70  # field_overlay preserves existing keys
         assert kw["Key"] == S3_PARAMS_KEY
+
+
+class TestApplySignificanceEnforce:
+    """config#1426 Phase 4 — significance ENFORCE wiring (default OFF)."""
+
+    def _blocked_result(self, verdict):
+        # Minimal enable result; _build_overlay_params is not reached when the
+        # enforce block short-circuits, so no multipliers needed here.
+        return {"status": "ok", "recommendation": "enable",
+                "stance_alpha_spread": 0.02, "significance_observe": verdict}
+
+    def test_default_off_applies_even_when_would_block(self):
+        """CRITICAL non-enforcement guarantee: default path unchanged."""
+        init_config({})  # no enforce_significance → defaults False
+        db = _make_db(with_stance=True, rows=_rows_two_qualifying())
+        out = analyze(db)
+        out["significance_observe"] = {"would_block": True}
+        mock_s3 = MagicMock()
+        mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: json.dumps({}).encode())}
+        with patch("boto3.client", return_value=mock_s3), \
+             patch("optimizer.stance_sizing_optimizer.produce_artifact", return_value={}):
+            res = apply(out, bucket="b")
+        assert res["applied"] is True
+
+    def test_enforce_blocks_insignificant(self):
+        init_config({"stance_sizing_optimizer": {"enforce_significance": True}})
+        mock_s3 = MagicMock()
+        with patch("boto3.client", return_value=mock_s3), \
+             patch("optimizer.stance_sizing_optimizer.produce_artifact", return_value={}):
+            res = apply(self._blocked_result({"would_block": True}), bucket="b")
+        assert res["applied"] is False
+        assert "significance enforce" in res["reason"]
+        mock_s3.put_object.assert_not_called()
+
+    def test_enforce_allows_significant(self):
+        init_config({"stance_sizing_optimizer": {"enforce_significance": True}})
+        db = _make_db(with_stance=True, rows=_rows_two_qualifying())
+        out = analyze(db)
+        out["significance_observe"] = {"would_block": False}
+        mock_s3 = MagicMock()
+        mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: json.dumps({}).encode())}
+        with patch("boto3.client", return_value=mock_s3), \
+             patch("optimizer.stance_sizing_optimizer.produce_artifact", return_value={}):
+            res = apply(out, bucket="b")
+        assert res["applied"] is True
+
+    def test_enforce_missing_verdict_blocks_conservatively(self):
+        init_config({"stance_sizing_optimizer": {"enforce_significance": True}})
+        mock_s3 = MagicMock()
+        with patch("boto3.client", return_value=mock_s3), \
+             patch("optimizer.stance_sizing_optimizer.produce_artifact", return_value={}):
+            res = apply(self._blocked_result(None), bucket="b")
+        assert res["applied"] is False
