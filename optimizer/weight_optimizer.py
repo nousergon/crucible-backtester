@@ -22,6 +22,7 @@ from nousergon_lib.eval_artifacts import (
     eval_latest_key,
     new_eval_run_id,
 )
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
@@ -40,28 +41,34 @@ _CONFIDENCE_MEDIUM = 300
 
 # Signed, canonical-horizon effect-size floor for the significance-enforce gate
 # (config#1426 Phase 4; refined 2026-07-01). The weight promotion is DEFENDED
-# only if some sub-score's OOS IC on the CANONICAL log_alpha_21d horizon is both
-# significant AND positive AND ≥ this value. Signed (not |IC|) and canonical-only
-# because a significant NEGATIVE IC (or one only on the legacy 5d horizon) means
-# "down-weight", not a promotable reweight. Only consulted when
-# enforce_significance=True.
+# only if some sub-score's OOS IC on the CANONICAL primary-horizon log-alpha
+# target is both significant AND positive AND ≥ this value. Signed (not |IC|)
+# and canonical-only because a significant NEGATIVE IC (or one only on the
+# diagnostic short horizon) means "down-weight", not a promotable reweight.
+# Only consulted when enforce_significance=True.
 _WEIGHT_MIN_SIGNED_IC = 0.03
 
-# ── Outcome horizons (config#1451) ──────────────────────────────────────────
-# The canonical-alpha cutover (2026-05-09) RETIRED the 10d/30d outcome horizons
-# in score_performance; resolution now writes 5d (short) + 21d (canonical
-# market-relative alpha). These optimizers previously gated on the now-dead
-# beat_spy_10d/30d columns → starved since April. Centralized here so a future
-# horizon change is one edit, not a scatter. The dict keys are the binary
-# beat-SPY columns (legacy Pearson path); the skill-composite path maps each to
-# its continuous target — `log_alpha_21d` (the canonical market-relative alpha)
-# for the long horizon, `return_5d` for the short.
-_SHORT_OUTCOME = "beat_spy_5d"
-_LONG_OUTCOME = "beat_spy_21d"
+# ── Outcome horizons (config#1451 → config#1483/#1528) ──────────────────────
+# Horizons and their column names resolve from the fleet-wide HorizonPolicy
+# chokepoint (nousergon_lib.quant.horizons — which absorbed this module's
+# embryonic constants in EPIC config#1483 Phase 1), never hardcoded literals:
+# an incomplete hand-rename is how the retired horizons silently starved these
+# optimizers for months. The outcome DATA is long-format
+# (score_performance_outcomes), attached to the df upstream by
+# analysis.outcome_store.attach_outcomes under these policy-derived names.
+_POLICY = DEFAULT_POLICY
+# Short = the sole diagnostic horizon (5d); long = the canonical primary (21d).
+_SHORT_HORIZON = _POLICY.diagnostic_horizons[0]
+_LONG_HORIZON = _POLICY.primary_horizon
+_SHORT_OUTCOME = _POLICY.outcome_columns(_SHORT_HORIZON).beat_spy
+_LONG_OUTCOME = _POLICY.outcome_columns(_LONG_HORIZON).beat_spy
 # Column whose non-null-ness marks a resolved (canonical) outcome — the gate.
-_RESOLVED_OUTCOME = _LONG_OUTCOME
+_RESOLVED_OUTCOME = _POLICY.resolved_gate_column()
 _HORIZON_BLEND = {_SHORT_OUTCOME: 0.50, _LONG_OUTCOME: 0.50}
-_SKILL_TARGET = {_SHORT_OUTCOME: "return_5d", _LONG_OUTCOME: "log_alpha_21d"}
+_SKILL_TARGET = {
+    _SHORT_OUTCOME: _POLICY.skill_target_column(_SHORT_HORIZON),
+    _LONG_OUTCOME: _POLICY.skill_target_column(_LONG_HORIZON),
+}
 # Minimum resolved-outcome rows before a starvation WARN fires (fail-loud).
 _STARVATION_MIN_ROWS = 10
 
@@ -341,11 +348,12 @@ def _compute_ic_correlations(
     Same shape as ``_compute_correlations`` for drop-in substitution
     upstream.
 
-    Targets are continuous; for the canonical (long) horizon this is
-    ``log_alpha_21d`` — the 21-day log-domain market-relative alpha the system
-    actually predicts — not a raw return (config#1451). The result dict keys by
-    the beat-SPY horizon columns so the rest of the pipeline (`_validate_oos`,
-    blend, write) treats it uniformly.
+    Targets are continuous; for the canonical (long) horizon this is the
+    primary-horizon log-alpha column (``HorizonPolicy.skill_target_column``) —
+    the log-domain market-relative alpha the system actually predicts — not a
+    raw return (config#1451). The result dict keys by the beat-SPY horizon
+    columns so the rest of the pipeline (`_validate_oos`, blend, write) treats
+    it uniformly.
     """
     correlations: dict[str, dict] = {}
     target_map = dict(_SKILL_TARGET)
@@ -406,8 +414,8 @@ def compute_weights(
         df:               score_performance DataFrame with quant_score,
                           qual_score columns (from load_with_subscores).
         current_weights:  Current weights dict. Defaults to DEFAULT_WEIGHTS.
-        min_samples:      Minimum rows with the canonical beat_spy_21d outcome
-                          populated to proceed.
+        min_samples:      Minimum rows with the canonical (primary-horizon)
+                          beat-SPY outcome populated to proceed.
 
     Returns:
         {
@@ -415,9 +423,9 @@ def compute_weights(
             "n_samples": int,
             "confidence": "low" | "medium" | "high",
             "current_weights": {"quant": 0.50, "qual": 0.50},
-            "correlations": {
-                "quant":   {"beat_spy_5d": 0.11, "beat_spy_21d": 0.14},
-                "qual":    {"beat_spy_5d": 0.18, "beat_spy_21d": 0.22},
+            "correlations": {   # keyed by the policy-derived beat-SPY columns
+                "quant":   {"<short beat-SPY col>": 0.11, "<primary beat-SPY col>": 0.14},
+                "qual":    {"<short beat-SPY col>": 0.18, "<primary beat-SPY col>": 0.22},
             },
             "suggested_weights": {"quant": 0.48, "qual": 0.52},
             "changes": {"quant": -0.02, "qual": +0.02},
@@ -542,7 +550,7 @@ def compute_weights(
             f"Confidence: {confidence}. Blend factor: {blend:.2f}. "
             f"OOS degradation: {oos_degradation:.1%} "
             f"({'PASS' if oos_passed else 'FAIL — weights not applied'}). "
-            f"Fit target: {'IC vs canonical log_alpha_21d + return_5d (skill composite)' if use_skill_composite else 'Pearson vs beat_spy_5d/21d (legacy)'}."
+            f"Fit target: {f'IC vs canonical {_SKILL_TARGET[_LONG_OUTCOME]} + {_SKILL_TARGET[_SHORT_OUTCOME]} (skill composite)' if use_skill_composite else f'Pearson vs {_SHORT_OUTCOME}/{_LONG_HORIZON}d (legacy)'}."
         ),
     }
 
@@ -712,10 +720,11 @@ def apply_weights(result: dict, bucket: str) -> dict:
     # Only when enforce_significance=True does the observe verdict become
     # load-bearing; it can only BLOCK a promotion the live guardrails already
     # allowed (reached here), never enable one. The weight promotion is DEFENDED
-    # (not blocked) only if some sub-score's IC on the CANONICAL log_alpha_21d
-    # horizon is significant AND positive AND ≥ _WEIGHT_MIN_SIGNED_IC — otherwise
-    # block. This subsumes the "nothing significant" case and correctly REFUSES a
-    # promotion defended only by a significant NEGATIVE / legacy-5d-horizon IC.
+    # (not blocked) only if some sub-score's IC on the CANONICAL primary-horizon
+    # log-alpha target is significant AND positive AND ≥ _WEIGHT_MIN_SIGNED_IC —
+    # otherwise block. This subsumes the "nothing significant" case and correctly
+    # REFUSES a promotion defended only by a significant NEGATIVE /
+    # diagnostic-horizon-only IC.
     if bool(_cfg.get("enforce_significance", False)):
         from optimizer.significance_observe import weight_canonical_signed_floor_fails
         verdict = result.get("significance_observe")

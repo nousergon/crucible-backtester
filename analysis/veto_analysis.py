@@ -21,12 +21,21 @@ from nousergon_lib.eval_artifacts import (
     eval_latest_key,
     new_eval_run_id,
 )
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
 S3_PARAMS_KEY = "config/predictor_params.json"
 S3_SHADOW_PREFIX = "config/predictor_params_shadow_history"
+
+# ── Canonical outcome columns (config#1483/#1528) ────────────────────────────
+# Resolved from the fleet HorizonPolicy chokepoint, never hardcoded literals.
+# The outcome DATA is long-format (score_performance_outcomes), attached to the
+# df upstream by analysis.outcome_store.attach_outcomes under these names.
+_PRIMARY_OC = DEFAULT_POLICY.outcome_columns(DEFAULT_POLICY.primary_horizon)
+_BEAT = _PRIMARY_OC.beat_spy          # canonical beat-SPY flag column
+_RET = _PRIMARY_OC.stock_return       # canonical stock-return column (2dp %)
 
 # ── Fallback defaults (override via veto_analysis section in config.yaml) ──
 _CONFIDENCE_THRESHOLDS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
@@ -114,7 +123,8 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     Analyze veto gate effectiveness across confidence thresholds.
 
     Args:
-        df: score_performance DataFrame with beat_spy_21d, return_21d columns.
+        df: score_performance DataFrame with the canonical primary-horizon
+            outcome columns attached (analysis.outcome_store.attach_outcomes).
         bucket: S3 bucket containing predictor/predictions/{date}.json.
 
     Returns:
@@ -134,26 +144,26 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     # Only look at rows with the canonical 21d outcome resolved (config#1451:
     # the legacy 10d horizon was retired in the canonical-alpha cutover).
     min_preds = _cfg.get("min_predictions", _MIN_PREDICTIONS)
-    if "beat_spy_21d" not in df.columns:
+    if _BEAT not in df.columns:
         logger.warning(
-            "veto_analysis STARVED: 'beat_spy_21d' absent from score_performance "
-            "— schema drift / horizon retirement?",
+            "veto_analysis STARVED: %r absent from the outcome frame "
+            "— schema drift / horizon retirement?", _BEAT,
         )
-        return {"status": "insufficient_data", "n_rows": 0, "note": "beat_spy_21d column absent"}
-    populated = df[df["beat_spy_21d"].notna()].copy()
+        return {"status": "insufficient_data", "n_rows": 0, "note": f"{_BEAT} column absent"}
+    populated = df[df[_BEAT].notna()].copy()
     if len(populated) < min_preds:
         # Fail-loud (config#1451): a silent insufficient_data is how the 10d
         # retirement starved this gate for months.
         logger.warning(
-            "veto_analysis STARVED: only %d rows with resolved beat_spy_21d "
+            "veto_analysis STARVED: only %d rows with resolved %s "
             "(of %d, need %d) — check the outcome backfill / horizon.",
-            len(populated), len(df), min_preds,
+            len(populated), _BEAT, len(df), min_preds,
         )
         return {
             "status": "insufficient_data",
             "n_rows": len(populated),
             "min_required": min_preds,
-            "note": f"Only {len(populated)} rows with resolved beat_spy_21d (need {min_preds})",
+            "note": f"Only {len(populated)} rows with resolved {_BEAT} (need {min_preds})",
         }
 
     # Load ALL available prediction dates from S3 (not just score_dates,
@@ -192,8 +202,8 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
                 "symbol": ticker,
                 "score_date": d,
                 "prediction_confidence": float(preds["prediction_confidence"]),
-                "beat_spy_21d": float(row["beat_spy_21d"]),
-                "return_21d": float(row.get("return_21d", 0)),
+                _BEAT: float(row[_BEAT]),
+                _RET: float(row.get(_RET, 0)),
             }
             if has_sector and pd.notna(row.get("sector")):
                 entry["sector"] = row["sector"]
@@ -238,7 +248,7 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
     logger.info("Found %d DOWN predictions with outcomes for veto analysis", n_down)
 
     # Base rate: % of all BUY signals (in populated df) that beat SPY
-    base_rate = float(populated["beat_spy_21d"].mean())
+    base_rate = float(populated[_BEAT].mean())
     logger.info("Veto base rate: %.1f%% of BUY signals beat SPY at 10d", base_rate * 100)
 
     # Sweep thresholds and select best
@@ -266,8 +276,8 @@ def analyze_veto_effectiveness(df: pd.DataFrame, bucket: str) -> dict:
             if n_vetoes == 0:
                 by_sector.append({"sector": sector, "n_down": len(s_df), "n_vetoes": 0, "precision": None, "recall": None})
                 continue
-            tn = int((vetoed["beat_spy_21d"] == 0).sum())
-            total_under = int((s_df["beat_spy_21d"] == 0).sum())
+            tn = int((vetoed[_BEAT] == 0).sum())
+            total_under = int((s_df[_BEAT] == 0).sum())
             precision = tn / n_vetoes if n_vetoes > 0 else None
             recall = tn / total_under if total_under > 0 else None
             by_sector.append({
@@ -425,7 +435,7 @@ def _sweep_thresholds(
     from analysis.signal_quality import _wilson_ci
 
     # Total actual underperformers across ALL DOWN predictions (for recall denominator)
-    total_actual_underperformers = int((down_df["beat_spy_21d"] == 0).sum())
+    total_actual_underperformers = int((down_df[_BEAT] == 0).sum())
 
     results = []
     for threshold in thresholds:
@@ -449,8 +459,8 @@ def _sweep_thresholds(
             })
             continue
 
-        true_neg = int((vetoed["beat_spy_21d"] == 0).sum())
-        false_neg = int((vetoed["beat_spy_21d"] == 1).sum())
+        true_neg = int((vetoed[_BEAT] == 0).sum())
+        false_neg = int((vetoed[_BEAT] == 1).sum())
         precision = true_neg / n_vetoes
 
         # Recall: of all actual underperformers, how many did we veto?
@@ -464,9 +474,9 @@ def _sweep_thresholds(
         precision_ci = _wilson_ci(true_neg, n_vetoes)
         low_confidence = n_vetoes < 30
 
-        vetoed_winners = vetoed[vetoed["beat_spy_21d"] == 1]
-        missed_total = float(vetoed_winners["return_21d"].sum())
-        missed_per_winner = float(vetoed_winners["return_21d"].mean()) if len(vetoed_winners) > 0 else 0.0
+        vetoed_winners = vetoed[vetoed[_BEAT] == 1]
+        missed_total = float(vetoed_winners[_RET].sum())
+        missed_per_winner = float(vetoed_winners[_RET].mean()) if len(vetoed_winners) > 0 else 0.0
 
         lift = precision - base_rate
 

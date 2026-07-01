@@ -261,9 +261,14 @@ def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict)
     if sq_result.get("status") in ("skipped", "error", "db_not_found"):
         return sq_result, [], [], {"status": "skipped"}, None
 
-    # Load df_base for downstream modules
+    # Load df_base for downstream modules. Outcome columns are re-sourced from
+    # the long-format score_performance_outcomes store (config#1483/#1528) via
+    # the repo's single accessor — every downstream consumer of df_base reads
+    # long-format outcome data under the HorizonPolicy-derived column names.
     try:
+        from analysis.outcome_store import attach_outcomes
         df_base = signal_quality.load_score_performance(db_path)
+        df_base = attach_outcomes(df_base, db_path)
     except Exception:
         df_base = None
 

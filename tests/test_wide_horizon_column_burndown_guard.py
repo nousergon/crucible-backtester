@@ -91,12 +91,7 @@ _MIGRATING = frozenset({
     "analysis/score_analysis.py",
     "analysis/signal_quality.py",
     "analysis/team_skill_metrics.py",
-    "analysis/veto_analysis.py",
     "evaluate.py",
-    "optimizer/research_optimizer.py",
-    "optimizer/significance_observe.py",
-    "optimizer/stance_sizing_optimizer.py",
-    "optimizer/weight_optimizer.py",
     "reporter.py",
 })
 

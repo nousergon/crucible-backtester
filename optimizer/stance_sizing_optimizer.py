@@ -14,8 +14,10 @@ against realized per-stance alpha (the ``by_stance`` cohort surfaced by
 ``analysis.signal_quality``), exactly as p_up/barrier sizing are tuned against
 realized outcomes — NOT a predictionless grid sweep.
 
-METHOD: read ``score_performance`` (research.db); per stance, compute realized
-mean alpha (canonical ``log_alpha_21d``) + rolling-week consistency. Anchor
+METHOD: read the long-format ``score_performance_outcomes`` store (research.db,
+EPIC config#1483) joined to ``score_performance.stance``; per stance, compute
+realized mean alpha (the canonical primary-horizon log-alpha, resolved via the
+``HorizonPolicy`` chokepoint) + rolling-week consistency. Anchor
 on the executor's thesis-ordered FACTORY defaults (momentum 1.0 ≥ quality 0.8 ≥
 value 0.7 ≥ catalyst 0.6 — higher-uncertainty theses get smaller stakes) and
 NUDGE each qualifying stance toward/away by its realized alpha relative to the
@@ -37,6 +39,7 @@ from datetime import date
 
 import boto3
 import pandas as pd
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
 logger = logging.getLogger(__name__)
 
@@ -93,27 +96,36 @@ def analyze(research_db_path: str) -> dict:
                     "realized outcomes (L300 activation prerequisite)."
                 ),
             }
-        # config#1452 + config#1451: the prior query selected `prediction_date`
-        # (which score_performance does NOT have — it has `score_date`) AND the
-        # retired 10d outcome (`return_10d`/`spy_10d_return`, dark since April).
-        # Use the canonical `log_alpha_21d` (21d log-domain market-relative alpha)
-        # keyed by `score_date`.
-        df = pd.read_sql_query(
-            "SELECT score_date, symbol, stance, log_alpha_21d "
-            "FROM score_performance "
-            "WHERE stance IS NOT NULL "
-            "  AND log_alpha_21d IS NOT NULL "
-            "ORDER BY score_date",
+        # config#1483/#1528: the canonical per-signal log-alpha is read from
+        # the LONG-FORMAT score_performance_outcomes store (filtered to the
+        # HorizonPolicy primary horizon via analysis.outcome_store — the repo's
+        # single accessor), joined to score_performance's stance column. The
+        # prior wide-column read (config#1452/#1451 fix) is retired with the
+        # wide horizon-suffixed schema.
+        from analysis.outcome_store import load_outcomes
+
+        policy = DEFAULT_POLICY
+        outcomes = load_outcomes(
+            conn, policy=policy, horizons=(policy.primary_horizon,)
+        )
+        stances = pd.read_sql_query(
+            "SELECT score_date, symbol, stance FROM score_performance "
+            "WHERE stance IS NOT NULL ORDER BY score_date",
             conn,
         )
         conn.close()
+        outcomes = outcomes[outcomes["log_alpha"].notna()]
+        df = stances.merge(
+            outcomes[["symbol", "score_date", "log_alpha"]],
+            on=["symbol", "score_date"], how="inner",
+        ).sort_values("score_date", kind="stable").reset_index(drop=True)
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
     if df.empty:
         return {"status": "insufficient_stance_history", "n_samples": 0}
 
-    df["alpha_21d"] = df["log_alpha_21d"].astype(float)
+    df["alpha_21d"] = df["log_alpha"].astype(float)
     overall_alpha = float(df["alpha_21d"].mean())
     df["year_week"] = (
         pd.to_datetime(df["score_date"]).dt.year.astype(str) + "-W"

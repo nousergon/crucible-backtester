@@ -47,6 +47,7 @@ import logging
 from typing import Sequence
 
 import numpy as np
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
 from analysis.information_coefficient import compute_ic
 from analysis.intervals import bootstrap_ci, wilson_score_interval
@@ -231,7 +232,12 @@ def significance_would_block(verdict: dict | None) -> bool:
     return bool(verdict.get("would_block", True))
 
 
-_WEIGHT_CANONICAL_HORIZON = "log_alpha_21d"
+# The canonical continuous target column (primary-horizon log-alpha), resolved
+# from the fleet HorizonPolicy chokepoint (config#1483/#1528) — never a
+# hardcoded horizon-suffixed literal.
+_WEIGHT_CANONICAL_HORIZON = DEFAULT_POLICY.skill_target_column(
+    DEFAULT_POLICY.primary_horizon
+)
 
 
 def weight_canonical_signed_floor_fails(
@@ -243,18 +249,19 @@ def weight_canonical_signed_floor_fails(
     """Signed, canonical-horizon effect-size floor for the weight gate under
     enforce (config#1426 Phase 4; refined 2026-07-01 after a re-replay).
 
-    Returns True (⇒ BLOCK) UNLESS at least one sub-score's per-horizon verdict on
-    the CANONICAL ``log_alpha_21d`` horizon is BOTH significant (bootstrap CI
-    excludes zero) AND has a POSITIVE signed IC ≥ ``min_signed_ic``.
+    Returns True (⇒ BLOCK) UNLESS at least one sub-score's per-horizon verdict
+    on the CANONICAL primary-horizon log-alpha target is BOTH significant
+    (bootstrap CI excludes zero) AND has a POSITIVE signed IC ≥ ``min_signed_ic``.
 
     Why signed + canonical-only (not absolute + any-horizon): the re-replay
     showed the weight gate's ``significant=True`` was driven ENTIRELY by a large
-    NEGATIVE IC (quant × return_5d = −0.254) on the LEGACY 5d horizon while the
-    canonical 21d horizon was null. A significant negative IC means "down-weight"
-    — not a promotable reweight — so an absolute |IC| floor on any horizon would
-    wrongly "defend" the promotion. The floor is therefore signed (≥ +0.03) and
-    read ONLY off the canonical horizon. A missing/None verdict has no qualifying
-    horizon ⇒ blocks (conservative — enforce can only block, never enable).
+    NEGATIVE IC (quant × the 5d stock-return target = −0.254) on the diagnostic
+    short horizon while the canonical primary horizon was null. A significant
+    negative IC means "down-weight" — not a promotable reweight — so an absolute
+    |IC| floor on any horizon would wrongly "defend" the promotion. The floor is
+    therefore signed (≥ +0.03) and read ONLY off the canonical horizon. A
+    missing/None verdict has no qualifying horizon ⇒ blocks (conservative —
+    enforce can only block, never enable).
     """
     detail = (verdict or {}).get("detail") or {}
     per_subscore = detail.get("per_subscore") or {}
@@ -269,7 +276,9 @@ def observe_weight_optimizer(
     test_set,
     sub_cols: dict[str, str],
     *,
-    return_cols: tuple[str, ...] = ("return_10d", "return_30d"),
+    return_cols: tuple[str, ...] = tuple(
+        DEFAULT_POLICY.skill_target_column(h) for h in DEFAULT_POLICY.all_horizons
+    ),
     cfg: dict | None = None,
 ) -> dict:
     """Phase-2 observe verdict for ``weight_optimizer`` (config#1426).

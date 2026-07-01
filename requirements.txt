@@ -57,7 +57,7 @@ cvxpy>=1.4,<1.8
 # test). Without it the test's `pytest.importorskip` would not skip but ERROR at
 # first validate() (module imports; jsonschema missing) — so the shared-schema
 # gate would never actually run in backtester CI, defeating the cross-repo pin.
-nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.72.0
+nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.77.1
 
 # krepis (MIT foundation) — direct dep for krepis.dates.resolve_trading_day
 # (pipeline_common re-exports it) and, as of config#1300, krepis.console.console_url
