@@ -743,6 +743,25 @@ def apply(result: dict, bucket: str) -> dict:
             "veto_confidence": recommended,
         }
 
+    # Significance ENFORCE gate (config#1426 Phase 4) — default OFF. The existing
+    # 5pp point-lift gate stays as-is; enforce ADDS a block when the veto
+    # precision lift is not statistically significant (Wilson lower bound not
+    # above base rate → would_block). Missing verdict → conservative block.
+    # Enforce can only BLOCK a promotion the live gate already allowed.
+    if bool(_cfg.get("enforce_significance", False)):
+        from optimizer.significance_observe import significance_would_block
+        verdict = result.get("significance_observe")
+        if significance_would_block(verdict):
+            logger.info(
+                "veto_analysis: significance enforce BLOCKED promotion (config#1426)"
+            )
+            return {
+                "applied": False,
+                "reason": "veto_analysis: blocked by significance enforce "
+                          "(config#1426) — undefended evidence",
+                "observe_verdict": verdict,
+            }
+
     from optimizer.rollback import save_previous
     save_previous(bucket, "predictor_params")
 

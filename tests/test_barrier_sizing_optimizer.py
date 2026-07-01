@@ -161,3 +161,63 @@ class TestApply:
         res = apply(self._enable_result(), "bucket")
         assert res["applied"] is False
         assert "cutover" in res["reason"]
+
+
+class TestApplySignificanceEnforce:
+    """config#1426 Phase 4 — significance ENFORCE wiring (default OFF)."""
+
+    def setup_method(self):
+        import optimizer.barrier_sizing_optimizer as mod
+        self._saved_cfg = mod._cfg
+
+    def teardown_method(self):
+        import optimizer.barrier_sizing_optimizer as mod
+        mod._cfg = self._saved_cfg
+
+    def _set_cfg(self, enforce: bool):
+        import optimizer.barrier_sizing_optimizer as mod
+        mod._cfg = {"enforce_significance": enforce}
+
+    def _enable_result(self, verdict):
+        return {"status": "ok", "recommendation": "enable",
+                "overall_rank_ic": 0.11, "significance_observe": verdict}
+
+    @patch("optimizer.barrier_sizing_optimizer.produce_artifact")
+    @patch("optimizer.barrier_sizing_optimizer.boto3")
+    def test_default_off_applies_even_when_would_block(self, mock_boto3, _art):
+        """CRITICAL non-enforcement guarantee: default path unchanged."""
+        self._set_cfg(False)
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("no params")
+        mock_boto3.client.return_value = s3
+        res = apply(self._enable_result({"would_block": True}), "bucket")
+        assert res["applied"] is True
+
+    @patch("optimizer.barrier_sizing_optimizer.produce_artifact")
+    @patch("optimizer.barrier_sizing_optimizer.boto3")
+    def test_enforce_blocks_insignificant(self, mock_boto3, _art):
+        self._set_cfg(True)
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        res = apply(self._enable_result({"would_block": True}), "bucket")
+        assert res["applied"] is False
+        assert "significance enforce" in res["reason"]
+        s3.put_object.assert_not_called()
+
+    @patch("optimizer.barrier_sizing_optimizer.produce_artifact")
+    @patch("optimizer.barrier_sizing_optimizer.boto3")
+    def test_enforce_allows_significant(self, mock_boto3, _art):
+        self._set_cfg(True)
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("no params")
+        mock_boto3.client.return_value = s3
+        res = apply(self._enable_result({"would_block": False}), "bucket")
+        assert res["applied"] is True
+
+    @patch("optimizer.barrier_sizing_optimizer.produce_artifact")
+    @patch("optimizer.barrier_sizing_optimizer.boto3")
+    def test_enforce_missing_verdict_blocks_conservatively(self, mock_boto3, _art):
+        self._set_cfg(True)
+        mock_boto3.client.return_value = MagicMock()
+        res = apply(self._enable_result(None), "bucket")
+        assert res["applied"] is False

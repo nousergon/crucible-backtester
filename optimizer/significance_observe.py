@@ -179,6 +179,7 @@ def build_observe_record(
     significant: bool,
     did_promote: bool | None,
     detail: dict | None = None,
+    enforced: bool = False,
 ) -> dict:
     """Wrap a significance result into the standard observe record.
 
@@ -186,6 +187,13 @@ def build_observe_record(
     ``None`` when that decision isn't known at the call site. The headline field
     is ``promotes_on_undefended_evidence``: the live gate promoted while the
     significance bar would have blocked (the leg-f failure mode).
+
+    ``enforced`` records the MODE the verdict was emitted under (config#1426
+    Phase 4). It defaults to ``False`` (observe-only). When an optimizer's
+    ``enforce_significance`` flag is on, the emitted record carries
+    ``enforced=True`` so the artifact reflects that the verdict was load-bearing
+    for that cycle. This field is descriptive metadata only — the actual
+    block/allow decision is made in each optimizer's ``apply()``.
     """
     would_block = not significant
     promotes_on_undefended = bool(did_promote and would_block) if did_promote is not None else None
@@ -196,11 +204,65 @@ def build_observe_record(
         "would_block": would_block,
         "did_promote": did_promote,
         "promotes_on_undefended_evidence": promotes_on_undefended,
-        "enforced": False,  # observe-first: this verdict NEVER changes a decision.
+        "enforced": bool(enforced),
     }
     if detail:
         rec["detail"] = detail
     return rec
+
+
+def _cfg_enforced(cfg: dict | None) -> bool:
+    """Resolve the ``enforce_significance`` mode flag from an optimizer's config
+    section (config#1426 Phase 4). Defaults False — observe-only."""
+    return bool((cfg or {}).get("enforce_significance", False))
+
+
+def significance_would_block(verdict: dict | None) -> bool:
+    """Conservative enforce-mode block decision (config#1426 Phase 4).
+
+    Returns True (⇒ block promotion) when the observe verdict is missing/None or
+    reports ``would_block`` (evidence not statistically significant). A missing
+    verdict blocks under enforce: we refuse to promote live config on evidence we
+    could not even measure to defend — the SAFE direction. Enforce can only
+    BLOCK a promotion the live gate already allowed; it never enables one.
+    """
+    if not verdict:
+        return True
+    return bool(verdict.get("would_block", True))
+
+
+_WEIGHT_CANONICAL_HORIZON = "log_alpha_21d"
+
+
+def weight_canonical_signed_floor_fails(
+    verdict: dict | None,
+    min_signed_ic: float,
+    *,
+    canonical_horizon: str = _WEIGHT_CANONICAL_HORIZON,
+) -> bool:
+    """Signed, canonical-horizon effect-size floor for the weight gate under
+    enforce (config#1426 Phase 4; refined 2026-07-01 after a re-replay).
+
+    Returns True (⇒ BLOCK) UNLESS at least one sub-score's per-horizon verdict on
+    the CANONICAL ``log_alpha_21d`` horizon is BOTH significant (bootstrap CI
+    excludes zero) AND has a POSITIVE signed IC ≥ ``min_signed_ic``.
+
+    Why signed + canonical-only (not absolute + any-horizon): the re-replay
+    showed the weight gate's ``significant=True`` was driven ENTIRELY by a large
+    NEGATIVE IC (quant × return_5d = −0.254) on the LEGACY 5d horizon while the
+    canonical 21d horizon was null. A significant negative IC means "down-weight"
+    — not a promotable reweight — so an absolute |IC| floor on any horizon would
+    wrongly "defend" the promotion. The floor is therefore signed (≥ +0.03) and
+    read ONLY off the canonical horizon. A missing/None verdict has no qualifying
+    horizon ⇒ blocks (conservative — enforce can only block, never enable).
+    """
+    detail = (verdict or {}).get("detail") or {}
+    per_subscore = detail.get("per_subscore") or {}
+    for sub in per_subscore.values():
+        h = (sub.get("horizons") or {}).get(canonical_horizon) or {}
+        if h.get("significant") and float(h.get("ic") or 0.0) >= float(min_signed_ic):
+            return False
+    return True
 
 
 def observe_weight_optimizer(
@@ -246,11 +308,17 @@ def observe_weight_optimizer(
         per_subscore[label] = {"significant": sub_significant, "horizons": horizons}
         any_significant = any_significant or sub_significant
 
+    # The per-subscore × per-horizon verdicts (each carrying signed ``ic`` +
+    # ``significant``) are the substrate the Phase-4 weight enforce floor reads
+    # directly — see ``weight_canonical_signed_floor_fails``. No summary field is
+    # surfaced: the floor is signed + canonical-horizon-specific, so a scalar
+    # (e.g. max |IC|) would lose exactly the sign/horizon it must discriminate.
     return build_observe_record(
         gate="weight_optimizer",
         significant=any_significant,
         did_promote=None,
         detail={"per_subscore": per_subscore, "n_test": int(len(test_set))},
+        enforced=_cfg_enforced(cfg),
     )
 
 
@@ -372,7 +440,7 @@ def observe_ic_gate(
     )
     return build_observe_record(
         gate=gate, significant=verdict.get("significant", False),
-        did_promote=None, detail=verdict,
+        did_promote=None, detail=verdict, enforced=_cfg_enforced(cfg),
     )
 
 
@@ -393,10 +461,12 @@ def observe_veto(
         (t for t in (thresholds or []) if t.get("confidence") == recommended_threshold),
         None,
     )
+    enforced = _cfg_enforced(cfg)
     if not row or row.get("true_negatives") is None or not row.get("n_vetoes"):
         return build_observe_record(
             gate="veto_analysis", significant=False, did_promote=None,
             detail={"status": "insufficient_data", "recommended_threshold": recommended_threshold},
+            enforced=enforced,
         )
     verdict = proportion_lift_significance_verdict(
         int(row["true_negatives"]), int(row["n_vetoes"]), float(base_rate),
@@ -404,7 +474,7 @@ def observe_veto(
     verdict["recommended_threshold"] = recommended_threshold
     return build_observe_record(
         gate="veto_analysis", significant=verdict.get("significant", False),
-        did_promote=None, detail=verdict,
+        did_promote=None, detail=verdict, enforced=enforced,
     )
 
 
@@ -421,6 +491,7 @@ def observe_stance_spread(
     zero). ``stance_alpha_samples`` maps stance → its per-name alpha samples.
     """
     _, n_resamples, seed = _opt_cfg(cfg)
+    enforced = _cfg_enforced(cfg)
     means = {
         s: float(np.nanmean(np.asarray(v, dtype=np.float64)))
         for s, v in (stance_alpha_samples or {}).items()
@@ -430,6 +501,7 @@ def observe_stance_spread(
         return build_observe_record(
             gate="stance_sizing", significant=False, did_promote=None,
             detail={"status": "insufficient_stances", "n_stances": len(means)},
+            enforced=enforced,
         )
     best = max(means, key=means.get)
     worst = min(means, key=means.get)
@@ -441,5 +513,5 @@ def observe_stance_spread(
     verdict["worst_stance"] = worst
     return build_observe_record(
         gate="stance_sizing", significant=verdict.get("significant", False),
-        did_promote=None, detail=verdict,
+        did_promote=None, detail=verdict, enforced=enforced,
     )

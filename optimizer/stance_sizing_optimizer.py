@@ -285,6 +285,25 @@ def apply(result: dict, bucket: str, run_date: str | None = None) -> dict:
         return {"applied": False, "reason": f"spread/consistency insufficient "
                                             f"(spread={result.get('stance_alpha_spread')})"}
 
+    # Significance ENFORCE gate (config#1426 Phase 4) — default OFF. Blocks the
+    # live promotion when the best-vs-worst stance mean-alpha difference is not
+    # statistically significant (two-sample bootstrap CI includes zero →
+    # would_block), or the verdict couldn't be computed (conservative block).
+    # Enforce can only BLOCK a promotion the live gate already allowed.
+    if bool(_cfg.get("enforce_significance", False)):
+        from optimizer.significance_observe import significance_would_block
+        verdict = result.get("significance_observe")
+        if significance_would_block(verdict):
+            logger.info(
+                "stance_sizing: significance enforce BLOCKED promotion (config#1426)"
+            )
+            return {
+                "applied": False,
+                "reason": "stance_sizing: blocked by significance enforce "
+                          "(config#1426) — undefended evidence",
+                "observe_verdict": verdict,
+            }
+
     s3 = boto3.client("s3")
     try:
         obj = s3.get_object(Bucket=bucket, Key=S3_PARAMS_KEY)

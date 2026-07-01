@@ -272,6 +272,25 @@ def apply(result: dict, bucket: str, run_date: str | None = None) -> dict:
                       f"recent_mean={result.get('recent_mean_ic')})",
         }
 
+    # Significance ENFORCE gate (config#1426 Phase 4) — default OFF. Blocks the
+    # live promotion when the IC's bootstrap CI does not exclude zero
+    # (would_block) — or the verdict couldn't be computed (conservative block).
+    # No effect-size floor: the p_up sizing overlay is clamped/reversible.
+    # Enforce can only BLOCK a promotion the live gate already allowed.
+    if bool(_cfg.get("enforce_significance", False)):
+        from optimizer.significance_observe import significance_would_block
+        verdict = result.get("significance_observe")
+        if significance_would_block(verdict):
+            logger.info(
+                "predictor_sizing: significance enforce BLOCKED promotion (config#1426)"
+            )
+            return {
+                "applied": False,
+                "reason": "predictor_sizing: blocked by significance enforce "
+                          "(config#1426) — undefended evidence",
+                "observe_verdict": verdict,
+            }
+
     s3 = boto3.client("s3")
     try:
         obj = s3.get_object(Bucket=bucket, Key=S3_PARAMS_KEY)
