@@ -374,8 +374,12 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
-        assert "@v0.72.0" in text, (
-            "nousergon-lib should pin to v0.72.0 — the cscv_pbo lift into "
+        assert "@v0.77.1" in text, (
+            "nousergon-lib should pin to v0.77.1 — the HorizonPolicy chokepoint "
+            "(nousergon_lib.quant.horizons + the outcome_record contract, "
+            "config#1483 Phase 1 / nousergon-lib#147) consumed by the "
+            "config#1528 optimizer cutover. "
+            "Prior: v0.72.0 — the cscv_pbo lift into "
             "nousergon_lib.quant.stats.pbo (config#1318 / nousergon-lib#140), "
             "which analysis/pbo.py now re-exports. "
             "Prior: v0.70.0 — the lifted experiment config resolver crossing "

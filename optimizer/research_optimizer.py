@@ -31,6 +31,7 @@ from nousergon_lib.eval_artifacts import (
     eval_latest_key,
     new_eval_run_id,
 )
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
 import boto3
 import pandas as pd
@@ -39,6 +40,13 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 S3_PARAMS_KEY = "config/research_params.json"
+
+# Canonical beat-SPY outcome column, resolved from the fleet HorizonPolicy
+# chokepoint (config#1483/#1528) — never a hardcoded horizon-suffixed literal.
+# Outcome data is long-format (score_performance_outcomes), attached upstream
+# by analysis.outcome_store.attach_outcomes under this name.
+_BEAT = DEFAULT_POLICY.outcome_columns(DEFAULT_POLICY.primary_horizon).beat_spy
+_CORR_KEY = f"corr_{_BEAT}"
 
 # Factory defaults — match universe.yaml research_params section.
 FACTORY_DEFAULTS = {
@@ -152,15 +160,16 @@ def compute_boost_correlations(
     Correlate individual signal boosts with beat_spy outcomes.
 
     Loads boost values (short_interest_adj, institutional_boost) from signals.json
-    and computes Pearson correlation with the canonical beat_spy_21d outcome
-    (config#1456 — the 10d/30d horizons were retired in the canonical-alpha cutover).
+    and computes Pearson correlation with the canonical primary-horizon beat-SPY
+    outcome (config#1456 retired 10d/30d; config#1483/#1528 made the horizon a
+    HorizonPolicy parameter).
 
     Returns dict with per-boost correlation data and sample sizes.
     """
     if df is None or df.empty:
         return {"status": "insufficient_data", "note": "No score_performance data"}
 
-    populated = df[df["beat_spy_21d"].notna()].copy()
+    populated = df[df[_BEAT].notna()].copy()
     min_samples = _cfg.get("min_samples", _MIN_SAMPLES)
     if len(populated) < min_samples:
         return {
@@ -203,13 +212,13 @@ def compute_boost_correlations(
     for col in boost_cols:
         if col not in merged.columns:
             continue
-        valid = merged[[col, "beat_spy_21d"]].dropna()
+        valid = merged[[col, _BEAT]].dropna()
         nonzero = valid[valid[col] != 0]
 
-        corr_21d = float(valid[col].corr(valid["beat_spy_21d"])) if len(valid) >= 20 else None
+        corr_21d = float(valid[col].corr(valid[_BEAT])) if len(valid) >= 20 else None
 
         correlations[col] = {
-            "corr_beat_spy_21d": round(corr_21d, 4) if corr_21d is not None else None,
+            _CORR_KEY: round(corr_21d, 4) if corr_21d is not None else None,
             "n_total": len(valid),
             "n_nonzero": len(nonzero),
             "mean_when_nonzero": round(float(nonzero[col].mean()), 3) if len(nonzero) > 0 else None,
@@ -258,7 +267,7 @@ def recommend(
 
     # Short interest: if correlation is positive, boosts are working → keep/increase
     si_corr = correlations.get("short_interest_adj", {})
-    si_c21 = si_corr.get("corr_beat_spy_21d")
+    si_c21 = si_corr.get(_CORR_KEY)
     if si_c21 is not None and si_corr.get("n_nonzero", 0) >= 10:
         if si_c21 > 0.05:
             # Positive correlation — increase boosts slightly
@@ -275,7 +284,7 @@ def recommend(
 
     # Institutional boost: same logic
     inst_corr = correlations.get("institutional_boost", {})
-    inst_c21 = inst_corr.get("corr_beat_spy_21d")
+    inst_c21 = inst_corr.get(_CORR_KEY)
     if inst_c21 is not None and inst_corr.get("n_nonzero", 0) >= 10:
         if inst_c21 > 0.05:
             current_val = current_params.get("institutional_boost", FACTORY_DEFAULTS["institutional_boost"])

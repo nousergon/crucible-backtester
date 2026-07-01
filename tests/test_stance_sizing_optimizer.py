@@ -32,17 +32,33 @@ def _reset():
 def _make_db(*, with_stance: bool, rows: list[tuple] | None = None) -> str:
     """rows: (date, symbol, stance, return, spy_return).
 
-    config#1451/#1452: the optimizer now reads the canonical `log_alpha_21d`
-    keyed by `score_date` (the retired 10d horizon is dark). We keep the
-    (return, spy_return) tuple interface and store alpha = return − spy_return
-    as `log_alpha_21d`, so the test-data builders are unchanged.
+    config#1483/#1528: the optimizer reads the canonical per-signal alpha from
+    the LONG-FORMAT ``score_performance_outcomes`` store (HorizonPolicy primary
+    horizon) joined to ``score_performance.stance``. The fixture dual-writes
+    both representations from the same (return, spy_return) truth — alpha =
+    return − spy_return — mirroring the alpha-engine-data producer, so the
+    test-data builders are unchanged.
     """
+    from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
+    primary = DEFAULT_POLICY.primary_horizon
     f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     conn = sqlite3.connect(f.name)
     cols = "score_date TEXT, symbol TEXT, log_alpha_21d REAL"
     if with_stance:
         cols += ", stance TEXT"
     conn.execute(f"CREATE TABLE score_performance ({cols})")
+    conn.execute(
+        """CREATE TABLE score_performance_outcomes (
+            id INTEGER PRIMARY KEY, signal_id TEXT NOT NULL,
+            symbol TEXT NOT NULL, score_date TEXT NOT NULL,
+            horizon_days INTEGER NOT NULL, beat_spy INTEGER,
+            stock_return REAL, spy_return REAL, log_alpha REAL,
+            is_primary INTEGER NOT NULL, resolved_at TEXT NOT NULL,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(signal_id, horizon_days)
+        )"""
+    )
     for r in (rows or []):
         d, sym, stance, r10, spy10 = r
         alpha = (r10 - spy10) if (r10 is not None and spy10 is not None) else None
@@ -56,6 +72,14 @@ def _make_db(*, with_stance: bool, rows: list[tuple] | None = None) -> str:
                 "INSERT INTO score_performance "
                 "(score_date, symbol, log_alpha_21d) "
                 "VALUES (?,?,?)", (d, sym, alpha))
+        if alpha is not None:
+            conn.execute(
+                "INSERT INTO score_performance_outcomes "
+                "(signal_id, symbol, score_date, horizon_days, beat_spy, "
+                " stock_return, spy_return, log_alpha, is_primary, resolved_at) "
+                "VALUES (?,?,?,?,?,?,?,?,1,'2026-06-27T00:00:00+00:00')",
+                (f"{sym}:{d}", sym, d, primary,
+                 1 if r10 > spy10 else 0, r10, spy10, round(alpha, 6)))
     conn.commit()
     conn.close()
     return f.name

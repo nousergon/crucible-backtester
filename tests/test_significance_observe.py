@@ -79,18 +79,28 @@ class TestICSignificanceVerdict:
 
 # ── observe_weight_optimizer ─────────────────────────────────────────────────
 
+# The policy-derived continuous fit-target columns (config#1483/#1528): the
+# canonical primary-horizon log-alpha + the diagnostic short-horizon return —
+# the same defaults observe_weight_optimizer now resolves from HorizonPolicy.
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
+_TARGET_COLS = tuple(
+    DEFAULT_POLICY.skill_target_column(h) for h in DEFAULT_POLICY.all_horizons
+)
+
+
 def _make_test_set(n: int, *, signal: bool, seed: int) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     quant = rng.normal(size=n)
     if signal:
-        ret10 = quant * 0.5 + rng.normal(0, 0.5, size=n)
+        primary_ret = quant * 0.5 + rng.normal(0, 0.5, size=n)
     else:
-        ret10 = rng.normal(size=n)  # independent of quant
+        primary_ret = rng.normal(size=n)  # independent of quant
     return pd.DataFrame({
         "quant_score": quant,
         "qual_score": rng.normal(size=n),  # always null
-        "return_10d": ret10,
-        "return_30d": ret10 + rng.normal(0, 1.0, size=n),
+        _TARGET_COLS[0]: primary_ret,
+        _TARGET_COLS[1]: primary_ret + rng.normal(0, 1.0, size=n),
     })
 
 
@@ -113,10 +123,10 @@ class TestObserveWeightOptimizer:
         assert rec["enforced"] is False
 
     def test_missing_return_column_is_handled(self):
-        ts = _make_test_set(60, signal=True, seed=4).drop(columns=["return_30d"])
-        rec = observe_weight_optimizer(ts, self.SUB_COLS, return_cols=("return_10d", "return_30d"))
+        ts = _make_test_set(60, signal=True, seed=4).drop(columns=[_TARGET_COLS[1]])
+        rec = observe_weight_optimizer(ts, self.SUB_COLS, return_cols=_TARGET_COLS)
         q = rec["detail"]["per_subscore"]["quant"]["horizons"]
-        assert q["return_30d"]["status"] == "missing_column"
+        assert q[_TARGET_COLS[1]]["status"] == "missing_column"
 
 
 # ── build_observe_record ─────────────────────────────────────────────────────
