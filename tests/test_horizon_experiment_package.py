@@ -60,21 +60,33 @@ def test_horizon_experiment_id_selects_slot(tmp_path, monkeypatch):
 
 
 def test_horizon_falls_back_to_legacy_when_no_package(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    cfg_repo = home / "alpha-engine-config"
-    _write(cfg_repo / "predictor" / "predictor.yaml", {"labeling": {"forward_days": 7}})
-    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    # Uses search_paths (not a Path.home patch): resolve_experiment_config's
+    # candidate list also includes a repo-root-relative sibling-clone root
+    # (repo_root.parent/alpha-engine-config, config#1042's "repo-parent
+    # clone" case) that a Path.home patch can't reach. On a dev machine that
+    # actually clones alpha-engine-config as a sibling of this repo (the
+    # standard ~/Development layout), that candidate resolves to the REAL
+    # config repo's experiments/reference/predictor/predictor.yaml and leaks
+    # its real forward_days into this test BEFORE the tmp-path legacy
+    # candidate is ever reached — the two tests above happen to pass only
+    # because their expected value already matches the experiment-package
+    # candidate that wins first. search_paths is exposed by
+    # _load_active_horizon_days precisely so tests don't need to stub
+    # pathlib/repo-layout internals at all.
+    legacy_path = tmp_path / "alpha-engine-config" / "predictor" / "predictor.yaml"
+    _write(legacy_path, {"labeling": {"forward_days": 7}})
     monkeypatch.delenv("ALPHA_ENGINE_EXPERIMENT_ID", raising=False)
 
-    assert pipeline_common._load_active_horizon_days() == 7
+    assert pipeline_common._load_active_horizon_days(search_paths=[legacy_path]) == 7
 
 
 def test_horizon_default_when_nothing_resolves(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    # See test_horizon_falls_back_to_legacy_when_no_package: search_paths
+    # sidesteps the repo-root-relative candidate a Path.home patch can't reach
+    # on a machine with a real sibling alpha-engine-config clone.
     monkeypatch.delenv("ALPHA_ENGINE_EXPERIMENT_ID", raising=False)
 
-    assert pipeline_common._load_active_horizon_days(default=99) == 99
+    assert pipeline_common._load_active_horizon_days(default=99, search_paths=[]) == 99
 
 
 # ── pipeline_common._load_label_barrier_config (config#723) ───────────────────
