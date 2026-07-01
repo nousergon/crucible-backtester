@@ -50,9 +50,9 @@ def load_with_subscores_and_regime(db_path: str) -> pd.DataFrame:
 
     Returns a DataFrame with at minimum:
       - market_regime (str | NaN for pre-migration rows)
-      - return_10d, spy_10d_return (arithmetic; converted to log alpha downstream)
-      - return_30d, spy_30d_return (arithmetic; same)
-      - beat_spy_10d, beat_spy_30d (booleans for hit rate)
+      - return_5d, spy_5d_return (arithmetic; converted to log alpha downstream)
+      - return_21d, spy_21d_return (arithmetic; same)
+      - beat_spy_5d, beat_spy_21d (booleans for hit rate)
 
     Pre-migration rows with NULL market_regime are kept in the
     DataFrame but filtered out at the per-regime grouping stage —

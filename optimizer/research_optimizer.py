@@ -152,14 +152,15 @@ def compute_boost_correlations(
     Correlate individual signal boosts with beat_spy outcomes.
 
     Loads boost values (short_interest_adj, institutional_boost) from signals.json
-    and computes Pearson correlation with beat_spy_10d / beat_spy_30d.
+    and computes Pearson correlation with the canonical beat_spy_21d outcome
+    (config#1456 — the 10d/30d horizons were retired in the canonical-alpha cutover).
 
     Returns dict with per-boost correlation data and sample sizes.
     """
     if df is None or df.empty:
         return {"status": "insufficient_data", "note": "No score_performance data"}
 
-    populated = df[df["beat_spy_10d"].notna()].copy()
+    populated = df[df["beat_spy_21d"].notna()].copy()
     min_samples = _cfg.get("min_samples", _MIN_SAMPLES)
     if len(populated) < min_samples:
         return {
@@ -202,17 +203,13 @@ def compute_boost_correlations(
     for col in boost_cols:
         if col not in merged.columns:
             continue
-        valid = merged[[col, "beat_spy_10d"]].dropna()
+        valid = merged[[col, "beat_spy_21d"]].dropna()
         nonzero = valid[valid[col] != 0]
 
-        corr_10d = float(valid[col].corr(valid["beat_spy_10d"])) if len(valid) >= 20 else None
-
-        valid_30d = merged[[col, "beat_spy_30d"]].dropna() if "beat_spy_30d" in merged.columns else pd.DataFrame()
-        corr_30d = float(valid_30d[col].corr(valid_30d["beat_spy_30d"])) if len(valid_30d) >= 20 else None
+        corr_21d = float(valid[col].corr(valid["beat_spy_21d"])) if len(valid) >= 20 else None
 
         correlations[col] = {
-            "corr_beat_spy_10d": round(corr_10d, 4) if corr_10d is not None else None,
-            "corr_beat_spy_30d": round(corr_30d, 4) if corr_30d is not None else None,
+            "corr_beat_spy_21d": round(corr_21d, 4) if corr_21d is not None else None,
             "n_total": len(valid),
             "n_nonzero": len(nonzero),
             "mean_when_nonzero": round(float(nonzero[col].mean()), 3) if len(nonzero) > 0 else None,
@@ -261,15 +258,15 @@ def recommend(
 
     # Short interest: if correlation is positive, boosts are working → keep/increase
     si_corr = correlations.get("short_interest_adj", {})
-    si_c10 = si_corr.get("corr_beat_spy_10d")
-    if si_c10 is not None and si_corr.get("n_nonzero", 0) >= 10:
-        if si_c10 > 0.05:
+    si_c21 = si_corr.get("corr_beat_spy_21d")
+    if si_c21 is not None and si_corr.get("n_nonzero", 0) >= 10:
+        if si_c21 > 0.05:
             # Positive correlation — increase boosts slightly
             for key in ("short_interest_buy_boost", "short_interest_high_boost"):
                 current_val = current_params.get(key, FACTORY_DEFAULTS[key])
                 target = current_val * 1.15
                 recommended[key] = round(current_val * (1 - blend) + target * blend, 2)
-        elif si_c10 < -0.05:
+        elif si_c21 < -0.05:
             # Negative correlation — reduce boosts
             for key in ("short_interest_buy_boost", "short_interest_high_boost"):
                 current_val = current_params.get(key, FACTORY_DEFAULTS[key])
@@ -278,13 +275,13 @@ def recommend(
 
     # Institutional boost: same logic
     inst_corr = correlations.get("institutional_boost", {})
-    inst_c10 = inst_corr.get("corr_beat_spy_10d")
-    if inst_c10 is not None and inst_corr.get("n_nonzero", 0) >= 10:
-        if inst_c10 > 0.05:
+    inst_c21 = inst_corr.get("corr_beat_spy_21d")
+    if inst_c21 is not None and inst_corr.get("n_nonzero", 0) >= 10:
+        if inst_c21 > 0.05:
             current_val = current_params.get("institutional_boost", FACTORY_DEFAULTS["institutional_boost"])
             target = current_val * 1.15
             recommended["institutional_boost"] = round(current_val * (1 - blend) + target * blend, 2)
-        elif inst_c10 < -0.05:
+        elif inst_c21 < -0.05:
             current_val = current_params.get("institutional_boost", FACTORY_DEFAULTS["institutional_boost"])
             target = current_val * 0.85
             recommended["institutional_boost"] = round(current_val * (1 - blend) + target * blend, 2)

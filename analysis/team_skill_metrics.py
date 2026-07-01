@@ -25,7 +25,7 @@ Outputs:
   - team_metrics: dict keyed by team_id with ic / expectancy / excursion
     / alpha_vs_ew_high_vol / alpha_vs_beta_spy sub-results
   - calibration_diagnostics: result of compute_calibration on the
-    portfolio-wide (score → beat_spy_10d) corpus
+    portfolio-wide (score → beat_spy_21d) corpus
   - action_entropy / excursion_summary at portfolio level: optional,
     computed when the requisite inputs are provided
 
@@ -178,8 +178,8 @@ def _compute_team_ic(
     ]
     if df.empty:
         return {"status": "insufficient_data", "reason": "no score_performance match"}
-    # Prefer return_10d, fall back to return_5d.
-    fwd_col = "return_10d" if "return_10d" in df.columns and df["return_10d"].notna().any() else "return_5d"
+    # config#1456: prefer canonical return_21d, fall back to return_5d.
+    fwd_col = "return_21d" if "return_21d" in df.columns and df["return_21d"].notna().any() else "return_5d"
     return compute_ic(
         conviction=df["score"].to_numpy(),
         forward_return=df[fwd_col].to_numpy(),
@@ -198,7 +198,7 @@ def _compute_team_expectancy(picks: list[dict]) -> dict:
 def compute_portfolio_calibration(
     score_performance_df: pd.DataFrame | None,
     score_col: str = "score",
-    outcome_col: str = "beat_spy_10d",
+    outcome_col: str = "beat_spy_21d",
 ) -> dict:
     """Reliability diagram on portfolio-wide (score → outcome) corpus.
 

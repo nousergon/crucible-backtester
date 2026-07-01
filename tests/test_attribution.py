@@ -22,41 +22,35 @@ def _make_df(
 ) -> pd.DataFrame:
     """Build a synthetic score_performance-shaped DataFrame.
 
-    Sub-scores are noisy linear predictors of the beat_spy_10d / 30d outcome.
-    quant_signal_strength > qual_signal_strength is the contract we
-    assert on in the ranking tests.
+    Sub-scores are noisy linear predictors of the canonical beat_spy_21d
+    outcome (config#1456). quant_signal_strength > qual_signal_strength is
+    the contract we assert on in the ranking tests.
     """
     rng = np.random.default_rng(seed)
     quant = rng.normal(50, 10, n)
     qual = rng.normal(50, 10, n)
-    noise_10 = rng.normal(0, 1, n)
-    noise_30 = rng.normal(0, 1, n)
-    latent_10 = quant_signal_strength * (quant - 50) + qual_signal_strength * (qual - 50) + noise_10
-    latent_30 = quant_signal_strength * (quant - 50) + qual_signal_strength * (qual - 50) + noise_30
+    noise_21 = rng.normal(0, 1, n)
+    latent_21 = quant_signal_strength * (quant - 50) + qual_signal_strength * (qual - 50) + noise_21
 
-    beat_10 = (latent_10 > 0).astype(int)
-    beat_30 = (latent_30 > 0).astype(int)
-    ret_10 = latent_10 / 10
-    ret_30 = latent_30 / 10
+    beat_21 = (latent_21 > 0).astype(int)
+    ret_21 = latent_21 / 10
 
     df = pd.DataFrame({
         "symbol": [f"T{i % 25}" for i in range(n)],
         "quant_score": quant,
         "qual_score": qual,
-        "beat_spy_10d": beat_10,
-        "beat_spy_30d": beat_30,
-        "return_10d": ret_10,
-        "return_30d": ret_30,
+        "beat_spy_21d": beat_21,
+        "return_21d": ret_21,
     })
 
     if with_predictor:
-        df["p_up"] = rng.uniform(0.3, 0.8, n) + (latent_10 / 50)
+        df["p_up"] = rng.uniform(0.3, 0.8, n) + (latent_21 / 50)
         df["p_down"] = 1 - df["p_up"]
         df["prediction_confidence"] = rng.uniform(0.5, 0.9, n)
         df["predicted_direction"] = np.where(df["p_up"] > 0.5, "UP", "DOWN")
 
     if with_correct:
-        df["correct"] = (df["beat_spy_10d"] == 1).astype(int)
+        df["correct"] = (df["beat_spy_21d"] == 1).astype(int)
 
     return df
 
@@ -69,11 +63,10 @@ def test_compute_attribution_ok_with_sufficient_rows():
     assert result["rows_analyzed"] == 200
     assert set(result["correlations"].keys()) == {"quant", "qual"}
     for label in SUB_SCORES:
-        assert "beat_spy_10d" in result["correlations"][label]
-        assert isinstance(result["correlations"][label]["beat_spy_10d"], float)
-    assert result["ranking_10d"][0] == "quant"
-    assert result["ranking_30d"][0] == "quant"
-    assert result["p_values"]["quant"]["beat_spy_10d"] is not None
+        assert "beat_spy_21d" in result["correlations"][label]
+        assert isinstance(result["correlations"][label]["beat_spy_21d"], float)
+    assert result["ranking_21d"][0] == "quant"
+    assert result["p_values"]["quant"]["beat_spy_21d"] is not None
 
 
 def test_compute_attribution_insufficient_rows():
@@ -88,10 +81,8 @@ def test_compute_attribution_insufficient_rows():
 def test_compute_attribution_no_sub_score_columns():
     df = pd.DataFrame({
         "symbol": [f"T{i}" for i in range(150)],
-        "beat_spy_10d": [1] * 150,
-        "beat_spy_30d": [1] * 150,
-        "return_10d": [0.01] * 150,
-        "return_30d": [0.01] * 150,
+        "beat_spy_21d": [1] * 150,
+        "return_21d": [0.01] * 150,
     })
 
     result = compute_attribution(df)
@@ -100,11 +91,11 @@ def test_compute_attribution_no_sub_score_columns():
     assert "No sub-score columns" in result["note"]
 
 
-def test_compute_attribution_filters_nulls_in_beat_spy_10d():
+def test_compute_attribution_filters_nulls_in_beat_spy_21d():
     df = _make_df(n=120).copy()
-    df["beat_spy_10d"] = df["beat_spy_10d"].astype(float)
+    df["beat_spy_21d"] = df["beat_spy_21d"].astype(float)
     null_rows = _make_df(n=40, seed=11).copy()
-    null_rows["beat_spy_10d"] = float("nan")
+    null_rows["beat_spy_21d"] = float("nan")
     combined = pd.concat([df, null_rows], ignore_index=True)
 
     result = compute_attribution(combined)
@@ -118,8 +109,8 @@ def test_compute_attribution_with_predictor_columns():
     result = compute_attribution(df)
 
     assert result["status"] == "ok"
-    assert "beat_spy_10d" in result["predictor_correlation"]
-    assert result["predictor_correlation"]["beat_spy_10d"] is not None
+    assert "beat_spy_21d" in result["predictor_correlation"]
+    assert result["predictor_correlation"]["beat_spy_21d"] is not None
     assert result["predictor_hit_rate"] is not None
     assert 0.0 <= result["predictor_hit_rate"] <= 1.0
     assert result["predictor_hit_rate_ci_95"] is not None
@@ -131,10 +122,8 @@ def test_compute_attribution_resolves_sub_scores_from_dict_column():
     df = pd.DataFrame({
         "symbol": [f"T{i % 20}" for i in range(n)],
         "sub_scores": [{"quant": float(rng.uniform(40, 60)), "qual": float(rng.uniform(40, 60))} for _ in range(n)],
-        "beat_spy_10d": rng.integers(0, 2, n),
-        "beat_spy_30d": rng.integers(0, 2, n),
-        "return_10d": rng.normal(0, 0.05, n),
-        "return_30d": rng.normal(0, 0.05, n),
+        "beat_spy_21d": rng.integers(0, 2, n),
+        "return_21d": rng.normal(0, 0.05, n),
     })
 
     result = compute_attribution(df)
@@ -149,7 +138,7 @@ def test_compute_attribution_fdr_flag_present_on_correlations():
 
     assert result["status"] == "ok"
     for label in SUB_SCORES:
-        for target in ["beat_spy_10d", "beat_spy_30d", "return_10d", "return_30d"]:
+        for target in ["beat_spy_21d", "return_21d"]:
             key = f"{target}_fdr_significant"
             assert key in result["correlations"][label]
             assert isinstance(result["correlations"][label][key], (bool, np.bool_))
@@ -158,7 +147,7 @@ def test_compute_attribution_fdr_flag_present_on_correlations():
 def test_compute_attribution_predictor_hit_rate_falls_back_to_correct_5d():
     """Pre-2026-05-09 schema only has correct_5d — verify fallback."""
     df = _make_df(n=200, with_predictor=True)
-    df["correct_5d"] = (df["beat_spy_10d"] == 1).astype(int)
+    df["correct_5d"] = (df["beat_spy_21d"] == 1).astype(int)
     result = compute_attribution(df)
 
     assert result["status"] == "ok"
@@ -194,7 +183,7 @@ def _make_mv_df(
     """score_performance-shaped frame with a *known* linear data-generating
     process so the recovered standardized coefficients are checkable.
 
-    return_10d = quant_beta*z(quant) + qual_beta*z(qual)
+    return_21d = quant_beta*z(quant) + qual_beta*z(qual)
                  + regime_beta*1[bear] + small noise
     """
     rng = np.random.default_rng(seed)
@@ -214,10 +203,8 @@ def _make_mv_df(
         "score_date": pd.date_range("2026-01-01", periods=n, freq="h"),
         "quant_score": quant,
         "qual_score": qual,
-        "return_10d": latent,
-        "return_30d": latent + rng.normal(0, 0.05, n),
-        "beat_spy_10d": (latent > latent.mean()).astype(int),
-        "beat_spy_30d": (latent > latent.mean()).astype(int),
+        "return_21d": latent,
+        "beat_spy_21d": (latent > latent.mean()).astype(int),
     })
     if with_regime:
         df["market_regime"] = regimes
@@ -233,7 +220,7 @@ def test_multivariate_recovers_known_coefficients():
     assert result["status"] == "ok"
     mv = result["multivariate"]
     assert mv["status"] == "ok"
-    fit = mv["targets"]["return_10d"]
+    fit = mv["targets"]["return_21d"]
     assert fit["method"] == "multivariate_ols"
 
     coefs = fit["coefficients"]
@@ -257,7 +244,7 @@ def test_multivariate_includes_regime_dummies():
     regime_feats = [f for f in mv["feature_labels"] if f.startswith("regime=")]
     assert len(regime_feats) == 2
     # A target fit jointly carries a regime coefficient.
-    fit = mv["targets"]["return_10d"]
+    fit = mv["targets"]["return_21d"]
     assert any(k.startswith("regime=") for k in fit["coefficients"])
 
 
@@ -267,7 +254,7 @@ def test_multivariate_recovers_regime_effect():
     drop-first drops 'bear', so the bear effect surfaces as a negative
     coefficient on the retained bull/neutral dummies (relative to bear)."""
     df = _make_mv_df(n=600, quant_beta=0.5, qual_beta=0.2, regime_beta=0.6)
-    fit = compute_attribution(df)["multivariate"]["targets"]["return_10d"]
+    fit = compute_attribution(df)["multivariate"]["targets"]["return_21d"]
     regime_coefs = [v for k, v in fit["coefficients"].items() if k.startswith("regime=")]
     assert regime_coefs  # regime dummies present
     # At least one retained regime dummy carries a non-trivial effect.
@@ -284,9 +271,9 @@ def test_multivariate_falls_back_on_collinear_inputs():
     assert result["status"] == "ok"  # no crash
 
     mv = result["multivariate"]
-    target = mv["targets"]["return_10d"]
+    target = mv["targets"]["return_21d"]
     assert target["method"] == "univariate_fallback"
-    assert "return_10d" in (mv.get("targets_fell_back_to_univariate") or [])
+    assert "return_21d" in (mv.get("targets_fell_back_to_univariate") or [])
     # Fallback coefficients come from the retained univariate correlations.
     assert set(target["coefficients"].keys()) == {"quant", "qual"}
 
@@ -300,12 +287,12 @@ def test_multivariate_falls_back_on_low_n():
         small,
         {"quant": "quant_score", "qual": "qual_score"},
         fallback_correlations={
-            "quant": {"return_10d": 0.3},
-            "qual": {"return_10d": 0.1},
+            "quant": {"return_21d": 0.3},
+            "qual": {"return_21d": 0.1},
         },
     )
     # With regime dummies the design has 4 regressors; 35 rows < 10*4 floor.
-    fit = mv["targets"]["return_10d"]
+    fit = mv["targets"]["return_21d"]
     assert fit["method"] == "univariate_fallback"
 
 
@@ -315,7 +302,7 @@ def test_multivariate_works_without_regime_column():
     mv = compute_attribution(df)["multivariate"]
     assert mv["status"] == "ok"
     assert mv["regime_levels"] == []
-    fit = mv["targets"]["return_10d"]
+    fit = mv["targets"]["return_21d"]
     assert fit["method"] == "multivariate_ols"
     assert set(fit["coefficients"].keys()) == {"quant", "qual"}
 
@@ -328,8 +315,7 @@ def test_legacy_univariate_schema_preserved():
 
     # Legacy keys still present and well-formed.
     assert set(result["correlations"].keys()) == {"quant", "qual"}
-    assert result["ranking_10d"]
-    assert result["ranking_30d"]
+    assert result["ranking_21d"]
     assert "p_values" in result
     # New block added without removing the old contract.
     assert "multivariate" in result

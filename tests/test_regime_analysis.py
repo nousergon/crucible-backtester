@@ -36,10 +36,8 @@ def fresh_db(tmp_path: Path) -> str:
                 price_on_date REAL,
                 price_5d REAL, return_5d REAL, spy_5d_return REAL,
                 beat_spy_5d INTEGER, eval_date_5d TEXT,
-                price_10d REAL, return_10d REAL, spy_10d_return REAL,
-                beat_spy_10d INTEGER, eval_date_10d TEXT,
-                price_30d REAL, return_30d REAL, spy_30d_return REAL,
-                beat_spy_30d INTEGER, eval_date_30d TEXT,
+                return_21d REAL, spy_21d_return REAL,
+                beat_spy_21d INTEGER, eval_date_21d TEXT,
                 quant_score REAL, qual_score REAL,
                 conviction TEXT, sector_modifier REAL, market_regime TEXT,
                 UNIQUE(symbol, score_date)
@@ -88,10 +86,10 @@ class TestLoadWithRegime:
         _seed(fresh_db, [
             {"symbol": "AAPL", "score_date": "2026-05-01",
              "score": 78.0, "price_on_date": 200.0,
-             "beat_spy_10d": 1, "market_regime": "bull"},
+             "beat_spy_21d": 1, "market_regime": "bull"},
             {"symbol": "MSFT", "score_date": "2026-05-01",
              "score": 70.0, "price_on_date": 430.0,
-             "beat_spy_10d": 0, "market_regime": "bull"},
+             "beat_spy_21d": 0, "market_regime": "bull"},
         ])
         df = load_with_regime(fresh_db)
         assert isinstance(df["market_regime"], pd.Series)
@@ -136,21 +134,21 @@ class TestLoadWithRegime:
 class TestAccuracyByRegime:
 
     def _seed_rows_across_regimes(self, db: str, min_per_regime: int):
-        """Seed enough beat_spy_10d-populated rows in two regimes to clear
+        """Seed enough beat_spy_21d-populated rows in two regimes to clear
         signal_quality.MIN_SAMPLES."""
         rows = []
         for i in range(min_per_regime):
             rows.append({
                 "symbol": f"BULL{i}", "score_date": "2026-05-01",
                 "score": 75.0, "price_on_date": 100.0,
-                "beat_spy_10d": i % 2,
+                "beat_spy_21d": i % 2,
                 "market_regime": "bull",
             })
         for i in range(min_per_regime):
             rows.append({
                 "symbol": f"BEAR{i}", "score_date": "2026-04-15",
                 "score": 75.0, "price_on_date": 100.0,
-                "beat_spy_10d": (i + 1) % 2,
+                "beat_spy_21d": (i + 1) % 2,
                 "market_regime": "bear",
             })
         _seed(db, rows)
@@ -173,7 +171,7 @@ class TestAccuracyByRegime:
         _seed(fresh_db, [
             {"symbol": "AAPL", "score_date": "2026-05-01",
              "score": 75.0, "price_on_date": 200.0,
-             "beat_spy_10d": 1, "market_regime": "bull"},
+             "beat_spy_21d": 1, "market_regime": "bull"},
         ])
         df = load_with_regime(fresh_db)
         assert accuracy_by_regime(df) == []

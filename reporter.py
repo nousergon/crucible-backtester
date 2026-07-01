@@ -38,11 +38,9 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
 
         # score_performance counts
         sp_total = conn.execute("SELECT COUNT(*) FROM score_performance").fetchone()[0]
-        sp_with_10d = conn.execute(
-            "SELECT COUNT(*) FROM score_performance WHERE beat_spy_10d IS NOT NULL"
-        ).fetchone()[0]
-        sp_with_30d = conn.execute(
-            "SELECT COUNT(*) FROM score_performance WHERE beat_spy_30d IS NOT NULL"
+        # config#1456: canonical 21d horizon (10d/30d outcomes retired).
+        sp_with_21d = conn.execute(
+            "SELECT COUNT(*) FROM score_performance WHERE beat_spy_21d IS NOT NULL"
         ).fetchone()[0]
         sp_dates = conn.execute("SELECT COUNT(DISTINCT score_date) FROM score_performance").fetchone()[0]
         sp_earliest = conn.execute("SELECT MIN(score_date) FROM score_performance").fetchone()[0] or "—"
@@ -78,23 +76,23 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
         "",
         "| Optimizer | Metric | Progress | Status |",
         "|-----------|--------|----------|--------|",
-        f"| Signal quality | 10d returns | {_bar(sp_with_10d, 5)} | {'**Active**' if sp_with_10d >= 5 else 'Accumulating'} |",
-        f"| Scoring weights | 10d returns | {_bar(sp_with_10d, 43)} | {'**Active**' if sp_with_10d >= 43 else 'Accumulating'} |",
-        f"| Attribution | 10d returns | {_bar(sp_with_10d, 50)} | {'**Active**' if sp_with_10d >= 50 else 'Accumulating'} |",
+        f"| Signal quality | 21d returns | {_bar(sp_with_21d, 5)} | {'**Active**' if sp_with_21d >= 5 else 'Accumulating'} |",
+        f"| Scoring weights | 21d returns | {_bar(sp_with_21d, 43)} | {'**Active**' if sp_with_21d >= 43 else 'Accumulating'} |",
+        f"| Attribution | 21d returns | {_bar(sp_with_21d, 50)} | {'**Active**' if sp_with_21d >= 50 else 'Accumulating'} |",
         f"| Predictor veto | Resolved outcomes | {_bar(po_resolved, 20)} | {'**Active**' if po_resolved >= 20 else 'Accumulating'} |",
         f"| Research params | Signals | {_bar(sp_total, 200)} | {'**Active**' if sp_total >= 200 else 'Deferred'} |",
     ]
 
     # Add accuracy preview if we have any data
-    if sp_with_10d > 0:
+    if sp_with_21d > 0:
         try:
             import sqlite3
             conn = sqlite3.connect(db_path)
             beat = conn.execute(
-                "SELECT SUM(beat_spy_10d) FROM score_performance WHERE beat_spy_10d IS NOT NULL"
+                "SELECT SUM(beat_spy_21d) FROM score_performance WHERE beat_spy_21d IS NOT NULL"
             ).fetchone()[0] or 0
-            acc = beat / sp_with_10d * 100
-            lines.append(f"| **10d accuracy** | **Beat SPY** | **{acc:.0f}% ({int(beat)}/{sp_with_10d})** | {'✓ Above 55%' if acc >= 55 else '⚠ Below 55%'} |")
+            acc = beat / sp_with_21d * 100
+            lines.append(f"| **21d accuracy** | **Beat SPY** | **{acc:.0f}% ({int(beat)}/{sp_with_21d})** | {'✓ Above 55%' if acc >= 55 else '⚠ Below 55%'} |")
             conn.close()
         except Exception:
             pass
@@ -314,8 +312,8 @@ def _scorecard_key_metric(mod: dict) -> str:
     # Research: show composite scoring accuracy
     cs = comps.get("composite_scoring", {})
     cs_detail = cs.get("detail", {})
-    if "accuracy_10d" in cs_detail:
-        return f"10d accuracy: {cs_detail['accuracy_10d']}"
+    if "accuracy_21d" in cs_detail:
+        return f"21d accuracy: {cs_detail['accuracy_21d']}"
 
     # Predictor: show IC
     meta = comps.get("meta_model", {})
@@ -328,8 +326,8 @@ def _scorecard_key_metric(mod: dict) -> str:
     pf_detail = pf.get("detail", {})
     if "sharpe" in pf_detail:
         return f"Sharpe: {pf_detail['sharpe']}"
-    if "accuracy_10d" in pf_detail:
-        return f"accuracy: {pf_detail['accuracy_10d']}"
+    if "accuracy_21d" in pf_detail:
+        return f"accuracy: {pf_detail['accuracy_21d']}"
 
     return ""
 
@@ -1837,7 +1835,7 @@ def _section_signal_quality(sq: dict) -> list[str]:
         lines += [
             "",
             f"> **Insufficient data.** "
-            f"{sq.get('rows_10d_populated', 0)} rows with 10d returns populated "
+            f"{sq.get('rows_21d_populated', 0)} rows with 21d returns populated "
             f"(need {sq.get('rows_needed', 10)}). "
             "Results will be available after Week 4 (~200 populated rows).",
         ]
@@ -1845,18 +1843,16 @@ def _section_signal_quality(sq: dict) -> list[str]:
 
     overall = sq.get("overall", {})
     acc_5d = overall.get("accuracy_5d")
-    acc_10d = overall.get("accuracy_10d")
-    acc_30d = overall.get("accuracy_30d")
+    acc_21d = overall.get("accuracy_21d")
     n_5d = overall.get("n_5d", 0)
-    n_10d = overall.get("n_10d", 0)
-    n_30d = overall.get("n_30d", 0)
+    n_21d = overall.get("n_21d", 0)
 
     lines += [
         "",
-        f"| Metric | 5d | 10d | 30d |",
-        f"|--------|-----|-----|-----|",
-        f"| Accuracy vs SPY | {_pct(acc_5d)} (n={n_5d}) | {_pct(acc_10d)} (n={n_10d}) | {_pct(acc_30d)} (n={n_30d}) |",
-        f"| Avg alpha | {_alpha_pp(overall.get('avg_alpha_5d'))} | {_alpha_pp(overall.get('avg_alpha_10d'))} | {_alpha_pp(overall.get('avg_alpha_30d'))} |",
+        f"| Metric | 5d | 21d |",
+        f"|--------|-----|-----|",
+        f"| Accuracy vs SPY | {_pct(acc_5d)} (n={n_5d}) | {_pct(acc_21d)} (n={n_21d}) |",
+        f"| Avg alpha | {_alpha_pp(overall.get('avg_alpha_5d'))} | {_alpha_pp(overall.get('avg_alpha_21d'))} |",
         "",
         "> 50% = coin flip. 55%+ over 30+ signals suggests real alpha.",
     ]
@@ -1864,8 +1860,8 @@ def _section_signal_quality(sq: dict) -> list[str]:
     buckets = sq.get("by_score_bucket", [])
     if buckets:
         lines += ["", "### By score bucket", ""]
-        lines += ["| Bucket | Acc 5d | Acc 10d | Acc 30d | Avg α 10d | n | FDR |"]
-        lines += ["|--------|--------|---------|---------|-----------|---|-----|"]
+        lines += ["| Bucket | Acc 5d | Acc 21d | Avg α 21d | n | FDR |"]
+        lines += ["|--------|--------|---------|-----------|---|-----|"]
         has_exploratory = False
         has_fdr_exploratory = False
         for b in buckets:
@@ -1879,9 +1875,8 @@ def _section_signal_quality(sq: dict) -> list[str]:
                 has_fdr_exploratory = True
             lines.append(
                 f"| {b.get('bucket')} | {_pct(b.get('accuracy_5d'))}{star} | "
-                f"{_pct(b.get('accuracy_10d'))}{star} | "
-                f"{_pct(b.get('accuracy_30d'))}{star} | {_alpha_pp(b.get('avg_alpha_10d'))}{star} | "
-                f"{b.get('n_10d', 0)} | {fdr_tag} |"
+                f"{_pct(b.get('accuracy_21d'))}{star} | {_alpha_pp(b.get('avg_alpha_21d'))}{star} | "
+                f"{b.get('n_21d', 0)} | {fdr_tag} |"
             )
         if has_exploratory:
             lines += ["", "\\* exploratory — fewer than 20 samples, treat with caution"]
@@ -1891,14 +1886,13 @@ def _section_signal_quality(sq: dict) -> list[str]:
     sectors = sq.get("by_sector", [])
     if sectors:
         lines += ["", "### By sector", ""]
-        lines += ["| Sector | Acc 5d | Acc 10d | Acc 30d | Avg α 10d | n |"]
-        lines += ["|--------|--------|---------|---------|-----------|---|"]
+        lines += ["| Sector | Acc 5d | Acc 21d | Avg α 21d | n |"]
+        lines += ["|--------|--------|---------|-----------|---|"]
         for s in sectors:
             lines.append(
                 f"| {s.get('sector', '?')} | {_pct(s.get('accuracy_5d'))} | "
-                f"{_pct(s.get('accuracy_10d'))} | "
-                f"{_pct(s.get('accuracy_30d'))} | {_alpha_pp(s.get('avg_alpha_10d'))} | "
-                f"{s.get('n_10d', 0)} |"
+                f"{_pct(s.get('accuracy_21d'))} | {_alpha_pp(s.get('avg_alpha_21d'))} | "
+                f"{s.get('n_21d', 0)} |"
             )
 
     # Per-stance attribution (stance taxonomy arc PR 4, 2026-05-11).
@@ -1910,14 +1904,13 @@ def _section_signal_quality(sq: dict) -> list[str]:
     stances = sq.get("by_stance", [])
     if stances:
         lines += ["", "### By stance", ""]
-        lines += ["| Stance | Acc 5d | Acc 10d | Acc 30d | Avg α 10d | n |"]
-        lines += ["|--------|--------|---------|---------|-----------|---|"]
+        lines += ["| Stance | Acc 5d | Acc 21d | Avg α 21d | n |"]
+        lines += ["|--------|--------|---------|-----------|---|"]
         for s in stances:
             lines.append(
                 f"| {s.get('stance', '?')} | {_pct(s.get('accuracy_5d'))} | "
-                f"{_pct(s.get('accuracy_10d'))} | "
-                f"{_pct(s.get('accuracy_30d'))} | {_alpha_pp(s.get('avg_alpha_10d'))} | "
-                f"{s.get('n_10d', 0)} |"
+                f"{_pct(s.get('accuracy_21d'))} | {_alpha_pp(s.get('avg_alpha_21d'))} | "
+                f"{s.get('n_21d', 0)} |"
             )
 
     return lines
@@ -1929,13 +1922,12 @@ def _section_score_analysis(rows: list[dict]) -> list[str]:
         lines += ["", "> Deferred until Week 4+ (insufficient data)."]
         return lines
 
-    lines += ["", "| Min score | Acc 5d | Acc 10d | Acc 30d | n |"]
-    lines += ["|-----------|--------|---------|---------|---|"]
+    lines += ["", "| Min score | Acc 5d | Acc 21d | n |"]
+    lines += ["|-----------|--------|---------|---|"]
     for r in rows:
         lines.append(
             f"| {r.get('threshold')} | {_pct(r.get('accuracy_5d'))} | "
-            f"{_pct(r.get('accuracy_10d'))} | "
-            f"{_pct(r.get('accuracy_30d'))} | {r.get('n_10d', 0)} |"
+            f"{_pct(r.get('accuracy_21d'))} | {r.get('n_21d', 0)} |"
         )
     return lines
 
@@ -1946,13 +1938,12 @@ def _section_regime(rows: list[dict]) -> list[str]:
         lines += ["", "> Deferred until Week 4+ (insufficient data)."]
         return lines
 
-    lines += ["", "| Regime | Acc 5d | Acc 10d | Acc 30d | n |"]
-    lines += ["|--------|--------|---------|---------|---|"]
+    lines += ["", "| Regime | Acc 5d | Acc 21d | n |"]
+    lines += ["|--------|--------|---------|---|"]
     for r in rows:
         lines.append(
             f"| {r.get('market_regime')} | {_pct(r.get('accuracy_5d'))} | "
-            f"{_pct(r.get('accuracy_10d'))} | "
-            f"{_pct(r.get('accuracy_30d'))} | {r.get('n_10d', 0)} |"
+            f"{_pct(r.get('accuracy_21d'))} | {r.get('n_21d', 0)} |"
         )
     return lines
 
@@ -1979,27 +1970,27 @@ def _section_attribution(attr: dict) -> list[str]:
     mv = attr.get("multivariate") or {}
     mv_targets = mv.get("targets") or {}
     if mv.get("status") == "ok" and mv_targets:
-        b10 = mv_targets.get("beat_spy_10d", {})
+        b21 = mv_targets.get("beat_spy_21d", {})
         lines += [
             "",
-            "### Multivariate attribution (joint regression → beat_spy_10d)",
+            "### Multivariate attribution (joint regression → beat_spy_21d)",
             "",
             "Standardized partial coefficients from a joint OLS on sub-scores "
             "+ market_regime (each input held against the others).",
             "",
         ]
-        if b10.get("method") == "multivariate_ols":
+        if b21.get("method") == "multivariate_ols":
             lines += [
                 "| Input | Std. coefficient |",
                 "|-------|------------------|",
             ]
-            for label, coef in (b10.get("coefficients") or {}).items():
+            for label, coef in (b21.get("coefficients") or {}).items():
                 lines.append(f"| {label} | {_fmt(coef)} |")
-            if b10.get("r_squared") is not None:
-                lines += ["", f"R² (10d): {_fmt(b10.get('r_squared'))}"]
+            if b21.get("r_squared") is not None:
+                lines += ["", f"R² (21d): {_fmt(b21.get('r_squared'))}"]
         else:
             lines += [
-                f"> beat_spy_10d fell back to univariate: {b10.get('note', '')}",
+                f"> beat_spy_21d fell back to univariate: {b21.get('note', '')}",
             ]
         fell_back = mv.get("targets_fell_back_to_univariate")
         if fell_back:
@@ -2008,9 +1999,9 @@ def _section_attribution(attr: dict) -> list[str]:
                 f"> Targets using univariate fallback (collinear/low-N): "
                 f"{', '.join(fell_back)}",
             ]
-        mv_rank = mv.get("ranking_10d") or []
+        mv_rank = mv.get("ranking_21d") or []
         if mv_rank:
-            lines += ["", f"**Strongest joint driver (10d):** {mv_rank[0]}"]
+            lines += ["", f"**Strongest joint driver (21d):** {mv_rank[0]}"]
     elif mv.get("status") == "fallback":
         lines += [
             "",
@@ -2023,19 +2014,17 @@ def _section_attribution(attr: dict) -> list[str]:
         "",
         "### Univariate correlation with beat_spy (context / fallback)",
         "",
-        "| Sub-score | Corr (10d) | Corr (30d) | FDR sig (10d) | FDR sig (30d) |",
-        "|-----------|------------|------------|---------------|---------------|",
+        "| Sub-score | Corr (21d) | FDR sig (21d) |",
+        "|-----------|------------|---------------|",
     ]
     for label, corrs in attr.get("correlations", {}).items():
-        c10 = corrs.get("beat_spy_10d")
-        c30 = corrs.get("beat_spy_30d")
-        fdr_10 = "Yes" if corrs.get("beat_spy_10d_fdr_significant") else "No"
-        fdr_30 = "Yes" if corrs.get("beat_spy_30d_fdr_significant") else "No"
-        lines.append(f"| {label} | {_fmt(c10)} | {_fmt(c30)} | {fdr_10} | {fdr_30} |")
+        c21 = corrs.get("beat_spy_21d")
+        fdr_21 = "Yes" if corrs.get("beat_spy_21d_fdr_significant") else "No"
+        lines.append(f"| {label} | {_fmt(c21)} | {fdr_21} |")
 
-    ranking_10d = attr.get("ranking_10d", [])
-    if ranking_10d:
-        lines += ["", f"**Strongest univariate predictor (10d):** {ranking_10d[0]}"]
+    ranking_21d = attr.get("ranking_21d", [])
+    if ranking_21d:
+        lines += ["", f"**Strongest univariate predictor (21d):** {ranking_21d[0]}"]
 
     fdr_ns = attr.get("fdr_non_significant")
     if fdr_ns:
@@ -2428,17 +2417,17 @@ def _section_weight_recommendation(result: dict) -> list[str]:
         "",
         f"_n={n} signals · confidence: {confidence}{blend_str}_",
         "",
-        "| Sub-score | Current | Corr (10d) | Corr (30d) | Suggested | Change |",
-        "|-----------|---------|------------|------------|-----------|--------|",
+        "| Sub-score | Current | Corr (5d) | Corr (21d) | Suggested | Change |",
+        "|-----------|---------|-----------|------------|-----------|--------|",
     ]
     for k in ("news", "research"):
         corr = correlations.get(k, {})
-        c10 = corr.get("beat_spy_10d")
-        c30 = corr.get("beat_spy_30d")
+        c5 = corr.get("beat_spy_5d")
+        c21 = corr.get("beat_spy_21d")
         chg = changes.get(k, 0)
         chg_str = f"+{chg:.1%}" if chg > 0 else f"{chg:.1%}"
         lines.append(
-            f"| {k} | {_pct(current.get(k))} | {_fmt(c10)} | {_fmt(c30)} "
+            f"| {k} | {_pct(current.get(k))} | {_fmt(c5)} | {_fmt(c21)} "
             f"| {_pct(suggested.get(k))} | {chg_str} |"
         )
 

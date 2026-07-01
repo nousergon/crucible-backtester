@@ -45,8 +45,8 @@ def compute_sample_size_adequacy(
     """Per-analysis finalized-signal count vs documented floor (config#1151).
 
     Args:
-        signal_quality: the ``compute_accuracy`` result ({status, overall:{n_10d,
-            n_30d, ...}}). The realized-outcome count the accuracy grade used.
+        signal_quality: the ``compute_accuracy`` result ({status, overall:{n_21d,
+            ...}}). The realized-outcome count the accuracy grade used.
         attribution: optional ``attribution`` result; its finalized-row count
             (``rows_analyzed`` — the key ``compute_attribution`` actually emits;
             ``n`` / ``n_samples`` accepted as fallbacks) is compared to
@@ -61,9 +61,8 @@ def compute_sample_size_adequacy(
     sq = signal_quality or {}
     if sq.get("status") == "ok":
         overall = sq.get("overall") or {}
-        # Prefer the longer-horizon realized slice (more decision-relevant at the
-        # 21d canonical horizon); fall back to the 10d count.
-        n_sq = overall.get("n_30d") or overall.get("n_10d")
+        # Canonical 21d horizon realized-signal count (config#1456 collapse).
+        n_sq = overall.get("n_21d")
         if n_sq is not None:
             per_analysis["signal_quality"] = {
                 "n": int(n_sq), "floor": SIGNAL_QUALITY_SAMPLE_FLOOR,

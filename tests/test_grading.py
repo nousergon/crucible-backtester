@@ -160,8 +160,8 @@ class TestComputeScorecard:
         result = compute_scorecard(
             signal_quality={
                 "status": "ok",
-                "overall": {"accuracy_10d": 0.58, "avg_alpha_10d": 1.5, "n_10d": 50},
-                "by_score_bucket": [{"bucket": "90+", "accuracy_10d": 0.71}],
+                "overall": {"accuracy_21d": 0.58, "avg_alpha_21d": 1.5, "n_21d": 50},
+                "by_score_bucket": [{"bucket": "90+", "accuracy_21d": 0.71}],
             },
         )
         # Only portfolio sub-component has data → executor partial, research/predictor empty
@@ -171,8 +171,8 @@ class TestComputeScorecard:
         result = compute_scorecard(
             signal_quality={
                 "status": "ok",
-                "overall": {"accuracy_10d": 0.58, "avg_alpha_10d": 1.5, "n_10d": 50},
-                "by_score_bucket": [{"bucket": "90+", "accuracy_10d": 0.71}],
+                "overall": {"accuracy_21d": 0.58, "avg_alpha_21d": 1.5, "n_21d": 50},
+                "by_score_bucket": [{"bucket": "90+", "accuracy_21d": 0.71}],
             },
             e2e_lift={
                 "status": "ok",
@@ -528,7 +528,7 @@ class TestComputeScorecardEvaluatorRevamp:
         result = compute_scorecard(
             signal_quality={
                 "status": "ok",
-                "overall": {"accuracy_10d": 0.55, "avg_alpha_10d": 1.0, "n_10d": 50},
+                "overall": {"accuracy_21d": 0.55, "avg_alpha_21d": 1.0, "n_21d": 50},
                 "by_score_bucket": [],
             },
             portfolio_stats={
@@ -547,7 +547,7 @@ class TestComputeScorecardEvaluatorRevamp:
         result = compute_scorecard(
             signal_quality={
                 "status": "ok",
-                "overall": {"accuracy_10d": 0.55, "avg_alpha_10d": 1.0, "n_10d": 50},
+                "overall": {"accuracy_21d": 0.55, "avg_alpha_21d": 1.0, "n_21d": 50},
                 "by_score_bucket": [],
             },
             portfolio_stats={

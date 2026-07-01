@@ -73,24 +73,23 @@ def accuracy_by_regime(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> list
         return []
 
     populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
-    populated_10d = df[df["beat_spy_10d"].notna()]
-    populated_30d = df[df["beat_spy_30d"].notna()]
+    # config#1456: canonical 21d horizon (10d/30d outcomes retired).
+    populated_21d = df[df["beat_spy_21d"].notna()] if "beat_spy_21d" in df.columns else pd.DataFrame()
 
-    if len(populated_10d) < min_samples:
+    if len(populated_21d) < min_samples:
         logger.warning(
-            "Only %d rows with beat_spy_10d populated — regime analysis deferred until Week 4.",
-            len(populated_10d),
+            "Only %d rows with beat_spy_21d populated — regime analysis deferred until Week 4.",
+            len(populated_21d),
         )
         return []
 
-    regimes = populated_10d["market_regime"].dropna().unique()
+    regimes = populated_21d["market_regime"].dropna().unique()
     results = []
 
     for regime in sorted(regimes):
         slice_5d = populated_5d[populated_5d["market_regime"] == regime] if not populated_5d.empty else pd.DataFrame()
-        slice_10d = populated_10d[populated_10d["market_regime"] == regime]
-        slice_30d = populated_30d[populated_30d["market_regime"] == regime]
-        metrics = _compute_slice_metrics(slice_5d, slice_10d, slice_30d)
+        slice_21d = populated_21d[populated_21d["market_regime"] == regime]
+        metrics = _compute_slice_metrics(slice_5d, slice_21d)
         results.append({"market_regime": regime, **metrics})
 
     return results

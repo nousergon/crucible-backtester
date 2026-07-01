@@ -2,11 +2,16 @@
 signal_quality.py — Mode 1: aggregate score_performance from research.db.
 
 Reads the score_performance table (populated by the research pipeline) and
-computes accuracy metrics: % of BUY signals that beat SPY at 5d, 10d, and 30d.
+computes accuracy metrics: % of BUY signals that beat SPY at the canonical
+5d (short) and 21d (primary) horizons.
+
+The 10d/30d outcome horizons were RETIRED in the canonical-alpha cutover
+(config#1456); resolution now writes 5d + 21d only. Gating + reporting is on
+the canonical 21d horizon (the system's prediction target).
 
 Data availability: meaningful results require ~200 populated rows.
-As of 2026-03-06, score_performance has 9 rows with beat_spy_10d = NULL.
-This module will return empty results until Week 4 (~200 rows with 10d returns).
+This module returns insufficient_data until ~200 rows carry the canonical
+beat_spy_21d outcome.
 """
 
 import logging
@@ -28,9 +33,9 @@ def load_score_performance(db_path: str) -> pd.DataFrame:
     Load score_performance from research.db.
 
     Returns a DataFrame with columns:
-        symbol, score_date, score, price_on_date, price_10d, price_30d,
-        spy_10d_return, spy_30d_return, return_10d, return_30d,
-        beat_spy_10d, beat_spy_30d, eval_date_10d, eval_date_30d
+        symbol, score_date, score, price_on_date,
+        spy_5d_return, spy_21d_return, return_5d, return_21d,
+        beat_spy_5d, beat_spy_21d
     """
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -69,17 +74,15 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
     Given score_performance rows, compute accuracy metrics.
 
     Returns a dict with:
-        - overall: {accuracy_5d, accuracy_10d, accuracy_30d, avg_alpha_5d/10d/30d, n}
+        - overall: {accuracy_5d, accuracy_21d, avg_alpha_5d/21d, n_5d/21d}
         - by_score_bucket: accuracy split into [60-70, 70-80, 80-90, 90+]
         - by_conviction: accuracy split by conviction (rising/stable/declining)
         - status: "insufficient_data" if not enough rows are populated yet
     """
     populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
-    populated_10d = df[df["beat_spy_10d"].notna()] if "beat_spy_10d" in df.columns else pd.DataFrame()
-    populated_30d = df[df["beat_spy_30d"].notna()] if "beat_spy_30d" in df.columns else pd.DataFrame()
     # config#1456: gate on the canonical 21d horizon. The 10d/30d horizons were
-    # retired in the canonical-alpha cutover (dark since April) — gating on
-    # beat_spy_10d left the whole signal-quality tile insufficient/dark.
+    # retired in the canonical-alpha cutover (dark since April) — gating on the
+    # retired horizon left the whole signal-quality tile insufficient/dark.
     populated_21d = df[df["beat_spy_21d"].notna()] if "beat_spy_21d" in df.columns else pd.DataFrame()
 
     if len(populated_21d) < min_samples:
@@ -91,8 +94,6 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
             "status": "insufficient_data",
             "rows_5d_populated": len(populated_5d),
             "rows_21d_populated": len(populated_21d),
-            "rows_10d_populated": len(populated_10d),
-            "rows_30d_populated": len(populated_30d),
             "rows_needed": min_samples,
         }
 
@@ -100,17 +101,15 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
         "status": "ok",
         "rows_5d_populated": len(populated_5d),
         "rows_21d_populated": len(populated_21d),
-        "rows_10d_populated": len(populated_10d),
-        "rows_30d_populated": len(populated_30d),
-        "overall": _compute_slice_metrics(populated_5d, populated_10d, populated_30d, populated_21d),
-        "by_score_bucket": _accuracy_by_score_bucket(populated_5d, populated_10d, populated_30d),
+        "overall": _compute_slice_metrics(populated_5d, populated_21d),
+        "by_score_bucket": _accuracy_by_score_bucket(populated_5d, populated_21d),
     }
 
     if "conviction" in df.columns:
-        result["by_conviction"] = _accuracy_by_field(populated_5d, populated_10d, populated_30d, "conviction")
+        result["by_conviction"] = _accuracy_by_field(populated_5d, populated_21d, "conviction")
 
     if "sector" in df.columns and df["sector"].notna().any():
-        result["by_sector"] = _accuracy_by_field(populated_5d, populated_10d, populated_30d, "sector")
+        result["by_sector"] = _accuracy_by_field(populated_5d, populated_21d, "sector")
 
     # Per-stance attribution (stance taxonomy arc PR 4, 2026-05-11).
     # Stance was added to predictions.json on 2026-05-11; if upstream
@@ -124,7 +123,7 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
     # stances in the taxonomy after the 4-12 week observation window.
     if "stance" in df.columns and df["stance"].notna().any():
         result["by_stance"] = _accuracy_by_field(
-            populated_5d, populated_10d, populated_30d, "stance",
+            populated_5d, populated_21d, "stance",
         )
 
     return result
@@ -141,27 +140,16 @@ def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (round(max(0.0, centre - spread), 4), round(min(1.0, centre + spread), 4))
 
 
-def _compute_slice_metrics(
-    df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd.DataFrame,
-    df_21d: pd.DataFrame | None = None,
-) -> dict:
-    if df_21d is None:
-        df_21d = pd.DataFrame()
+def _compute_slice_metrics(df_5d: pd.DataFrame, df_21d: pd.DataFrame) -> dict:
     n_5d = len(df_5d)
-    n_10d = len(df_10d)
-    n_30d = len(df_30d)
     n_21d = len(df_21d)
 
     acc_5d = float(df_5d["beat_spy_5d"].mean()) if n_5d > 0 else None
-    acc_10d = float(df_10d["beat_spy_10d"].mean()) if n_10d > 0 else None
-    acc_30d = float(df_30d["beat_spy_30d"].mean()) if n_30d > 0 else None
     # config#1456: canonical 21d horizon (the system's prediction target).
     acc_21d = float(df_21d["beat_spy_21d"].mean()) if n_21d > 0 else None
 
     # Wilson score 95% confidence intervals
     ci_5d = _wilson_ci(int(df_5d["beat_spy_5d"].sum()), n_5d) if n_5d > 0 else None
-    ci_10d = _wilson_ci(int(df_10d["beat_spy_10d"].sum()), n_10d) if n_10d > 0 else None
-    ci_30d = _wilson_ci(int(df_30d["beat_spy_30d"].sum()), n_30d) if n_30d > 0 else None
     ci_21d = _wilson_ci(int(df_21d["beat_spy_21d"].sum()), n_21d) if n_21d > 0 else None
 
     # Classification metrics at the canonical 21d horizon.
@@ -169,50 +157,36 @@ def _compute_slice_metrics(
     # Recall is not computable here (requires universe-level data from end_to_end.py).
     tp_21d = int(df_21d["beat_spy_21d"].sum()) if n_21d > 0 else 0
     fp_21d = n_21d - tp_21d
-    tp_10d = int(df_10d["beat_spy_10d"].sum()) if n_10d > 0 else 0
-    fp_10d = n_10d - tp_10d
 
     return {
         "accuracy_5d": acc_5d,
         "accuracy_21d": acc_21d,
-        "accuracy_10d": acc_10d,
-        "accuracy_30d": acc_30d,
         "ci_95_5d": ci_5d,
         "ci_95_21d": ci_21d,
-        "ci_95_10d": ci_10d,
-        "ci_95_30d": ci_30d,
         "avg_alpha_5d": float((df_5d["return_5d"] - df_5d["spy_5d_return"]).mean()) if n_5d > 0 else None,
         "avg_alpha_21d": float((df_21d["return_21d"] - df_21d["spy_21d_return"]).mean()) if n_21d > 0 else None,
-        "avg_alpha_10d": float((df_10d["return_10d"] - df_10d["spy_10d_return"]).mean()) if n_10d > 0 else None,
-        "avg_alpha_30d": float((df_30d["return_30d"] - df_30d["spy_30d_return"]).mean()) if n_30d > 0 else None,
         "n_5d": n_5d,
         "n_21d": n_21d,
-        "n_10d": n_10d,
-        "n_30d": n_30d,
         "precision_21d": round(tp_21d / n_21d, 4) if n_21d > 0 else None,
         "tp_21d": tp_21d,
         "fp_21d": fp_21d,
-        "precision_10d": round(tp_10d / n_10d, 4) if n_10d > 0 else None,
-        "tp_10d": tp_10d,
-        "fp_10d": fp_10d,
     }
 
 
-def _accuracy_by_score_bucket(df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd.DataFrame) -> list[dict]:
+def _accuracy_by_score_bucket(df_5d: pd.DataFrame, df_21d: pd.DataFrame) -> list[dict]:
     buckets = [(60, 70), (70, 80), (80, 90), (90, 101)]
     rows = []
     for lo, hi in buckets:
         label = f"{lo}-{min(hi, 100)}" if hi <= 100 else f"{lo}+"
         slice_5d = df_5d[(df_5d["score"] >= lo) & (df_5d["score"] < hi)] if not df_5d.empty else pd.DataFrame()
-        slice_10d = df_10d[(df_10d["score"] >= lo) & (df_10d["score"] < hi)]
-        slice_30d = df_30d[(df_30d["score"] >= lo) & (df_30d["score"] < hi)]
-        if len(slice_10d) == 0:
+        slice_21d = df_21d[(df_21d["score"] >= lo) & (df_21d["score"] < hi)]
+        if len(slice_21d) == 0:
             continue
         exploratory_threshold = 20
         rows.append({
             "bucket": label,
-            "exploratory": len(slice_10d) < exploratory_threshold,
-            **_compute_slice_metrics(slice_5d, slice_10d, slice_30d),
+            "exploratory": len(slice_21d) < exploratory_threshold,
+            **_compute_slice_metrics(slice_5d, slice_21d),
         })
 
     # Apply BH FDR correction across bucket accuracy p-values
@@ -221,8 +195,8 @@ def _accuracy_by_score_bucket(df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d:
     import math
     p_values = []
     for row in rows:
-        n = row.get("n_10d", 0)
-        acc = row.get("accuracy_10d")
+        n = row.get("n_21d", 0)
+        acc = row.get("accuracy_21d")
         if n > 0 and acc is not None:
             # Two-sided z-test for proportion vs 0.50
             z = abs(acc - 0.50) / max(math.sqrt(0.25 / n), 1e-10)
@@ -245,15 +219,14 @@ def _norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
-def _accuracy_by_field(df_5d: pd.DataFrame, df_10d: pd.DataFrame, df_30d: pd.DataFrame, field: str) -> list[dict]:
-    values = df_10d[field].dropna().unique()
+def _accuracy_by_field(df_5d: pd.DataFrame, df_21d: pd.DataFrame, field: str) -> list[dict]:
+    values = df_21d[field].dropna().unique()
     rows = []
     for val in sorted(values):
         slice_5d = df_5d[df_5d[field] == val] if not df_5d.empty and field in df_5d.columns else pd.DataFrame()
-        slice_10d = df_10d[df_10d[field] == val]
-        slice_30d = df_30d[df_30d[field] == val]
+        slice_21d = df_21d[df_21d[field] == val]
         rows.append({
             field: val,
-            **_compute_slice_metrics(slice_5d, slice_10d, slice_30d),
+            **_compute_slice_metrics(slice_5d, slice_21d),
         })
     return rows

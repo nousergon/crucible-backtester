@@ -529,13 +529,13 @@ def _grade_composite_scoring(signal_quality: dict | None,
     overall = signal_quality.get("overall", {})
     buckets = signal_quality.get("by_score_bucket", [])
 
-    # Overall accuracy at 10d
-    acc_10d = overall.get("accuracy_10d")
-    acc_g = _pct_to_grade(acc_10d, baseline=0.45, ceiling=0.70)
+    # Overall accuracy at the canonical 21d horizon (config#1456)
+    acc_21d = overall.get("accuracy_21d")
+    acc_g = _pct_to_grade(acc_21d, baseline=0.45, ceiling=0.70)
 
     # High-score bucket accuracy (90+ should be highest)
     high_bucket = next((b for b in buckets if b.get("bucket") == "90+"), None)
-    high_acc = _safe_get(high_bucket, "accuracy_10d") if high_bucket else None
+    high_acc = _safe_get(high_bucket, "accuracy_21d") if high_bucket else None
     high_g = _pct_to_grade(high_acc, baseline=0.50, ceiling=0.80)
 
     # Calibration: prefer the robust row-level Spearman rank correlation of
@@ -555,8 +555,8 @@ def _grade_composite_scoring(signal_quality: dict | None,
     ])
 
     detail = {}
-    if acc_10d is not None:
-        detail["accuracy_10d"] = f"{acc_10d:.1%}"
+    if acc_21d is not None:
+        detail["accuracy_21d"] = f"{acc_21d:.1%}"
     if high_acc is not None:
         detail["90+_accuracy"] = f"{high_acc:.1%}"
     detail.update(cal_detail)
@@ -911,7 +911,7 @@ def _grade_portfolio(signal_quality: dict | None,
     When ``portfolio_stats`` includes the evaluator-revamp downside-aware
     fields (``sortino_ratio``, ``cvar_95``, plus optionally an
     ``information_ratio_spy`` populated upstream), the composite uses:
-      - 25% accuracy_10d  (selection accuracy, kept)
+      - 25% accuracy_21d  (selection accuracy, kept)
       - 25% Sortino       (replaces Sharpe — penalises downside vol only)
       - 15% Calmar        (annualised return / max drawdown)
       - 15% CVaR(95%)     (tail-risk metric)
@@ -928,9 +928,9 @@ def _grade_portfolio(signal_quality: dict | None,
     """
     overall = _safe_get(signal_quality, "overall") or {}
 
-    acc_10d = overall.get("accuracy_10d")
-    avg_alpha = overall.get("avg_alpha_10d")
-    acc_g = _pct_to_grade(acc_10d, baseline=0.45, ceiling=0.70)
+    acc_21d = overall.get("accuracy_21d")
+    avg_alpha = overall.get("avg_alpha_21d")
+    acc_g = _pct_to_grade(acc_21d, baseline=0.45, ceiling=0.70)
     alpha_g = _lift_to_grade(avg_alpha, floor=-2.0, ceiling=4.0) if avg_alpha is not None else None
 
     sharpe = _safe_get(portfolio_stats, "sharpe_ratio")
@@ -975,10 +975,10 @@ def _grade_portfolio(signal_quality: dict | None,
         ])
 
     detail = {}
-    if acc_10d is not None:
-        detail["accuracy_10d"] = f"{acc_10d:.1%}"
+    if acc_21d is not None:
+        detail["accuracy_21d"] = f"{acc_21d:.1%}"
     if avg_alpha is not None:
-        detail["avg_alpha_10d"] = f"{avg_alpha:+.2f}%"
+        detail["avg_alpha_21d"] = f"{avg_alpha:+.2f}%"
     if sharpe is not None:
         detail["sharpe"] = f"{sharpe:.2f}"
     if sortino is not None:

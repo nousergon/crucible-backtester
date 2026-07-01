@@ -136,7 +136,7 @@ class TestPortfolioCalibration:
                 "symbol": f"T{i}",
                 "score_date": "2026-01-05",
                 "score": score,
-                "beat_spy_10d": outcome,
+                "beat_spy_21d": outcome,
             })
         df = pd.DataFrame(rows)
         result = compute_portfolio_calibration(df)

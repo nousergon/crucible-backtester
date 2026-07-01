@@ -34,18 +34,8 @@ _RETIRED_COLUMNS = ("beat_spy_10d", "beat_spy_30d", "spy_10d_return", "spy_30d_r
 # Files with KNOWN pre-existing reads, being migrated under config#1456.
 # REMOVE each entry in the PR that migrates it — the guard fails if a listed
 # file is already clean, so this set is forced to empty as the arc completes.
-_GRANDFATHERED = frozenset({
-    "analysis/alpha_distribution.py",
-    "analysis/attribution.py",
-    "analysis/end_to_end.py",
-    "analysis/regime_analysis.py",
-    "analysis/regime_stratified_sortino.py",
-    "analysis/score_analysis.py",
-    "analysis/signal_quality.py",
-    "analysis/team_skill_metrics.py",
-    "optimizer/research_optimizer.py",
-    "reporter.py",
-})
+# config#1456 COMPLETE: all consumers migrated to canonical 5d/21d; allowlist empty.
+_GRANDFATHERED = frozenset()
 
 # Directories that are not production import paths.
 _EXCLUDE_PREFIXES = ("tests/", ".venv", ".claude/", "synthetic/gate_calibration.py")

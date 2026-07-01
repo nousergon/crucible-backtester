@@ -36,25 +36,23 @@ class TestExtractMetrics:
         assert "irrelevant_key" not in metrics
 
     def test_extracts_signal_quality_fields(self):
-        """Should extract accuracy_10d and accuracy_30d from overall dict."""
+        """Should extract canonical accuracy_21d from overall dict."""
         sq = {
             "status": "ok",
             "overall": {
-                "accuracy_10d": 0.62,
-                "accuracy_30d": 0.58,
+                "accuracy_21d": 0.62,
             },
         }
         metrics = extract_metrics(None, sq)
-        assert metrics["accuracy_10d"] == 0.62
-        assert metrics["accuracy_30d"] == 0.58
+        assert metrics["accuracy_21d"] == 0.62
 
     def test_combines_both_sources(self):
         """Should merge fields from both portfolio stats and signal quality."""
         stats = {"sharpe_ratio": 1.2, "total_alpha": 0.05}
-        sq = {"overall": {"accuracy_10d": 0.60}}
+        sq = {"overall": {"accuracy_21d": 0.60}}
         metrics = extract_metrics(stats, sq)
         assert "sharpe_ratio" in metrics
-        assert "accuracy_10d" in metrics
+        assert "accuracy_21d" in metrics
 
     def test_none_inputs_return_empty(self):
         """Both None inputs should return empty dict."""
@@ -95,12 +93,12 @@ class TestCheckRegression:
         mock_load.return_value = {
             "sharpe_ratio": 2.0,
             "sortino_ratio": 2.0,
-            "accuracy_10d": 0.60,
+            "accuracy_21d": 0.60,
             "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"sharpe_ratio": 1.0, "sortino_ratio": 1.95, "accuracy_10d": 0.58},
+            {"sharpe_ratio": 1.0, "sortino_ratio": 1.95, "accuracy_21d": 0.58},
             run_date="2026-05-16",
         )
         assert result["checked"] is True
@@ -129,12 +127,12 @@ class TestCheckRegression:
         """Negative baseline Sortino should skip the Sortino regression check."""
         mock_load.return_value = {
             "sortino_ratio": -0.5,
-            "accuracy_10d": 0.60,
+            "accuracy_21d": 0.60,
             "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"sortino_ratio": -1.0, "accuracy_10d": 0.58},
+            {"sortino_ratio": -1.0, "accuracy_21d": 0.58},
             run_date="2026-05-16",
         )
         assert result["checked"] is True
@@ -152,12 +150,12 @@ class TestCheckRegression:
         """Accuracy dropping >5pp should trigger regression (with adequate
         samples + fresh baseline)."""
         mock_load.return_value = {
-            "accuracy_10d": 0.65,
+            "accuracy_21d": 0.65,
             "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"accuracy_10d": 0.55, "total_trades": 80, "n_signals": 80},
+            {"accuracy_21d": 0.55, "total_trades": 80, "n_signals": 80},
             run_date="2026-05-16",
         )
         assert result["checked"] is True
@@ -169,7 +167,7 @@ class TestCheckRegression:
     def test_same_metrics_no_regression(self, mock_load):
         """Identical metrics should not trigger regression."""
         baseline = {
-            "sharpe_ratio": 1.5, "sortino_ratio": 1.8, "accuracy_10d": 0.60,
+            "sharpe_ratio": 1.5, "sortino_ratio": 1.8, "accuracy_21d": 0.60,
             "saved_at": "2026-05-10",
         }
         mock_load.return_value = baseline
@@ -303,8 +301,8 @@ class TestWriteRollbackAudit:
         regression_result = {
             "regression_detected": True,
             "details": {"sharpe_drop_pct": 0.30, "accuracy_drop": 2.5},
-            "baseline": {"sharpe_ratio": 0.84, "accuracy_10d": 0.62},
-            "current": {"sharpe_ratio": 0.59, "accuracy_10d": 0.60},
+            "baseline": {"sharpe_ratio": 0.84, "accuracy_21d": 0.62},
+            "current": {"sharpe_ratio": 0.59, "accuracy_21d": 0.60},
         }
         rollback_results = [
             {"rolled_back": True, "config_type": "executor_params",
@@ -412,11 +410,11 @@ class TestExtractMetricsSkilledRisk:
         # Sharpe still persisted for continuity/observability.
         assert metrics["sharpe_ratio"] == 1.5
 
-    def test_extracts_n_signals_from_overall_n_10d(self):
-        sq = {"overall": {"accuracy_10d": 0.60, "n_10d": 42}}
+    def test_extracts_n_signals_from_overall_n_21d(self):
+        sq = {"overall": {"accuracy_21d": 0.60, "n_21d": 42}}
         metrics = extract_metrics(None, sq)
         assert metrics["n_signals"] == 42
-        assert metrics["accuracy_10d"] == 0.60
+        assert metrics["accuracy_21d"] == 0.60
 
 
 # ── 2026-05-16 spurious-rollback regression guards ──────────────────────────
@@ -437,11 +435,11 @@ class TestRegressionGuards:
         """(a) Sortino-drop > threshold + adequate samples + fresh baseline
         → rollback fires."""
         mock_load.return_value = {
-            "sortino_ratio": 2.0, "accuracy_10d": 0.60, "saved_at": "2026-05-10",
+            "sortino_ratio": 2.0, "accuracy_21d": 0.60, "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"sortino_ratio": 1.0, "accuracy_10d": 0.60,
+            {"sortino_ratio": 1.0, "accuracy_21d": 0.60,
              "total_trades": 80, "n_signals": 80},
             run_date="2026-05-16",
         )
@@ -459,11 +457,11 @@ class TestRegressionGuards:
         moved off Sharpe)."""
         mock_load.return_value = {
             "sharpe_ratio": 2.0, "sortino_ratio": 2.0,
-            "accuracy_10d": 0.60, "saved_at": "2026-05-10",
+            "accuracy_21d": 0.60, "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"sharpe_ratio": 0.8, "sortino_ratio": 1.95, "accuracy_10d": 0.60,
+            {"sharpe_ratio": 0.8, "sortino_ratio": 1.95, "accuracy_21d": 0.60,
              "total_trades": 80, "n_signals": 80},
             run_date="2026-05-16",
         )
@@ -484,12 +482,12 @@ class TestRegressionGuards:
         untouched. (n=42/55 are below this test's stricter configured floor
         — proving the exact spurious-rollback shape is now suppressed.)"""
         mock_load.return_value = {
-            "sortino_ratio": 0.4179, "accuracy_10d": 0.60,
+            "sortino_ratio": 0.4179, "accuracy_21d": 0.60,
             "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"sortino_ratio": 0.3154, "accuracy_10d": 0.60,
+            {"sortino_ratio": 0.3154, "accuracy_21d": 0.60,
              "total_trades": 55, "n_signals": 42},
             config={"regression_monitor": {
                 "min_trades_for_rollback": 60,
@@ -513,12 +511,12 @@ class TestRegressionGuards:
         """(c) Below the DEFAULT min-sample floor (30): regression detected
         but rollback_triggered=False, configs untouched."""
         mock_load.return_value = {
-            "sortino_ratio": 0.4179, "accuracy_10d": 0.60,
+            "sortino_ratio": 0.4179, "accuracy_21d": 0.60,
             "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"sortino_ratio": 0.3154, "accuracy_10d": 0.60,
+            {"sortino_ratio": 0.3154, "accuracy_21d": 0.60,
              "total_trades": 25, "n_signals": 18},
             run_date="2026-05-16",
         )
@@ -539,12 +537,12 @@ class TestRegressionGuards:
         exact spurious case: baseline older than max-age) → skipped +
         baseline refreshed, rollback_triggered=False."""
         mock_load.return_value = {
-            "sortino_ratio": 0.4179, "accuracy_10d": 0.60,
+            "sortino_ratio": 0.4179, "accuracy_21d": 0.60,
             "saved_at": "2026-04-20",  # 26 days before run → > 21-day max
         }
         result = check_regression(
             "test-bucket",
-            {"sortino_ratio": 0.3154, "accuracy_10d": 0.50,
+            {"sortino_ratio": 0.3154, "accuracy_21d": 0.50,
              "total_trades": 80, "n_signals": 80},
             run_date="2026-05-16",
         )
@@ -588,12 +586,12 @@ class TestRegressionGuards:
         not comparable; do NOT fall back to firing on Sharpe."""
         mock_load.return_value = {
             "sharpe_ratio": 2.0,          # only Sharpe, no Sortino
-            "accuracy_10d": 0.60,
+            "accuracy_21d": 0.60,
             "saved_at": "2026-05-10",
         }
         result = check_regression(
             "test-bucket",
-            {"sharpe_ratio": 0.5, "sortino_ratio": 0.4, "accuracy_10d": 0.60,
+            {"sharpe_ratio": 0.5, "sortino_ratio": 0.4, "accuracy_21d": 0.60,
              "total_trades": 80, "n_signals": 80},
             run_date="2026-05-16",
         )
