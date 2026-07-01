@@ -53,6 +53,24 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      # deploy_health.sh's canary-rollback path publishes a dedup-keyed
+      # alert via `python3 -m krepis.alerts publish` (the L221
+      # independent-channel alert) so a rolled-back deploy isn't silent
+      # beyond the GHA red-icon. Without krepis installed on THIS runner
+      # (not the Lambda's Docker image — this call runs on the bare
+      # GHA host), the alert call fails with ModuleNotFoundError and is
+      # swallowed by the trailing `|| true` — silently, with no CI red.
+      # This step was previously MISSING entirely (config#1545, found
+      # auditing the crucible-predictor/evaluator krepis.aws
+      # invoke-canary incident 2026-07-01). Pin matches requirements.txt's
+      # `krepis>=0.4.0` floor.
+      - name: Set up Python for canary-rollback alert publish
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install krepis for deploy_health.sh alerts call
+        run: pip install "krepis>=0.4.0"
+
       # deploy_health.sh builds lambda_health/Dockerfile (which COPYs the
       # fixed analysis/production_health.py + pins the lib ECE primitive),
       # pushes to ECR, publishes a version, runs a dry-run canary against the

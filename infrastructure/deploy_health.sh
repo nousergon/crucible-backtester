@@ -123,7 +123,11 @@ if [ "$CANARY_STATUS" != "200" ]; then
   # an image-wide rebuild that breaks N Lambdas' canaries within the hour
   # into one alert per (Lambda, version). Best-effort; trailing || true
   # never overrides exit 1.
-  python3 -m nousergon_lib.alerts publish \
+  # krepis.alerts (config#1339/config#1545) — this is the ONLY deploy
+  # script in the repo wired into GHA CI (deploy.yml); the workflow now
+  # installs krepis on the runner so this call actually publishes instead
+  # of silently ModuleNotFoundError-ing behind the trailing `|| true`.
+  python3 -m krepis.alerts publish \
     --severity error \
     --source "alpha-engine-backtester/infrastructure/deploy_health.sh" \
     --dedup-key "canary-fail-${LAMBDA_FUNCTION}-v${VERSION}" \
