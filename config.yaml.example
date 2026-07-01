@@ -167,9 +167,21 @@ weight_optimizer:
   blend_ramp_samples: 500        # n_train at which blend reaches max
   confidence_low: 100            # samples threshold for "low" confidence
   confidence_medium: 300         # samples threshold for "medium"/"high"
+  # Keys are the canonical short/long outcome columns (config#1456 cutover,
+  # 2026-07-01) — must match _SHORT_OUTCOME/_LONG_OUTCOME in
+  # optimizer/weight_optimizer.py. A stale key here silently falls through to
+  # the 0.50 default instead of raising (config#1426 flip finding, live repo).
   horizon_blend:
-    beat_spy_10d: 0.50
-    beat_spy_30d: 0.50
+    beat_spy_5d: 0.50
+    beat_spy_21d: 0.50
+  # config#1426 Phase 4 — per-gate significance-enforce flag, default OFF.
+  # When true, a promotion the live guardrails already allow is additionally
+  # required to clear a signed, canonical-21d-horizon IC floor
+  # (weight_canonical_signed_floor_fails in optimizer/significance_observe.py)
+  # before it writes live config/scoring_weights.json. Can only BLOCK, never
+  # enable — flip false to revert. See alpha-engine-config/backtester/
+  # config.yaml (private) for the live value + ratification rationale.
+  enforce_significance: false
 
 # ── Executor optimizer guardrails ────────────────────────────────────────────
 executor_optimizer:
@@ -211,6 +223,28 @@ stance_sizing_optimizer:
   sensitivity: 2.0               # nudge gain on realized alpha relative to the book
   size_floor: 0.4                # multiplier bounds (match executor stance defaults)
   size_cap: 1.1
+  enforce_significance: false    # config#1426 Phase 4 — see weight_optimizer comment above
+
+# ── Predictor p_up sizing optimizer ──────────────────────────────────────────
+# Offline rank-IC gate for scaling position size by predictor p_up confidence.
+# Omit the block to use the institutional defaults below.
+predictor_sizing_optimizer:
+  min_samples: 30                # resolved (prediction, outcome) pairs required
+  min_ic_to_enable: 0.05         # rank IC must exceed this to recommend enabling
+  min_positive_weeks: 6          # at least 6 of the recent rolling weeks positive
+  rolling_weeks: 8
+  enforce_significance: false    # config#1426 Phase 4 — see weight_optimizer comment above
+
+# ── Barrier-touch sizing optimizer ───────────────────────────────────────────
+# Offline rank-IC gate for scaling position size by upstream barrier_win_prob.
+# Dormant (insufficient_data) until that upstream feature lands. Omit the
+# block to use the institutional defaults below.
+barrier_sizing_optimizer:
+  min_samples: 30                # resolved (prediction, outcome) pairs required
+  min_ic_to_enable: 0.05         # rank IC must exceed this to recommend the flip
+  min_positive_weeks: 6          # at least 6 of the recent rolling weeks positive
+  rolling_weeks: 8
+  enforce_significance: false    # config#1426 Phase 4 — see weight_optimizer comment above
 
 # ── Regression monitor / auto-rollback ──────────────────────────────────────
 # Post-run gate that auto-rolls-back optimizer config promotions if metrics
@@ -253,3 +287,4 @@ veto_analysis:
   min_veto_decisions: 10
   min_threshold_change: 0.10
   cost_penalty_weight: 0.30
+  enforce_significance: false    # config#1426 Phase 4 — see weight_optimizer comment above
