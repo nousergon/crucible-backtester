@@ -56,7 +56,7 @@
 # **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 3).**
 # Mirrors alpha-engine-data PR 2 (#330). Communication with the spot is
 # now via `aws ssm send-command` wrapped at the lib chokepoint
-# `python -m nousergon_lib.ssm_dispatcher run`. No port-22 inbound on
+# `python -m krepis.ssm_dispatcher run`. No port-22 inbound on
 # the spot SG; no ssh / scp / ssh-keyscan. The 3 config files (no .env post
 # #890) are staged to a temporary S3 prefix and pulled down by the spot. PR 3 of
 # the 5-PR L342 arc.
@@ -517,7 +517,11 @@ pre_launch_preflight
 # us-east-1f.
 echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
 
-INSTANCE_ID=$("$LIB_PYTHON" -m nousergon_lib.ec2_spot launch \
+# Invoked as `-m krepis.ec2_spot` directly (config#1649): the
+# `nousergon_lib.ec2_spot` name is a guard-less re-export shim on lib
+# >=0.81.0 — silent exit-0 no-op under `python -m` (the config#1646 class
+# that aborted recovery attempt 1 at this exact layer in spot_train.sh).
+INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
     --types "$INSTANCE_TYPES" \
     --subnets "$SUBNETS" \
     --image-id "$AMI_ID" \
@@ -745,7 +749,7 @@ done
 run_ssm() {
     local description="$1" timeout_s="${2:-3600}"
     LAST_SSM_DESC="$description"
-    "$LIB_PYTHON" -m nousergon_lib.ssm_dispatcher run \
+    "$LIB_PYTHON" -m krepis.ssm_dispatcher run \
         --instance-id "$INSTANCE_ID" \
         --description "backtester: $description" \
         --timeout "$timeout_s" \
