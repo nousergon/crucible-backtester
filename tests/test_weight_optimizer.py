@@ -675,3 +675,108 @@ class TestLoadWithSubscoresCanonicalSource:
         assert out["qual_score"].iloc[0] == 50.0
         assert "quant_score_x" not in out.columns
         assert "quant_score_y" not in out.columns
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Round-trip: apply_weights() write → evaluate._read_current_weights() read
+# (config#1679 regression)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# apply_weights() persists s3://{bucket}/config/scoring_weights.json under
+# SUB_SCORES ("quant"/"qual") — has done so since the 2026-03-29 rename
+# (commit 92c5067, "Rename sub_scores from news/research to quant/qual").
+# evaluate._read_current_weights() had never been updated to match and was
+# still reading the pre-rename "news"/"research" keys, so it could never find
+# the persisted weights and silently fell back to default_weights. That wrong
+# baseline then fed compute_weights()'s delta/churn computation every cycle.
+# This test drives the real write path (apply_weights) and the real read path
+# (evaluate._read_current_weights) against the same fake S3 object store and
+# asserts the read recovers exactly what was applied — not the fallback.
+
+
+class TestApplyReadRoundTrip:
+
+    def setup_method(self):
+        _init_default_config()
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.weight_optimizer.save_previous", create=True)
+    def test_read_current_weights_matches_last_applied(self, mock_save, mock_wo_boto3):
+        """apply_weights() writes quant/qual; _read_current_weights() must
+        read back those exact values, not the default_weights fallback."""
+        import json
+        from evaluate import _read_current_weights
+
+        # Fake S3 object store shared across the write (apply_weights) and
+        # read (_read_current_weights) sides of the round trip.
+        store: dict[str, bytes] = {}
+
+        def _put_object(Bucket, Key, Body, **kwargs):
+            store[Key] = Body.encode() if isinstance(Body, str) else Body
+
+        mock_s3 = MagicMock()
+        mock_s3.put_object.side_effect = _put_object
+        mock_wo_boto3.client.return_value = mock_s3
+
+        result = {
+            "status": "ok",
+            "confidence": "high",
+            "oos_passed": True,
+            "suggested_weights": {"quant": 0.58, "qual": 0.42},
+            "changes": {"quant": 0.08, "qual": -0.08},
+            "n_samples": 500,
+        }
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            outcome = apply_weights(result, bucket="test-bucket")
+        assert outcome["applied"] is True
+
+        written_body = store["config/scoring_weights.json"]
+        payload = json.loads(written_body)
+        # Pins the producer side of the contract too: quant/qual, not
+        # news/research.
+        assert payload["quant"] == 0.58
+        assert payload["qual"] == 0.42
+        assert "news" not in payload and "research" not in payload
+
+        # Read it back through evaluate._read_current_weights against the
+        # same fake object store.
+        def _get_object(Bucket, Key):
+            body = MagicMock()
+            body.read.return_value = store[Key]
+            return {"Body": body}
+
+        read_s3 = MagicMock()
+        read_s3.get_object.side_effect = _get_object
+        with patch("evaluate.boto3") as mock_eval_boto3:
+            mock_eval_boto3.client.return_value = read_s3
+            current = _read_current_weights({"signals_bucket": "test-bucket"})
+
+        assert current == {"quant": 0.58, "qual": 0.42}
+        # Must not have silently fallen through to the 0.50/0.50 default.
+        import optimizer.weight_optimizer as wo
+        assert current != wo._DEFAULT_WEIGHTS
+
+    def test_read_current_weights_migrates_legacy_news_research_keys(self):
+        """A scoring_weights.json object persisted before the 2026-03-29
+        news/research → quant/qual rename (and never since overwritten)
+        must still be read back correctly, not silently dropped to the
+        default_weights fallback."""
+        import json
+        from evaluate import _read_current_weights
+
+        legacy_payload = json.dumps({
+            "news": 0.55, "research": 0.45, "updated_at": "2026-02-01",
+        }).encode()
+
+        def _get_object(Bucket, Key):
+            body = MagicMock()
+            body.read.return_value = legacy_payload
+            return {"Body": body}
+
+        read_s3 = MagicMock()
+        read_s3.get_object.side_effect = _get_object
+        with patch("evaluate.boto3") as mock_eval_boto3:
+            mock_eval_boto3.client.return_value = read_s3
+            current = _read_current_weights({"signals_bucket": "test-bucket"})
+
+        assert current == {"quant": 0.55, "qual": 0.45}
