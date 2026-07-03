@@ -896,12 +896,25 @@ def _run_feature_drift(config: dict) -> dict:
 def _read_current_weights(config: dict) -> dict:
     """Read current scoring weights from S3, local config, or defaults."""
     bucket = config.get("signals_bucket", "alpha-engine-research")
+    # Canonical keys are weight_optimizer.SUB_SCORES ("quant", "qual") — the
+    # payload apply_weights() actually persists to scoring_weights.json.
+    # "news"/"research" were the pre-rename key names (commit 92c5067,
+    # 2026-03-29, "Rename sub_scores from news/research to quant/qual") and
+    # are accepted here only as a read-side migration fallback, in case an
+    # S3 object written before that rename has never since been overwritten
+    # (config#1679: this mismatch meant the true previous weights could
+    # never be read back, so every cycle's delta/churn was computed against
+    # the default_weights fallback instead).
+    legacy_to_canonical = dict(zip(("news", "research"), weight_optimizer.SUB_SCORES))
     try:
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=bucket, Key="config/scoring_weights.json")
         data = json.loads(obj["Body"].read())
-        weights = {k: float(data[k]) for k in ("news", "research") if k in data}
-        if len(weights) == 2:
+        weights = {k: float(data[k]) for k in weight_optimizer.SUB_SCORES if k in data}
+        for legacy_key, canonical_key in legacy_to_canonical.items():
+            if canonical_key not in weights and legacy_key in data:
+                weights[canonical_key] = float(data[legacy_key])
+        if len(weights) == len(weight_optimizer.SUB_SCORES):
             return weights
     except Exception:
         pass
