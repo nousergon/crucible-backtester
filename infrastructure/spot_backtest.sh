@@ -56,7 +56,9 @@
 # **2026-05-27 — SSH/SCP → SSM transport migration (ROADMAP L342 PR 3).**
 # Mirrors alpha-engine-data PR 2 (#330). Communication with the spot is
 # now via `aws ssm send-command` wrapped at the lib chokepoint
-# `python -m nousergon_lib.ssm_dispatcher run`. No port-22 inbound on
+# `python -m krepis.ssm_dispatcher run` (invoked directly via krepis per
+# config#1649 — the nousergon_lib re-export shim is guard-less under
+# `python -m` on lib >=0.81.0 and silently no-ops). No port-22 inbound on
 # the spot SG; no ssh / scp / ssh-keyscan. The 3 config files (no .env post
 # #890) are staged to a temporary S3 prefix and pulled down by the spot. PR 3 of
 # the 5-PR L342 arc.
@@ -510,14 +512,17 @@ echo "==> Dispatcher pre-launch preflight (fail-fast before provisioning spot)..
 pre_launch_preflight
 
 # ── Launch spot instance ──────────────────────────────────────────────────────
-# Capacity-resilient launch via alpha_engine_lib.ec2_spot (lib v0.26.0+).
+# Capacity-resilient launch via krepis.ec2_spot (lib v0.26.0+ as
+# alpha_engine_lib.ec2_spot / nousergon_lib.ec2_spot; invoked directly via
+# krepis per config#1649 — the nousergon_lib re-export shim is guard-less
+# under `python -m` on lib >=0.81.0 and silently no-ops).
 # Rotates (instance_type × subnet) on InsufficientInstanceCapacity etc.
 # Direct fix for the 2026-05-22 incident: THIS LAUNCHER's Evaluator
 # invocation failed with InsufficientInstanceCapacity for c5.large in
 # us-east-1f.
 echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
 
-INSTANCE_ID=$("$LIB_PYTHON" -m nousergon_lib.ec2_spot launch \
+INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
     --types "$INSTANCE_TYPES" \
     --subnets "$SUBNETS" \
     --image-id "$AMI_ID" \
@@ -534,7 +539,8 @@ if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$INSTANCE_ID" ]; then
     if [ "$ec2_spot_rc" -eq 0 ]; then
       # rc=0 with an EMPTY instance id = the launch layer produced nothing
       # (e.g. the guard-less `-m nousergon_lib.ec2_spot` shim no-op,
-      # config#1646). `${ec2_spot_rc:-1}` defaults only when UNSET — a
+      # config#1646 — closed at this launcher's transport by the krepis
+      # migration, config#1649). `${ec2_spot_rc:-1}` defaults only when UNSET — a
       # captured 0 passed through and the SF recorded a silent success
       # on 2026-07-03. An empty id must always fail loud.
       echo "ERROR: ec2_spot launch exited 0 without an instance id — failing loud (config#1646)" >&2
@@ -730,9 +736,12 @@ done
 # ── SSM dispatch primitive (lib chokepoint) ──────────────────────────────────
 # run_ssm "<description>" [timeout_seconds] <<HEREDOC ... HEREDOC
 #
-# Thin wrapper around `python -m nousergon_lib.ssm_dispatcher run`
-# (lib v0.35.0+). Body read from stdin via --script-stdin so the
-# dispatcher's bash parser does not scan it for quote/paren balance.
+# Thin wrapper around `python -m krepis.ssm_dispatcher run`
+# (lib v0.35.0+ as nousergon_lib.ssm_dispatcher; invoked directly via
+# krepis per config#1649 — the nousergon_lib re-export shim is guard-less
+# under `python -m` on lib >=0.81.0 and silently no-ops). Body read from
+# stdin via --script-stdin so the dispatcher's bash parser does not scan
+# it for quote/paren balance.
 # Records the description in LAST_SSM_DESC so the EXIT trap can name
 # which call ran last on failure. Mirrors ae-data PR 2 (#330).
 #
@@ -745,7 +754,7 @@ done
 run_ssm() {
     local description="$1" timeout_s="${2:-3600}"
     LAST_SSM_DESC="$description"
-    "$LIB_PYTHON" -m nousergon_lib.ssm_dispatcher run \
+    "$LIB_PYTHON" -m krepis.ssm_dispatcher run \
         --instance-id "$INSTANCE_ID" \
         --description "backtester: $description" \
         --timeout "$timeout_s" \
