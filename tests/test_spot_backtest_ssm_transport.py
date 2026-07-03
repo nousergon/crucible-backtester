@@ -132,22 +132,38 @@ def test_no_ssh_keyscan_invocation():
 
 def test_uses_lib_ssm_dispatcher_chokepoint():
     """The migration's load-bearing surface: ``python -m
-    alpha_engine_lib.ssm_dispatcher`` MUST appear in the script. Pinning
+    krepis.ssm_dispatcher`` MUST appear in the script. Pinning
     this catches a regression where a future PR replaces the lib CLI
     with an inline ``aws ssm send-command`` bash helper (the pre-lift
     pattern L342 explicitly lifts to the lib chokepoint)."""
     body = _SCRIPT.read_text()
-    assert "nousergon_lib.ssm_dispatcher" in body, (
+    assert "krepis.ssm_dispatcher" in body, (
         "spot_backtest.sh does not reference "
-        "nousergon_lib.ssm_dispatcher. The 2026-05-27 migration uses "
+        "krepis.ssm_dispatcher. The 2026-05-27 migration uses "
         "the lib chokepoint as the SSM dispatch path (package renamed "
-        "alpha_engine_lib -> nousergon_lib at lib 0.60.0; config#1245)."
+        "alpha_engine_lib -> nousergon_lib at lib 0.60.0, config#1245; "
+        "then the module relocated to krepis and is invoked directly per "
+        "config#1649)."
     )
     assert "-m alpha_engine_lib." not in body, (
         "spot_backtest.sh still invokes 'python -m alpha_engine_lib.<mod>'. "
         "That deprecated meta-path alias shim lacks runpy's get_code, so "
         "'-m' dies under runpy on any box crossed to nousergon-lib "
-        ">=0.60.x. Use '-m nousergon_lib.<mod>' (config#1245 / #1172)."
+        ">=0.60.x. Use '-m krepis.<mod>' (config#1245 / #1172 / #1649)."
+    )
+    offenders = [
+        (n, line)
+        for n, line in _script_lines()
+        if "-m nousergon_lib." in line
+    ]
+    assert not offenders, (
+        f"Found {len(offenders)} non-comment 'python -m nousergon_lib.<mod>' "
+        f"invocation(s) in spot_backtest.sh:\n"
+        + "\n".join(f"  line {n}: {line.strip()}" for n, line in offenders)
+        + "\n\nOn lib >=0.81.0 that path is a guard-less re-export shim: "
+        "under `python -m` (runpy) it exits 0 silently WITHOUT executing "
+        "the inner dispatch (config#1646 bug class). Invoke `-m "
+        "krepis.ssm_dispatcher` directly (config#1649)."
     )
 
 
