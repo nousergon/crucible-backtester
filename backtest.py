@@ -4502,10 +4502,17 @@ def _run_simulation_pipeline(
     _sim_setup: tuple | None,
     current_executor_params: dict | None,
     fd=None,
-) -> tuple[dict | None, object | None, dict | None]:
+) -> tuple[dict | None, object | None, dict | None, list[dict]]:
     """Run simulate mode, param sweep, executor optimizer, and twin simulation.
 
-    Returns (portfolio_stats, sweep_df, executor_rec).
+    Returns (portfolio_stats, sweep_df, executor_rec, sim_all_orders).
+    sim_all_orders is the per-trade order-record list popped out of
+    portfolio_stats by the simulate phase for the reporter's all_orders.csv
+    export (config#806) — [] when simulate is skipped/errors. It MUST be
+    threaded back to _main_impl's save() call: defining it only in this
+    function while save() references it in _main_impl was a NameError that
+    killed the report/upload/email stage on the first live weekly after
+    PR #404 (2026-07-03, flow-doctor CRITICAL ×2).
     """
     portfolio_stats = None
     sweep_df = None
@@ -4811,7 +4818,7 @@ def _run_simulation_pipeline(
                         "site": "executor_optimizer", "mode": args.mode})
                 executor_rec = {"status": "error", "error": str(e)}
 
-    return portfolio_stats, sweep_df, executor_rec
+    return portfolio_stats, sweep_df, executor_rec, sim_all_orders
 
 
 def _run_predictor_pipeline(
@@ -5411,10 +5418,15 @@ def _main_impl() -> None:
         )
 
     # ── Simulate + param sweep + executor optimizer ───────────────────────
+    # Reporter default: modes that never run the simulation pipeline still
+    # reach save(all_orders=sim_all_orders) below — [] keeps that path safe.
+    sim_all_orders: list[dict] = []
     if args.mode in ("simulate", "param-sweep", "all"):
         with registry.phase("simulation_pipeline", mode=args.mode):
-            portfolio_stats, sweep_df, executor_rec = _run_simulation_pipeline(
-                args, config, _sim_setup, current_executor_params, fd,
+            portfolio_stats, sweep_df, executor_rec, sim_all_orders = (
+                _run_simulation_pipeline(
+                    args, config, _sim_setup, current_executor_params, fd,
+                )
             )
 
     # ── Predictor backtest ────────────────────────────────────────────────

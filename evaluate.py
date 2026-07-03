@@ -1705,7 +1705,7 @@ def _main_impl() -> None:
                 df_base, ohlc_for_metrics, horizon_days=10,
             )
         except Exception as e:
-            log.warning("evaluator-revamp metric bundle failed: %s", e)
+            logger.warning("evaluator-revamp metric bundle failed: %s", e)
 
         # Decision-stream entropy (config#1151 Batch C) — the executor-tile
         # action_entropy diagnostic. Computed over the finalized-signal frame's
