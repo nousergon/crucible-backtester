@@ -23,6 +23,19 @@ jobs:
           pip install -r requirements.txt
           pip install pytest hypothesis
 
+      # Undefined-name lint (config#1646 follow-on): `sim_all_orders` was
+      # referenced in a function that never defined it — a NameError that only
+      # detonated at report time on the live weekly (backtest.py, PR #404),
+      # killing the backtester report/upload/email while primary artifacts
+      # survived. A second latent one sat in evaluate.py's except handler
+      # (`log` vs `logger`). F821 is a zero-false-positive class and runs
+      # BEFORE the suite: an undefined name in a rarely-exercised branch is
+      # exactly what tests miss.
+      - name: Undefined-name lint (ruff F821)
+        run: |
+          pip install ruff
+          ruff check --select F821 .
+
       - name: Run tests
         run: pytest tests/ -v
 
