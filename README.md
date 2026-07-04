@@ -1,8 +1,8 @@
 # alpha-engine-backtester
 
-> Part of [**Nous Ergon**](https://nousergon.ai) — a harness for rigorous AI/ML experiments in finance: an equity research-and-trading system instrumented end-to-end. Repo and S3 names use the underlying project name `alpha-engine`.
+> Part of [**Crucible**](https://nousergon.ai) — a [Nous Ergon](https://nousergon.ai) product: a harness for rigorous AI/ML experiments in finance, an equity research-and-trading system instrumented end-to-end. Repo and S3 names use the underlying project codename `alpha-engine`.
 
-[![Part of Nous Ergon](https://img.shields.io/badge/Part_of-Nous_Ergon-1a73e8?style=flat-square)](https://nousergon.ai)
+[![Part of Crucible](https://img.shields.io/badge/Part_of-Crucible-1a73e8?style=flat-square)](https://nousergon.ai)
 [![Python](https://img.shields.io/badge/python-3.11+-blue?style=flat-square)](https://www.python.org/)
 [![vectorbt](https://img.shields.io/badge/vectorbt-1a73e8?style=flat-square)](https://vectorbt.dev/)
 [![LightGBM](https://img.shields.io/badge/LightGBM-1a73e8?style=flat-square)](https://lightgbm.readthedocs.io/)
