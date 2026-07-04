@@ -161,3 +161,89 @@ def test_dual_writers_merge_not_overwrite():
         "config/predictor_params.json — veto_analysis's veto_confidence would "
         "be silently erased on every Phase 4 apply."
     )
+
+
+# ── Sole-writer guard for config/research_params.json (config#1719) ───────────
+# The retired ``pipeline_optimizer.apply_cio_mode`` was a SECOND, undeclared
+# writer into the shared config/research_params.json key — it wrote a
+# ``cio_mode`` field NO consumer read (research ``config._RP_DEFAULTS`` drops
+# it), a 63-day dead write. Guard the bug class structurally: research_params
+# must have exactly ONE producer module. A new writer fails here until it is
+# declared in PIPELINE_CONTRACT.yaml AND wired to a research-side consumer.
+
+_RESEARCH_PARAMS_KEY = "config/research_params.json"
+_ALLOWED_RESEARCH_PARAMS_WRITERS = {"research_optimizer"}
+
+
+def _module_const_strings(tree: ast.Module) -> dict[str, str]:
+    """Module-level ``NAME = "literal"`` string constants."""
+    out: dict[str, str] = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    out[tgt.id] = node.value.value
+    return out
+
+
+def _put_object_keys(tree: ast.Module) -> set[str]:
+    """Every ``Key=`` value passed to an ``s3.put_object(...)`` call, resolving
+    module-level string-constant references. Ignores docstrings/comments — only
+    ACTUAL write targets count (that is the whole point of the guard)."""
+    consts = _module_const_strings(tree)
+    keys: set[str] = set()
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "put_object"):
+            for kw in n.keywords:
+                if kw.arg != "Key":
+                    continue
+                v = kw.value
+                if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                    keys.add(v.value)
+                elif isinstance(v, ast.Name) and v.id in consts:
+                    keys.add(consts[v.id])
+    return keys
+
+
+def _modules_writing_key(key: str, subdirs=("optimizer", "analysis")) -> set[str]:
+    writers: set[str] = set()
+    for sub in subdirs:
+        d = _REPO / sub
+        if not d.exists():
+            continue
+        for path in d.glob("*.py"):
+            if key in _put_object_keys(ast.parse(path.read_text())):
+                writers.add(path.stem)
+    return writers
+
+
+def test_research_params_has_single_declared_writer():
+    """config#1719 regression: only research_optimizer writes research_params.json.
+
+    Catches the cio_mode bug class — a second module silently writing a field
+    into the shared config key that no consumer reads.
+    """
+    writers = _modules_writing_key(_RESEARCH_PARAMS_KEY)
+    assert writers == _ALLOWED_RESEARCH_PARAMS_WRITERS, (
+        f"unexpected writer(s) into {_RESEARCH_PARAMS_KEY}: "
+        f"{sorted(writers - _ALLOWED_RESEARCH_PARAMS_WRITERS)} — a new producer "
+        f"of the shared research-params config must be declared in "
+        f"PIPELINE_CONTRACT.yaml AND wired to a research-side consumer "
+        f"(config#1719); an undeclared field is a silent dead write."
+    )
+
+
+def test_apply_cio_mode_retired():
+    """config#1719: the dead cio_mode write path is gone (measurement retained)."""
+    from optimizer import pipeline_optimizer
+    assert not hasattr(pipeline_optimizer, "apply_cio_mode"), (
+        "apply_cio_mode was retired (config#1719 — dead write, no consumer). Do "
+        "not reintroduce a cio_mode actuation without a research-side consumer "
+        "and a bidirectional gate (scoped under config#1060)."
+    )
+    assert hasattr(pipeline_optimizer, "analyze_cio_performance"), (
+        "analyze_cio_performance (the retained CIO-vs-ranking measurement) must "
+        "survive — its recommendation feeds the eval report + config#1060."
+    )
