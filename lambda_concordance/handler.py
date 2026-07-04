@@ -40,7 +40,7 @@ call, 150 artifacts fits comfortably under the 900s Lambda timeout.
 
 Environment variables:
   S3_BUCKET             — default: alpha-engine-research
-  ANTHROPIC_API_KEY     — pulled from SSM by ssm_secrets.load_secrets
+  ANTHROPIC_API_KEY     — pulled from SSM by nousergon_lib.secrets.get_secret()
   EMAIL_SENDER          — flow-doctor wiring
   EMAIL_RECIPIENTS      — flow-doctor wiring
   GMAIL_APP_PASSWORD    — flow-doctor wiring

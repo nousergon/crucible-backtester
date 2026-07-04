@@ -33,8 +33,8 @@ import os
 import sys
 import time
 
-# Ensure the project root is on sys.path so sibling modules (ssm_secrets)
-# can be imported below. Cheap; safe at module-top.
+# Ensure the project root is on sys.path so sibling modules can be
+# imported below. Cheap; safe at module-top.
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
