@@ -1,12 +1,20 @@
 """
-pipeline_optimizer.py — team slot allocation + CIO fallback optimization.
+pipeline_optimizer.py — team slot allocation + CIO performance measurement.
 
 4b: If a sector team consistently underperforms its sector over 8+ weeks,
     reduce its slot count. Writes to config/team_slots.json on S3.
 
-4c: If CIO underperforms a simple score-ranking baseline over 8+ weeks,
-    recommend switching to deterministic CIO mode. Writes cio_mode flag
-    to config/research_params.json on S3.
+4c: Measure whether CIO underperforms a simple score-ranking baseline over
+    8+ weeks and surface the verdict as observability. NOTE: the former
+    ``apply_cio_mode`` actuation (which wrote a ``cio_mode`` flag into
+    config/research_params.json) was RETIRED 2026-07-04 (config#1719) — no
+    consumer ever read it (research ``config._RP_DEFAULTS`` excludes
+    ``cio_mode``, so the loader dropped it), making the write a 63-day no-op
+    that also mis-led the backtester into "believing" it had corrected CIO.
+    The CIO-vs-ranking MEASUREMENT (``analyze_cio_performance``) is retained;
+    its recommendation feeds the eval report + the research-edge
+    investigation (config#1060). Whether CIO should gain a real, consumed
+    deterministic-fallback mode is deferred to config#1060.
 
 Both items depend on end_to_end.py lift metrics being populated.
 Min-data gate: 8 weeks of team/CIO lift data.
@@ -22,7 +30,6 @@ import boto3
 logger = logging.getLogger(__name__)
 
 S3_TEAM_SLOTS_KEY = "config/team_slots.json"
-S3_RESEARCH_PARAMS_KEY = "config/research_params.json"
 
 _MIN_WEEKS = 8
 _NEGATIVE_LIFT_THRESHOLD = -0.005  # -0.5% avg lift → underperforming
@@ -351,30 +358,12 @@ def analyze_cio_performance(e2e_lift: dict) -> dict:
     }
 
 
-def apply_cio_mode(result: dict, bucket: str) -> dict:
-    """Write cio_mode to research_params.json on S3."""
-    if result.get("status") != "ok":
-        return {"applied": False, "reason": f"status={result.get('status')}"}
-
-    if result.get("recommendation") != "deterministic":
-        return {"applied": False, "reason": "CIO performing adequately — keeping LLM mode"}
-
-    s3 = boto3.client("s3")
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=S3_RESEARCH_PARAMS_KEY)
-        current = json.loads(obj["Body"].read())
-    except Exception:
-        current = {}
-
-    if current.get("cio_mode") == "deterministic":
-        return {"applied": False, "reason": "already in deterministic mode"}
-
-    current["cio_mode"] = "deterministic"
-    current["cio_mode_updated_at"] = str(date.today())
-    current["cio_mode_reason"] = result.get("reasoning")
-
-    body = json.dumps(current, indent=2)
-    s3.put_object(Bucket=bucket, Key=S3_RESEARCH_PARAMS_KEY, Body=body, ContentType="application/json")
-    logger.info("CIO mode set to deterministic in S3")
-
-    return {"applied": True, "mode": "deterministic"}
+# NOTE: ``apply_cio_mode`` was retired 2026-07-04 (config#1719). It wrote a
+# ``cio_mode="deterministic"`` flag into config/research_params.json that NO
+# consumer read (research ``config._RP_DEFAULTS`` excludes it → dropped on
+# load), with a one-way latch that stuck it permanently. It was a 63-day
+# dead write that mis-led the backtester into "believing" it had actuated a
+# CIO correction. The measurement (``analyze_cio_performance`` above) is
+# retained as observability; a real, consumed deterministic-CIO mode — if
+# wanted — is scoped under config#1060 (research-edge root-cause), where it
+# must ship with an actual research-side consumer and a bidirectional gate.

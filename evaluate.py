@@ -1040,7 +1040,7 @@ def _run_optimizers(
 
     results["cio_opt"] = tracker.run_module(
         "cio_optimizer",
-        lambda: _run_cio_opt(e2e_lift, freeze, bucket),
+        lambda: _run_cio_opt(e2e_lift),
         required_inputs={"e2e_lift": has_e2e},
         skip_if_missing=["e2e_lift"],
     )
@@ -1300,13 +1300,22 @@ def _run_team_opt(e2e_lift: dict, freeze: bool, bucket: str) -> dict:
     return result
 
 
-def _run_cio_opt(e2e_lift: dict, freeze: bool, bucket: str) -> dict:
+def _run_cio_opt(e2e_lift: dict) -> dict:
+    # Observability-only since 2026-07-04 (config#1719): the CIO-vs-ranking
+    # MEASUREMENT is computed and surfaced in the eval report, but there is no
+    # longer any S3 actuation. ``apply_cio_mode`` wrote a ``cio_mode`` flag no
+    # consumer read (a 63-day dead write) and was retired; a real consumed
+    # deterministic-CIO mode is scoped under config#1060. No ``freeze``/
+    # ``bucket`` params: this path has no side effects to freeze.
     result = pipeline_optimizer.analyze_cio_performance(e2e_lift)
     if result.get("status") == "ok":
-        if freeze:
-            result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
-        elif result.get("recommendation") == "deterministic":
-            result["apply_result"] = pipeline_optimizer.apply_cio_mode(result, bucket)
+        result["apply_result"] = {
+            "applied": False,
+            "reason": (
+                "observability-only — cio_mode actuation retired (config#1719); "
+                "CIO-vs-ranking recommendation surfaced as diagnostic (config#1060)"
+            ),
+        }
     return result
 
 
