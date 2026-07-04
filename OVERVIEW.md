@@ -64,7 +64,6 @@ Weekly system evaluator + autonomous parameter optimizer. Reads historical signa
 | SES email delivery | [`emailer.py`](emailer.py) |
 | Health-status writer | [`health_status.py`](health_status.py) |
 | Preflight | [`preflight.py`](preflight.py) |
-| SSM secret loader | [`ssm_secrets.py`](ssm_secrets.py) |
 
 ## Inputs / outputs
 
