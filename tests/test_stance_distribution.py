@@ -246,7 +246,7 @@ def test_alert_publish_called_on_fail(monkeypatch):
     fake_result.telegram.ok = True
     fake_result.any_ok = True
 
-    with patch("nousergon_lib.alerts.publish", return_value=fake_result) as mock_publish:
+    with patch("ops_alerts.publish_ops_alert", return_value=fake_result) as mock_publish:
         report = sd.compute_stance_distribution_drift(
             bucket="test-bucket", current_date="2026-05-15", s3_client=s3,
         )

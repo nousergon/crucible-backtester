@@ -5573,8 +5573,9 @@ def _main_impl() -> None:
                 # gate is the follow-up that classifies legit-vs-garbage.
                 logger.warning("%s", outcome.reason)
                 try:
-                    import nousergon_lib.alerts as _alerts
-                    _alerts.publish(
+                    from ops_alerts import publish_ops_alert
+
+                    publish_ops_alert(
                         message=(
                             f"Backtester empty param-sweep (mode={args.mode}, "
                             f"date={args.date}): no admissible combo; configs held, "
