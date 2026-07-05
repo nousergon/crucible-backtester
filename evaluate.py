@@ -52,6 +52,7 @@ from pathlib import Path
 #
 # exclude_patterns starts empty by deliberate convention.
 from nousergon_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.quant.horizons import DEFAULT_POLICY as _HORIZON_POLICY
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
 setup_logging(
@@ -262,13 +263,12 @@ def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict)
         return sq_result, [], [], {"status": "skipped"}, None
 
     # Load df_base for downstream modules. Outcome columns are re-sourced from
-    # the long-format score_performance_outcomes store (config#1483/#1528) via
-    # the repo's single accessor — every downstream consumer of df_base reads
-    # long-format outcome data under the HorizonPolicy-derived column names.
+    # the long-format score_performance_outcomes store (config#1483/#1528/#1529)
+    # inside load_score_performance (the repo's single accessor) — every
+    # downstream consumer of df_base reads long-format outcome data under the
+    # HorizonPolicy-derived column names.
     try:
-        from analysis.outcome_store import attach_outcomes
         df_base = signal_quality.load_score_performance(db_path)
-        df_base = attach_outcomes(df_base, db_path)
     except Exception:
         df_base = None
 
@@ -309,21 +309,54 @@ def _check_data_freshness(db_path: str) -> None:
     them (corrupt DB, missing table, etc.) but do not raise — the caller's
     main pipeline should continue. Previously this caught all exceptions
     silently with ``pass``, which hid real DB corruption and SQL errors.
+
+    config#1483/#1529: "resolved" is now determined by the long-format
+    score_performance_outcomes store, not the wide return_Nd columns. Staleness
+    is gated on the PRIMARY horizon only — that is the canonical resolution the
+    Phase-2 producer must deliver. The DIAGNOSTIC horizon (5d) is intentionally
+    optional (an unproduced diagnostic horizon yields no store rows by design),
+    so its absence is NOT a freshness defect and would raise spurious warnings.
+    The retired 10d/30d horizons are DROPPED (config#1456 — dead columns). A row
+    is stale if its score_date is old enough that the primary horizon should have
+    resolved (its trading-day window + a producer-lag grace), yet no primary-
+    horizon store row exists. Gating on one horizon also avoids double-counting a
+    row across horizons.
     """
     import sqlite3
+
+    from analysis.outcome_store import store_exists
+
+    policy = _HORIZON_POLICY
+    primary_h = int(policy.primary_horizon)
+    # Calendar-day staleness threshold: the primary horizon's trading-day window
+    # (~1.4 calendar days per trading day) plus a producer-lag grace, preserving
+    # the spirit of the legacy 21d→~30d threshold.
+    threshold_days = int(round(primary_h * 1.4)) + 2
     try:
         conn = sqlite3.connect(db_path)
-        stale = conn.execute(
-            "SELECT COUNT(*) FROM score_performance "
-            "WHERE (return_5d IS NULL AND score_date <= date('now', '-10 days')) "
-            "   OR (return_10d IS NULL AND score_date <= date('now', '-14 days')) "
-            "   OR (return_30d IS NULL AND score_date <= date('now', '-45 days'))"
-        ).fetchone()[0]
-        conn.close()
+        try:
+            if not store_exists(conn):
+                logger.warning(
+                    "Data freshness: score_performance_outcomes store absent — "
+                    "long-format producer (signal_returns Step 2c) has not run"
+                )
+                return
+            stale = conn.execute(
+                "SELECT COUNT(*) FROM score_performance sp "
+                "WHERE sp.score_date <= date('now', ?) "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM score_performance_outcomes o "
+                "    WHERE o.symbol = sp.symbol AND o.score_date = sp.score_date "
+                "      AND o.horizon_days = ?)",
+                (f"-{threshold_days} days", primary_h),
+            ).fetchone()[0]
+        finally:
+            conn.close()
         if stale > 0:
             logger.warning(
-                "Data freshness: %d score_performance rows have missing returns "
-                "(data module may not have run signal_returns collector)", stale,
+                "Data freshness: %d score_performance rows have no resolved "
+                "primary-horizon (%dd) outcome (data module may not have run "
+                "signal_returns collector)", stale, primary_h,
             )
     except Exception as exc:
         logger.error(

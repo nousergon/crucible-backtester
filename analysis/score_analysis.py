@@ -13,7 +13,7 @@ import logging
 
 import pandas as pd
 
-from analysis.signal_quality import _compute_slice_metrics, MIN_SAMPLES
+from analysis.signal_quality import _BEAT_5D, _BEAT_21D, _compute_slice_metrics, MIN_SAMPLES
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,9 @@ def accuracy_by_threshold(
     Use this to find the score cutoff that maximises accuracy while maintaining
     a meaningful sample size.
     """
-    populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
+    populated_5d = df[df[_BEAT_5D].notna()] if _BEAT_5D in df.columns else pd.DataFrame()
     # config#1456: canonical 21d horizon (10d/30d outcomes retired).
-    populated_21d = df[df["beat_spy_21d"].notna()] if "beat_spy_21d" in df.columns else pd.DataFrame()
+    populated_21d = df[df[_BEAT_21D].notna()] if _BEAT_21D in df.columns else pd.DataFrame()
 
     results = []
     for t in sorted(thresholds):

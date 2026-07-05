@@ -16,8 +16,27 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
+from analysis.outcome_store import attach_outcomes
 
 logger = logging.getLogger(__name__)
+
+_POLICY = DEFAULT_POLICY
+
+# Horizon label ("5d"/"21d") → (stock-return col, spy-return col, beat-SPY col),
+# resolved from HorizonPolicy.outcome_columns rather than hardcoded literals
+# (config#1529). The DataFrame these read is re-sourced from the long-format
+# score_performance_outcomes store via attach_outcomes; the physical column
+# names are unchanged (percent, 2dp) so the alpha arithmetic is byte-identical.
+_HORIZON_COLS: dict[str, tuple[str, str, str]] = {
+    f"{h}d": (
+        _POLICY.outcome_columns(h).stock_return,
+        _POLICY.outcome_columns(h).spy_return,
+        _POLICY.outcome_columns(h).beat_spy,
+    )
+    for h in _POLICY.all_horizons
+}
 
 _ALPHA_BUCKETS = [
     ("<-5%", -float("inf"), -5.0),
@@ -29,9 +48,12 @@ _ALPHA_BUCKETS = [
 ]
 
 
+_DEFAULT_HORIZON_LABELS = tuple(f"{h}d" for h in _POLICY.all_horizons)
+
+
 def compute_alpha_distribution(
     db_path: str,
-    horizons: tuple[str, ...] = ("5d", "21d"),
+    horizons: tuple[str, ...] = _DEFAULT_HORIZON_LABELS,
     min_samples: int = 5,
 ) -> dict:
     """
@@ -58,18 +80,16 @@ def compute_alpha_distribution(
     if df.empty:
         return {"status": "insufficient_data", "error": "score_performance is empty"}
 
+    # Re-source outcome columns from the long-format store (config#1529).
+    df = attach_outcomes(df, str(db_path), policy=_POLICY)
+
     distributions: dict = {}
     summary: dict = {}
 
-    horizon_cols = {
-        "5d": ("return_5d", "spy_5d_return"),
-        "21d": ("return_21d", "spy_21d_return"),
-    }
-
     for h in horizons:
-        if h not in horizon_cols:
+        if h not in _HORIZON_COLS:
             continue
-        ret_col, spy_col = horizon_cols[h]
+        ret_col, spy_col, _beat_col = _HORIZON_COLS[h]
         if ret_col not in df.columns or spy_col not in df.columns:
             continue
 
@@ -116,7 +136,7 @@ def compute_alpha_distribution(
 
 def compute_score_calibration(
     db_path: str,
-    horizon: str = "21d",
+    horizon: str = f"{_POLICY.primary_horizon}d",
     n_buckets: int = 5,
     min_per_bucket: int = 3,
 ) -> dict:
@@ -134,14 +154,10 @@ def compute_score_calibration(
     if not Path(db_path).exists():
         return {"status": "error", "error": f"DB not found at {db_path}"}
 
-    horizon_cols = {
-        "5d": ("return_5d", "spy_5d_return", "beat_spy_5d"),
-        "21d": ("return_21d", "spy_21d_return", "beat_spy_21d"),
-    }
-    if horizon not in horizon_cols:
+    if horizon not in _HORIZON_COLS:
         return {"status": "error", "error": f"unsupported horizon: {horizon}"}
 
-    ret_col, spy_col, beat_col = horizon_cols[horizon]
+    ret_col, spy_col, beat_col = _HORIZON_COLS[horizon]
 
     try:
         conn = sqlite3.connect(db_path)
@@ -179,6 +195,9 @@ def compute_score_calibration(
         conn.close()
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+    # Re-source outcome columns from the long-format store (config#1529).
+    df = attach_outcomes(df, str(db_path), policy=_POLICY)
 
     required = ["score", ret_col, spy_col]
     for c in required:
