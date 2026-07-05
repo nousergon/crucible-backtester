@@ -1396,11 +1396,10 @@ def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
     if status == "ok":
         return
     try:
-        from nousergon_lib import alerts  # noqa: PLC0415
+        from ops_alerts import publish_ops_alert
     except ImportError as e:
         logger.warning(
-            "[executor_optimizer] alerts publish skipped — nousergon_lib.alerts "
-            "unavailable (lib pin <v0.21.0?): %s", e,
+            "[executor_optimizer] alerts publish skipped — ops_alerts unavailable: %s", e,
         )
         return
     run_date = config.get("run_date") or result.get("run_date") or "unknown"
@@ -1418,7 +1417,7 @@ def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
         f"and ROADMAP item (c) of the 5/23-SF aggregate-cycle P0 sweep."
     )
     try:
-        publish_result = alerts.publish(
+        publish_result = publish_ops_alert(
             message,
             severity="warning",
             source="alpha-engine-backtester/evaluate.py::_run_executor_opt",
@@ -1426,10 +1425,9 @@ def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
             dedup_window_min=1440,  # one alert per (run_date, status) per day
         )
         logger.info(
-            "[executor_optimizer] REJECTED alert publish: sns_ok=%s telegram_ok=%s "
+            "[executor_optimizer] REJECTED alert publish: sns_ok=%s "
             "any_ok=%s dedup_skipped=%s",
             publish_result.sns.ok,
-            publish_result.telegram.ok,
             publish_result.any_ok,
             getattr(publish_result, "dedup_skipped", False),
         )

@@ -221,11 +221,10 @@ def _publish_drift_alert(report: dict) -> None:
     ):
         return
     try:
-        from nousergon_lib import alerts  # noqa: PLC0415 — lazy import
+        from ops_alerts import publish_ops_alert
     except ImportError as e:
         logger.warning(
-            "[stance_distribution] alerts publish skipped — nousergon_lib.alerts "
-            "unavailable (lib pin <v0.21.0?): %s", e,
+            "[stance_distribution] alerts publish skipped — ops_alerts unavailable: %s", e,
         )
         return
     failures = report.get("failures", []) or []
@@ -252,15 +251,14 @@ def _publish_drift_alert(report: dict) -> None:
         "classify_stance pillar-vs-heuristic path."
     )
     try:
-        result = alerts.publish(
+        result = publish_ops_alert(
             message,
             severity="error",
             source="alpha-engine-backtester/analysis/stance_distribution.py",
         )
         logger.info(
-            "[stance_distribution] drift alert publish: sns_ok=%s "
-            "telegram_ok=%s any_ok=%s",
-            result.sns.ok, result.telegram.ok, result.any_ok,
+            "[stance_distribution] drift alert publish: sns_ok=%s any_ok=%s",
+            result.sns.ok, result.any_ok,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
