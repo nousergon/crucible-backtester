@@ -210,24 +210,51 @@ USE_VECTORIZED_SWEEP="${USE_VECTORIZED_SWEEP:-false}"
 # `=`. Boolean flags (--smoke-only, --force, --dry-run, etc.) accept no
 # value and don't need the companion case.
 
-# L4485-b (2026-06-05): bounded self-relaunch on a mid-run AWS spot RECLAIM.
-# The Saturday SF's per-state Retry is on the `ssm:sendCommand` Task, which
-# only SENDS the command and returns — the actual run is polled by a separate
-# Choice loop, so a worker spot reclaimed mid-run (Server.SpotInstanceTermination
-# / instance-terminated-no-capacity) surfaces in the poll as a generic Failed,
+# #883 — bounded mid-run spot-reclaim relaunch. The Saturday SF's per-state
+# Retry is on the `ssm:sendCommand` Task, which only SENDS the command and
+# returns — the actual run is polled by a separate Choice loop, so a worker
+# spot reclaimed mid-run (Server.SpotInstanceTermination /
+# instance-terminated-no-capacity) surfaces in the poll as a generic Failed,
 # NOT a sendCommand TaskFailed → the SF Retry never fires (its "handles spot
-# interruption" comment is structurally wrong). This dispatcher (which OWNS the
-# worker-spot lifecycle) is the only layer that can see the reclaim reason — it
-# already classifies it in cleanup(). On a classified reclaim, cleanup() re-execs
-# this script on a FRESH spot, bounded by RECLAIM_RELAUNCH_MAX. Gated STRICTLY on
-# the reclaim reason — any non-reclaim failure exits immediately (no blind retry
-# that could mask a real bug, per feedback_no_silent_fails). Happy path unchanged.
-# Default budget 3 (was 1): 2026-06-06 saw TWO consecutive reclaims during a
-# capacity-volatile window; a budget of 1 exhausts on such a streak. Each
-# relaunch resumes cheaply via the S3 phase auto-skip markers (completed phases
-# are skipped on the fresh spot), so a higher bound is low-cost and only ever
-# burns on a CLASSIFIED reclaim — a real crash/OOM/timeout still exits at once.
-RECLAIM_RELAUNCH_MAX="${RECLAIM_RELAUNCH_MAX:-3}"
+# interruption" comment is structurally wrong). This dispatcher (which OWNS
+# the worker-spot lifecycle) is the only layer that can see the reclaim
+# reason. Originally (L4485-b, #283/#289) this classified the reclaim INLINE
+# and self-relaunched via a decrementing RECLAIM_RELAUNCH_MAX budget — a
+# divergent copy of the identical logic in alpha-engine-data's #349 reference
+# implementation and the predictor launcher's gap (no relaunch at all). Per
+# #883, the classify→decide DECISION is now the lib chokepoint
+# `python -m krepis.ec2_spot relaunch-decision` (lib v0.65.0+; already
+# satisfied by this repo's nousergon-lib@v0.78.0 / krepis>=0.4.0 pins — no
+# bump needed). Invoked directly via krepis, NOT `nousergon_lib.ec2_spot`
+# (config#1649 / config#1646): on lib >=0.81.0 `nousergon_lib.ec2_spot` is a
+# guard-less re-export shim that silently no-ops under `python -m` — this
+# launcher's other lib CLI callsites already migrated off it, so the new
+# relaunch-decision callsite must follow the same convention from day one.
+# ONLY a confirmed reclaim relaunches; a genuine workload failure (OOM /
+# crash / timeout) classifies as "other"/"unknown" and fails loud — a blind
+# retry would mask a real bug (feedback_no_silent_fails). SPOT_ATTEMPT is
+# threaded across re-execs via the env (first run = 1). Happy path unchanged.
+#
+# MAX_SPOT_ATTEMPTS ↔ per-attempt-budget coupling (#883 requirement): each
+# attempt costs boot time plus up to MAX_RUNTIME_SECONDS of workload. The
+# lib's --sf-execution-timeout/--per-attempt-seconds guard refuses to advise a
+# relaunch the OUTER budget cannot absorb. The Saturday backtest runs from a
+# weekly cron (`spot_backtest.sh`), NOT under a Step-Functions
+# executionTimeout, so there is no outer SF budget to couple to —
+# SF_EXECUTION_TIMEOUT defaults empty (guard inert; bound is
+# MAX_SPOT_ATTEMPTS only). If this launcher is ever wired under an SF state
+# with an executionTimeout, set SF_EXECUTION_TIMEOUT to that budget and the
+# lib guard activates ((attempt+1)*MAX_RUNTIME_SECONDS must fit).
+#
+# MAX_SPOT_ATTEMPTS=4 preserves the prior RECLAIM_RELAUNCH_MAX=3 budget (3
+# relaunches = 4 total attempts): 2026-06-06 saw TWO consecutive reclaims
+# during a capacity-volatile window, so a lower bound would exhaust on such a
+# streak. Each relaunch resumes cheaply via the S3 phase auto-skip markers
+# (completed phases are skipped on the fresh spot), so the higher bound is
+# low-cost and only ever burns on a CLASSIFIED reclaim.
+MAX_SPOT_ATTEMPTS="${MAX_SPOT_ATTEMPTS:-4}"
+SPOT_ATTEMPT="${SPOT_ATTEMPT:-1}"
+SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 _ORIG_ARGS=("$@")  # captured pre-parse for the relaunch exec
 
 while [[ $# -gt 0 ]]; do
@@ -379,6 +406,7 @@ echo "  Skip stages   : ${SKIP_STAGES:-(none)}"
 echo "  Freeze eval   : $FREEZE_EVALUATOR"
 echo "  Vectorized sw : $USE_VECTORIZED_SWEEP"
 echo "  S3 bucket     : $S3_BUCKET"
+echo "  Spot attempt  : $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS  (#883 — relaunch on confirmed mid-run reclaim)"
 echo ""
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
@@ -564,31 +592,23 @@ LAST_SSM_DESC=""
 # with diagnostics on failure.
 cleanup() {
     local exit_code=$?
-    local _will_relaunch=0 _alert_sev="error" _is_reclaim=0
+    local _will_relaunch=0 _alert_sev="error"
     echo ""
     echo "==> Dispatcher EXIT (code=$exit_code)"
+    local state="<not yet provisioned>" reason_code="<none>" state_reason="<none>"
     if [ "$exit_code" -ne 0 ]; then
         local last_desc="${LAST_SSM_DESC:-<none — failed before any SSM call>}"
         echo "    last run_ssm: $last_desc"
-        local state="<not yet provisioned>" state_reason="<none>"
         if [ -n "${INSTANCE_ID:-}" ]; then
-            # Capture State.Name + StateTransitionReason BEFORE terminating so
-            # the L4485 rc=-1 / empty-output failure class (SSM Failed with no
-            # stdout/stderr) is classifiable post-hoc: a spot interruption
-            # shows "Server.SpotInstanceTermination" here, a delivery-timeout /
-            # genuine crash shows something else. Without this the instance is
-            # gone by the time anyone looks and the diagnostics JSON carries
-            # empty tails — exactly the 2026-06-01 dead-end. One describe call,
-            # flattened to "State.Name<TAB>StateTransitionReason".
-            # Capture State.Name + StateReason.Code + StateTransitionReason.
-            # The AUTHORITATIVE spot-reclaim signal is StateReason.Code ==
-            # Server.SpotInstanceTermination; StateTransitionReason only shows
-            # the human "Service initiated (<ts>)" form. Earlier this queried
-            # StateTransitionReason ALONE and classified against
-            # Server.SpotInstanceTermination — a field/value mismatch that could
-            # never match, so two real reclaims on 2026-06-06 hard-failed instead
-            # of relaunching. Now both are captured (3 tab-separated fields).
-            local _desc reason_code
+            # Capture State.Name + StateReason.Code + StateTransitionReason
+            # BEFORE terminating so the L4485 rc=-1 / empty-output failure
+            # class (SSM Failed with no stdout/stderr) is classifiable
+            # post-hoc and so the diagnostics below are populated (the
+            # instance is gone once terminated). This describe call is for
+            # STDOUT DIAGNOSTICS ONLY — the actual reclaim classify→decide
+            # DECISION below is delegated to the lib chokepoint, which runs
+            # its own describe-instances internally.
+            local _desc
             _desc=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --query 'Reservations[0].Instances[0].[State.Name,StateReason.Code,StateTransitionReason]' --output text 2>/dev/null || true)
             state=$(printf '%s' "$_desc" | cut -f1)
             reason_code=$(printf '%s' "$_desc" | cut -f2)
@@ -600,25 +620,38 @@ cleanup() {
             echo "    spot state-reason-code: $reason_code"
             echo "    spot state-transition-reason: $state_reason"
         fi
-        # L4485-b (classifier fixed 2026-06-06): classify a genuine AWS spot
-        # reclaim. Authoritative signal = StateReason.Code ==
-        # Server.SpotInstanceTermination. Belt-and-suspenders: also treat a
-        # worker already in shutting-down/terminated whose StateTransitionReason
-        # is "Service initiated" as a reclaim — AWS tore it down out from under a
-        # still-running (exit_code!=0) dispatcher (a real crash/OOM leaves the
-        # worker state=running until we terminate it below, so this can't
-        # mis-fire on a genuine bug). Every other failure exits as-is so a blind
-        # retry never masks a real bug. Downgrade the alert to warning when we
-        # will relaunch, so a recovered run does not page as an error.
-        case "$reason_code" in
-            *Server.SpotInstanceTermination*) _is_reclaim=1 ;;
-        esac
-        case "$state:$state_reason" in
-            shutting-down:*Service\ initiated* | terminated:*Service\ initiated*) _is_reclaim=1 ;;
-        esac
-        if [ "$_is_reclaim" = "1" ] && [ "${RECLAIM_RELAUNCH_MAX:-0}" -gt 0 ]; then
-            _will_relaunch=1
-            _alert_sev="warning"
+        # #883 — mid-run spot-reclaim relaunch DECISION (lib chokepoint).
+        # Originally (L4485-b, #283/#289) this classified the reclaim INLINE
+        # (grepping StateReason.Code / StateTransitionReason directly) — a
+        # divergent copy of the identical logic duplicated across the data
+        # (#349), backtester, and (missing) predictor launchers. Per #883
+        # that classify→decide DECISION now lives in the lib:
+        # `python -m krepis.ec2_spot relaunch-decision` (lib v0.65.0+),
+        # invoked directly via krepis (config#1649 — the nousergon_lib
+        # re-export shim is guard-less on lib >=0.81.0, same as this
+        # launcher's other lib CLI callsites). The lib's classify_termination
+        # (describe-instances) MUST run while the instance still exists, so
+        # decide HERE, BEFORE terminate-instances. exit 0 = relaunch;
+        # NO_RELAUNCH_EXIT_CODE (75) / any other = hold (fail loud) — a
+        # genuine crash/OOM/timeout still exits at once, no blind retry that
+        # could mask a real bug (feedback_no_silent_fails). Downgrade the
+        # alert to warning when we will relaunch, so a recovered run does not
+        # page as an error.
+        if [ -n "${INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
+            local _decide_out _decide_rc
+            _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
+                --instance-id "$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --attempt "$SPOT_ATTEMPT" \
+                --max-attempts "$MAX_SPOT_ATTEMPTS" \
+                ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
+                2>/dev/null)"
+            _decide_rc=$?
+            echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}"
+            if [ "$_decide_rc" -eq 0 ]; then
+                _will_relaunch=1
+                _alert_sev="warning"
+            fi
         fi
         # Independent-channel surveillance: fan out the diagnostic via
         # krepis.alerts (SNS + Telegram). Mirrors the L117 "Lambda CI
@@ -652,14 +685,18 @@ cleanup() {
     aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
     aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
     echo "  Instance terminated; S3 staging cleaned."
-    # L4485-b: on a classified spot reclaim, relaunch on a FRESH spot (bounded).
-    # The dead worker + its S3 staging are already cleaned above, so re-exec is
-    # clean. exec replaces this process, decrementing the budget so the relaunch
-    # is bounded; the pending `exit` below is moot. Any non-reclaim failure falls
-    # through to the status-preserving exit.
+    # #883 — on a classified reclaim, relaunch a FRESH spot with the SAME
+    # argv, threading the incremented SPOT_ATTEMPT via the env. `trap - EXIT`
+    # first so the exec'd process installs its own trap cleanly; exec
+    # replaces this process, so the relaunch is bounded by
+    # SPOT_ATTEMPT<MAX_SPOT_ATTEMPTS (re-checked above) and the pending
+    # `exit` below is moot. Any non-reclaim failure falls through to the
+    # status-preserving exit. The dead worker + its S3 staging are already
+    # cleaned above, so re-exec is clean.
     if [ "$_will_relaunch" = "1" ]; then
-        echo "==> Spot RECLAIMED by AWS (reason_code='$reason_code' state='$state' transition='$state_reason') — relaunching on a fresh spot (budget remaining after this: $((RECLAIM_RELAUNCH_MAX - 1)))"
-        exec env RECLAIM_RELAUNCH_MAX="$((RECLAIM_RELAUNCH_MAX - 1))" bash "$0" "${_ORIG_ARGS[@]}"
+        echo "==> Spot RECLAIMED by AWS (reason_code='$reason_code' state='$state' transition='$state_reason') — relaunching on a fresh spot (attempt $((SPOT_ATTEMPT + 1))/$MAX_SPOT_ATTEMPTS)"
+        trap - EXIT
+        SPOT_ATTEMPT=$((SPOT_ATTEMPT + 1)) exec bash "$0" ${_ORIG_ARGS[@]+"${_ORIG_ARGS[@]}"}
     fi
     # CRITICAL (L4485): re-exit with the captured status. A bash EXIT trap
     # that ends on a successful command (the echo above, or the `|| true`
