@@ -153,6 +153,23 @@ class TestFlowDoctorYamlSchema:
             assert key in cfg, f"missing top-level key: {key}"
         assert cfg["repo"] == "nousergon/crucible-backtester"
 
+    def test_yaml_github_routes_to_config_backlog(self):
+        import yaml
+
+        with open(REPO_ROOT / "flow-doctor.yaml") as f:
+            cfg = yaml.safe_load(f)
+        github = next(n for n in cfg["notify"] if n.get("type") == "github")
+        assert github["repo"] == "nousergon/alpha-engine-config"
+        assert github.get("notify_on_category") == ["CODE", "CONFIG"]
+        assert "area:backtester" in github.get("labels", [])
+        ops_health = next(
+            n
+            for n in cfg["notify"]
+            if n.get("type") == "telegram"
+            and n.get("message_thread_id") == "${FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH}"
+        )
+        assert ops_health.get("notify_on_category") == ["TRANSIENT", "EXTERNAL", "INFRA"]
+
 
 @flow_doctor_required
 class TestSetupLoggingAttach:
@@ -379,17 +396,10 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
-        assert "@v0.78.0" in text, (
-            "nousergon-lib should pin to v0.78.0 — repinned to restore "
-            "co-install parity with crucible-predictor (predictor moved to "
-            "v0.78.0 for the research_intel contracts schema, config#1500 / "
-            "nousergon-lib#146). L4517's LibPinDriftCheck asserts "
-            "backtester-pin == predictor-pin before every spot_backtest.sh "
-            "co-install (both land in one venv); a lag here silently "
-            "downgrades the lib in the shared venv (2026-05-12 incident) and, "
-            "as of this repin, hard-fails the weekly SF at the pin-drift gate "
-            "before any spot launch. "
-            "Prior: v0.77.1 — the HorizonPolicy chokepoint "
+        assert "@v0.86.0" in text, (
+            "nousergon-lib should pin to v0.86.0 (nousergon_lib.health enrichment "
+            "writer for config#1727 Phase C; lockstep with fleet at v0.86.0). "
+            "Prior: v0.83.0 — flow-doctor>=0.8.0 notify_on_category for config#1695. "
             "(nousergon_lib.quant.horizons + the outcome_record contract, "
             "config#1483 Phase 1 / nousergon-lib#147) consumed by the "
             "config#1528 optimizer cutover. "

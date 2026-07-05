@@ -63,6 +63,39 @@ def store_exists(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def primary_beat_counts(
+    db_path: str | Path,
+    policy: HorizonPolicy = DEFAULT_POLICY,
+) -> tuple[int, int]:
+    """Return ``(n_resolved, n_beat)`` at the primary horizon from the store.
+
+    The counterpart to the legacy wide-column aggregates
+    ``SELECT COUNT(*)/SUM(<primary beat-SPY column>) FROM score_performance``
+    where that column ``IS NOT NULL`` — re-sourced from
+    ``score_performance_outcomes`` filtered by ``policy.primary_horizon``
+    (config#1529). ``beat_spy`` is stored as 0/1 in both representations, so the
+    count + sum are byte-identical to the wide aggregates. A pre-cutover DB
+    (store table absent) returns ``(0, 0)`` — the same "no data yet" signal the
+    wide COUNT would give on an unpopulated column.
+    """
+    own_conn = not isinstance(db_path, sqlite3.Connection)
+    conn = sqlite3.connect(str(db_path)) if own_conn else db_path
+    try:
+        if not store_exists(conn):
+            return (0, 0)
+        row = conn.execute(
+            f"SELECT COUNT(beat_spy), SUM(beat_spy) FROM {_TABLE} "
+            f"WHERE horizon_days = ? AND beat_spy IS NOT NULL",
+            (int(policy.primary_horizon),),
+        ).fetchone()
+    finally:
+        if own_conn:
+            conn.close()
+    n_resolved = int(row[0] or 0)
+    n_beat = int(row[1] or 0)
+    return (n_resolved, n_beat)
+
+
 def load_outcomes(
     db_path: str | Path | sqlite3.Connection,
     policy: HorizonPolicy = DEFAULT_POLICY,
@@ -149,9 +182,33 @@ def attach_outcomes(
     but missing from the long store is counted and WARNed — a divergence there
     means the Phase-2 producer is skipping rows and must be investigated, not
     silently absorbed.
+
+    Pre-cutover DB (store table absent): the raw wide columns pass through
+    UNCHANGED — a graceful no-op. Dropping+NaN-ing the wide columns when the
+    long store has not yet been produced would starve every downstream consumer
+    of data that is present in the wide columns; the whole point of the soak is
+    that consumers keep working off the wide columns until the store is
+    populated. ``load_outcomes`` already WARNs loudly on the absent table.
     """
     if df is None or df.empty:
         return df
+
+    # Pre-cutover / unpopulated store: leave the wide columns in place. Detected
+    # here (not via an empty long frame — a legitimately empty PRODUCED store is
+    # different from an ABSENT one and must still drop the wide columns).
+    own_conn = not isinstance(db_path, sqlite3.Connection)
+    conn = sqlite3.connect(str(db_path)) if own_conn else db_path
+    try:
+        store_present = store_exists(conn)
+    finally:
+        if own_conn:
+            conn.close()
+    if not store_present:
+        logger.warning(
+            "%s absent — attach_outcomes passing wide columns through unchanged "
+            "(pre-cutover fallback; long-format producer not yet run)", _TABLE,
+        )
+        return df.copy()
 
     out = df.copy()
     key = ["symbol", "score_date"]

@@ -159,7 +159,7 @@ def test_handler_full_run(mock_db, mock_drift, mock_health, mock_cal, mock_trigg
     with patch("analysis.production_health.compute_production_health", mock_health), \
          patch("analysis.production_health.compute_calibration_validation", mock_cal), \
          patch("analysis.retrain_alert.evaluate_retrain_triggers", mock_triggers), \
-         patch("health_status.write_health", mock_write):
+         patch("nousergon_lib.health.write_health", mock_write):
         result = handler({}, None)
 
     assert result["statusCode"] == 200
