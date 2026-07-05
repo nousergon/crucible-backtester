@@ -653,33 +653,27 @@ cleanup() {
                 _alert_sev="warning"
             fi
         fi
-        # Independent-channel surveillance: fan out the diagnostic via
-        # krepis.alerts (SNS + Telegram). Mirrors the L117 "Lambda CI
-        # canary rollback should Telegram/email the operator on rollback"
-        # pattern and the CLAUDE.md SOTA rule sub-sub-rule (lift-to-lib
-        # for ≥2 consumers) via the `python -m krepis.alerts publish` CLI
-        # primitive. Target is `krepis.alerts`, NOT `nousergon_lib.alerts`
-        # (config#1339): the alerts module relocated to krepis (MIT) at
-        # nousergon-lib v0.66.0, and `nousergon_lib.alerts` is now a
-        # `sys.modules` re-export shim with NO runpy `__main__` — so
-        # `python -m nousergon_lib.alerts publish` is a SILENT no-op
-        # (exits 0, publishes nothing). krepis is a direct requirements
-        # pin, so `-m krepis.alerts` runs the real CLI under runpy.
-        # Best-effort: ``|| true`` keeps cleanup running even if Python /
-        # the lib / SNS / Telegram are all unreachable — the local stdout
-        # diagnostic above is the primary surface; the alert is the
-        # independent fan-out.
-        local _alert_python
+        # Independent-channel surveillance: fan out via ops_alerts
+        # (SNS + flow-doctor forum topics; config#1749 T3). Best-effort:
+        # ``|| echo ...`` keeps cleanup running even if Python / lib / SNS /
+        # flow-doctor are unreachable — stdout diagnostic above is primary.
+        local _alert_python _alert_msg
+        _alert_msg="exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_reason_code='$reason_code' spot_transition_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>} will_relaunch=$_will_relaunch"
         if [ -x "$(dirname "$0")/../.venv/bin/python" ]; then
             _alert_python="$(dirname "$0")/../.venv/bin/python"
         else
             _alert_python="$(command -v python3 || command -v python || echo python)"
         fi
-        "$_alert_python" -m krepis.alerts publish \
-            --message "exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_reason_code='$reason_code' spot_transition_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>} will_relaunch=$_will_relaunch" \
-            --severity "$_alert_sev" \
-            --source alpha-engine-backtester/spot_backtest.sh \
-            > /dev/null 2>&1 || echo "    (alerts.publish fan-out failed; primary stdout diagnostic above is the surface)"
+        (cd "$REPO_ROOT" && "$_alert_python" -c "
+import sys
+from ops_alerts import publish_ops_alert
+publish_ops_alert(
+    sys.argv[1],
+    severity=sys.argv[2],
+    source='alpha-engine-backtester/spot_backtest.sh',
+)
+" "$_alert_msg" "$_alert_sev") \
+            > /dev/null 2>&1 || echo "    (ops alert fan-out failed; primary stdout diagnostic above is the surface)"
     fi
     echo "==> Terminating spot instance $INSTANCE_ID..."
     aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true

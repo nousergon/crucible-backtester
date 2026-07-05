@@ -196,14 +196,13 @@ def _publish_parity_alarm(
 
     if publish_fn is None:
         try:
-            from nousergon_lib import alerts  # noqa: PLC0415 — lazy import
+            from ops_alerts import publish_ops_alert
         except ImportError as e:
             logger.warning(
-                "[parity_alarms] paging skipped — nousergon_lib.alerts "
-                "unavailable: %s", e,
+                "[parity_alarms] paging skipped — ops_alerts unavailable: %s", e,
             )
             return False
-        publish_fn = alerts.publish
+        publish_fn = publish_ops_alert
 
     try:
         publish_fn(message, severity="error", source=source)
