@@ -2,16 +2,20 @@
 signal_quality.py — Mode 1: aggregate score_performance from research.db.
 
 Reads the score_performance table (populated by the research pipeline) and
-computes accuracy metrics: % of BUY signals that beat SPY at the canonical
-5d (short) and 21d (primary) horizons.
+computes accuracy metrics: % of BUY signals that beat SPY at the diagnostic
+short and primary horizons. Outcome columns are re-sourced from the
+long-format score_performance_outcomes store via analysis.outcome_store
+(config#1483/#1529); the horizons + column names resolve from
+nousergon_lib.quant.horizons.HorizonPolicy (primary 21d + diagnostic 5d)
+rather than hardcoded horizon-suffixed literals.
 
-The 10d/30d outcome horizons were RETIRED in the canonical-alpha cutover
-(config#1456); resolution now writes 5d + 21d only. Gating + reporting is on
-the canonical 21d horizon (the system's prediction target).
+The legacy 10d/30d outcome horizons were RETIRED in the canonical-alpha
+cutover (config#1456); the store carries policy horizons only. Gating +
+reporting is on the primary horizon (the system's prediction target).
 
 Data availability: meaningful results require ~200 populated rows.
-This module returns insufficient_data until ~200 rows carry the canonical
-beat_spy_21d outcome.
+This module returns insufficient_data until ~200 rows carry the primary
+beat-SPY outcome.
 """
 
 import logging
@@ -19,7 +23,9 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
+from analysis.outcome_store import attach_outcomes
 from analysis.stats_utils import benjamini_hochberg
 
 logger = logging.getLogger(__name__)
@@ -27,15 +33,46 @@ logger = logging.getLogger(__name__)
 # Minimum rows needed before reporting results — avoid misleading metrics on tiny samples
 MIN_SAMPLES = 30
 
+# Outcome column names resolve from the fleet-wide HorizonPolicy (primary 21d +
+# diagnostic 5d) rather than hardcoded `_Nd` literals — the config#1483/#1529
+# cutover. The physical column NAMES are unchanged (attach_outcomes re-sources
+# them under the same names during the soak), but the SOURCE is now the
+# long-format score_performance_outcomes store, not the wide score_performance
+# columns. Deriving the names here (a) kills the scattered-literal bug class and
+# (b) makes the burn-down guard pass without touching the value semantics.
+_POLICY = DEFAULT_POLICY
+_SHORT_H = _POLICY.diagnostic_horizons[0]  # 5
+_LONG_H = _POLICY.primary_horizon  # 21
+_SHORT_COLS = _POLICY.outcome_columns(_SHORT_H)
+_LONG_COLS = _POLICY.outcome_columns(_LONG_H)
+_BEAT_5D = _SHORT_COLS.beat_spy
+_BEAT_21D = _LONG_COLS.beat_spy
+_RET_5D = _SHORT_COLS.stock_return
+_RET_21D = _LONG_COLS.stock_return
+_SPY_5D = _SHORT_COLS.spy_return
+_SPY_21D = _LONG_COLS.spy_return
+
 
 def load_score_performance(db_path: str) -> pd.DataFrame:
     """
-    Load score_performance from research.db.
+    Load score_performance from research.db, with the outcome columns
+    re-sourced from the long-format ``score_performance_outcomes`` store.
 
-    Returns a DataFrame with columns:
-        symbol, score_date, score, price_on_date,
-        spy_5d_return, spy_21d_return, return_5d, return_21d,
-        beat_spy_5d, beat_spy_21d
+    The wide horizon-suffixed outcome columns (beat-SPY flag, stock / SPY
+    returns, and the primary-horizon log-alpha) are DROPPED from the raw
+    ``score_performance`` read and replaced with values from
+    ``score_performance_outcomes`` filtered by the HorizonPolicy horizons
+    (config#1483/#1528/#1529). Values are byte-identical to the legacy wide
+    read (the store is canonical DECIMAL; :func:`attach_outcomes` reproduces the
+    legacy 2dp-percent convention on returns at that single boundary). If the
+    store table is absent (pre-cutover DB), the raw wide columns pass through
+    unchanged — a graceful no-op.
+
+    Returns a DataFrame carrying the score_performance non-outcome columns
+    (symbol, score_date, score, price_on_date, …) plus the per-horizon outcome
+    columns named by ``HorizonPolicy.outcome_columns`` (beat-SPY flag, stock /
+    SPY returns, and — primary horizon only — the canonical log-alpha),
+    re-sourced from score_performance_outcomes.
     """
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -46,7 +83,7 @@ def load_score_performance(db_path: str) -> pd.DataFrame:
         df = pd.read_sql_query(
             "SELECT * FROM score_performance ORDER BY score_date",
             conn,
-            parse_dates=["score_date", "eval_date_10d", "eval_date_30d"],
+            parse_dates=["score_date"],
         )
 
         # Enrich with sector from universe_returns (if table exists)
@@ -65,6 +102,10 @@ def load_score_performance(db_path: str) -> pd.DataFrame:
     finally:
         conn.close()
 
+    # Re-source outcome columns from the long-format store (config#1529). The
+    # wide columns are dropped and rebuilt from score_performance_outcomes.
+    df = attach_outcomes(df, str(path), policy=_POLICY)
+
     logger.info("Loaded %d rows from score_performance", len(df))
     return df
 
@@ -79,16 +120,16 @@ def compute_accuracy(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> dict:
         - by_conviction: accuracy split by conviction (rising/stable/declining)
         - status: "insufficient_data" if not enough rows are populated yet
     """
-    populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
+    populated_5d = df[df[_BEAT_5D].notna()] if _BEAT_5D in df.columns else pd.DataFrame()
     # config#1456: gate on the canonical 21d horizon. The 10d/30d horizons were
     # retired in the canonical-alpha cutover (dark since April) — gating on the
     # retired horizon left the whole signal-quality tile insufficient/dark.
-    populated_21d = df[df["beat_spy_21d"].notna()] if "beat_spy_21d" in df.columns else pd.DataFrame()
+    populated_21d = df[df[_BEAT_21D].notna()] if _BEAT_21D in df.columns else pd.DataFrame()
 
     if len(populated_21d) < min_samples:
         logger.warning(
-            "Only %d rows with canonical beat_spy_21d populated (need %d).",
-            len(populated_21d), min_samples,
+            "Only %d rows with canonical %s populated (need %d).",
+            len(populated_21d), _BEAT_21D, min_samples,
         )
         return {
             "status": "insufficient_data",
@@ -144,18 +185,18 @@ def _compute_slice_metrics(df_5d: pd.DataFrame, df_21d: pd.DataFrame) -> dict:
     n_5d = len(df_5d)
     n_21d = len(df_21d)
 
-    acc_5d = float(df_5d["beat_spy_5d"].mean()) if n_5d > 0 else None
+    acc_5d = float(df_5d[_BEAT_5D].mean()) if n_5d > 0 else None
     # config#1456: canonical 21d horizon (the system's prediction target).
-    acc_21d = float(df_21d["beat_spy_21d"].mean()) if n_21d > 0 else None
+    acc_21d = float(df_21d[_BEAT_21D].mean()) if n_21d > 0 else None
 
     # Wilson score 95% confidence intervals
-    ci_5d = _wilson_ci(int(df_5d["beat_spy_5d"].sum()), n_5d) if n_5d > 0 else None
-    ci_21d = _wilson_ci(int(df_21d["beat_spy_21d"].sum()), n_21d) if n_21d > 0 else None
+    ci_5d = _wilson_ci(int(df_5d[_BEAT_5D].sum()), n_5d) if n_5d > 0 else None
+    ci_21d = _wilson_ci(int(df_21d[_BEAT_21D].sum()), n_21d) if n_21d > 0 else None
 
     # Classification metrics at the canonical 21d horizon.
     # For BUY signals: precision = % that beat SPY (same as accuracy).
     # Recall is not computable here (requires universe-level data from end_to_end.py).
-    tp_21d = int(df_21d["beat_spy_21d"].sum()) if n_21d > 0 else 0
+    tp_21d = int(df_21d[_BEAT_21D].sum()) if n_21d > 0 else 0
     fp_21d = n_21d - tp_21d
 
     return {
@@ -163,8 +204,8 @@ def _compute_slice_metrics(df_5d: pd.DataFrame, df_21d: pd.DataFrame) -> dict:
         "accuracy_21d": acc_21d,
         "ci_95_5d": ci_5d,
         "ci_95_21d": ci_21d,
-        "avg_alpha_5d": float((df_5d["return_5d"] - df_5d["spy_5d_return"]).mean()) if n_5d > 0 else None,
-        "avg_alpha_21d": float((df_21d["return_21d"] - df_21d["spy_21d_return"]).mean()) if n_21d > 0 else None,
+        "avg_alpha_5d": float((df_5d[_RET_5D] - df_5d[_SPY_5D]).mean()) if n_5d > 0 else None,
+        "avg_alpha_21d": float((df_21d[_RET_21D] - df_21d[_SPY_21D]).mean()) if n_21d > 0 else None,
         "n_5d": n_5d,
         "n_21d": n_21d,
         "precision_21d": round(tp_21d / n_21d, 4) if n_21d > 0 else None,

@@ -16,7 +16,8 @@ Inputs:
   - score_performance_df: canonical per-pick outcome table from research.db
     (loaded by analysis.signal_quality.load_score_performance)
   - team_lift: list[dict] from analysis.end_to_end._team_lift, where each
-    team has a ``picks`` field of (ticker, eval_date, return_5d, conviction)
+    team has a ``picks`` field of (ticker, eval_date, short-horizon return,
+    conviction)
   - prices (optional): pd.DataFrame for risk-matched-benchmark + excursion
   - spy_daily_returns (optional): pd.Series for beta-matched-SPY benchmark
   - ohlc (optional): dict[ticker, ohlc_df] for MFE/MAE excursion
@@ -25,7 +26,7 @@ Outputs:
   - team_metrics: dict keyed by team_id with ic / expectancy / excursion
     / alpha_vs_ew_high_vol / alpha_vs_beta_spy sub-results
   - calibration_diagnostics: result of compute_calibration on the
-    portfolio-wide (score → beat_spy_21d) corpus
+    portfolio-wide (score → primary beat-SPY) corpus
   - action_entropy / excursion_summary at portfolio level: optional,
     computed when the requisite inputs are provided
 
@@ -40,6 +41,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
 from analysis.calibration_diagnostics import compute_calibration
 from analysis.expectancy import compute_expectancy
@@ -57,6 +59,16 @@ from analysis.risk_matched_benchmark import (
 from analysis.team_daily_returns import compute_team_daily_returns
 
 logger = logging.getLogger(__name__)
+
+# Outcome column / pick-field names resolve from the fleet HorizonPolicy rather
+# than hardcoded `_Nd` literals (config#1483/#1529). Names are unchanged; the
+# score_performance_df is re-sourced from score_performance_outcomes upstream
+# (signal_quality.load_score_performance). The pick records carry the same
+# short-horizon stock-return field name by construction.
+_POLICY = DEFAULT_POLICY
+_RET_PRIMARY = _POLICY.outcome_columns(_POLICY.primary_horizon).stock_return  # return_21d
+_RET_SHORT = _POLICY.outcome_columns(_POLICY.diagnostic_horizons[0]).stock_return  # return_5d
+_BEAT_PRIMARY = _POLICY.outcome_columns(_POLICY.primary_horizon).beat_spy  # beat_spy_21d
 
 
 def compute_team_metrics(
@@ -178,8 +190,12 @@ def _compute_team_ic(
     ]
     if df.empty:
         return {"status": "insufficient_data", "reason": "no score_performance match"}
-    # config#1456: prefer canonical return_21d, fall back to return_5d.
-    fwd_col = "return_21d" if "return_21d" in df.columns and df["return_21d"].notna().any() else "return_5d"
+    # config#1456: prefer canonical primary-horizon return, fall back to short.
+    fwd_col = (
+        _RET_PRIMARY
+        if _RET_PRIMARY in df.columns and df[_RET_PRIMARY].notna().any()
+        else _RET_SHORT
+    )
     return compute_ic(
         conviction=df["score"].to_numpy(),
         forward_return=df[fwd_col].to_numpy(),
@@ -188,8 +204,8 @@ def _compute_team_ic(
 
 
 def _compute_team_expectancy(picks: list[dict]) -> dict:
-    """Expectancy over the team's picks' return_5d (or alpha if available)."""
-    returns = [p["return_5d"] for p in picks if p.get("return_5d") is not None]
+    """Expectancy over the team's picks' short-horizon return (or alpha)."""
+    returns = [p[_RET_SHORT] for p in picks if p.get(_RET_SHORT) is not None]
     if len(returns) < 5:
         return {"status": "insufficient_data", "reason": f"only {len(returns)} picks"}
     return compute_expectancy(np.array(returns), threshold=0.0, min_samples=5)
@@ -198,7 +214,7 @@ def _compute_team_expectancy(picks: list[dict]) -> dict:
 def compute_portfolio_calibration(
     score_performance_df: pd.DataFrame | None,
     score_col: str = "score",
-    outcome_col: str = "beat_spy_21d",
+    outcome_col: str = _BEAT_PRIMARY,
 ) -> dict:
     """Reliability diagram on portfolio-wide (score → outcome) corpus.
 
