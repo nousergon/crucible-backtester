@@ -5724,21 +5724,23 @@ def _main_impl() -> None:
             })
     finally:
         try:
-            from health_status import write_health
+            from nousergon_lib.health import Deliverable, write_health
             configs_applied = []
             if executor_rec and executor_rec.get("apply_result", {}).get("applied"):
                 configs_applied.append("executor_params")
             bucket = config.get("signals_bucket", "alpha-engine-research")
             write_health(
-                bucket=bucket,
                 module_name="backtester",
-                status="ok",
+                deliverables=[
+                    Deliverable(name="backtest_run", required=True, produced=True),
+                ],
                 run_date=args.date,
                 duration_seconds=_time.time() - _health_start,
                 summary={
                     "mode": args.mode,
                     "configs_applied": configs_applied,
                 },
+                bucket=bucket,
             )
         except Exception as _he:
             logger.warning("Health status write failed: %s", _he)
