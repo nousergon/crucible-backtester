@@ -2527,6 +2527,18 @@ def run_production_strategy_backtest(config: dict, s3_client=None) -> dict:
         return {"status": "error", "error": str(e)}
 
 
+class OptimizerGatePersistError(RuntimeError):
+    """Raised when the LOAD-BEARING portfolio_optimizer_gate report fails to
+    persist to S3 (config#1234).
+
+    Distinguishes a *persist* failure — which is FATAL, because the Saturday SF
+    reads this artifact as the SOLE predictor-weight-promotion lever and a
+    missing/stale write is the silent absence-of-artifact bug the audit targets —
+    from a gate-*run*/verdict failure, which remains observability-only
+    (non-fatal). The outer phase handler re-raises only this type.
+    """
+
+
 def run_portfolio_optimizer_gate(
     config: dict,
     run_date: str,
@@ -2592,14 +2604,27 @@ def run_portfolio_optimizer_gate(
     body = json.dumps(payload, default=str, indent=2).encode("utf-8")
 
     s3 = s3_client or boto3.client("s3")
+    # CRITICAL / LOAD-BEARING (config#1234 root-cause fix): this artifact
+    # (predictor/optimizer_gate/{,production/}{latest.json}) is the Saturday SF's
+    # PR-5 readiness signal and the SOLE promotion lever for predictor weights.
+    # A swallowed PUT would let the backtester report success while the consumer
+    # reads a STALE/absent verdict — the silent absence-of-artifact bug class the
+    # audit targets. Fail LOUD: raise OptimizerGatePersistError so the write
+    # failure propagates (the outer phase handler re-raises this type). Do NOT
+    # "helpfully" wrap this in a fail-soft except that returns/swallows.
     try:
         s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
         s3.put_object(Bucket=bucket, Key=latest_key, Body=body, ContentType="application/json")
-        logger.info("portfolio_optimizer_gate: persisted s3://%s/%s", bucket, key)
     except Exception as exc:
-        logger.warning(
-            "portfolio_optimizer_gate: S3 persist failed (non-fatal): %s", exc,
+        logger.error(
+            "portfolio_optimizer_gate: S3 persist FAILED (FATAL — promotion "
+            "lever artifact): %s", exc, exc_info=True,
         )
+        raise OptimizerGatePersistError(
+            f"failed to persist portfolio_optimizer_gate report to "
+            f"s3://{bucket}/{key}"
+        ) from exc
+    logger.info("portfolio_optimizer_gate: persisted s3://%s/%s", bucket, key)
 
     verdict = (gate_result.get("gate_report") or {}).get("verdict")
     logger.info(
@@ -2688,6 +2713,10 @@ def run_cov_estimator_sweep_stage(
         s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
         logger.info("cov_estimator_sweep: persisted s3://%s/%s", bucket, key)
     except Exception as exc:
+        # config#1234 rationale: cov_estimator_sweep.json is OBSERVE-only /
+        # non-load-bearing (ROADMAP A.4b) and is registered/grandfathered in
+        # ARTIFACT_REGISTRY.yaml, so the ENFORCE freshness-monitor is the
+        # recording surface for a missed write. Fail-soft here is intentional.
         logger.warning(
             "cov_estimator_sweep: S3 persist failed (non-fatal): %s", exc,
         )
@@ -2852,6 +2881,10 @@ def run_gamma_sweep_stage(
         s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
         logger.info("gamma_sweep: persisted s3://%s/%s", bucket, key)
     except Exception as exc:
+        # config#1234 rationale: gamma_sweep.json is OBSERVE-only /
+        # non-load-bearing (L4469 W3.4 study) and is registered/grandfathered in
+        # ARTIFACT_REGISTRY.yaml, so the ENFORCE freshness-monitor is the
+        # recording surface for a missed write. Fail-soft here is intentional.
         logger.warning(
             "gamma_sweep: S3 persist failed (non-fatal): %s", exc,
         )
@@ -2961,6 +2994,10 @@ def run_optimizer_param_sweep_stage(
         s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
         logger.info("optimizer_param_sweep: persisted s3://%s/%s", bucket, key)
     except Exception as exc:
+        # config#1234 rationale: optimizer_param_sweep.json is OBSERVE-only /
+        # non-load-bearing (config#1057) and is registered/grandfathered in
+        # ARTIFACT_REGISTRY.yaml, so the ENFORCE freshness-monitor is the
+        # recording surface for a missed write. Fail-soft here is intentional.
         logger.warning("optimizer_param_sweep: S3 persist failed (non-fatal): %s", exc)
 
     logger.info(
@@ -3063,8 +3100,15 @@ def run_predictor_backtest(config: dict) -> dict:
                     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
                     logger.info("horizon_net_alpha: persisted s3://%s/%s", bucket, key)
                 except Exception as exc:
+                    # config#1234 rationale: horizon_net_alpha.json is OBSERVE-only /
+                    # non-load-bearing (W3.4) and is registered/grandfathered in
+                    # ARTIFACT_REGISTRY.yaml, so the ENFORCE freshness-monitor is the
+                    # recording surface for a missed write. Fail-soft is intentional.
                     logger.warning("horizon_net_alpha S3 persist failed (non-fatal): %s", exc)
     except Exception as exc:
+        # config#1234 rationale (outer of dual-layer swallow): the whole W3.4
+        # OBSERVE stage gates nothing; a failure must never abort the backtest
+        # run. Fail-soft is intentional (see registry note on the PUT above).
         logger.warning("horizon_net_alpha stage failed (OBSERVE, non-fatal): %s", exc)
 
     # ── L4488b (OBSERVE): per-model-version net-of-cost alpha under a FIXED ──
@@ -3106,8 +3150,15 @@ def run_predictor_backtest(config: dict) -> dict:
                     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
                     logger.info("model_version_net_alpha: persisted s3://%s/%s", bucket, key)
                 except Exception as exc:
+                    # config#1234 rationale: model_version_net_alpha.json is OBSERVE-only /
+                    # non-load-bearing (L4488b) and is registered/grandfathered in
+                    # ARTIFACT_REGISTRY.yaml, so the ENFORCE freshness-monitor is the
+                    # recording surface for a missed write. Fail-soft is intentional.
                     logger.warning("model_version_net_alpha S3 persist failed (non-fatal): %s", exc)
     except Exception as exc:
+        # config#1234 rationale (outer of dual-layer swallow): the whole L4488b
+        # OBSERVE stage gates nothing; a failure must never abort the backtest
+        # run. Fail-soft is intentional (see registry note on the PUT above).
         logger.warning("model_version_net_alpha stage failed (OBSERVE, non-fatal): %s", exc)
 
     return stats
@@ -5467,6 +5518,20 @@ def _main_impl() -> None:
                     legacy_metrics=portfolio_stats,
                     signal_source=getattr(args, "signal_source", "synthetic"),
                 )
+        except OptimizerGatePersistError as exc:
+            # config#1234: a PERSIST failure of the load-bearing gate report is
+            # FATAL — the Saturday SF's SOLE predictor-weight promotion lever
+            # would read a stale/absent verdict. Do NOT swallow; propagate so the
+            # run fails loudly. (A gate-RUN/verdict failure is still non-fatal
+            # observability — that path is the generic handler below.)
+            logger.error(
+                "portfolio_optimizer_gate: report persist FAILED — FATAL "
+                "(load-bearing promotion-lever artifact): %s", exc, exc_info=True,
+            )
+            if fd:
+                fd.report(exc, severity="critical", context={
+                    "site": "portfolio_optimizer_gate", "mode": args.mode})
+            raise
         except Exception as exc:
             logger.warning(
                 "portfolio_optimizer_gate phase failed (non-fatal): %s",
