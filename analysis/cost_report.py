@@ -832,11 +832,10 @@ def _publish_anomaly_alert(
     ):
         return
     try:
-        from nousergon_lib import alerts  # noqa: PLC0415 — lazy import
+        from ops_alerts import publish_ops_alert
     except ImportError as e:
         logger.warning(
-            "[cost_report] alerts publish skipped — nousergon_lib.alerts "
-            "unavailable (lib pin <v0.24.0?): %s", e,
+            "[cost_report] alerts publish skipped — ops_alerts unavailable: %s", e,
         )
         return
 
@@ -859,7 +858,7 @@ def _publish_anomaly_alert(
     )
     dedup_key = _anomaly_alert_dedup_key(run_date, anomaly)
     try:
-        result = alerts.publish(
+        result = publish_ops_alert(
             message,
             severity="error",
             source="alpha-engine-backtester/analysis/cost_report.py",
@@ -874,8 +873,8 @@ def _publish_anomaly_alert(
             )
         else:
             logger.info(
-                "[cost_report] anomaly alert publish: sns_ok=%s telegram_ok=%s any_ok=%s",
-                result.sns.ok, result.telegram.ok, result.any_ok,
+                "[cost_report] anomaly alert publish: sns_ok=%s any_ok=%s",
+                result.sns.ok, result.any_ok,
             )
     except Exception as e:
         logger.warning(

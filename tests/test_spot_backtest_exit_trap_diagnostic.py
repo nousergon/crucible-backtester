@@ -111,67 +111,35 @@ def test_cleanup_still_terminates():
     )
 
 
-def test_cleanup_fans_out_via_lib_alerts_cli():
-    """L2246 SOTA upgrade per the CLAUDE.md sub-sub-rule (lift-to-lib for
-    ≥2 consumers): the dispatcher cleanup must publish the diagnostic via
-    `python -m krepis.alerts publish` so the operator gets an
-    independent-channel alert (SNS + Telegram) regardless of whether the
-    SF wrapper's own NotifyComplete/HandleFailure path fired. Pins the
-    full invocation contract."""
+def test_cleanup_fans_out_via_ops_alerts():
+    """T3 config#1749: dispatcher cleanup publishes via ops_alerts.publish_ops_alert
+    (SNS + flow-doctor forum topics) instead of raw krepis CLI telegram=True."""
     text = _read_script()
     m = re.search(r"^cleanup\(\) \{.*?^\}", text, re.MULTILINE | re.DOTALL)
     assert m, "no cleanup() function found — spot_backtest.sh structure changed"
     body = m.group(0)
-    assert "krepis.alerts publish" in body, (
-        "cleanup() must fan out the diagnostic via the krepis alerts CLI "
-        "(L2246 SOTA upgrade — see CLAUDE.md sub-sub-rule). Mirrors the "
-        "L117 'Lambda CI canary rollback should Telegram/email the "
-        "operator on rollback' pattern via the canonical primitive. "
-        "Target is krepis.alerts, NOT nousergon_lib.alerts (config#1339): "
-        "the alerts module relocated to krepis (MIT) at nousergon-lib "
-        "v0.66.0 and nousergon_lib.alerts is now a sys.modules re-export "
-        "shim with no runpy __main__, so '-m nousergon_lib.alerts publish' "
-        "is a SILENT no-op (exits 0, publishes nothing)."
+    assert "from ops_alerts import publish_ops_alert" in body, (
+        "cleanup() must fan out via ops_alerts.publish_ops_alert (config#1749 T3)."
     )
-    # Guard the EXECUTED command (not comment text): the `python -m <mod>`
-    # the dispatcher actually runs must be krepis.alerts, never the
-    # runpy-silent nousergon_lib.alerts shim (config#1339).
-    invoke = re.search(r'"\$_alert_python"\s+-m\s+(\S+)\s+publish', body)
-    assert invoke, "no `\"$_alert_python\" -m <mod> publish` invocation in cleanup()"
-    assert invoke.group(1) == "krepis.alerts", (
-        f"cleanup() invokes `-m {invoke.group(1)}` — must be krepis.alerts; "
-        f"'-m nousergon_lib.alerts' is a silent runpy no-op since the krepis "
-        f"relocation at nousergon-lib v0.66.0 (config#1339)."
+    assert "publish_ops_alert(" in body
+    assert "cd \"$REPO_ROOT\"" in body, (
+        "cleanup() must run the ops_alerts import from REPO_ROOT so ops_alerts.py resolves."
     )
-    # L4485-b: severity is now variable — defaults to "error" (Telegram push),
-    # downgraded to "warning" only on a recoverable spot reclaim about to relaunch.
     assert 'local _will_relaunch=0 _alert_sev="error"' in body, (
-        "alerts.publish severity must default to error (Telegram push) — "
-        "L4485-b made it a variable that only downgrades to warning on a "
-        "recoverable spot reclaim."
+        "ops alert severity must default to error — downgraded to warning only on "
+        "a recoverable spot reclaim about to relaunch (L4485-b)."
     )
-    assert '--severity "$_alert_sev"' in body, (
-        "alerts.publish call must tag severity via $_alert_sev (error default, "
-        "warning on a will-relaunch reclaim)."
+    assert 'source=\'alpha-engine-backtester/spot_backtest.sh\'' in body, (
+        "publish_ops_alert must identify itself via source for operator triage."
     )
-    assert "--source alpha-engine-backtester/spot_backtest.sh" in body, (
-        "alerts.publish call must identify itself via --source so the "
-        "operator can triage at a glance."
-    )
-    # Best-effort fallback — the alert is independent fan-out, not a
-    # cleanup blocker. The wrapping `|| echo ...` keeps cleanup running
-    # even when Python / lib / SNS / Telegram are all unreachable.
-    assert "alerts.publish fan-out failed" in body or "|| true" in body, (
-        "alerts.publish must be best-effort — never block cleanup on "
-        "secondary surveillance failure."
+    assert "ops alert fan-out failed" in body or "|| true" in body, (
+        "ops alert must be best-effort — never block cleanup on secondary failure."
     )
 
 
 def test_lib_pin_at_least_v0_21_0():
-    """The dispatcher's alerts.publish call requires alpha_engine_lib >=
-    v0.21.0 (the version that ships the new `alerts` module + CLI). Pin
-    the floor; lib bumps for unrelated reasons are fine but a downgrade
-    below v0.21.0 would silently break the alert fan-out."""
+    """The dispatcher's ops_alerts fan-out requires nousergon-lib >= v0.21.0
+    (ships the alerts module). Pin the floor; downgrades below v0.21.0 break SNS."""
     from pathlib import Path
 
     reqs = (
@@ -184,25 +152,20 @@ def test_lib_pin_at_least_v0_21_0():
     major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
     assert (major, minor, patch) >= (0, 21, 0), (
         f"alpha-engine-lib pin v{major}.{minor}.{patch} is below the "
-        f"v0.21.0 floor required by the dispatcher's alerts.publish call. "
-        f"Re-pin or remove the alerts call."
+        f"v0.21.0 floor required by ops_alerts SNS fan-out. "
+        f"Re-pin or remove the alert call."
     )
 
 
-def test_krepis_pinned_for_alerts_cli():
-    """The alerts CLI the dispatcher invokes is now `python -m krepis.alerts`
-    (config#1339): the module relocated to krepis (MIT) at nousergon-lib
-    v0.66.0, and `nousergon_lib.alerts` is a runpy-silent re-export shim.
-    krepis must therefore be a direct requirements pin so the CLI is present
-    in the dispatcher venv — relying on the transitive nousergon-lib pull
-    would leave the alert one un-pinned hop from silently disappearing."""
+def test_krepis_pinned_for_alerts_transport():
+    """krepis remains a direct pin — ops_alerts.publish_ops_alert calls
+    krepis.alerts.publish internally (config#1749 T3)."""
     from pathlib import Path
 
     reqs = (
         Path(__file__).resolve().parent.parent / "requirements.txt"
     ).read_text()
     assert re.search(r"^\s*krepis\b", reqs, re.MULTILINE), (
-        "requirements.txt must pin `krepis` directly — it provides the "
-        "`python -m krepis.alerts` CLI the dispatcher's cleanup fan-out "
-        "invokes (config#1339)."
+        "requirements.txt must pin `krepis` directly — ops_alerts uses "
+        "krepis.alerts.publish for the SNS leg (config#1749)."
     )
