@@ -11,6 +11,7 @@ Covers the López de Prado selection-bias battery wired into
 
 from __future__ import annotations
 
+import hashlib
 import numpy as np
 import pandas as pd
 
@@ -23,6 +24,23 @@ from optimizer.executor_optimizer import (
 )
 
 
+def _stable_seed(*parts) -> int:
+    """Process-independent seed derived from ``parts``.
+
+    Python's builtin ``hash()`` salts str/tuple hashes with a per-process
+    random seed (``PYTHONHASHSEED``) unless explicitly pinned, so a sim_fn
+    keyed off ``hash((...))`` draws a *different* RNG stream every run. Under
+    an unlucky salt the per-combo noise stops separating cleanly across CSCV
+    blocks and PBO can land at 1.0 by chance — flaking
+    ``test_strong_low_trial_passes`` on totally unrelated CI runs (#1751).
+    ``hashlib`` digests are stable across processes/interpreters, so the same
+    inputs always yield the same seed and thus the same simulated returns.
+    """
+    key = "|".join(str(p) for p in parts).encode("utf-8")
+    digest = hashlib.sha256(key).digest()
+    return int.from_bytes(digest[:4], "big") % (2**31)
+
+
 def _returns_sim(mu: float, sigma: float = 0.01, seed_salt: int = 0):
     """Date-aware sim_fn emitting a return series + Sharpe/Sortino. Mean return
     scales with the combo's ``atr_multiplier`` so combos are separable for PBO,
@@ -30,7 +48,7 @@ def _returns_sim(mu: float, sigma: float = 0.01, seed_salt: int = 0):
     def sim_fn(combo_config, dates=None):
         d = list(dates)
         scale = float(combo_config.get("atr_multiplier", 1.0))
-        seed = (abs(hash((round(scale, 4), len(d), d[0] if d else "", seed_salt))) % (2**31))
+        seed = _stable_seed(round(scale, 4), len(d), d[0] if d else "", seed_salt)
         rng = np.random.RandomState(seed)
         r = pd.Series(rng.normal(mu * scale, sigma, len(d)), index=pd.to_datetime(d))
         sh = r.mean() / r.std() * np.sqrt(252) if r.std() > 0 else 0.0
