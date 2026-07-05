@@ -2175,7 +2175,7 @@ def _main_impl() -> None:
     finally:
         # Health status
         try:
-            from health_status import write_health
+            from nousergon_lib.health import Deliverable, write_health
             summary = tracker.summary()
             configs_applied = []
             for label, key in [
@@ -2187,23 +2187,27 @@ def _main_impl() -> None:
                 if res and res.get("apply_result", {}).get("applied"):
                     configs_applied.append(label)
 
-            status = "ok"
+            stage_warnings = []
             if summary.get("error", 0) > 0:
-                status = "degraded"
-            if summary.get("ok", 0) == 0:
-                status = "failed"
-            if not report_ok:
-                # Report build / upload / email crashed. The tracker's
-                # per-stage summary doesn't capture this because the crash
-                # happens after all [OK] stages finish. Mark the run failed
-                # so the health marker matches reality.
-                status = "failed"
+                stage_warnings.append(
+                    f"{summary.get('error', 0)} evaluation stage(s) errored"
+                )
 
             bucket = config.get("signals_bucket", "alpha-engine-research")
             write_health(
-                bucket=bucket,
                 module_name="evaluator",
-                status=status,
+                deliverables=[
+                    Deliverable(
+                        name="evaluation_stages",
+                        required=True,
+                        produced=summary.get("ok", 0) > 0,
+                    ),
+                    Deliverable(
+                        name="evaluation_report",
+                        required=True,
+                        produced=report_ok,
+                    ),
+                ],
                 run_date=args.date,
                 duration_seconds=_time.time() - _health_start,
                 summary={
@@ -2211,6 +2215,8 @@ def _main_impl() -> None:
                     "completeness": summary,
                     "configs_applied": configs_applied,
                 },
+                warnings=stage_warnings or None,
+                bucket=bucket,
             )
         except Exception as _he:
             logger.warning("Health status write failed: %s", _he)

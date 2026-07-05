@@ -210,15 +210,26 @@ def handler(event: dict, context) -> dict:
 
     if not dry_run:
         try:
-            from health_status import write_health
+            from nousergon_lib.health import Deliverable, write_health
+
+            failed = status in ("failed", "error")
             write_health(
-                bucket=bucket,
                 module_name="predictor_health_check",
-                status=status,
+                deliverables=[
+                    Deliverable(
+                        name="health_check",
+                        required=True,
+                        produced=not failed,
+                    ),
+                ],
                 run_date=run_date,
                 duration_seconds=round(elapsed, 1),
                 summary=results,
-                warnings=warnings,
+                warnings=warnings or None,
+                error="; ".join(phase_errors) if failed and phase_errors else (
+                    status if failed else None
+                ),
+                bucket=bucket,
             )
         except Exception as exc:
             log.error("Failed to write health status: %s", exc, exc_info=True)

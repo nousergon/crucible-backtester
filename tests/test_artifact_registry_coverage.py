@@ -74,7 +74,6 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # config#1726: optimizer_run/{trading_day}.json liveness proxy for event_driven
     # config_* rows — registered as optimizer_run_manifest in ARTIFACT_REGISTRY.yaml.
     "evaluate.py": 1,
-    "health_status.py": 1,
     "optimizer/assembler.py": 5,
     "optimizer/barrier_sizing_optimizer.py": 1,
     "optimizer/config_archive.py": 1,
