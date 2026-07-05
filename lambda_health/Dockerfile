@@ -26,7 +26,7 @@ COPY requirements-health.txt .
 # why the health Lambda image stayed frozen at its 2026-04-08 build and
 # re-raised the already-fixed 2026-05-11 false-positive retrain alert.
 RUN microdnf install -y git && microdnf clean all
-RUN pip install --no-cache-dir "nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.78.0" "krepis>=0.3.0" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.82.0" "krepis>=0.3.0" && \
     pip install --no-cache-dir -r requirements-health.txt && \
     rm -rf /root/.cache/pip
 
