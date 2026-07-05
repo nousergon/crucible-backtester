@@ -6,14 +6,13 @@ Pins:
   2. NO publish when status == "ok".
   3. Dedup_key includes (run_date, status) so recurring classes don't N-spam.
   4. Suppression respects ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS env var.
-  5. ImportError on alerts module is best-effort (logged, no raise).
+  5. ImportError on ops_alerts is best-effort (logged, no raise).
   6. Publish failure is best-effort (logged, no raise).
   7. `_run_executor_opt` calls the alert helper on the `degraded` short-circuit
      path AND on a non-ok `recommend()` result.
 """
 from __future__ import annotations
 
-import os
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -26,52 +25,44 @@ def _clear_suppress_env(monkeypatch):
     monkeypatch.delenv("ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS", raising=False)
 
 
-def _make_alerts_module_mock(any_ok: bool = True, dedup_skipped: bool = False):
-    mod = MagicMock()
+def _fake_publish_result(any_ok: bool = True, dedup_skipped: bool = False):
     result = MagicMock()
     result.sns.ok = any_ok
-    result.telegram.ok = any_ok
+    result.telegram.ok = False
     result.any_ok = any_ok
     result.dedup_skipped = dedup_skipped
-    mod.publish.return_value = result
-    return mod
+    return result
 
 
 def test_publishes_warn_on_non_ok_status():
     from evaluate import _publish_executor_opt_rejection_alert
     result = {"status": "alpha_below_floor", "note": "All combos below floor"}
     config = {"run_date": "2026-05-24"}
-    alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
-                                     "nousergon_lib.alerts": alerts_mod}):
+    with patch("ops_alerts.publish_ops_alert", return_value=_fake_publish_result()) as mock_publish:
         _publish_executor_opt_rejection_alert(result, config)
-    alerts_mod.publish.assert_called_once()
-    call_kwargs = alerts_mod.publish.call_args.kwargs
+    mock_publish.assert_called_once()
+    call_kwargs = mock_publish.call_args.kwargs
     assert call_kwargs["severity"] == "warning"
-    assert "alpha_below_floor" in alerts_mod.publish.call_args.args[0]
-    assert "2026-05-24" in alerts_mod.publish.call_args.args[0]
+    assert "alpha_below_floor" in mock_publish.call_args.args[0]
+    assert "2026-05-24" in mock_publish.call_args.args[0]
 
 
 def test_no_publish_on_ok_status():
     from evaluate import _publish_executor_opt_rejection_alert
     result = {"status": "ok"}
     config = {"run_date": "2026-05-24"}
-    alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
-                                     "nousergon_lib.alerts": alerts_mod}):
+    with patch("ops_alerts.publish_ops_alert") as mock_publish:
         _publish_executor_opt_rejection_alert(result, config)
-    alerts_mod.publish.assert_not_called()
+    mock_publish.assert_not_called()
 
 
 def test_dedup_key_includes_run_date_and_status():
     from evaluate import _publish_executor_opt_rejection_alert
     result = {"status": "insufficient_data", "note": "Only 5 valid combos"}
     config = {"run_date": "2026-05-30"}
-    alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
-                                     "nousergon_lib.alerts": alerts_mod}):
+    with patch("ops_alerts.publish_ops_alert", return_value=_fake_publish_result()) as mock_publish:
         _publish_executor_opt_rejection_alert(result, config)
-    call_kwargs = alerts_mod.publish.call_args.kwargs
+    call_kwargs = mock_publish.call_args.kwargs
     assert call_kwargs["dedup_key"] == "executor_optimizer_rejected_2026-05-30_insufficient_data"
     assert call_kwargs["dedup_window_min"] == 1440
 
@@ -81,85 +72,69 @@ def test_suppress_env_blocks_publish(monkeypatch):
     from evaluate import _publish_executor_opt_rejection_alert
     result = {"status": "alpha_below_floor"}
     config = {"run_date": "2026-05-24"}
-    alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
-                                     "nousergon_lib.alerts": alerts_mod}):
+    with patch("ops_alerts.publish_ops_alert") as mock_publish:
         _publish_executor_opt_rejection_alert(result, config)
-    alerts_mod.publish.assert_not_called()
+    mock_publish.assert_not_called()
 
 
-def test_alerts_import_error_is_best_effort(caplog):
-    """If `from nousergon_lib import alerts` fails (lib pin too old or
-    deps missing), the helper logs WARN and returns without raising.
-    Narrow-scope import patch via meta_path finder to avoid clobbering
-    unrelated imports (`os`, `logging`)."""
-    import logging
+def test_ops_alerts_import_error_is_best_effort(caplog):
     import importlib.abc
-    import importlib.machinery
+    import logging
+    import sys
     from evaluate import _publish_executor_opt_rejection_alert
-    result = {"status": "alpha_below_floor"}
-    config = {"run_date": "2026-05-24"}
 
-    class _BlockAlertsFinder(importlib.abc.MetaPathFinder):
+    class _BlockOpsAlertsFinder(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path, target=None):
-            if fullname == "nousergon_lib.alerts" or fullname == "nousergon_lib":
-                raise ImportError(f"blocked for test: {fullname}")
+            if fullname == "ops_alerts":
+                raise ImportError("blocked for test: ops_alerts")
             return None
 
-    import sys
-    blocker = _BlockAlertsFinder()
-    # Drop any cached `nousergon_lib*` so the import attempt actually runs.
-    cached = [k for k in list(sys.modules.keys()) if k.startswith("nousergon_lib")]
-    saved = {k: sys.modules.pop(k) for k in cached}
+    blocker = _BlockOpsAlertsFinder()
+    saved = sys.modules.pop("ops_alerts", None)
     sys.meta_path.insert(0, blocker)
     try:
         with caplog.at_level(logging.WARNING, logger="evaluate"):
-            _publish_executor_opt_rejection_alert(result, config)
+            _publish_executor_opt_rejection_alert(
+                {"status": "alpha_below_floor"},
+                {"run_date": "2026-05-24"},
+            )
     finally:
         sys.meta_path.remove(blocker)
-        sys.modules.update(saved)
+        if saved is not None:
+            sys.modules["ops_alerts"] = saved
 
 
 def test_publish_exception_is_best_effort():
     from evaluate import _publish_executor_opt_rejection_alert
     result = {"status": "alpha_below_floor"}
     config = {"run_date": "2026-05-24"}
-    alerts_mod = MagicMock()
-    alerts_mod.publish.side_effect = RuntimeError("SNS unreachable")
-    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
-                                     "nousergon_lib.alerts": alerts_mod}):
-        # Should not raise
+    with patch(
+        "ops_alerts.publish_ops_alert",
+        side_effect=RuntimeError("SNS unreachable"),
+    ) as mock_publish:
         _publish_executor_opt_rejection_alert(result, config)
-    alerts_mod.publish.assert_called_once()
+    mock_publish.assert_called_once()
 
 
 def test_run_executor_opt_publishes_on_degraded_short_circuit():
-    """When `sweep_df` is None, `_run_executor_opt` short-circuits to
-    `status=degraded` and must fire the alert from that branch."""
     from evaluate import _run_executor_opt
     config = {"run_date": "2026-05-24"}
-    alerts_mod = _make_alerts_module_mock()
-    with patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
-                                     "nousergon_lib.alerts": alerts_mod}):
+    with patch("ops_alerts.publish_ops_alert", return_value=_fake_publish_result()) as mock_publish:
         result = _run_executor_opt(config, sweep_df=None, freeze=False)
     assert result["status"] == "degraded"
-    alerts_mod.publish.assert_called_once()
+    mock_publish.assert_called_once()
 
 
 def test_run_executor_opt_publishes_when_recommend_returns_non_ok():
-    """When `executor_optimizer.recommend()` returns a non-ok status,
-    `_run_executor_opt` must fire the alert."""
     from evaluate import _run_executor_opt
     config = {"signals_bucket": "alpha-engine-research", "run_date": "2026-05-24"}
-    alerts_mod = _make_alerts_module_mock()
     sweep_df = pd.DataFrame({"sharpe_ratio": [0.1, 0.2]})
     with patch("evaluate.executor_optimizer.recommend",
                return_value={"status": "alpha_below_floor",
                              "note": "All 60 combos below floor"}), \
          patch("evaluate.read_params_pit_or_current",
                return_value=None), \
-         patch.dict("sys.modules", {"nousergon_lib": MagicMock(alerts=alerts_mod),
-                                     "nousergon_lib.alerts": alerts_mod}):
+         patch("ops_alerts.publish_ops_alert", return_value=_fake_publish_result()) as mock_publish:
         result = _run_executor_opt(config, sweep_df, freeze=False)
     assert result["status"] == "alpha_below_floor"
-    alerts_mod.publish.assert_called_once()
+    mock_publish.assert_called_once()

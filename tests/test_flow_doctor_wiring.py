@@ -39,10 +39,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def stub_flow_doctor_env(monkeypatch):
     """Populate the env vars that flow-doctor.yaml's ${VAR} refs resolve."""
     monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
+    monkeypatch.setenv("FLOW_DOCTOR_SKIP_PREFLIGHT", "1")
     monkeypatch.setenv("EMAIL_SENDER", "test@example.com")
     monkeypatch.setenv("EMAIL_RECIPIENTS", "test@example.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "stub-password")
     monkeypatch.setenv("FLOW_DOCTOR_GITHUB_TOKEN", "stub-token")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:stub-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100stub")
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL", "1")
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH", "2")
 
 
 @pytest.fixture
