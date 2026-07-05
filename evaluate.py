@@ -40,7 +40,7 @@ import json
 import logging
 import os
 import time as _time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
@@ -1126,7 +1126,83 @@ def _run_optimizers(
         skip_if_missing=None,  # runs in degraded mode, doesn't skip
     )
 
+    if not freeze:
+        manifest_date = run_date or config.get("_run_date")
+        if not manifest_date:
+            from alpha_engine_lib.dates import today_iso
+            manifest_date = today_iso()
+        write_optimizer_run_manifest(
+            bucket,
+            manifest_date,
+            results,
+            freeze=freeze,
+        )
+
     return results
+
+
+def _summarize_optimizer_module(name: str, result: dict | None) -> dict:
+    """Compact per-optimizer row for the optimizer_run freshness proxy."""
+    if not result:
+        return {"ran": False, "applied": False, "reason": "no_result"}
+    status = result.get("status")
+    if status == "skipped":
+        return {
+            "ran": False,
+            "applied": False,
+            "reason": result.get("degradation_reason") or "skipped",
+        }
+    if status == "error":
+        return {"ran": True, "applied": False, "reason": result.get("error", "error")}
+
+    apply = result.get("apply_result")
+    if apply is None:
+        apply = result.get("apply")
+    if isinstance(apply, dict):
+        applied = bool(apply.get("applied"))
+        reason = apply.get("reason") or result.get("status", "ok")
+        return {"ran": True, "applied": applied, "reason": reason}
+
+    return {"ran": True, "applied": False, "reason": result.get("status", "ok")}
+
+
+def write_optimizer_run_manifest(
+    bucket: str,
+    run_date: str,
+    results: dict,
+    *,
+    freeze: bool,
+    s3_client=None,
+) -> str:
+    """Write the Saturday optimizer-stage liveness proxy (config#1726).
+
+    Unconditionally records which optimizers ran/applied/declined. Raises on
+    S3 failure — this artifact is load-bearing for event_driven config rows.
+    """
+    if freeze:
+        return ""
+
+    import boto3
+
+    client = s3_client or boto3.client("s3")
+    key = f"optimizer_run/{run_date}.json"
+    payload = {
+        "trading_day": run_date,
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "freeze": freeze,
+        "optimizers": {
+            name: _summarize_optimizer_module(name, result)
+            for name, result in results.items()
+        },
+    }
+    client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    logger.info("Wrote optimizer run manifest s3://%s/%s", bucket, key)
+    return key
 
 
 def _run_weight_opt(config: dict, df_base, freeze: bool) -> dict:
