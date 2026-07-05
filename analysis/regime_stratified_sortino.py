@@ -20,6 +20,9 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
+from analysis.outcome_store import attach_outcomes
 
 # Pure metric core — implementation + unit tests live in the lib.
 from nousergon_lib.quant.stats.regime_sortino import (
@@ -48,11 +51,14 @@ def load_with_subscores_and_regime(db_path: str) -> pd.DataFrame:
     plus the arithmetic return columns needed for stratified Sortino.
     Log conversion happens at metric-compute time (in the lib core).
 
-    Returns a DataFrame with at minimum:
-      - market_regime (str | NaN for pre-migration rows)
-      - return_5d, spy_5d_return (arithmetic; converted to log alpha downstream)
-      - return_21d, spy_21d_return (arithmetic; same)
-      - beat_spy_5d, beat_spy_21d (booleans for hit rate)
+    The per-horizon outcome columns (arithmetic stock/SPY returns + beat-SPY
+    flags, named by ``HorizonPolicy.outcome_columns``) are re-sourced from the
+    long-format score_performance_outcomes store (config#1529). Values are
+    byte-identical to the legacy wide read (percent, 2dp).
+
+    Returns a DataFrame with at minimum the market_regime column (str | NaN for
+    pre-migration rows) plus the HorizonPolicy per-horizon stock/SPY returns and
+    beat-SPY flags used for hit rate.
 
     Pre-migration rows with NULL market_regime are kept in the
     DataFrame but filtered out at the per-regime grouping stage —
@@ -65,10 +71,12 @@ def load_with_subscores_and_regime(db_path: str) -> pd.DataFrame:
         df = pd.read_sql_query(
             "SELECT * FROM score_performance ORDER BY score_date",
             conn,
-            parse_dates=["score_date", "eval_date_10d", "eval_date_30d"],
+            parse_dates=["score_date"],
         )
     finally:
         conn.close()
+
+    df = attach_outcomes(df, str(path), policy=DEFAULT_POLICY)
 
     if "market_regime" not in df.columns:
         # Pre-migration #12 schema. Inject as all-NULL so downstream

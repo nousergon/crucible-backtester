@@ -20,10 +20,24 @@ import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
 
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
 from analysis.lookahead_disclosure import build_disclosure as _build_lookahead
 from analysis.lookahead_disclosure import render_section as _render_lookahead
+from analysis.outcome_store import primary_beat_counts
 
 logger = logging.getLogger(__name__)
+
+# Primary-horizon outcome dict-key names resolve from the fleet HorizonPolicy
+# (config#1483/#1529). Names are unchanged (beat_spy_21d / beat_spy_5d) — they
+# are the attribution-artifact keys reporter renders — but the underlying data
+# is now sourced from score_performance_outcomes upstream. The raw
+# score_performance beat-SPY COUNT/SUM aggregates below likewise read the
+# long-format store via analysis.outcome_store.primary_beat_counts.
+_PRIMARY_H = DEFAULT_POLICY.primary_horizon
+_SHORT_H = DEFAULT_POLICY.diagnostic_horizons[0]
+_BEAT_PRIMARY = DEFAULT_POLICY.outcome_columns(_PRIMARY_H).beat_spy  # beat_spy_21d
+_BEAT_SHORT = DEFAULT_POLICY.outcome_columns(_SHORT_H).beat_spy      # beat_spy_5d
 
 
 def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
@@ -38,10 +52,11 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
 
         # score_performance counts
         sp_total = conn.execute("SELECT COUNT(*) FROM score_performance").fetchone()[0]
-        # config#1456: canonical 21d horizon (10d/30d outcomes retired).
-        sp_with_21d = conn.execute(
-            "SELECT COUNT(*) FROM score_performance WHERE beat_spy_21d IS NOT NULL"
-        ).fetchone()[0]
+        # config#1456/#1529: canonical primary horizon (10d/30d outcomes
+        # retired). The resolved-count + beat-sum now come from the long-format
+        # score_performance_outcomes store (primary horizon), not the wide
+        # beat-SPY column — byte-identical (beat_spy is 0/1 in both).
+        sp_with_21d, sp_beat_21d = primary_beat_counts(conn, policy=DEFAULT_POLICY)
         sp_dates = conn.execute("SELECT COUNT(DISTINCT score_date) FROM score_performance").fetchone()[0]
         sp_earliest = conn.execute("SELECT MIN(score_date) FROM score_performance").fetchone()[0] or "—"
         sp_latest = conn.execute("SELECT MAX(score_date) FROM score_performance").fetchone()[0] or "—"
@@ -83,19 +98,12 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
         f"| Research params | Signals | {_bar(sp_total, 200)} | {'**Active**' if sp_total >= 200 else 'Deferred'} |",
     ]
 
-    # Add accuracy preview if we have any data
+    # Add accuracy preview if we have any data. beat-sum comes from the
+    # long-format store (primary horizon), read alongside sp_with_21d above.
     if sp_with_21d > 0:
-        try:
-            import sqlite3
-            conn = sqlite3.connect(db_path)
-            beat = conn.execute(
-                "SELECT SUM(beat_spy_21d) FROM score_performance WHERE beat_spy_21d IS NOT NULL"
-            ).fetchone()[0] or 0
-            acc = beat / sp_with_21d * 100
-            lines.append(f"| **21d accuracy** | **Beat SPY** | **{acc:.0f}% ({int(beat)}/{sp_with_21d})** | {'✓ Above 55%' if acc >= 55 else '⚠ Below 55%'} |")
-            conn.close()
-        except Exception:
-            pass
+        beat = sp_beat_21d
+        acc = beat / sp_with_21d * 100
+        lines.append(f"| **21d accuracy** | **Beat SPY** | **{acc:.0f}% ({int(beat)}/{sp_with_21d})** | {'✓ Above 55%' if acc >= 55 else '⚠ Below 55%'} |")
 
     return lines
 
@@ -1970,10 +1978,10 @@ def _section_attribution(attr: dict) -> list[str]:
     mv = attr.get("multivariate") or {}
     mv_targets = mv.get("targets") or {}
     if mv.get("status") == "ok" and mv_targets:
-        b21 = mv_targets.get("beat_spy_21d", {})
+        b21 = mv_targets.get(_BEAT_PRIMARY, {})
         lines += [
             "",
-            "### Multivariate attribution (joint regression → beat_spy_21d)",
+            f"### Multivariate attribution (joint regression → {_BEAT_PRIMARY})",
             "",
             "Standardized partial coefficients from a joint OLS on sub-scores "
             "+ market_regime (each input held against the others).",
@@ -1990,7 +1998,7 @@ def _section_attribution(attr: dict) -> list[str]:
                 lines += ["", f"R² (21d): {_fmt(b21.get('r_squared'))}"]
         else:
             lines += [
-                f"> beat_spy_21d fell back to univariate: {b21.get('note', '')}",
+                f"> {_BEAT_PRIMARY} fell back to univariate: {b21.get('note', '')}",
             ]
         fell_back = mv.get("targets_fell_back_to_univariate")
         if fell_back:
@@ -2018,8 +2026,8 @@ def _section_attribution(attr: dict) -> list[str]:
         "|-----------|------------|---------------|",
     ]
     for label, corrs in attr.get("correlations", {}).items():
-        c21 = corrs.get("beat_spy_21d")
-        fdr_21 = "Yes" if corrs.get("beat_spy_21d_fdr_significant") else "No"
+        c21 = corrs.get(_BEAT_PRIMARY)
+        fdr_21 = "Yes" if corrs.get(f"{_BEAT_PRIMARY}_fdr_significant") else "No"
         lines.append(f"| {label} | {_fmt(c21)} | {fdr_21} |")
 
     ranking_21d = attr.get("ranking_21d", [])
@@ -2422,8 +2430,8 @@ def _section_weight_recommendation(result: dict) -> list[str]:
     ]
     for k in ("news", "research"):
         corr = correlations.get(k, {})
-        c5 = corr.get("beat_spy_5d")
-        c21 = corr.get("beat_spy_21d")
+        c5 = corr.get(_BEAT_SHORT)
+        c21 = corr.get(_BEAT_PRIMARY)
         chg = changes.get(k, 0)
         chg_str = f"+{chg:.1%}" if chg > 0 else f"{chg:.1%}"
         lines.append(
