@@ -396,9 +396,9 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
-        assert "@v0.82.0" in text, (
-            "nousergon-lib should pin to v0.82.0 (flow-doctor>=0.8.0 notify_on_category "
-            "for config#1695; lockstep with crucible-predictor at v0.82.0 — "
+        assert "@v0.83.0" in text, (
+            "nousergon-lib should pin to v0.83.0 (flow-doctor>=0.8.0 notify_on_category "
+            "for config#1695; lockstep with crucible-predictor at v0.83.0 — "
             "merge predictor PR before or with this PR (LibPinDriftCheck). "
             "Prior: v0.77.1 — the HorizonPolicy chokepoint "
             "(nousergon_lib.quant.horizons + the outcome_record contract, "
