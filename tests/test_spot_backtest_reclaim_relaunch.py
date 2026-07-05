@@ -162,18 +162,30 @@ def test_cleanup_captures_and_reexits_status():
 
 def test_describe_instances_diagnostics_retained():
     """The pre-existing describe-instances diagnostic (state / reason_code /
-    state_reason logged to stdout + fanned out via krepis.alerts) must
-    survive the migration — it is orthogonal to the relaunch DECISION (now
-    the lib's job) and remains the primary human-facing failure surface."""
+    state_reason logged to stdout + fanned out via the shared ops-alerts
+    chokepoint) must survive the migration — it is orthogonal to the
+    relaunch DECISION (now the lib's job) and remains the primary
+    human-facing failure surface.
+
+    NOTE: the fan-out transport itself is `ops_alerts.publish_ops_alert`
+    (config#1749 T3, landed on main and merged into this branch in
+    3d90fc3), not the raw `python -m krepis.alerts publish` CLI this test
+    originally pinned pre-merge — `ops_alerts.publish_ops_alert` still
+    routes SNS through krepis internally (see ops_alerts.py), so the
+    krepis-backed fan-out this test cares about is unchanged in substance.
+    `test_spot_backtest_exit_trap_diagnostic.py::test_cleanup_fans_out_via_ops_alerts`
+    pins the full ops_alerts call shape; this assertion only needs to
+    confirm SOME failure fan-out survives the #883 migration.
+    """
     body = _cleanup_body()
     assert "StateReason.Code" in body and "StateTransitionReason" in body, (
         "cleanup() must still query StateReason.Code + StateTransitionReason "
         "for the stdout diagnostic — #883 only lifts the relaunch DECISION, "
         "not the human-facing failure diagnostics."
     )
-    assert "krepis.alerts publish" in body, (
+    assert "publish_ops_alert(" in body, (
         "cleanup() must still fan out the failure diagnostic via "
-        "`python -m krepis.alerts publish`."
+        "`ops_alerts.publish_ops_alert` (config#1749 T3)."
     )
 
 
