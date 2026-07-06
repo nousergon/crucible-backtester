@@ -237,7 +237,20 @@ _MIN_BASELINE_MAGNITUDE_BY_RANK: dict[str, float] = {
 def _resolve_min_baseline_magnitude(rank_metric: str) -> float:
     """Pick the significance floor for ``rank_metric``, honouring
     operator overrides at config-write time."""
+    from optimizer.config_guards import validate_keyed_block
+
     by_rank_override = _cfg.get("min_baseline_magnitude_by_rank") or {}
+    # Fail-loud key guard (config#1842): an override keyed by a stale/renamed
+    # rank metric would be silently ignored (the exact key-drift class that
+    # zero-filled weight_optimizer.default_weights). Subset mode — the block
+    # is an OPTIONAL per-metric override, so naming fewer metrics is valid;
+    # unknown metric names raise.
+    validate_keyed_block(
+        by_rank_override,
+        _MIN_BASELINE_MAGNITUDE_BY_RANK,
+        config_path="executor_optimizer.min_baseline_magnitude_by_rank",
+        allow_subset=True,
+    )
     if rank_metric in by_rank_override:
         return float(by_rank_override[rank_metric])
     single_override = _cfg.get("min_baseline_magnitude")

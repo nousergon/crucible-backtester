@@ -985,12 +985,23 @@ def _read_current_weights(config: dict) -> dict:
             with open(universe_yaml) as f:
                 universe = yaml.safe_load(f)
             weights = universe.get("scoring_weights", {})
-            if weights:
-                return weights
         except Exception:
-            pass
+            weights = {}
+        if weights:
+            # Fail-loud key guard (config#1842): a drifted scoring_weights
+            # block in research's universe.yaml would reproduce the phantom
+            # 0.0 baseline downstream. Raise (isolated per-module by
+            # tracker.run_module) instead of returning drifted keys.
+            from optimizer.config_guards import validate_keyed_block
+            validate_keyed_block(
+                weights, weight_optimizer.SUB_SCORES,
+                config_path="crucible-research config/universe.yaml scoring_weights",
+            )
+            return weights
 
-    return weight_optimizer._cfg.get("default_weights", weight_optimizer._DEFAULT_WEIGHTS).copy()
+    # Validated chokepoint (config#1842): raises ConfigKeyDriftError on a
+    # stale default_weights block instead of silently zero-filling.
+    return weight_optimizer.configured_default_weights()
 
 
 def _run_optimizers(

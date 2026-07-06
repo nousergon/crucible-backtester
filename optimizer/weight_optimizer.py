@@ -82,6 +82,49 @@ def init_config(config: dict) -> None:
     _cfg = config.get("weight_optimizer", {})
 
 
+def configured_default_weights() -> dict:
+    """Return the configured ``default_weights`` block, fail-loud validated.
+
+    Chokepoint for every ``default_weights`` read (config#1842): the
+    configured block's keys must EXACTLY equal ``SUB_SCORES`` — a stale block
+    (the live config carried pre-2026-03-29 ``news``/``research`` keys until
+    alpha-engine-config PR #1848) makes ``current_weights.get("quant"/"qual")``
+    resolve to 0.0, so every proposal is measured against a phantom zero
+    baseline and ``max_single_change`` trips permanently (the root cause of
+    ``config/scoring_weights.json`` never being written). Raises
+    ``ConfigKeyDriftError`` instead of zero-filling. Absent block → code
+    default.
+    """
+    from optimizer.config_guards import validate_keyed_block
+
+    configured = _cfg.get("default_weights")
+    validate_keyed_block(
+        configured, SUB_SCORES, config_path="weight_optimizer.default_weights",
+    )
+    return (configured if configured is not None else _DEFAULT_WEIGHTS).copy()
+
+
+def _configured_horizon_blend() -> dict:
+    """Return the configured ``horizon_blend`` block, fail-loud validated.
+
+    Same key-drift class, same file, already bit once: the live block carried
+    the retired 10d/30d beat-SPY keys after the canonical-alpha
+    cutover, so ``horizon.get(_SHORT_OUTCOME, 0.50)`` silently fell through to
+    the 0.50/0.50 default and the tuned 60/40 blend was inert (caught
+    2026-07-01 while wiring the significance-enforce flip — see the live
+    config comment). Raises ``ConfigKeyDriftError`` on drift.
+    """
+    from optimizer.config_guards import validate_keyed_block
+
+    configured = _cfg.get("horizon_blend")
+    validate_keyed_block(
+        configured,
+        (_SHORT_OUTCOME, _LONG_OUTCOME),
+        config_path="weight_optimizer.horizon_blend",
+    )
+    return dict(configured) if configured is not None else dict(_HORIZON_BLEND)
+
+
 def load_with_subscores(
     df: pd.DataFrame,
     bucket: str,
@@ -433,7 +476,18 @@ def compute_weights(
         }
     """
     if current_weights is None:
-        current_weights = _cfg.get("default_weights", _DEFAULT_WEIGHTS).copy()
+        current_weights = configured_default_weights()
+    else:
+        # Defense-in-depth at the single compute chokepoint (config#1842):
+        # whatever path produced current_weights (S3 read, universe.yaml,
+        # config default), drifted keys here mean every downstream
+        # ``current_weights.get(sub_score)`` measures the proposal against a
+        # phantom 0.0 baseline. Fail loud instead.
+        from optimizer.config_guards import validate_keyed_block
+        validate_keyed_block(
+            current_weights, SUB_SCORES,
+            config_path="compute_weights(current_weights=...)",
+        )
 
     # Phase 1: Validate inputs and split
     result = _validate_and_split(df, current_weights, min_samples)
@@ -454,7 +508,7 @@ def compute_weights(
         correlations = _compute_correlations(train_set, sub_cols)
 
     # Derive suggested weights from horizon-blended correlations
-    horizon = _cfg.get("horizon_blend", _HORIZON_BLEND)
+    horizon = _configured_horizon_blend()
     w_short = horizon.get(_SHORT_OUTCOME, 0.50)
     w_long = horizon.get(_LONG_OUTCOME, 0.50)
     weighted_corrs: dict[str, float] = {}
