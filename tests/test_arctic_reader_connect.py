@@ -63,12 +63,14 @@ def test_get_arctic_list_libraries_failure_is_non_fatal(monkeypatch, caplog):
     assert "list_libraries failed" in caplog.text
 
 
-def test_load_universe_opens_universe_via_helper_macro_via_local_arctic(monkeypatch):
-    """config#804: ``load_universe_from_arctic`` must open the ``universe``
-    library via the shared ``open_universe_lib`` helper. The ``macro``
-    library open and the #826 empty-universe diagnostic still go through the
-    local ``_get_arctic`` handle — assert that split so a future refactor
-    can't silently reroute (or break) the diagnostic path.
+def test_load_universe_opens_universe_and_macro_via_helpers(monkeypatch):
+    """config#804: ``load_universe_from_arctic`` must open BOTH the ``universe``
+    and ``macro`` libraries via the shared ``open_universe_lib`` /
+    ``open_macro_lib`` helpers (the last raw ``arctic.get_library("macro")``
+    is retired). The local ``_get_arctic`` handle is retained ONLY for the
+    #826 empty-universe ``list_libraries`` diagnostic — assert that split so a
+    future refactor can't silently reroute a library open back off the handle
+    or break the diagnostic path.
     """
     import store.arctic_reader as ar
 
@@ -88,21 +90,23 @@ def test_load_universe_opens_universe_via_helper_macro_via_local_arctic(monkeypa
     macro_lib = MagicMock()
     macro_lib.read.side_effect = KeyError("no macro symbol")
 
-    # Local arctic handle still owns ``macro`` (+ list_libraries for the
-    # #826 diagnostic) — proving that block is untouched by the migration.
+    # Local arctic handle is retained ONLY for the #826 list_libraries
+    # diagnostic — it must NOT be used to open any library anymore.
     fake_arctic = MagicMock()
-    fake_arctic.get_library.return_value = macro_lib
 
     monkeypatch.setattr(ar, "_get_arctic", lambda bucket: fake_arctic)
 
-    helper = MagicMock(return_value=universe_lib)
-    monkeypatch.setattr("alpha_engine_lib.arcticdb.open_universe_lib", helper)
+    open_universe = MagicMock(return_value=universe_lib)
+    open_macro = MagicMock(return_value=macro_lib)
+    monkeypatch.setattr("nousergon_lib.arcticdb.open_universe_lib", open_universe)
+    monkeypatch.setattr("nousergon_lib.arcticdb.open_macro_lib", open_macro)
 
     price_data, features = ar.load_universe_from_arctic("alpha-engine-research")
 
-    # Universe opened via the shared helper, with the bucket.
-    helper.assert_called_once_with("alpha-engine-research")
-    # Macro still opened off the local arctic handle (diagnostic block intact).
-    fake_arctic.get_library.assert_called_once_with("macro")
+    # Both libraries opened via the shared helpers, with the bucket.
+    open_universe.assert_called_once_with("alpha-engine-research")
+    open_macro.assert_called_once_with("alpha-engine-research")
+    # The local arctic handle no longer opens any library.
+    fake_arctic.get_library.assert_not_called()
     assert "AAPL" in price_data
     assert "AAPL" in features

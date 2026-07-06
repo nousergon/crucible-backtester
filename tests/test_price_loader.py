@@ -290,38 +290,37 @@ class TestArcticFreshnessGate:
             lib.read.return_value.data = pd.DataFrame({"Close": [500.0]}, index=idx)
         return lib
 
+    @patch("nousergon_lib.arcticdb.open_macro_lib")
     @patch("store.arctic_reader._get_arctic")
-    def test_missing_spy_raises(self, mock_get_arctic):
+    def test_missing_spy_raises(self, mock_get_arctic, mock_open_macro):
         import pytest
 
         from store.arctic_reader import _verify_arctic_fresh
 
-        macro = self._macro_lib(raise_exc=Exception("SymbolNotFound"))
-        arctic = mock_get_arctic.return_value
-        arctic.get_library.return_value = macro
+        # config#804: macro opens via the shared open_macro_lib helper;
+        # _get_arctic is still called (patched harmless) for the diagnostic log.
+        mock_open_macro.return_value = self._macro_lib(raise_exc=Exception("SymbolNotFound"))
 
         with pytest.raises(RuntimeError, match="unreadable"):
             _verify_arctic_fresh(bucket="test", min_date="2026-04-16")
 
+    @patch("nousergon_lib.arcticdb.open_macro_lib")
     @patch("store.arctic_reader._get_arctic")
-    def test_fresh_spy_passes(self, mock_get_arctic):
+    def test_fresh_spy_passes(self, mock_get_arctic, mock_open_macro):
         from store.arctic_reader import _verify_arctic_fresh
 
-        macro = self._macro_lib(last_date="2026-04-16")
-        arctic = mock_get_arctic.return_value
-        arctic.get_library.return_value = macro
+        mock_open_macro.return_value = self._macro_lib(last_date="2026-04-16")
 
         _verify_arctic_fresh(bucket="test", min_date="2026-04-16")  # should not raise
 
+    @patch("nousergon_lib.arcticdb.open_macro_lib")
     @patch("store.arctic_reader._get_arctic")
-    def test_stale_spy_raises(self, mock_get_arctic):
+    def test_stale_spy_raises(self, mock_get_arctic, mock_open_macro):
         import pytest
 
         from store.arctic_reader import _verify_arctic_fresh
 
-        macro = self._macro_lib(last_date="2026-04-15")
-        arctic = mock_get_arctic.return_value
-        arctic.get_library.return_value = macro
+        mock_open_macro.return_value = self._macro_lib(last_date="2026-04-15")
 
         with pytest.raises(RuntimeError, match="stale"):
             _verify_arctic_fresh(bucket="test", min_date="2026-04-16")
