@@ -49,6 +49,40 @@ def _letter(score: float | None) -> str:
     return "F"
 
 
+def _na_reason(
+    artifact: dict | None,
+    *,
+    label: str,
+    ok_statuses: tuple[str, ...] = ("ok",),
+) -> str:
+    """Build a specific N/A reason naming *which* upstream artifact is missing.
+
+    The generic ``"insufficient data"`` copy framed a producer-INPUT gap as a
+    sample-size story ("we don't have enough signals yet"), which the Report
+    Card then amplified with a "typically 4-8 weeks" caption. In reality an
+    N/A here almost always means the upstream analysis simply wasn't produced
+    or persisted this cycle — a plumbing gap, not a maturity one (config#859
+    Problem 1b). This distinguishes the two honest cases:
+
+    * input ABSENT (``None``/empty, or present with no ``status``) → the
+      analysis didn't run this cycle: ``"no <label> this cycle"``;
+    * input PRESENT but carrying a non-ok ``status`` → a real producer signal,
+      surfaced verbatim: ``"<label> status: <status>"``.
+
+    ``ok_statuses`` mirrors the caller's own guard (e.g. the veto gate treats
+    ``insufficient_lift`` as gradeable, so it never reaches this reason).
+    """
+    if not artifact:
+        return f"no {label} this cycle"
+    status = artifact.get("status")
+    if status is None:
+        return f"no {label} this cycle"
+    if status in ok_statuses:
+        # Defensive: caller's guard should have accepted this artifact.
+        return f"{label} present"
+    return f"{label} status: {status}"
+
+
 # ---------------------------------------------------------------------------
 # Normalisation helpers
 # ---------------------------------------------------------------------------
@@ -193,7 +227,8 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     """Grade the quant scanner filter."""
     sl = _safe_get(e2e, "scanner_lift")
     if not sl or _safe_get(sl, "n_passing") is None:
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": "no scanner-lift data this cycle"}
 
     lift = _safe_get(sl, "lift")
     n_passing = _safe_get(sl, "n_passing", default=0)
@@ -432,7 +467,8 @@ def _grade_team_skill_composite(
 def _grade_macro(macro_eval: dict | None) -> dict:
     """Grade the macro agent's contribution."""
     if not macro_eval or macro_eval.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(macro_eval, label="macro evaluation")}
 
     acc_lift = macro_eval.get("accuracy_lift")
     alpha_lift = macro_eval.get("alpha_lift")
@@ -462,7 +498,9 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
     cio_vs = _safe_get(e2e, "cio_vs_ranking")
 
     if not cio_lift or _safe_get(cio_lift, "n_advance", default=0) < 3:
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": ("no CIO decision-lift data this cycle" if not cio_lift
+                           else "fewer than 3 CIO advance decisions this cycle")}
 
     # Canonical 21d horizon first; legacy 5d fallback (ROADMAP L4551).
     clf = _safe_get(cio_lift, "classification_21d") or _safe_get(cio_lift, "classification")
@@ -524,7 +562,8 @@ def _grade_composite_scoring(signal_quality: dict | None,
                              score_cal: dict | None) -> dict:
     """Grade the composite scoring system (monotonicity + bucket accuracy)."""
     if not signal_quality or signal_quality.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(signal_quality, label="composite-scoring analysis")}
 
     overall = signal_quality.get("overall", {})
     buckets = signal_quality.get("by_score_bucket", [])
@@ -616,7 +655,12 @@ def _grade_meta_model(predictor_sizing: dict | None,
     if not predictor_sizing or predictor_sizing.get("status") != "ok":
         # Fall back to veto result for any signal of model quality
         if not veto_result or veto_result.get("status") not in ("ok", "insufficient_lift"):
-            return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+            return {"grade": None, "letter": "N/A",
+                    "reason": _na_reason(
+                        veto_result,
+                        label="meta-model inputs (predictor sizing + veto)",
+                        ok_statuses=("ok", "insufficient_lift"),
+                    )}
 
     ic_g = _ic_to_grade(ic)
 
@@ -652,7 +696,11 @@ def _grade_veto_gate(veto_result: dict | None,
                      veto_value: dict | None) -> dict:
     """Grade the predictor's veto system."""
     if not veto_result or veto_result.get("status") not in ("ok", "insufficient_lift"):
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(
+                    veto_result, label="veto-gate result",
+                    ok_statuses=("ok", "insufficient_lift"),
+                )}
 
     # Find the recommended threshold's metrics
     thresholds = veto_result.get("thresholds", [])
@@ -707,7 +755,8 @@ def _grade_veto_gate(veto_result: dict | None,
 def _grade_entry_triggers(trigger_scorecard: dict | None) -> dict:
     """Grade entry trigger effectiveness."""
     if not trigger_scorecard or trigger_scorecard.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(trigger_scorecard, label="trigger scorecard")}
 
     summary = trigger_scorecard.get("summary", {})
     triggers = trigger_scorecard.get("triggers", [])
@@ -766,7 +815,8 @@ def _grade_entry_triggers(trigger_scorecard: dict | None) -> dict:
 def _grade_risk_guard(shadow_book: dict | None) -> dict:
     """Grade the risk guard's blocking decisions."""
     if not shadow_book or shadow_book.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(shadow_book, label="shadow-book sweep")}
 
     assessment = shadow_book.get("assessment", "neutral")
     guard_lift = shadow_book.get("guard_lift")
@@ -833,7 +883,8 @@ def _grade_risk_guard(shadow_book: dict | None) -> dict:
 def _grade_exit_rules(exit_timing: dict | None) -> dict:
     """Grade exit rule effectiveness."""
     if not exit_timing or exit_timing.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(exit_timing, label="exit-timing analysis")}
 
     summary = exit_timing.get("summary", {})
     diagnosis = exit_timing.get("diagnosis", "unknown")
@@ -878,7 +929,8 @@ def _grade_exit_rules(exit_timing: dict | None) -> dict:
 def _grade_position_sizing(sizing_ab: dict | None) -> dict:
     """Grade position sizing vs equal-weight baseline."""
     if not sizing_ab or sizing_ab.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(sizing_ab, label="sizing A/B")}
 
     sharpe_diff = sizing_ab.get("sharpe_diff")
     alpha_diff = sizing_ab.get("alpha_diff")
@@ -1058,7 +1110,7 @@ def _grade_action_entropy(action_entropy: dict | None) -> dict:
     if not action_entropy or action_entropy.get("status") != "ok":
         return {
             "grade": None, "letter": "N/A",
-            "reason": "insufficient data",
+            "reason": _na_reason(action_entropy, label="action-entropy analysis"),
         }
 
     h_norm = action_entropy.get("entropy_normalized")
@@ -1096,7 +1148,7 @@ def _grade_excursion(excursion_summary: dict | None) -> dict:
     if not excursion_summary or excursion_summary.get("status") != "ok":
         return {
             "grade": None, "letter": "N/A",
-            "reason": "insufficient data",
+            "reason": _na_reason(excursion_summary, label="excursion analysis"),
         }
 
     ratio = excursion_summary.get("mean_mfe_mae_ratio")

@@ -9,10 +9,16 @@ from analysis.grading import (
     _grade_action_entropy,
     _grade_calibration,
     _grade_calibration_diagnostics,
+    _grade_entry_triggers,
     _grade_excursion,
+    _grade_exit_rules,
+    _grade_position_sizing,
+    _grade_risk_guard,
+    _grade_veto_gate,
     _ic_to_grade,
     _letter,
     _lift_to_grade,
+    _na_reason,
     _pct_to_grade,
     _ratio_to_grade,
     _weighted_avg,
@@ -634,3 +640,83 @@ class TestSectorTeamSkillComposite:
         # Legacy detail keys.
         assert "lift_vs_sector" in tech["detail"]
         assert "lift_vs_quant" in tech["detail"]
+
+
+class TestNAReason:
+    """config#859 Problem 1b — N/A reasons must name the missing upstream
+    artifact (a producer-INPUT gap), not the misleading generic
+    "insufficient data" (a sample-size story)."""
+
+    def test_absent_artifact_names_the_gap(self):
+        assert _na_reason(None, label="trigger scorecard") == (
+            "no trigger scorecard this cycle"
+        )
+
+    def test_empty_artifact_names_the_gap(self):
+        assert _na_reason({}, label="shadow-book sweep") == (
+            "no shadow-book sweep this cycle"
+        )
+
+    def test_present_no_status_treated_as_absent(self):
+        assert _na_reason({"foo": 1}, label="sizing A/B") == (
+            "no sizing A/B this cycle"
+        )
+
+    def test_present_non_ok_status_surfaced_verbatim(self):
+        assert _na_reason({"status": "degraded"}, label="exit-timing analysis") == (
+            "exit-timing analysis status: degraded"
+        )
+
+    def test_ok_statuses_are_honoured(self):
+        # insufficient_lift is gradeable for the veto gate, so the defensive
+        # "present" branch is what fires if it ever reaches the reason.
+        assert _na_reason(
+            {"status": "insufficient_lift"},
+            label="veto-gate result",
+            ok_statuses=("ok", "insufficient_lift"),
+        ) == "veto-gate result present"
+
+
+class TestGraderNAReasons:
+    """Each Executor/Predictor grader surfaces which upstream artifact is
+    missing when its input is absent, and the real producer status when the
+    input is present-but-not-ok. Never the generic "insufficient data"."""
+
+    def test_entry_triggers_absent(self):
+        assert _grade_entry_triggers(None)["reason"] == (
+            "no trigger scorecard this cycle"
+        )
+
+    def test_entry_triggers_non_ok_status(self):
+        assert _grade_entry_triggers({"status": "error"})["reason"] == (
+            "trigger scorecard status: error"
+        )
+
+    def test_risk_guard_absent(self):
+        assert _grade_risk_guard(None)["reason"] == "no shadow-book sweep this cycle"
+
+    def test_exit_rules_absent(self):
+        assert _grade_exit_rules(None)["reason"] == (
+            "no exit-timing analysis this cycle"
+        )
+
+    def test_position_sizing_absent(self):
+        assert _grade_position_sizing(None)["reason"] == "no sizing A/B this cycle"
+
+    def test_veto_gate_absent(self):
+        assert _grade_veto_gate(None, None)["reason"] == (
+            "no veto-gate result this cycle"
+        )
+
+    def test_no_grader_emits_the_generic_reason(self):
+        na_dicts = [
+            _grade_entry_triggers(None),
+            _grade_entry_triggers({"status": "error"}),
+            _grade_risk_guard(None),
+            _grade_exit_rules(None),
+            _grade_position_sizing(None),
+            _grade_veto_gate(None, None),
+        ]
+        for d in na_dicts:
+            assert d["letter"] == "N/A"
+            assert d["reason"] != "insufficient data"
