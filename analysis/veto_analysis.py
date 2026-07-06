@@ -555,6 +555,7 @@ def _select_best_threshold(
     if best_lift is not None and best_lift < min_lift:
         return {
             "status": "insufficient_lift",
+            "blocked_by": ["min_lift_over_base_rate"],
             "fit_target": fit_target,
             "current_threshold": current_default,
             "base_rate": round(base_rate, 4),
@@ -582,6 +583,7 @@ def _select_best_threshold(
         if ci_lower is not None and ci_lower <= base_rate:
             return {
                 "status": "insufficient_confidence",
+                "blocked_by": ["precision_ci_below_base_rate"],
                 "fit_target": fit_target,
                 "current_threshold": current_default,
                 "base_rate": round(base_rate, 4),
@@ -692,6 +694,7 @@ def apply(result: dict, bucket: str) -> dict:
     if abs(recommended - current) < min_change:
         return {
             "applied": False,
+            "blocked_by": ["min_threshold_change"],
             "reason": (
                 f"Recommended ({recommended:.2f}) too close to current "
                 f"({current:.2f}) — need {min_change}+ difference"
@@ -767,6 +770,7 @@ def apply(result: dict, bucket: str) -> dict:
             )
             return {
                 "applied": False,
+                "blocked_by": ["significance_floor"],
                 "reason": "veto_analysis: blocked by significance enforce "
                           "(config#1426) — undefended evidence",
                 "observe_verdict": verdict,
