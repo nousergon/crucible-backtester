@@ -26,7 +26,7 @@ def test_get_arctic_first_call_does_not_nameerror(monkeypatch, caplog):
 
     # open_arctic is imported inside _get_arctic at call time → patch the lib attr.
     monkeypatch.setattr(
-        "alpha_engine_lib.arcticdb.open_arctic", lambda bucket: _FakeArctic()
+        "nousergon_lib.arcticdb.open_arctic", lambda bucket: _FakeArctic()
     )
     # Force the first-call (INFO-logging) branch.
     monkeypatch.setattr(ar, "_ARCTIC_LOGGED", False)
@@ -53,7 +53,7 @@ def test_get_arctic_list_libraries_failure_is_non_fatal(monkeypatch, caplog):
             raise RuntimeError("boom")
 
     monkeypatch.setattr(
-        "alpha_engine_lib.arcticdb.open_arctic", lambda bucket: _FakeArctic()
+        "nousergon_lib.arcticdb.open_arctic", lambda bucket: _FakeArctic()
     )
     monkeypatch.setattr(ar, "_ARCTIC_LOGGED", False)
 
@@ -96,7 +96,7 @@ def test_load_universe_opens_universe_via_helper_macro_via_local_arctic(monkeypa
     monkeypatch.setattr(ar, "_get_arctic", lambda bucket: fake_arctic)
 
     helper = MagicMock(return_value=universe_lib)
-    monkeypatch.setattr("alpha_engine_lib.arcticdb.open_universe_lib", helper)
+    monkeypatch.setattr("nousergon_lib.arcticdb.open_universe_lib", helper)
 
     price_data, features = ar.load_universe_from_arctic("alpha-engine-research")
 
