@@ -72,7 +72,9 @@ _UNIVERSE_RETURNS_EXEMPT = frozenset({
     "analysis/shadow_book.py",             # SELECT ... FROM universe_returns
     "analysis/cio_rule_tag_precision.py",  # SELECT ur.beat_spy_5d FROM universe_returns
     "analysis/macro_eval.py",              # SELECT ... FROM universe_returns
-    "analysis/quant_rank_quality.py",      # SELECT ur.return_5d FROM universe_returns
+    # analysis/quant_rank_quality.py left this set 2026-07-06 (config#1529):
+    # its universe_returns column names now resolve from HorizonPolicy
+    # (OutcomeColumns attribute access), so no wide-column literal remains.
     "analysis/end_to_end.py",              # universe_returns joins + locally-computed alpha
     "reporter.py",                         # renders universe_returns-sourced artifact keys
     "evaluate.py",                         # reads u.log_return_21d FROM universe_returns

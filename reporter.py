@@ -557,11 +557,14 @@ def _section_provenance_grounding(grounding: dict) -> list[str]:
 def _section_quant_rank_quality(quality: dict) -> list[str]:
     """Build Quant Rank Quality section.
 
-    Per-sector ``corr(quant_rank, return_5d)`` over a rolling 8-week
-    window. Negative correlations = skilled (rank #1 → highest return);
-    positive = anti-skill (rank #1 → lowest return). The 2026-05-09
-    post-mortem found healthcare/industrials/tech at +0.33-0.36 — this
-    section surfaces that drift weekly so it doesn't recur in silence.
+    Per-sector ``corr(quant_rank, realized return)`` over a rolling 8-week
+    window, at BOTH policy horizons — the diagnostic short horizon (legacy
+    unsuffixed keys) and the canonical primary horizon (suffixed keys,
+    config#1529). Negative correlations = skilled (rank #1 → highest
+    return); positive = anti-skill (rank #1 → lowest return). The
+    2026-05-09 post-mortem found healthcare/industrials/tech at +0.33-0.36
+    — this section surfaces that drift weekly so it doesn't recur in
+    silence.
     """
     lines = ["## Quant Rank Quality", ""]
 
@@ -575,13 +578,18 @@ def _section_quant_rank_quality(quality: dict) -> list[str]:
         lines.append("")
         return lines
 
+    p_suf = f"{_PRIMARY_H}d"
+    d_suf = f"{_SHORT_H}d"
     win_start = quality.get("window_start", "?")
     win_end = quality.get("window_end", "?")
     overall_rank = quality.get("overall_rank_corr")
     overall_score = quality.get("overall_score_corr")
+    overall_rank_p = quality.get(f"overall_rank_corr_{p_suf}")
+    overall_score_p = quality.get(f"overall_score_corr_{p_suf}")
     n_obs = quality.get("n_total_obs", 0)
     threshold = quality.get("anti_skill_threshold", 0.10)
     anti_skill = quality.get("anti_skill_teams", []) or []
+    anti_skill_p = quality.get(f"anti_skill_teams_{p_suf}", []) or []
 
     overall_flag = "✅" if (overall_rank is not None and overall_rank < 0) else (
         "⚠️" if (overall_rank is not None and overall_rank > threshold) else "🟡"
@@ -591,9 +599,18 @@ def _section_quant_rank_quality(quality: dict) -> list[str]:
         f"- Window: **{win_start}** → **{win_end}** ({n_obs} obs)"
     )
     lines.append(
-        f"- {overall_flag} Overall rank corr: **{overall_str}** "
+        f"- {overall_flag} Overall rank corr ({d_suf}): **{overall_str}** "
         f"(score corr: {overall_score:+.3f})" if overall_score is not None
-        else f"- {overall_flag} Overall rank corr: **{overall_str}**"
+        else f"- {overall_flag} Overall rank corr ({d_suf}): **{overall_str}**"
+    )
+    overall_p_flag = "✅" if (overall_rank_p is not None and overall_rank_p < 0) else (
+        "⚠️" if (overall_rank_p is not None and overall_rank_p > threshold) else "🟡"
+    )
+    overall_p_str = f"{overall_rank_p:+.3f}" if overall_rank_p is not None else "—"
+    lines.append(
+        f"- {overall_p_flag} Overall rank corr ({p_suf}, canonical): **{overall_p_str}** "
+        f"(score corr: {overall_score_p:+.3f})" if overall_score_p is not None
+        else f"- {overall_p_flag} Overall rank corr ({p_suf}, canonical): **{overall_p_str}**"
     )
     lines.append(
         f"  *Negative = skilled ranker; positive = anti-skill (top picks "
@@ -601,30 +618,41 @@ def _section_quant_rank_quality(quality: dict) -> list[str]:
     )
 
     if anti_skill:
-        lines.append(f"- ⚠️ Anti-skill teams (corr > +{threshold:.2f}): "
+        lines.append(f"- ⚠️ Anti-skill teams ({d_suf} corr > +{threshold:.2f}): "
                      f"**{', '.join(anti_skill)}**")
+    if anti_skill_p:
+        lines.append(f"- ⚠️ Anti-skill teams ({p_suf} corr > +{threshold:.2f}): "
+                     f"**{', '.join(anti_skill_p)}**")
 
-    # Per-team table.
+    # Per-team table — both horizons side by side.
     per_team = quality.get("per_team", []) or []
     if per_team:
         lines.append("")
-        lines.append("| Team | Rank corr | Score corr | Top-3 hit-rate | n_obs |")
-        lines.append("|---|---|---|---|---|")
+        lines.append(
+            f"| Team | Rank corr {d_suf} | Rank corr {p_suf} | "
+            f"Score corr {d_suf} | Top-3 hit {d_suf} | Top-3 hit {p_suf} | n_obs |"
+        )
+        lines.append("|---|---|---|---|---|---|---|")
         for entry in per_team:
             rc = entry.get("rank_corr")
+            rc_p = entry.get(f"rank_corr_{p_suf}")
             sc = entry.get("score_corr")
             hr = entry.get("hit_rate_top3")
+            hr_p = entry.get(f"hit_rate_top3_{p_suf}")
             n = entry.get("n_obs", 0)
             rc_str = f"{rc:+.3f}" if rc is not None else "—"
+            rc_p_str = f"{rc_p:+.3f}" if rc_p is not None else "—"
             sc_str = f"{sc:+.3f}" if sc is not None else "—"
             hr_str = f"{hr:.0f}%" if hr is not None else "—"
+            hr_p_str = f"{hr_p:.0f}%" if hr_p is not None else "—"
             flag = ""
             if rc is not None and rc > threshold:
                 flag = " ⚠️"
             elif rc is not None and rc < -threshold:
                 flag = " ✅"
             lines.append(
-                f"| {entry['team_id']}{flag} | {rc_str} | {sc_str} | {hr_str} | {n} |"
+                f"| {entry['team_id']}{flag} | {rc_str} | {rc_p_str} | "
+                f"{sc_str} | {hr_str} | {hr_p_str} | {n} |"
             )
 
     lines.append("")
