@@ -78,6 +78,7 @@ from analysis import decision_capture_coverage, executor_decision_capture_covera
 from analysis import cio_rule_tag_precision
 from analysis import agent_justification
 from analysis import end_to_end
+from analysis import attractiveness_eval as attractiveness_eval_analysis
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
 from analysis import behavioral_anomaly as behavioral_anomaly_analysis
@@ -450,6 +451,26 @@ def _run_diagnostics(
             research_db_path=db_path, trades_db_path=trades_db,
             factor_loadings=factor_loadings, pillar_profiles=pillar_profiles,
             trajectory_scores=trajectory_scores,
+        ),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Universe-board attractiveness composite vs realized forward alpha
+    # (config#1389 per-pillar IC + suggested 1/N-shrunk weights, config#1392
+    # trajectory forward-IC, config#1398 top-N counterfactual vs the live
+    # tech_score gate). Read-only measurement — emits SUGGESTED weights inside
+    # the artifact only, never writes config/factor_attractiveness_weights.json.
+    # Reuses the trajectory_scores dict loaded above for e2e_lift (no second
+    # S3 read); frozen cross-repo schema v1 in
+    # contracts/attractiveness_eval.schema.json.
+    results["attractiveness_eval"] = tracker.run_module(
+        "attractiveness_eval",
+        lambda: attractiveness_eval_analysis.compute_attractiveness_eval(
+            db_path,
+            as_of=config.get("_run_date") or date.today().isoformat(),
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            trajectory_scores=trajectory_scores or None,
         ),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
@@ -2080,6 +2101,7 @@ def _main_impl() -> None:
             barrier_coherence=diagnostics.get("barrier_coherence"),
             score_calibration=diagnostics.get("score_calibration"),
             macro_eval=diagnostics.get("macro_eval"),
+            attractiveness_eval=diagnostics.get("attractiveness_eval"),
             team_metrics=team_metrics or None,
             calibration_diagnostics=portfolio_calibration,
             excursion_summary=portfolio_excursion,

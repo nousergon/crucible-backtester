@@ -1512,6 +1512,7 @@ def save(
     barrier_coherence: dict | None = None,
     score_calibration: dict | None = None,
     macro_eval: dict | None = None,
+    attractiveness_eval: dict | None = None,
     team_metrics: dict | None = None,
     calibration_diagnostics: dict | None = None,
     excursion_summary: dict | None = None,
@@ -1688,6 +1689,13 @@ def save(
         # N/A on any non-"ok" status, so emitting the non-ok body is safe.
         ("score_calibration.json", score_calibration),
         ("macro_eval.json", macro_eval),
+        # Universe-board attractiveness eval (config#1389/#1392/#1398) —
+        # always-emit from birth: the crucible-evaluator consumer grades a
+        # non-"ok" body as an honest N/A-with-reason, and absence must
+        # unambiguously mean "producer never ran" (same rationale as the
+        # freshness-monitored artifacts above). Frozen cross-repo schema v1:
+        # contracts/attractiveness_eval.schema.json.
+        ("attractiveness_eval.json", attractiveness_eval),
         ("portfolio_calibration.json", calibration_diagnostics),
         # Optimizer churn / walk-forward stability (config#1151 Batch C) —
         # always-emit so the evaluator's backtester tile distinguishes "producer
