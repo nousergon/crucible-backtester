@@ -1761,12 +1761,25 @@ def _main_impl() -> None:
         # This is handled by the diagnostics dict being empty
 
     # ── Optimizers ───────────────────────────────────────────────────────
+    # config#1841: the optimizer stage is wrapped so the apply-audit artifact
+    # below is emitted even when the stage itself raises (per-LOOP errors are
+    # already isolated by tracker.run_module; this catches stage-level raises
+    # such as write_optimizer_run_manifest's load-bearing S3 failure). The
+    # original error re-raises after emission — except-log-emit-reraise, no
+    # swallow.
+    opt_stage_error: BaseException | None = None
     if run_optimizers:
-        opt_results = _run_optimizers(
-            config, tracker, avail, df_base,
-            freeze=args.freeze,
-            diagnostics=diagnostics,
-        )
+        try:
+            opt_results = _run_optimizers(
+                config, tracker, avail, df_base,
+                freeze=args.freeze,
+                diagnostics=diagnostics,
+            )
+        except Exception as e:
+            opt_stage_error = e
+            logger.error(
+                "Optimizer stage raised: %s — emitting apply-audit before re-raising", e,
+            )
 
     # ── Assembler (optimizer-artifact-assembler arc) ────────────────────
     # Reads the per-optimizer recommendation artifacts written by each
@@ -1777,7 +1790,8 @@ def _main_impl() -> None:
     # individual optimizers' apply() paths skip their legacy live writes
     # (gated by ``optimizer.assembler.is_cutover_enabled()``).
     # Failure is non-fatal: the assembler must not break the pipeline.
-    if run_optimizers and not args.freeze:
+    assemble_result = None
+    if run_optimizers and opt_stage_error is None and not args.freeze:
         try:
             from optimizer.assembler import assemble, is_cutover_enabled
             bucket = config.get("signals_bucket", "alpha-engine-research")
@@ -1803,6 +1817,26 @@ def _main_impl() -> None:
             logger.warning(
                 "Assembler run failed (non-fatal — pipeline continues): %s", e,
             )
+
+    # ── Apply-audit artifact (config#1841) ───────────────────────────────
+    # Unconditional per-loop outcome record for the four auto-apply loops
+    # (promoted / blocked-by-guardrail / insufficient_data / disabled /
+    # error) → config/apply_audit/{date}.json + latest.json. The S3 write
+    # rides the same args.upload gate as sibling artifacts (--freeze /
+    # local runs build + log the audit without persisting); build/log is
+    # unconditional so a blocked apply can never again be silent.
+    if run_optimizers:
+        from optimizer.apply_audit import emit_apply_audit
+        emit_apply_audit(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            run_date=args.date,
+            opt_results=opt_results,
+            assembler_result=assemble_result,
+            upload=bool(getattr(args, "upload", False)) and not args.freeze,
+            run_error=opt_stage_error,
+        )
+        if opt_stage_error is not None:
+            raise opt_stage_error
 
     # ── Regression detection ─────────────────────────────────────────────
     regression_result = _run_regression(

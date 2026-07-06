@@ -694,11 +694,19 @@ def apply_weights(result: dict, bucket: str) -> dict:
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
     if result.get("oos_passed") is False:
-        return {"applied": False, "reason": f"OOS validation failed (degradation={result.get('oos_degradation', 0):.1%})"}
+        return {
+            "applied": False,
+            "blocked_by": ["oos_degradation"],
+            "reason": f"OOS validation failed (degradation={result.get('oos_degradation', 0):.1%})",
+        }
 
     confidence = result.get("confidence", "low")
     if confidence == "low":
-        return {"applied": False, "reason": "confidence too low — need medium or high (50+ samples)"}
+        return {
+            "applied": False,
+            "blocked_by": ["confidence_below_medium"],
+            "reason": "confidence too low — need medium or high (50+ samples)",
+        }
 
     max_single = _cfg.get("max_single_change", _MAX_SINGLE_CHANGE)
     min_meaningful = _cfg.get("min_meaningful_change", _MIN_MEANINGFUL_CHANGE)
@@ -710,12 +718,14 @@ def apply_weights(result: dict, bucket: str) -> dict:
     if max_change > max_single:
         return {
             "applied": False,
+            "blocked_by": ["max_single_change"],
             "reason": f"largest change {max_change:.1%} exceeds {max_single:.0%} limit — skipping to avoid instability",
         }
 
     if not meaningful:
         return {
             "applied": False,
+            "blocked_by": ["min_meaningful_change"],
             "reason": f"all changes < {min_meaningful:.0%} — not worth updating",
         }
 
@@ -790,6 +800,7 @@ def apply_weights(result: dict, bucket: str) -> dict:
             )
             return {
                 "applied": False,
+                "blocked_by": ["significance_floor"],
                 "reason": "weight_optimizer: blocked by significance enforce "
                           "(config#1426) — undefended evidence",
                 "observe_verdict": verdict,
