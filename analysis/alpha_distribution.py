@@ -38,6 +38,12 @@ _HORIZON_COLS: dict[str, tuple[str, str, str]] = {
     for h in _POLICY.all_horizons
 }
 
+# Horizon label → integer day count, for artifacts that declare their horizon
+# explicitly (config#1529: consumers must never have to GUESS the measurement
+# horizon from a producer default — the evaluator's composite_scoring tile
+# displays the horizon the calibration was actually computed at).
+_HORIZON_DAYS: dict[str, int] = {f"{h}d": int(h) for h in _POLICY.all_horizons}
+
 _ALPHA_BUCKETS = [
     ("<-5%", -float("inf"), -5.0),
     ("-5% to -2%", -5.0, -2.0),
@@ -304,7 +310,12 @@ def compute_score_calibration(
 
     return {
         "status": "ok",
+        # Explicit measurement-horizon declaration (config#1529): the label
+        # AND the integer day count, so downstream consumers (evaluator
+        # composite_scoring tile) display the TRUE horizon rather than
+        # falling back to a stale assumed default.
         "horizon": horizon,
+        "horizon_days": _HORIZON_DAYS[horizon],
         "calibration": calibration,
         "monotonic": monotonic,
         "spearman_rho": spearman_rho,

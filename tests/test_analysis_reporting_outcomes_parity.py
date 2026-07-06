@@ -91,7 +91,20 @@ def _log_alpha(r21: float, s21: float) -> float:
 def research_db(tmp_path):
     """A research.db carrying the same ground truth in both representations,
     plus retired 10d/30d wide columns (all-NULL) to prove they drop cleanly."""
-    db = tmp_path / "research.db"
+    return _build_research_db(tmp_path / "research.db", include_long_store=True)
+
+
+@pytest.fixture()
+def research_db_wide_only(tmp_path):
+    """The SAME ground truth with the long store ABSENT — attach_outcomes
+    passes the wide columns through unchanged (pre-cutover fallback), which
+    IS the mechanical legacy read path. Comparing a function's output on
+    this DB vs the dual-representation DB proves the long-store read is
+    equivalent to the pre-migration wide read, with zero frozen-code drift."""
+    return _build_research_db(tmp_path / "research_wide.db", include_long_store=False)
+
+
+def _build_research_db(db, include_long_store: bool) -> str:
     conn = sqlite3.connect(db)
     conn.execute(
         """CREATE TABLE score_performance (
@@ -104,17 +117,18 @@ def research_db(tmp_path):
             return_10d REAL, return_30d REAL
         )"""
     )
-    conn.execute(
-        """CREATE TABLE score_performance_outcomes (
-            id INTEGER PRIMARY KEY, signal_id TEXT NOT NULL,
-            symbol TEXT NOT NULL, score_date TEXT NOT NULL,
-            horizon_days INTEGER NOT NULL, beat_spy INTEGER,
-            stock_return REAL, spy_return REAL, log_alpha REAL,
-            is_primary INTEGER NOT NULL, resolved_at TEXT NOT NULL,
-            schema_version INTEGER NOT NULL DEFAULT 1,
-            UNIQUE(signal_id, horizon_days)
-        )"""
-    )
+    if include_long_store:
+        conn.execute(
+            """CREATE TABLE score_performance_outcomes (
+                id INTEGER PRIMARY KEY, signal_id TEXT NOT NULL,
+                symbol TEXT NOT NULL, score_date TEXT NOT NULL,
+                horizon_days INTEGER NOT NULL, beat_spy INTEGER,
+                stock_return REAL, spy_return REAL, log_alpha REAL,
+                is_primary INTEGER NOT NULL, resolved_at TEXT NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(signal_id, horizon_days)
+            )"""
+        )
     for sym, d, sc, q, ql, stance, regime, sector, r5, s5, r21, s21 in _TRUTH:
         resolved = r5 is not None
         conn.execute(
@@ -131,7 +145,7 @@ def research_db(tmp_path):
                 None, None,  # retired 10d/30d — all-NULL, as live schema carries them
             ),
         )
-        if not resolved:
+        if not resolved or not include_long_store:
             continue
         for h, ret, spy in ((_DIAG, r5, s5), (_PRIMARY, r21, s21)):
             is_primary = h == _PRIMARY
@@ -263,17 +277,39 @@ def test_alpha_distribution_identical(research_db):
     assert migrated == legacy
 
 
-def test_score_calibration_identical(research_db):
+def test_score_calibration_identical(research_db, research_db_wide_only):
+    """Mechanical read-path parity at the SAME horizon: the long-store-sourced
+    calibration must equal the calibration computed over the identical ground
+    truth with the long store ABSENT (attach_outcomes' documented pre-cutover
+    fallback = the exact legacy wide-column read). The horizon UPGRADE itself
+    is asserted separately (test_score_calibration_declares_primary_horizon)."""
     migrated = alpha_distribution.compute_score_calibration(
         research_db, n_buckets=3, min_per_bucket=1,
     )
-    # Legacy reference: the migrated path re-sources from the long store, whose
-    # decimal→percent round-trip is byte-identical to the wide columns, so the
-    # calibration curve + Spearman are unchanged. We assert the migrated result
-    # is well-formed and monotonic-computable (the wide-vs-long identity of the
-    # underlying alpha column is proven byte-for-byte in test_outcome_store_parity).
+    legacy = alpha_distribution.compute_score_calibration(
+        research_db_wide_only, n_buckets=3, min_per_bucket=1,
+    )
+    assert migrated == legacy
     assert migrated["status"] == "ok"
     assert migrated["horizon"] == f"{_PRIMARY}d"
+    # Non-vacuous: the curve and the Spearman association actually computed.
+    assert len(migrated["calibration"]) >= 2
+    assert migrated["spearman_rho"] is not None
+
+
+def test_score_calibration_declares_primary_horizon(research_db):
+    """The horizon-upgrade assertion (config#1529): called exactly as the
+    evaluate.py producer calls it (db_path only), score_calibration.json
+    declares the CANONICAL primary horizon — label AND integer days — so the
+    evaluator's composite_scoring tile displays the true measurement horizon
+    instead of falling back to an assumed sub-canonical default. The HORIZON
+    argument is left at its default — the exact producer call shape."""
+    artifact = alpha_distribution.compute_score_calibration(
+        research_db, n_buckets=3, min_per_bucket=1,  # fixture-sized buckets
+    )
+    assert artifact["horizon"] == f"{_PRIMARY}d"
+    assert artifact["horizon_days"] == _PRIMARY
+    assert artifact["horizon_days"] == DEFAULT_POLICY.primary_horizon
 
 
 # ── reporter data-accumulation aggregate (primary beat COUNT/SUM) ────────────

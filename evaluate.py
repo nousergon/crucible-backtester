@@ -707,8 +707,10 @@ def _run_diagnostics(
         required_inputs={},
     )
 
-    # Quant rank quality — per-sector corr(quant_rank, return_5d) over a
-    # rolling 8-week window. Surfaces "is the technical scorer's
+    # Quant rank quality — per-sector corr(quant_rank, realized return) over a
+    # rolling 8-week window, at both policy horizons (diagnostic 5d legacy
+    # keys + canonical 21d suffixed keys, config#1529). Surfaces "is the
+    # technical scorer's
     # ranking even ordering correctly?" before drift compounds. The
     # 2026-05-09 evaluator-email post-mortem found healthcare/industrials/
     # tech rank-correlations at +0.33-0.36 (anti-skill); without this
