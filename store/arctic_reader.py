@@ -106,9 +106,15 @@ def _verify_arctic_fresh(bucket: str, min_date: str | None = None) -> None:
 
     Raises RuntimeError on missing/stale SPY.
     """
-    arctic = _get_arctic(bucket)
+    from nousergon_lib.arcticdb import open_macro_lib
+
+    # Touch the connection through the logging chokepoint so a fresh
+    # verify-only subprocess still emits the once-per-process bucket +
+    # library-list diagnostic (the 2026-04-24 910-vs-0 divergence signal).
+    # The macro library itself opens via the shared lib helper (config#804).
+    _get_arctic(bucket)
     try:
-        macro_lib = arctic.get_library("macro")
+        macro_lib = open_macro_lib(bucket)
     except Exception as exc:
         raise RuntimeError(f"ArcticDB macro library unreachable: {exc}") from exc
 
@@ -166,13 +172,13 @@ def load_universe_from_arctic(
     """
     t0 = time.time()
     arctic = _get_arctic(bucket)
-    # Universe library opens via the shared lib helper (config#804). The
-    # ``macro`` open and the #826 empty-universe diagnostic below still use
-    # the local ``arctic`` handle and are intentionally left as-is.
-    from nousergon_lib.arcticdb import open_universe_lib
+    # Universe + macro libraries open via the shared lib helpers (config#804).
+    # The local ``arctic`` handle is retained only for the #826 empty-universe
+    # diagnostic below (list_libraries).
+    from nousergon_lib.arcticdb import open_macro_lib, open_universe_lib
     try:
         universe = open_universe_lib(bucket)
-        macro_lib = arctic.get_library("macro")
+        macro_lib = open_macro_lib(bucket)
     except Exception as exc:
         raise RuntimeError(
             f"ArcticDB library open failed on bucket {bucket}: {exc}"
