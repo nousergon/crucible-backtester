@@ -691,7 +691,12 @@ def apply(result: dict, bucket: str) -> dict:
     if recommended is None:
         return {"applied": False, "reason": "no recommended threshold"}
 
-    if abs(recommended - current) < min_change:
+    # Bootstrap: if no S3 artifact exists (s3_current is None), allow the first write
+    # even if it equals the default. The artifact's existence establishes the baseline
+    # for future min_threshold_change gates. Only write if significance verdict permits.
+    is_bootstrap = s3_current is None
+
+    if not is_bootstrap and abs(recommended - current) < min_change:
         return {
             "applied": False,
             "blocked_by": ["min_threshold_change"],
@@ -700,6 +705,27 @@ def apply(result: dict, bucket: str) -> dict:
                 f"({current:.2f}) — need {min_change}+ difference"
             ),
         }
+
+    # For bootstrap writes: check significance verdict first, block if failing
+    if is_bootstrap:
+        if bool(_cfg.get("enforce_significance", False)):
+            from optimizer.significance_observe import significance_would_block
+            verdict = result.get("significance_observe")
+            if significance_would_block(verdict):
+                logger.info(
+                    "veto_analysis: bootstrap seed BLOCKED by significance floor (config#1426)"
+                )
+                return {
+                    "applied": False,
+                    "blocked_by": ["significance_floor"],
+                    "reason": "veto_analysis: bootstrap seed blocked by significance enforce "
+                              "(config#1426) — undefended evidence",
+                    "observe_verdict": verdict,
+                }
+        logger.info(
+            "veto_analysis: bootstrap seed write (no prior S3 artifact) with "
+            "recommendation %.2f", recommended
+        )
 
     fit_target = result.get("fit_target", "precision_minus_alpha_cost_legacy")
     enforce_skill_composite = bool(_cfg.get("enforce_skill_composite", False))
@@ -761,7 +787,8 @@ def apply(result: dict, bucket: str) -> dict:
     # precision lift is not statistically significant (Wilson lower bound not
     # above base rate → would_block). Missing verdict → conservative block.
     # Enforce can only BLOCK a promotion the live gate already allowed.
-    if bool(_cfg.get("enforce_significance", False)):
+    # NOTE: bootstrap writes already checked this above; skip for non-bootstrap.
+    if not is_bootstrap and bool(_cfg.get("enforce_significance", False)):
         from optimizer.significance_observe import significance_would_block
         verdict = result.get("significance_observe")
         if significance_would_block(verdict):

@@ -197,6 +197,23 @@ class TestApplyShadowVsProduction:
             "recommendation_reason": "test",
         }
 
+    def _ok_result_with_threshold(self, threshold: float) -> dict:
+        """Helper for bootstrap tests — no significance verdict."""
+        result = self._ok_result("precision_minus_alpha_cost_legacy", threshold)
+        return result
+
+    def _ok_result_with_verdict(self, verdict: dict) -> dict:
+        """Helper for significance tests."""
+        result = self._ok_result("precision_minus_alpha_cost_legacy")
+        result["significance_observe"] = verdict
+        return result
+
+    def _ok_result_with_threshold_and_verdict(self, threshold: float, verdict: dict) -> dict:
+        """Helper for bootstrap + significance tests."""
+        result = self._ok_result("precision_minus_alpha_cost_legacy", threshold)
+        result["significance_observe"] = verdict
+        return result
+
     @patch("analysis.veto_analysis.boto3")
     def test_legacy_writes_to_production_key(self, mock_boto3):
         _init_config()
@@ -255,11 +272,6 @@ class TestApplyShadowVsProduction:
         assert not any(S3_SHADOW_PREFIX in k for k in keys_written)
 
     # ── config#1426 Phase 4 — significance ENFORCE (default OFF) ─────────────
-
-    def _ok_result_with_verdict(self, verdict) -> dict:
-        r = self._ok_result("precision_minus_alpha_cost_legacy")
-        r["significance_observe"] = verdict
-        return r
 
     @patch("analysis.veto_analysis.boto3")
     def test_enforce_default_off_applies_even_when_would_block(self, mock_boto3):
@@ -334,3 +346,54 @@ class TestApplyShadowVsProduction:
         body = json.loads(live_call.kwargs["Body"])
         assert body["fit_target"] == "skill_composite"
         assert body["veto_confidence"] == 0.70
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_bootstrap_seed_write_when_no_prior_artifact(self, mock_boto3):
+        """Bootstrap: first write occurs even when recommendation = default (fixed-point trap fix)."""
+        _init_config({"enforce_significance": False})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")  # No prior S3 artifact
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            # Recommendation = 0.65 (the default) — normally blocked by min_threshold_change
+            # But bootstrap allows it when artifact doesn't exist
+            outcome = apply(
+                self._ok_result_with_threshold(0.65),
+                bucket="test-bucket",
+            )
+        assert outcome["applied"] is True
+        live_call = next(
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == S3_PARAMS_KEY
+        )
+        body = json.loads(live_call.kwargs["Body"])
+        assert body["veto_confidence"] == 0.65
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_bootstrap_seed_blocked_by_significance_floor(self, mock_boto3):
+        """Bootstrap seed respects significance floor when enforce_significance=true."""
+        _init_config({"enforce_significance": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")  # No prior artifact
+        mock_boto3.client.return_value = s3
+        outcome = apply(
+            self._ok_result_with_threshold_and_verdict(0.65, {"would_block": True}),
+            bucket="test-bucket",
+        )
+        assert outcome["applied"] is False
+        assert "bootstrap seed blocked by significance enforce" in outcome["reason"]
+        assert S3_PARAMS_KEY not in [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_bootstrap_seed_allowed_when_significance_passes(self, mock_boto3):
+        """Bootstrap seed writes when significance verdict is clean."""
+        _init_config({"enforce_significance": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")  # No prior artifact
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(
+                self._ok_result_with_threshold_and_verdict(0.65, {"would_block": False}),
+                bucket="test-bucket",
+            )
+        assert outcome["applied"] is True
