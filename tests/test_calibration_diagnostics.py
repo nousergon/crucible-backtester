@@ -112,7 +112,7 @@ class TestLibConsolidation:
     def test_ece_matches_lib_primitive(self):
         # calibration_diagnostics must delegate the ECE scalar to the lib, not
         # re-derive it. Bit-for-bit identical on the same edges + min_bin_n.
-        from alpha_engine_lib.quant.stats.calibration import (
+        from nousergon_lib.quant.stats.calibration import (
             expected_calibration_error,
         )
 

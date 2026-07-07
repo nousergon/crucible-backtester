@@ -77,7 +77,7 @@ def test_load_universe_respects_tickers_allowlist():
 
     arctic, universe = _make_fake_arctic(["AAPL", "MSFT", "NVDA", "TSLA"])
     with patch.object(arctic_reader, "_get_arctic", return_value=arctic), \
-         patch("alpha_engine_lib.arcticdb.open_universe_lib", return_value=universe):
+         patch("nousergon_lib.arcticdb.open_universe_lib", return_value=universe):
         price_data, features = arctic_reader.load_universe_from_arctic(
             bucket="test-bucket",
             tickers_allowlist={"AAPL", "MSFT"},
@@ -94,7 +94,7 @@ def test_load_universe_none_allowlist_reads_all():
 
     arctic, universe = _make_fake_arctic(["AAPL", "MSFT", "NVDA"])
     with patch.object(arctic_reader, "_get_arctic", return_value=arctic), \
-         patch("alpha_engine_lib.arcticdb.open_universe_lib", return_value=universe):
+         patch("nousergon_lib.arcticdb.open_universe_lib", return_value=universe):
         arctic_reader.load_universe_from_arctic(bucket="test-bucket")
 
     read_calls = [c.args[0] for c in universe.read.call_args_list]
@@ -108,7 +108,7 @@ def test_load_universe_allowlist_misses_fall_through():
 
     arctic, universe = _make_fake_arctic(["AAPL", "MSFT"])
     with patch.object(arctic_reader, "_get_arctic", return_value=arctic), \
-         patch("alpha_engine_lib.arcticdb.open_universe_lib", return_value=universe):
+         patch("nousergon_lib.arcticdb.open_universe_lib", return_value=universe):
         price_data, _ = arctic_reader.load_universe_from_arctic(
             bucket="test-bucket",
             tickers_allowlist={"AAPL", "NONEXISTENT"},  # NONEXISTENT not in catalog

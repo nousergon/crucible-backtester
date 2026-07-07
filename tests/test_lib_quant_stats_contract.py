@@ -36,7 +36,7 @@ def test_shims_re_export_consumed_symbols():
 
 
 def test_shim_is_identity_with_lib():
-    from alpha_engine_lib.quant.stats import dsr as lib_dsr
+    from nousergon_lib.quant.stats import dsr as lib_dsr
 
     from analysis.dsr import compute_psr
 
