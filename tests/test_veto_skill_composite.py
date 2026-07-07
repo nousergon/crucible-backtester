@@ -381,7 +381,7 @@ class TestApplyShadowVsProduction:
             bucket="test-bucket",
         )
         assert outcome["applied"] is False
-        assert "bootstrap seed BLOCKED by significance floor" in outcome["reason"]
+        assert "bootstrap seed blocked by significance enforce" in outcome["reason"]
         assert S3_PARAMS_KEY not in [c.kwargs["Key"] for c in s3.put_object.call_args_list]
 
     @patch("analysis.veto_analysis.boto3")
