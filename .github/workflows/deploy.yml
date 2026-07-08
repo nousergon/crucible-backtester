@@ -1,28 +1,17 @@
 name: Deploy
 
 on:
-  # NO path filter — every main commit rebuilds + redeploys the health-check
-  # Lambda image. This is deliberate, and is the structural fix for the
-  # recurring drift that bit on 2026-04-08→05-11 and again 2026-05-15→06-25:
-  # a calibration fix (e.g. #346, analysis/production_health.py) lands in main,
-  # but the manually-deployed image was never rebuilt, so the live Lambda
-  # silently re-raised an already-fixed false `calibration_breakdown` retrain
-  # alert. The Lambda image is built from many repo paths (analysis/**,
-  # pipeline_common.py, health_status.py, preflight.py, lambda_health/**,
-  # requirements-health.txt, flow-doctor.yaml, plus the lib pin in the
-  # Dockerfile). A path filter would have to enumerate all of them and stay in
-  # lockstep with every future `COPY` — exactly the kind of silent miss that
-  # caused this. Rebuilding unconditionally (~3-5 min on a native-amd64 GH
-  # runner) is the right trade vs another month of false retrain alerts.
+  # NO path filter — every main commit rebuilds + redeploys ALL three backtester
+  # image Lambdas. Deliberate: the same silent-drift that caused the recurring
+  # false `calibration_breakdown` alert on the health-check image (2026-04-08→
+  # 06-25) applies identically to the two replay siblings — a fix lands in a
+  # shared module (analysis/**, pipeline_common.py, the lib pin) but the
+  # manually-deployed replay image was never rebuilt. Rebuilding all three
+  # unconditionally (~3-5 min each, parallel) is the right trade vs silent drift.
   # Mirrors alpha-engine-predictor deploy.yml's documented no-filter rationale.
   push:
     branches: [main]
   workflow_dispatch:  # manual trigger (e.g. ship an already-merged change)
-
-# One deploy at a time; never cancel an in-progress deploy mid-push.
-concurrency:
-  group: deploy-main
-  cancel-in-progress: false
 
 permissions:
   id-token: write   # required for OIDC role assumption
@@ -30,9 +19,29 @@ permissions:
 
 jobs:
   deploy:
-    name: Build + deploy health-check Lambda
+    name: Build + deploy ${{ matrix.target.label }} Lambda
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false   # one leg failing (e.g. a replay leg mid-IAM-grant) must
+                         # NOT cancel the others — health-check must still deploy.
+      matrix:
+        target:
+          - label: health-check
+            script: infrastructure/deploy_health.sh
+            function: alpha-engine-predictor-health-check
+          - label: replay-counterfactual
+            script: infrastructure/deploy_counterfactual.sh
+            function: alpha-engine-replay-counterfactual
+          - label: replay-concordance
+            script: infrastructure/deploy_concordance.sh
+            function: alpha-engine-replay-concordance
+    # One deploy at a time PER TARGET; never cancel an in-progress deploy
+    # mid-push. Job-level (not workflow-level) so it can read the matrix
+    # context — the three legs run in parallel, each serializes against itself.
+    concurrency:
+      group: deploy-main-${{ matrix.target.label }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout backtester repo
@@ -53,37 +62,37 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      # deploy_health.sh's canary-rollback path publishes a dedup-keyed
-      # alert via `python3 -m krepis.alerts publish` (the L221
-      # independent-channel alert) so a rolled-back deploy isn't silent
-      # beyond the GHA red-icon. Without krepis installed on THIS runner
-      # (not the Lambda's Docker image — this call runs on the bare
-      # GHA host), the alert call fails with ModuleNotFoundError and is
-      # swallowed by the trailing `|| true` — silently, with no CI red.
-      # This step was previously MISSING entirely (config#1545, found
-      # auditing the crucible-predictor/evaluator krepis.aws
-      # invoke-canary incident 2026-07-01). Pin matches requirements.txt's
-      # `krepis>=0.4.0` floor.
+      # Each deploy_*.sh's canary-rollback path publishes a dedup-keyed alert
+      # via `python3 -m krepis.alerts publish` (config#1339/config#1545) so a
+      # rolled-back deploy isn't silent beyond the GHA red-icon. Without krepis
+      # installed on THIS runner (not the Lambda's Docker image — this call
+      # runs on the bare GHA host), the alert call fails with
+      # ModuleNotFoundError and is swallowed by the trailing `|| true` —
+      # silently, with no CI red. Previously only deploy_health.sh had this
+      # wired in; deploy_counterfactual.sh/deploy_concordance.sh assumed
+      # operator-only invocation, which no longer holds once they run in this
+      # same matrixed GHA job. Pin matches requirements.txt's `krepis>=0.4.0`
+      # floor.
       - name: Set up Python for canary-rollback alert publish
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install krepis for deploy_health.sh alerts call
+      - name: Install krepis for deploy_*.sh alerts call
         run: pip install "krepis>=0.4.0"
 
-      # deploy_health.sh builds lambda_health/Dockerfile (which COPYs the
-      # fixed analysis/production_health.py + pins the lib ECE primitive),
-      # pushes to ECR, publishes a version, runs a dry-run canary against the
-      # new version, and only promotes the :live alias on canary success — so
-      # a bad build leaves live on the prior good version (no manual rollback).
-      - name: Build image + deploy health-check Lambda
-        run: bash infrastructure/deploy_health.sh
+      # Each deploy_*.sh builds its lambda_*/Dockerfile (which COPYs the fixed
+      # sources + pins the lib primitives), pushes to ECR, publishes a
+      # version, runs a dry-run canary against the new version, and only
+      # promotes the :live alias on canary success — so a bad build leaves
+      # live on the prior good version (no manual rollback).
+      - name: Build image + deploy ${{ matrix.target.label }} Lambda
+        run: bash ${{ matrix.target.script }}
 
       - name: Report deployed version
         run: |
           echo "Deployed commit: ${{ github.sha }}"
           aws lambda get-function \
-            --function-name alpha-engine-predictor-health-check \
+            --function-name ${{ matrix.target.function }} \
             --query "Configuration.[LastModified,CodeSha256]" \
             --output text
 
@@ -93,7 +102,7 @@ jobs:
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
           deploy_workflow: deploy.yml
-          subsystem: backtester
+          subsystem: backtester-${{ matrix.target.label }}
 
   # Alert (Telegram) on genuine post-merge failure of this workflow on the
   # default branch. Reusable workflow + transport in nousergon-lib. config#1128.
