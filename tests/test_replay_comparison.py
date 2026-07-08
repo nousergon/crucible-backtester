@@ -370,7 +370,7 @@ class TestRunnerIntegration:
 
         # Build langchain-style fake: factory → llm → with_structured_output
         # → runnable whose .invoke() returns the include_raw=True dict shape.
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         parsed = QuantAnalystOutput(ranked_picks=[
             {"ticker": "NVDA", "quant_score": 85, "rationale": "x"},
             {"ticker": "AAPL", "quant_score": 73, "rationale": "y"},

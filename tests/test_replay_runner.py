@@ -108,7 +108,7 @@ def _make_chat_anthropic_factory(
 
 class TestStructuredReplay:
     def test_extracts_model_dump_from_parsed_pydantic(self):
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact()
@@ -138,7 +138,7 @@ class TestStructuredReplay:
         assert replay.replay_model == "claude-haiku-4-5"
 
     def test_factory_called_with_target_model_and_max_tokens(self):
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact()
@@ -163,7 +163,7 @@ class TestStructuredReplay:
         """Replay must call with_structured_output(SchemaClass, include_raw=True)
         with the schema RESOLVED FROM THE CAPTURED agent_id — confirming
         invocation isomorphism with how production agents call the model."""
-        from alpha_engine_lib.agent_schemas import (
+        from nousergon_lib.agent_schemas import (
             QuantAnalystOutput, JointFinalizationOutput, CIORawOutput,
             MacroEconomistRawOutput, HeldThesisUpdateLLMOutput,
             QualAnalystOutput,
@@ -204,7 +204,7 @@ class TestStructuredReplay:
             assert llm.with_structured_output.call_args.kwargs["include_raw"] is True
 
     def test_invoke_called_with_system_and_user_messages(self):
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact(user_prompt="Pick 5 tech names.")
@@ -416,7 +416,7 @@ class TestDeterministicArtifactSkip:
 
 class TestPersistence:
     def test_persists_to_canonical_key(self):
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact(
@@ -458,7 +458,7 @@ class TestPersistence:
         """The latest.json sidecar must be a byte-for-byte mirror of the
         dated forensic artifact, and the payload must carry the minted
         replay_run_id so the dated key is self-describing (config#792)."""
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact(
@@ -488,7 +488,7 @@ class TestPersistence:
         assert payload["replay_run_id"] == run_id
 
     def test_no_persist_skips_put_object(self):
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact()
@@ -510,7 +510,7 @@ class TestPersistence:
         assert len(replay.replay_output["ranked_picks"]) == 1
 
     def test_model_name_with_colon_sanitized_in_key(self):
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact(model_name="claude-sonnet-4-6:live")
@@ -537,7 +537,7 @@ class TestPersistence:
 
 class TestUsageExtraction:
     def test_token_counts_carry_through(self):
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact()
@@ -562,7 +562,7 @@ class TestUsageExtraction:
         assert replay.replay_cost["cache_creation_input_tokens"] == 50
 
     def test_missing_usage_returns_empty_dict(self):
-        from alpha_engine_lib.agent_schemas import QuantAnalystOutput
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact()

@@ -68,6 +68,7 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis.sample_size_adequacy import compute_sample_size_adequacy
+from analysis.risk_ratio_ci import compute_risk_ratio_ci
 from analysis.action_entropy import compute_action_entropy_artifact
 from analysis.optimizer_churn import compute_optimizer_churn
 from analysis.walk_forward_stability import compute_walk_forward_stability
@@ -78,6 +79,7 @@ from analysis import decision_capture_coverage, executor_decision_capture_covera
 from analysis import cio_rule_tag_precision
 from analysis import agent_justification
 from analysis import end_to_end
+from analysis import attractiveness_eval as attractiveness_eval_analysis
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
 from analysis import behavioral_anomaly as behavioral_anomaly_analysis
@@ -455,6 +457,26 @@ def _run_diagnostics(
         skip_if_missing=["research_db"],
     )
 
+    # Universe-board attractiveness composite vs realized forward alpha
+    # (config#1389 per-pillar IC + suggested 1/N-shrunk weights, config#1392
+    # trajectory forward-IC, config#1398 top-N counterfactual vs the live
+    # tech_score gate). Read-only measurement — emits SUGGESTED weights inside
+    # the artifact only, never writes config/factor_attractiveness_weights.json.
+    # Reuses the trajectory_scores dict loaded above for e2e_lift (no second
+    # S3 read); frozen cross-repo schema v1 in
+    # contracts/attractiveness_eval.schema.json.
+    results["attractiveness_eval"] = tracker.run_module(
+        "attractiveness_eval",
+        lambda: attractiveness_eval_analysis.compute_attractiveness_eval(
+            db_path,
+            as_of=config.get("_run_date") or date.today().isoformat(),
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            trajectory_scores=trajectory_scores or None,
+        ),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
     # Entry trigger scorecard
     results["trigger_scorecard"] = tracker.run_module(
         "trigger_scorecard",
@@ -707,8 +729,10 @@ def _run_diagnostics(
         required_inputs={},
     )
 
-    # Quant rank quality — per-sector corr(quant_rank, return_5d) over a
-    # rolling 8-week window. Surfaces "is the technical scorer's
+    # Quant rank quality — per-sector corr(quant_rank, realized return) over a
+    # rolling 8-week window, at both policy horizons (diagnostic 5d legacy
+    # keys + canonical 21d suffixed keys, config#1529). Surfaces "is the
+    # technical scorer's
     # ranking even ordering correctly?" before drift compounds. The
     # 2026-05-09 evaluator-email post-mortem found healthcare/industrials/
     # tech rank-correlations at +0.33-0.36 (anti-skill); without this
@@ -962,12 +986,23 @@ def _read_current_weights(config: dict) -> dict:
             with open(universe_yaml) as f:
                 universe = yaml.safe_load(f)
             weights = universe.get("scoring_weights", {})
-            if weights:
-                return weights
         except Exception:
-            pass
+            weights = {}
+        if weights:
+            # Fail-loud key guard (config#1842): a drifted scoring_weights
+            # block in research's universe.yaml would reproduce the phantom
+            # 0.0 baseline downstream. Raise (isolated per-module by
+            # tracker.run_module) instead of returning drifted keys.
+            from optimizer.config_guards import validate_keyed_block
+            validate_keyed_block(
+                weights, weight_optimizer.SUB_SCORES,
+                config_path="crucible-research config/universe.yaml scoring_weights",
+            )
+            return weights
 
-    return weight_optimizer._cfg.get("default_weights", weight_optimizer._DEFAULT_WEIGHTS).copy()
+    # Validated chokepoint (config#1842): raises ConfigKeyDriftError on a
+    # stale default_weights block instead of silently zero-filling.
+    return weight_optimizer.configured_default_weights()
 
 
 def _run_optimizers(
@@ -1129,7 +1164,7 @@ def _run_optimizers(
     if not freeze:
         manifest_date = run_date or config.get("_run_date")
         if not manifest_date:
-            from alpha_engine_lib.dates import today_iso
+            from nousergon_lib.dates import today_iso
             manifest_date = today_iso()
         write_optimizer_run_manifest(
             bucket,
@@ -1203,6 +1238,49 @@ def write_optimizer_run_manifest(
     )
     logger.info("Wrote optimizer run manifest s3://%s/%s", bucket, key)
     return key
+
+
+def _portfolio_daily_returns_from_team_lift(team_lift: list[dict], prices, horizon_days: int = 10):
+    """Portfolio-wide aligned daily-return series from the e2e team-lift picks.
+
+    ``risk_ratio_ci`` (config#976) needs a single portfolio-level daily-return
+    series (mirroring the ``pf_returns_aligned`` series ``backtest.py``'s
+    deployed-strategy headline computes via ``_simulate_and_measure`` — a
+    process-separate, JSON-only artifact that does not carry raw series back
+    to evaluate.py). Rather than re-simulate the MVO solver here, this
+    aggregates every team's picks (already loaded for ``compute_team_metrics``
+    a few lines above) into one equal-weight portfolio sleeve via the same
+    ``compute_team_daily_returns`` helper each team already uses, stamping a
+    single synthetic ``team_id="portfolio"`` across all picks.
+
+    Returns ``None`` when there are no usable picks (caller degrades to
+    ``risk_ratio_ci`` reporting ``insufficient_data``, matching the module's
+    own always-emit contract).
+    """
+    if not team_lift or prices is None or getattr(prices, "empty", True):
+        return None
+
+    from analysis.team_daily_returns import compute_team_daily_returns
+
+    all_picks: list[dict] = []
+    for team in team_lift:
+        for pick in team.get("picks") or []:
+            all_picks.append({**pick, "team_id": "portfolio"})
+    if not all_picks:
+        return None
+
+    picks_df = pd.DataFrame(all_picks)
+    try:
+        portfolio_returns = compute_team_daily_returns(
+            picks_df, prices, horizon_days=horizon_days,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort; risk_ratio_ci degrades gracefully
+        logger.warning("[risk_ratio_ci] portfolio daily-returns aggregation failed: %s", e)
+        return None
+    series = portfolio_returns.get("portfolio")
+    if series is None or series.empty:
+        return None
+    return series
 
 
 def _run_weight_opt(config: dict, df_base, freeze: bool) -> dict:
@@ -1727,12 +1805,25 @@ def _main_impl() -> None:
         # This is handled by the diagnostics dict being empty
 
     # ── Optimizers ───────────────────────────────────────────────────────
+    # config#1841: the optimizer stage is wrapped so the apply-audit artifact
+    # below is emitted even when the stage itself raises (per-LOOP errors are
+    # already isolated by tracker.run_module; this catches stage-level raises
+    # such as write_optimizer_run_manifest's load-bearing S3 failure). The
+    # original error re-raises after emission — except-log-emit-reraise, no
+    # swallow.
+    opt_stage_error: BaseException | None = None
     if run_optimizers:
-        opt_results = _run_optimizers(
-            config, tracker, avail, df_base,
-            freeze=args.freeze,
-            diagnostics=diagnostics,
-        )
+        try:
+            opt_results = _run_optimizers(
+                config, tracker, avail, df_base,
+                freeze=args.freeze,
+                diagnostics=diagnostics,
+            )
+        except Exception as e:
+            opt_stage_error = e
+            logger.error(
+                "Optimizer stage raised: %s — emitting apply-audit before re-raising", e,
+            )
 
     # ── Assembler (optimizer-artifact-assembler arc) ────────────────────
     # Reads the per-optimizer recommendation artifacts written by each
@@ -1743,7 +1834,8 @@ def _main_impl() -> None:
     # individual optimizers' apply() paths skip their legacy live writes
     # (gated by ``optimizer.assembler.is_cutover_enabled()``).
     # Failure is non-fatal: the assembler must not break the pipeline.
-    if run_optimizers and not args.freeze:
+    assemble_result = None
+    if run_optimizers and opt_stage_error is None and not args.freeze:
         try:
             from optimizer.assembler import assemble, is_cutover_enabled
             bucket = config.get("signals_bucket", "alpha-engine-research")
@@ -1769,6 +1861,26 @@ def _main_impl() -> None:
             logger.warning(
                 "Assembler run failed (non-fatal — pipeline continues): %s", e,
             )
+
+    # ── Apply-audit artifact (config#1841) ───────────────────────────────
+    # Unconditional per-loop outcome record for the four auto-apply loops
+    # (promoted / blocked-by-guardrail / insufficient_data / disabled /
+    # error) → config/apply_audit/{date}.json + latest.json. The S3 write
+    # rides the same args.upload gate as sibling artifacts (--freeze /
+    # local runs build + log the audit without persisting); build/log is
+    # unconditional so a blocked apply can never again be silent.
+    if run_optimizers:
+        from optimizer.apply_audit import emit_apply_audit
+        emit_apply_audit(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            run_date=args.date,
+            opt_results=opt_results,
+            assembler_result=assemble_result,
+            upload=bool(getattr(args, "upload", False)) and not args.freeze,
+            run_error=opt_stage_error,
+        )
+        if opt_stage_error is not None:
+            raise opt_stage_error
 
     # ── Regression detection ─────────────────────────────────────────────
     regression_result = _run_regression(
@@ -1810,6 +1922,13 @@ def _main_impl() -> None:
         team_metrics = {}
         portfolio_calibration = {"status": "insufficient_data"}
         portfolio_excursion = {"status": "insufficient_data"}
+        risk_ratio_ci_result = {
+            "status": "insufficient_data",
+            "n_samples": 0,
+            "ratios": {},
+            "all_magnitude_certain": False,
+            "note": "evaluator-revamp metric bundle did not run",
+        }
         try:
             team_lift_for_metrics = (
                 diagnostics.get("e2e_lift") or {}
@@ -1832,6 +1951,19 @@ def _main_impl() -> None:
             portfolio_calibration = compute_portfolio_calibration(df_base)
             portfolio_excursion = compute_portfolio_excursion_summary(
                 df_base, ohlc_for_metrics, horizon_days=10,
+            )
+
+            # Risk-ratio magnitude-certainty monitor (config#976, L4558): block-
+            # bootstrap CIs for Sharpe/Sortino/Information Ratio over the same
+            # portfolio-wide daily-return sleeve derived from team_lift picks
+            # above (no new data read). ALWAYS-EMIT — compute_risk_ratio_ci's own
+            # insufficient_data/no_benchmark degrade paths handle thin data; this
+            # try/except only guards the aggregation step itself.
+            pf_returns_for_risk_ratio = _portfolio_daily_returns_from_team_lift(
+                team_lift_for_metrics, prices_for_metrics, horizon_days=10,
+            )
+            risk_ratio_ci_result = compute_risk_ratio_ci(
+                pf_returns_for_risk_ratio, spy_returns_for_metrics,
             )
         except Exception as e:
             logger.warning("evaluator-revamp metric bundle failed: %s", e)
@@ -2061,6 +2193,7 @@ def _main_impl() -> None:
             exit_timing=diagnostics.get("exit_timing"),
             behavioral_anomaly=diagnostics.get("behavioral_anomaly"),
             sample_size=compute_sample_size_adequacy(sq_result, attr_result),
+            risk_ratio_ci=risk_ratio_ci_result,
             action_entropy=action_entropy_result,
             optimizer_churn=optimizer_churn_result,
             walk_forward_stability=walk_forward_stability_result,
@@ -2080,6 +2213,7 @@ def _main_impl() -> None:
             barrier_coherence=diagnostics.get("barrier_coherence"),
             score_calibration=diagnostics.get("score_calibration"),
             macro_eval=diagnostics.get("macro_eval"),
+            attractiveness_eval=diagnostics.get("attractiveness_eval"),
             team_metrics=team_metrics or None,
             calibration_diagnostics=portfolio_calibration,
             excursion_summary=portfolio_excursion,
