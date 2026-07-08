@@ -1550,6 +1550,7 @@ def save(
     cio_opt: dict | None = None,
     behavioral_anomaly: dict | None = None,
     sample_size: dict | None = None,
+    risk_ratio_ci: dict | None = None,
     action_entropy: dict | None = None,
     optimizer_churn: dict | None = None,
     walk_forward_stability: dict | None = None,
@@ -1699,6 +1700,12 @@ def save(
         # Sample-size adequacy (config#1151 Batch C) — always-emit from birth so
         # the evaluator distinguishes "producer didn't run" from "ran, too few".
         ("sample_size.json", sample_size),
+        # Risk-ratio magnitude-certainty monitor (config#976, L4558) —
+        # always-emit from birth so the evaluator distinguishes "producer
+        # didn't run" from "ran, magnitude not yet certain at this sample
+        # size" (the no-action monitor's whole point per the Director's
+        # ruling). Same rationale as sample_size.json above.
+        ("risk_ratio_ci.json", risk_ratio_ci),
         # Decision-stream action entropy (config#1151 Batch C, executor tile) —
         # always-emit so the evaluator distinguishes "producer didn't run" from
         # "ran, decision distribution collapsed / no labelled decision stream".
