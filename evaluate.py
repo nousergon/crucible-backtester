@@ -463,8 +463,8 @@ def _run_diagnostics(
     # tech_score gate). Read-only measurement — emits SUGGESTED weights inside
     # the artifact only, never writes config/factor_attractiveness_weights.json.
     # Reuses the trajectory_scores dict loaded above for e2e_lift (no second
-    # S3 read); frozen cross-repo schema v1 in
-    # contracts/attractiveness_eval.schema.json.
+    # S3 read); frozen cross-repo schema v2 in
+    # nousergon_lib.contracts "attractiveness_eval" (config#1861).
     results["attractiveness_eval"] = tracker.run_module(
         "attractiveness_eval",
         lambda: attractiveness_eval_analysis.compute_attractiveness_eval(

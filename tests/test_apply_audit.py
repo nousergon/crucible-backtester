@@ -4,7 +4,7 @@
 Pins: (1) classification of every loop result shape into the frozen outcome
 vocabulary (a BLOCKED apply emits an outcome record — the issue's
 closes-when); (2) the consecutive_blocked_weeks carry-forward semantics;
-(3) frozen-schema conformance (contracts/apply_audit.schema.json) on every
+(3) frozen-schema conformance (nousergon_lib.contracts "apply_audit") on every
 outcome path; (4) the upload gate + fail-loud write posture; (5) the
 except-log-emit-reraise wiring in evaluate.py (source-level).
 """
@@ -13,6 +13,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+from nousergon_lib import contracts
 
 from optimizer.apply_audit import (
     BLOCKED_BY_SLUGS,
@@ -23,7 +25,9 @@ from optimizer.apply_audit import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_PATH = REPO_ROOT / "contracts" / "apply_audit.schema.json"
+# The schema now lives in nousergon_lib.contracts (config#1861 second-adoption
+# lift); the producer validates against that single authority, not a repo-local
+# copy. apply_audit was lifted unchanged at v1.
 
 
 # ── Fixture result shapes (mirroring the real producers) ─────────────────────
@@ -307,7 +311,7 @@ jsonschema = pytest.importorskip(
 
 
 def _validate(audit: dict) -> None:
-    schema = json.loads(SCHEMA_PATH.read_text())
+    schema = contracts.load_schema("apply_audit")
     jsonschema.validate(instance=audit, schema=schema)
 
 
@@ -345,7 +349,7 @@ class TestSchemaConformance:
     def test_module_slugs_exactly_match_schema_enum(self):
         """The slug vocabulary is frozen in BOTH the module and the schema —
         drift between them breaks the evaluator consumer."""
-        schema = json.loads(SCHEMA_PATH.read_text())
+        schema = contracts.load_schema("apply_audit")
         enum = schema["$defs"]["loop_record"]["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"]
         assert set(enum) == set(BLOCKED_BY_SLUGS)
 
