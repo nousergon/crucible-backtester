@@ -692,10 +692,70 @@ def _build_signal_lookup(
     )
 
 
+def _build_pit_universe_resolver(
+    bucket: str,
+    config: dict,
+    current_universe: set[str] | None,
+) -> "Callable[[str], set[str] | None] | None":
+    """Return a ``date_str -> universe_set`` resolver for point-in-time (PIT)
+    survivorship-free universe filtering, or ``None`` to preserve the legacy
+    date-agnostic behavior.
+
+    Off by default: only builds a resolver when
+    ``config['survivorship_free_universe']`` is truthy. This keeps every
+    existing backtest byte-identical unless the operator opts in — the
+    non-breaking default discipline for #1942 Leg 2.
+
+    When on, the weekly PIT constituent map (written to the same bucket by
+    alpha-engine-data's ``historical_constituents`` collector) is read ONCE
+    here via ``get_universe_symbols(bucket, as_of=<date>)`` per requested
+    date, so each backtest date filters signals against the index membership
+    that actually held on that date instead of today's snapshot (removing
+    look-ahead inclusion survivorship bias). Dates on/after the latest
+    recorded index change resolve to the current roster (the lib returns that
+    automatically), so recent history is unchanged.
+
+    ``current_universe`` is the already-fetched present-day roster; a resolver
+    that can't improve on it for a given date just returns it. The lib read is
+    memoized per date so a param sweep's 60 combos don't re-hit S3.
+    """
+    if not config.get("survivorship_free_universe"):
+        return None
+
+    from nousergon_lib.arcticdb import get_universe_symbols
+
+    _cache: dict[str, set[str] | None] = {}
+
+    def _resolve(date_str: str) -> set[str] | None:
+        if date_str in _cache:
+            return _cache[date_str]
+        try:
+            as_of = date.fromisoformat(date_str[:10])
+        except (ValueError, TypeError):
+            _cache[date_str] = current_universe
+            return current_universe
+        try:
+            pit = get_universe_symbols(bucket, as_of=as_of)
+        except Exception as exc:
+            # PIT map read is a hard precondition when the operator opted into
+            # survivorship-free mode — a silent fallback to today's roster
+            # would reintroduce exactly the bias they asked us to remove.
+            raise RuntimeError(
+                f"survivorship_free_universe is enabled but the PIT "
+                f"constituent map read failed for as_of={as_of} on bucket "
+                f"{bucket!r}: {exc}"
+            ) from exc
+        _cache[date_str] = pit
+        return pit
+
+    return _resolve
+
+
 def _precompute_signal_lookups(
     signals_by_date: dict | None,
     universe_symbols: set[str] | None = None,
     rejected_counter: dict[str, int] | None = None,
+    universe_resolver: "Callable[[str], set[str] | None] | None" = None,
 ) -> dict | None:
     """Precompute ``SignalLookup`` for each date in ``signals_by_date``.
 
@@ -707,13 +767,28 @@ def _precompute_signal_lookups(
     this ONCE before defining the per-combo ``sim_fn`` closure. All 60
     combos then share the precomputed lookups instead of rebuilding
     2316 dicts × 60 combos = 139k rebuilds.
+
+    ``universe_resolver`` (point-in-time / survivorship-free mode, #1942
+    Leg 2): when provided, the per-date universe is resolved by calling
+    ``universe_resolver(date_str)`` instead of using the single date-agnostic
+    ``universe_symbols`` for every date. This is the primary threading point
+    for PIT filtering — each date's signals are filtered against the index
+    membership that held on THAT date. A ``None`` return from the resolver
+    (or no resolver) falls back to ``universe_symbols``.
     """
     if signals_by_date is None:
         return None
-    return {
-        date_str: _build_signal_lookup(signals_raw, universe_symbols, rejected_counter)
-        for date_str, signals_raw in signals_by_date.items()
-    }
+    out: dict = {}
+    for date_str, signals_raw in signals_by_date.items():
+        per_date_universe = universe_symbols
+        if universe_resolver is not None:
+            resolved = universe_resolver(date_str)
+            if resolved is not None:
+                per_date_universe = resolved
+        out[date_str] = _build_signal_lookup(
+            signals_raw, per_date_universe, rejected_counter
+        )
+    return out
 
 
 def _filter_signals_to_universe(
@@ -1308,6 +1383,12 @@ def _run_simulation_loop(
             f"ArcticDB universe symbols from bucket {bucket!r}: {exc}"
         ) from exc
 
+    # Point-in-time (survivorship-free) universe resolver (#1942 Leg 2).
+    # None unless config['survivorship_free_universe'] is on, in which case
+    # each date filters against the index membership that held on that date
+    # instead of ``universe_symbols`` (today's snapshot).
+    pit_resolver = _build_pit_universe_resolver(bucket, config, universe_symbols)
+
     # Use signals_by_date keys as iteration dates when available
     if signals_by_date is not None:
         sim_dates = sorted(signals_by_date.keys())
@@ -1323,6 +1404,7 @@ def _run_simulation_loop(
     if signal_lookups is None and signals_by_date is not None:
         signal_lookups = _precompute_signal_lookups(
             signals_by_date, universe_symbols, rejected_ticker_counter,
+            universe_resolver=pit_resolver,
         )
 
     # Tier 3 Part C: precompute FeatureLookup ONCE (vectorized ATR /
@@ -1390,6 +1472,15 @@ def _run_simulation_loop(
         signal_date = sim_dates[idx]
         signals_override = signals_by_date[signal_date] if signals_by_date is not None else None
         signal_lookup = signal_lookups.get(signal_date) if signal_lookups is not None else None
+        # When there's no precomputed lookup, _simulate_single_date does the
+        # universe filter itself from ``universe_symbols`` — resolve the PIT
+        # set for THIS date (survivorship-free mode) so the live-load path is
+        # filtered against as-of membership, not today's snapshot.
+        _date_universe = universe_symbols
+        if signal_lookup is None and pit_resolver is not None:
+            _resolved = pit_resolver(signal_date)
+            if _resolved is not None:
+                _date_universe = _resolved
         _date_t0 = _time.monotonic()
         orders, skip = _simulate_single_date(
             sim_client=sim_client,
@@ -1401,7 +1492,7 @@ def _run_simulation_loop(
             strategy_config=strategy_config,
             signals_override=signals_override,
             signal_lookup=signal_lookup,
-            universe_symbols=universe_symbols,
+            universe_symbols=_date_universe,
             rejected_ticker_counter=rejected_ticker_counter,
             atr_by_ticker=atr_by_ticker,
             vwap_series_by_ticker=vwap_series_by_ticker,
@@ -1848,6 +1939,10 @@ def _replay_for_dates_per_date_bootstrap(
     n_skipped_no_bootstrap = 0
     skipped_dates: list[str] = []
 
+    # Point-in-time universe resolver (#1942 Leg 2). None unless
+    # config['survivorship_free_universe'] is on.
+    pit_resolver = _build_pit_universe_resolver(bucket, config, universe_symbols)
+
     for parity_date in sorted(dates):
         bootstrap_state = _load_initial_state_from_eod_pnl(
             config["trades_db_path"], parity_date,
@@ -1877,6 +1972,12 @@ def _replay_for_dates_per_date_bootstrap(
             bootstrap_state["cash"], bootstrap_state["peak_nav"],
         )
 
+        _date_universe = universe_symbols
+        if pit_resolver is not None:
+            _resolved = pit_resolver(parity_date)
+            if _resolved is not None:
+                _date_universe = _resolved
+
         orders, _skip = _simulate_single_date(
             sim_client=sim_client,
             signal_date=parity_date,
@@ -1886,7 +1987,7 @@ def _replay_for_dates_per_date_bootstrap(
             merged_config=merged_config,
             strategy_config=strategy_config,
             signals_override=None,  # loaded per-date inside helper
-            universe_symbols=universe_symbols,
+            universe_symbols=_date_universe,
             rejected_ticker_counter=rejected_ticker_counter,
         )
         if orders:
@@ -2122,6 +2223,10 @@ def replay_for_dates(
     else:
         sim_dates = sorted(dates)
 
+    # Point-in-time universe resolver (#1942 Leg 2). None unless
+    # config['survivorship_free_universe'] is on.
+    pit_resolver = _build_pit_universe_resolver(bucket, config, universe_symbols)
+
     captured: list[dict] = []
     for signal_date in sim_dates:
         # signals_by_date is set when bootstrap-mode replay extends sim to
@@ -2136,6 +2241,11 @@ def replay_for_dates(
                 continue
         else:
             signals_override = None
+        _date_universe = universe_symbols
+        if pit_resolver is not None:
+            _resolved = pit_resolver(signal_date)
+            if _resolved is not None:
+                _date_universe = _resolved
         orders, _skip = _simulate_single_date(
             sim_client=sim_client,
             signal_date=signal_date,
@@ -2145,7 +2255,7 @@ def replay_for_dates(
             merged_config=merged_config,
             strategy_config=strategy_config,
             signals_override=signals_override,
-            universe_symbols=universe_symbols,
+            universe_symbols=_date_universe,
             rejected_ticker_counter=rejected_ticker_counter,
         )
         if orders and signal_date in requested:
@@ -3687,10 +3797,18 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                 f"{bucket!r}: {exc}"
             ) from exc
         _sweep_rejected_counter: dict[str, int] = {}
+        # Point-in-time universe resolver (#1942 Leg 2). None unless
+        # config['survivorship_free_universe'] is on; when on, each date's
+        # precomputed lookup filters against as-of index membership. Built
+        # once here so all 60 sweep combos share the same per-date sets.
+        _sweep_pit_resolver = _build_pit_universe_resolver(
+            bucket, config, _universe_symbols_for_sweep
+        )
         signal_lookups = _precompute_signal_lookups(
             signals_by_date,
             _universe_symbols_for_sweep,
             _sweep_rejected_counter,
+            universe_resolver=_sweep_pit_resolver,
         )
         if _sweep_rejected_counter:
             top = sorted(_sweep_rejected_counter.items(), key=lambda kv: -kv[1])

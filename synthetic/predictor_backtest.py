@@ -582,12 +582,57 @@ def run_inference(
     return predictions_by_date
 
 
+def build_pit_universe_resolver(bucket: str, config: dict):
+    """Return a ``date_str -> set[str] | None`` point-in-time universe resolver
+    for the 10y synthetic predictor path, or ``None`` to preserve legacy
+    date-agnostic behavior (#1942 Leg 2).
+
+    Off by default: a resolver is built only when
+    ``config['survivorship_free_universe']`` is truthy, so the synthetic
+    backtest is byte-identical unless the operator opts in.
+
+    When on, ``get_universe_symbols(bucket, as_of=<date>)`` resolves the index
+    membership that held on each date from the weekly PIT constituent map
+    (written to the same bucket by alpha-engine-data). A ``None`` return
+    (date on/after the latest recorded index change) means "current roster",
+    so recent history is unchanged. Reads are memoized per date.
+    """
+    if not config.get("survivorship_free_universe"):
+        return None
+
+    from nousergon_lib.arcticdb import get_universe_symbols
+
+    _cache: dict[str, "set[str] | None"] = {}
+
+    def _resolve(date_str: str):
+        if date_str in _cache:
+            return _cache[date_str]
+        try:
+            as_of = _dt.date.fromisoformat(date_str[:10])
+        except (ValueError, TypeError):
+            _cache[date_str] = None
+            return None
+        try:
+            pit = get_universe_symbols(bucket, as_of=as_of)
+        except Exception as exc:
+            raise RuntimeError(
+                f"survivorship_free_universe is enabled but the PIT "
+                f"constituent map read failed for as_of={as_of} on bucket "
+                f"{bucket!r}: {exc}"
+            ) from exc
+        _cache[date_str] = pit
+        return pit
+
+    return _resolve
+
+
 def build_signals_by_date(
     predictions_by_date: dict[str, dict[str, float]],
     sector_map: dict[str, str],
     ohlcv_by_ticker: dict[str, pd.DataFrame],
     top_n: int = 20,
     min_score: float = 60,
+    pit_universe_resolver=None,
 ) -> dict[str, dict]:
     """
     Convert per-date predictions to executor signal envelopes using
@@ -643,6 +688,20 @@ def build_signals_by_date(
 
     for i, date_str in enumerate(sorted_dates):
         predictions = predictions_by_date[date_str]
+
+        # Point-in-time (survivorship-free) universe filter (#1942 Leg 2).
+        # When a resolver is supplied, restrict this date's candidate tickers
+        # to the index membership that actually held on ``date_str`` BEFORE
+        # scoring — so a name that wasn't in the index on that date can never
+        # be selected as an ENTER. A ``None`` return (date on/after the latest
+        # recorded index change) means "current roster", so no filter applies.
+        if pit_universe_resolver is not None:
+            pit_members = pit_universe_resolver(date_str)
+            if pit_members is not None:
+                predictions = {
+                    t: a for t, a in predictions.items()
+                    if t.upper() in pit_members
+                }
 
         # O(1) hashtable lookup per ticker — the hot path that was an
         # O(bars) list-comp scan before.
@@ -1298,9 +1357,15 @@ def run(
             pass
 
     # 7. Generate signals (using technical scoring from OHLCV, enriched by GBM alpha)
+    # Point-in-time (survivorship-free) universe resolver (#1942 Leg 2). None
+    # unless config['survivorship_free_universe'] is on — the same opt-in flag
+    # the backtester loop uses — so the 10y synthetic path stops applying
+    # today's constituent snapshot to every historical date.
+    pit_universe_resolver = build_pit_universe_resolver(bucket, config)
     signals_by_date = build_signals_by_date(
         predictions_by_date, sector_map, ohlcv_by_ticker,
         top_n=top_n, min_score=min_score,
+        pit_universe_resolver=pit_universe_resolver,
     )
     _log_rss("post_build_signals")
 
