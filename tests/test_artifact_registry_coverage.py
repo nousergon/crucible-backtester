@@ -90,6 +90,9 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # + history×2), same config-write shape as optimizer/executor_optimizer.py;
     # config writes, not freshness-SLA artifacts, so pinned here (grandfathered).
     "optimizer/portfolio_optimizer_optimizer.py": 5,
+    # config#789 Phase 6: shadow-only pillar-weight optimizer — 2 PUTs (shadow
+    # leaderboard + audit artifact), not a freshness-SLA artifact, grandfathered.
+    "optimizer/pillar_weight_optimizer.py": 2,
     "optimizer/predictor_optimizer.py": 3,
     "optimizer/predictor_sizing_optimizer.py": 1,
     "optimizer/recommendation_artifact.py": 1,
