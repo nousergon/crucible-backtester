@@ -81,6 +81,10 @@ PREDICTOR_PARAMS_DECLARED = {
     # veto_analysis.apply payload
     "veto_confidence", "fit_target", "precision", "n_vetoes",
     "updated_at", "recommendation_reason",
+    # per-sector veto threshold shadow soak (config#921), gated behind
+    # veto_sector_shadow_enabled (default False) — consumed shadow-only by
+    # crucible-predictor's write_output veto loop, never touches gbm_veto.
+    "per_sector_overrides",
     # predictor_optimizer.apply_recommendations updates
     "preferred_ensemble_mode", "ensemble_eval_date", "ensemble_eval_reason",
     "recommended_signal_threshold", "signal_threshold_eval_date",

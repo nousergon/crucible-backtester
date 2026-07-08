@@ -746,6 +746,17 @@ def apply(result: dict, bucket: str) -> dict:
         "recommendation_reason": result.get("recommendation_reason"),
     }
 
+    # Per-sector veto threshold shadow soak (config#921). Default OFF — mirrors
+    # the use_factor_blend_target naming/default-off convention. Brian's ruling
+    # (2026-07-07, config#921): "proceed with shadow soak" — attach the fitted
+    # overrides to the SAME artifact veto_confidence already writes to (no new
+    # S3 prefix) so the predictor can read+log a shadow decision, but nothing
+    # here changes what gets written for the live scalar threshold above.
+    if bool(_cfg.get("veto_sector_shadow_enabled", False)):
+        overrides = result.get("per_sector_thresholds", {}).get("overrides") or {}
+        if overrides:
+            payload["per_sector_overrides"] = overrides
+
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
 
