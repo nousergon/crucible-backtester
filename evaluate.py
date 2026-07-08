@@ -68,6 +68,7 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis.sample_size_adequacy import compute_sample_size_adequacy
+from analysis.risk_ratio_ci import compute_risk_ratio_ci
 from analysis.action_entropy import compute_action_entropy_artifact
 from analysis.optimizer_churn import compute_optimizer_churn
 from analysis.walk_forward_stability import compute_walk_forward_stability
@@ -1239,6 +1240,49 @@ def write_optimizer_run_manifest(
     return key
 
 
+def _portfolio_daily_returns_from_team_lift(team_lift: list[dict], prices, horizon_days: int = 10):
+    """Portfolio-wide aligned daily-return series from the e2e team-lift picks.
+
+    ``risk_ratio_ci`` (config#976) needs a single portfolio-level daily-return
+    series (mirroring the ``pf_returns_aligned`` series ``backtest.py``'s
+    deployed-strategy headline computes via ``_simulate_and_measure`` — a
+    process-separate, JSON-only artifact that does not carry raw series back
+    to evaluate.py). Rather than re-simulate the MVO solver here, this
+    aggregates every team's picks (already loaded for ``compute_team_metrics``
+    a few lines above) into one equal-weight portfolio sleeve via the same
+    ``compute_team_daily_returns`` helper each team already uses, stamping a
+    single synthetic ``team_id="portfolio"`` across all picks.
+
+    Returns ``None`` when there are no usable picks (caller degrades to
+    ``risk_ratio_ci`` reporting ``insufficient_data``, matching the module's
+    own always-emit contract).
+    """
+    if not team_lift or prices is None or getattr(prices, "empty", True):
+        return None
+
+    from analysis.team_daily_returns import compute_team_daily_returns
+
+    all_picks: list[dict] = []
+    for team in team_lift:
+        for pick in team.get("picks") or []:
+            all_picks.append({**pick, "team_id": "portfolio"})
+    if not all_picks:
+        return None
+
+    picks_df = pd.DataFrame(all_picks)
+    try:
+        portfolio_returns = compute_team_daily_returns(
+            picks_df, prices, horizon_days=horizon_days,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort; risk_ratio_ci degrades gracefully
+        logger.warning("[risk_ratio_ci] portfolio daily-returns aggregation failed: %s", e)
+        return None
+    series = portfolio_returns.get("portfolio")
+    if series is None or series.empty:
+        return None
+    return series
+
+
 def _run_weight_opt(config: dict, df_base, freeze: bool) -> dict:
     bucket = config.get("signals_bucket", "alpha-engine-research")
     current_weights = _read_current_weights(config)
@@ -1878,6 +1922,13 @@ def _main_impl() -> None:
         team_metrics = {}
         portfolio_calibration = {"status": "insufficient_data"}
         portfolio_excursion = {"status": "insufficient_data"}
+        risk_ratio_ci_result = {
+            "status": "insufficient_data",
+            "n_samples": 0,
+            "ratios": {},
+            "all_magnitude_certain": False,
+            "note": "evaluator-revamp metric bundle did not run",
+        }
         try:
             team_lift_for_metrics = (
                 diagnostics.get("e2e_lift") or {}
@@ -1900,6 +1951,19 @@ def _main_impl() -> None:
             portfolio_calibration = compute_portfolio_calibration(df_base)
             portfolio_excursion = compute_portfolio_excursion_summary(
                 df_base, ohlc_for_metrics, horizon_days=10,
+            )
+
+            # Risk-ratio magnitude-certainty monitor (config#976, L4558): block-
+            # bootstrap CIs for Sharpe/Sortino/Information Ratio over the same
+            # portfolio-wide daily-return sleeve derived from team_lift picks
+            # above (no new data read). ALWAYS-EMIT — compute_risk_ratio_ci's own
+            # insufficient_data/no_benchmark degrade paths handle thin data; this
+            # try/except only guards the aggregation step itself.
+            pf_returns_for_risk_ratio = _portfolio_daily_returns_from_team_lift(
+                team_lift_for_metrics, prices_for_metrics, horizon_days=10,
+            )
+            risk_ratio_ci_result = compute_risk_ratio_ci(
+                pf_returns_for_risk_ratio, spy_returns_for_metrics,
             )
         except Exception as e:
             logger.warning("evaluator-revamp metric bundle failed: %s", e)
@@ -2129,6 +2193,7 @@ def _main_impl() -> None:
             exit_timing=diagnostics.get("exit_timing"),
             behavioral_anomaly=diagnostics.get("behavioral_anomaly"),
             sample_size=compute_sample_size_adequacy(sq_result, attr_result),
+            risk_ratio_ci=risk_ratio_ci_result,
             action_entropy=action_entropy_result,
             optimizer_churn=optimizer_churn_result,
             walk_forward_stability=walk_forward_stability_result,
