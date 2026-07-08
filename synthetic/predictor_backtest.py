@@ -1223,22 +1223,26 @@ def run(
     logger.info("Freed raw price data (memory optimization)")
 
     # 5 + 6. Inference. Two mutually-exclusive paths:
-    #   - walk_forward OFF (default): single pass over all dates via
-    #     download_gbm_model → predictor/weights/meta/momentum_model.txt. This is
-    #     the deliberately-frozen legacy baseline, preserved byte-for-byte until
-    #     PR 3's parity report is reviewed and the default is flipped (plan §5 /
-    #     S3-contract caution: a new code path never silently changes optimizer
-    #     inputs). SCOPED OUT of the momentum-deterministic repoint (config#1518)
-    #     for exactly that reason — repointing the default path would silently
-    #     change optimizer inputs. NOTE: momentum_model.txt is itself a
-    #     pre-2026-05-09 leftover (the momentum GBM was retired that day), so this
-    #     path is a retirement candidate once walk_forward becomes the default.
-    #   - walk_forward ON: purged + embargoed fold scoring against the
-    #     deterministic momentum baseline (run_walk_forward_inference; momentum
-    #     retired its per-fold archived booster on 2026-05-09). model_path stays
-    #     None so the cleanup block below no-ops on this path.
+    #   - walk_forward ON (default since 2026-07-08, config#833 — Brian-
+    #     approved pit_parity.json review): purged + embargoed fold scoring
+    #     against the deterministic momentum baseline
+    #     (run_walk_forward_inference; momentum retired its per-fold
+    #     archived booster on 2026-05-09). model_path stays None so the
+    #     cleanup block below no-ops on this path.
+    #   - walk_forward OFF (opt-out via --no-walk-forward / config.yaml
+    #     `walk_forward: false`): single pass over all dates via
+    #     download_gbm_model → predictor/weights/meta/momentum_model.txt.
+    #     This is the deliberately-frozen legacy baseline, preserved
+    #     byte-for-byte for emergency rollback / A-B comparison (plan §5 /
+    #     S3-contract caution: a new code path never silently changes
+    #     optimizer inputs). SCOPED OUT of the momentum-deterministic
+    #     repoint (config#1518) for exactly that reason — repointing this
+    #     path would silently change optimizer inputs. NOTE:
+    #     momentum_model.txt is itself a pre-2026-05-09 leftover (the
+    #     momentum GBM was retired that day), so this path is a retirement
+    #     candidate now that walk_forward is the default.
     n_feature_tickers = len(features_by_ticker)
-    wf_enabled = bool(config.get("walk_forward", False))
+    wf_enabled = bool(config.get("walk_forward", True))
     wf_params = pb_config.get("walk_forward_params", {})
     if wf_enabled:
         logger.info(

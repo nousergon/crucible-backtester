@@ -4472,8 +4472,9 @@ def _parse_args() -> argparse.Namespace:
              "grid and emit the skilled-risk-basket contamination report to "
              "backtest/{date}/pit_parity.json (ROADMAP L2371 / plan §D4). "
              "Dedicated run — does NOT run the optimizer pipeline and never "
-             "writes configs. The --walk-forward default flip is gated on a "
-             "human reading this report (plan §5).",
+             "writes configs. --walk-forward defaulted to True on "
+             "2026-07-08 after Brian reviewed this report (config#833); "
+             "this dedicated run remains available for future re-review.",
     )
     parser.add_argument(
         "--pit-parity-pass", choices=["lookahead", "walkforward"], default=None,
@@ -4494,15 +4495,32 @@ def _parse_args() -> argparse.Namespace:
         help="INTERNAL (L4487): path the --pit-parity-pass child pickles its "
              "predictor-backtest stats dict to.",
     )
-    parser.add_argument(
-        "--walk-forward", action="store_true",
+    # --walk-forward / --no-walk-forward : mirrors the --use-vectorized-sweep
+    # / --use-scalar-sweep opt-out pattern above. DEFAULT ON since
+    # 2026-07-08 per Brian's pit_parity.json review (config#833, console
+    # Decision Queue "Option A"): the feature-engineering PIT audit
+    # (nousergon-data#638) and the momentum-weight dependency unblock
+    # (config#1518 / crucible-backtester#432) were both merged first.
+    walk_forward_flag = parser.add_mutually_exclusive_group()
+    walk_forward_flag.add_argument(
+        "--walk-forward", dest="walk_forward", action="store_true",
+        default=None,
         help="Point-in-time-honest predictor backtest: resolve archived "
              "momentum weights whose knowledge-time ≤ each fold's decision "
              "date instead of replaying history against the current live "
              "model (ROADMAP L2371 / Backtester Phase 2; plan "
-             "pit-discipline-260515.md). DEFAULT OFF — the single-pass "
-             "look-ahead path stays the default until PR 3's --pit-parity "
-             "report is reviewed and the flip is made manually (plan §5).",
+             "pit-discipline-260515.md). DEFAULT ON since 2026-07-08 per "
+             "Brian's pit_parity.json review — redundant under default-on, "
+             "kept for backward-compat with operator scripts.",
+    )
+    walk_forward_flag.add_argument(
+        "--no-walk-forward", dest="walk_forward", action="store_false",
+        default=None,
+        help="Opt out of point-in-time-honest replay — fall back to the "
+             "single-pass look-ahead path (momentum_model.txt, byte-for-"
+             "byte legacy baseline). Reserved for emergency rollback or "
+             "A/B comparison against the walk-forward default; default-on "
+             "flip happened 2026-07-08 (config#833).",
     )
     return parser.parse_args()
 
@@ -5176,11 +5194,14 @@ def _main_impl() -> None:
     # Stamped top-level (not under predictor_backtest) so it survives the
     # mode/smoke-fixture dict replacements that rewrite config["predictor_
     # backtest"]; predictor_backtest.run reads config.get("walk_forward").
-    # config.yaml may also set `walk_forward: true` to drive it from a file.
-    if args.walk_forward:
-        config["walk_forward"] = True
+    # config.yaml may also set `walk_forward: true`/`false` to drive it from
+    # a file. DEFAULT ON since 2026-07-08 (config#833, Brian-approved
+    # pit_parity.json review) — explicit --walk-forward/--no-walk-forward
+    # wins; otherwise a config.yaml value wins; otherwise defaults True.
+    if args.walk_forward is not None:
+        config["walk_forward"] = args.walk_forward
     else:
-        config.setdefault("walk_forward", False)
+        config.setdefault("walk_forward", True)
     # Run-date label = the PIT as-of for optimizer-baseline reads under
     # walk-forward (config_archive.as_of_date_from_config). evaluate.py:934
     # sets the same key; mirror it here so backtest-mode call sites
