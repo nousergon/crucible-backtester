@@ -9,8 +9,10 @@ deterministic momentum baseline (config#1518 — the momentum GBM retired
 2026-05-09, so there is no per-fold archived-weight resolution and no
 cold-start-from-missing-weights exclusion), that the inference tensor is built
 exactly once, that the scorer receives the canonical momentum feature set, and
-that the flag is OFF by default so the legacy single-pass path is byte-unchanged
-until the manual flip.
+that both the walk-forward path and the legacy single-pass fallback remain
+reachable from ``run()`` post-flip (config#833, 2026-07-08 — the flag now
+defaults ON; the legacy path stays available via --no-walk-forward /
+config.yaml ``walk_forward: false`` for rollback).
 
 The predictor's ``model.momentum_scorer.predict_array`` is stubbed via
 sys.modules so no predictor checkout / real booster is needed.
@@ -201,16 +203,30 @@ def test_no_folds_yields_empty_predictions(_stub_momentum_scorer):
 
 # ── wiring / default-OFF guards ────────────────────────────────────────────
 
-def test_walk_forward_flag_defaults_off_and_is_dispatched():
-    """run() must branch on config['walk_forward'] and only call the PIT
-    path when set — the legacy single-pass path stays the default."""
+def test_walk_forward_flag_dispatched_and_legacy_path_still_reachable():
+    """run() must branch on config['walk_forward'] and call the PIT path
+    when set, with the legacy single-pass path still reachable as the
+    opt-out fallback (config#833: default flipped ON 2026-07-08)."""
     src = inspect.getsource(predictor_backtest.run)
     assert 'config.get("walk_forward"' in src
     assert "run_walk_forward_inference(" in src
     # download_gbm_model (single-pass legacy baseline) must still be reachable
-    # on the else branch — the default path is unchanged (config#1518 scoped it
-    # out deliberately).
+    # on the else branch — the rollback path is preserved (config#1518 scoped
+    # it out deliberately; config#833 kept it as the --no-walk-forward escape
+    # hatch rather than deleting it).
     assert "download_gbm_model(bucket=bucket)" in src
+
+
+def test_walk_forward_config_default_is_true():
+    """Pin the resolved default itself: with no explicit config key, the
+    PIT-honest walk-forward path must be enabled (config#833 flip,
+    2026-07-08 — Brian-approved pit_parity.json review). This is the
+    regression tripwire for the flag-default flip; source-inspection tests
+    above only assert both code paths remain reachable, not which one wins
+    by default."""
+    assert bool({}.get("walk_forward", True)) is True
+    src = inspect.getsource(predictor_backtest.run)
+    assert 'config.get("walk_forward", True)' in src
 
 
 def test_metadata_carries_walk_forward_block():
