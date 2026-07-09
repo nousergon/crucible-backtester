@@ -456,3 +456,468 @@ class TestActiveWindowAnchoring:
         # All four legs compute cleanly — null_legs should be absent
         # (or empty) since no caller-action is owed.
         assert stats.get("null_legs", []) == []
+
+
+class TestEwUniverseLeg:
+    """config#834: full-universe equal-weight benchmark leg.
+
+    Distinct from ``ew_high_vol_basket_returns`` (top vol-quartile only —
+    see ``TestPortfolioStatsExtensions``): isolates stock-selection alpha
+    from cap-weighted-tilt alpha. Mirrors the ``TestPortfolioStatsExtensions``
+    shape (same fixtures, same default-None / active-window-anchoring /
+    null_legs conventions) applied to the new
+    ``ew_universe_basket_returns`` kwarg.
+    """
+
+    def _build_portfolio(self):
+        import vectorbt as vbt
+
+        dates = pd.date_range("2026-01-02", periods=10, freq="B")
+        prices = pd.DataFrame(
+            {
+                "AAA": np.linspace(100.0, 110.0, num=10),
+                "BBB": np.linspace(50.0, 48.0, num=10),
+            },
+            index=dates,
+        )
+        entries = pd.DataFrame(False, index=dates, columns=["AAA", "BBB"])
+        exits = pd.DataFrame(False, index=dates, columns=["AAA", "BBB"])
+        sizes = pd.DataFrame(0.0, index=dates, columns=["AAA", "BBB"])
+        entries.iloc[0] = True
+        sizes.iloc[0] = [100.0, 100.0]
+        exits.iloc[-1] = True
+
+        return vbt.Portfolio.from_signals(
+            close=prices,
+            entries=entries,
+            exits=exits,
+            size=sizes,
+            size_type="Amount",
+            init_cash=100_000.0,
+            cash_sharing=True,
+            group_by=True,
+            fees=0.0,
+            freq="D",
+        )
+
+    def _build_flat_prefix_portfolio(self, n_flat: int = 20, n_active: int = 10):
+        import vectorbt as vbt
+
+        total = n_flat + n_active
+        dates = pd.date_range("2026-01-02", periods=total, freq="B")
+        prices = pd.DataFrame(
+            {
+                "AAA": np.concatenate([
+                    np.full(n_flat, 100.0),
+                    np.linspace(100.0, 110.0, num=n_active),
+                ]),
+            },
+            index=dates,
+        )
+        entries = pd.DataFrame(False, index=dates, columns=["AAA"])
+        exits = pd.DataFrame(False, index=dates, columns=["AAA"])
+        sizes = pd.DataFrame(0.0, index=dates, columns=["AAA"])
+        entries.iloc[n_flat] = True
+        sizes.iloc[n_flat] = [100.0]
+        exits.iloc[-1] = True
+
+        return vbt.Portfolio.from_signals(
+            close=prices,
+            entries=entries,
+            exits=exits,
+            size=sizes,
+            size_type="Amount",
+            init_cash=100_000.0,
+            cash_sharing=True,
+            group_by=True,
+            fees=0.0,
+            freq="D",
+        )
+
+    def test_key_pair_present_and_distinct_from_ew_high_vol(self):
+        """New ew_universe_return/alpha_vs_ew_universe keys exist and are
+        independent of the pre-existing ew_high_vol_return/alpha_vs_ew_high_vol
+        pair (config#834's core distinctness requirement)."""
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+
+        high_vol_basket = pd.Series(0.002, index=pf.wrapper.index, name="ew_high_vol")
+        universe_basket = pd.Series(0.0005, index=pf.wrapper.index, name="ew_universe")
+        stats = portfolio_stats(
+            pf,
+            ew_high_vol_basket_returns=high_vol_basket,
+            ew_universe_basket_returns=universe_basket,
+        )
+
+        for key in ("ew_universe_return", "alpha_vs_ew_universe"):
+            assert key in stats
+
+        assert stats["ew_universe_return"] is not None
+        assert stats["ew_high_vol_return"] is not None
+        # Different input series (0.0005 vs 0.002 daily) must produce
+        # different compounded totals — proves the two legs are wired to
+        # independent kwargs, not aliases of the same computation.
+        assert stats["ew_universe_return"] != pytest.approx(
+            stats["ew_high_vol_return"], rel=1e-9,
+        )
+        assert stats["alpha_vs_ew_universe"] != pytest.approx(
+            stats["alpha_vs_ew_high_vol"], rel=1e-9,
+        )
+
+    def test_default_none_when_kwarg_omitted(self):
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        stats = portfolio_stats(pf)
+        assert stats["ew_universe_return"] is None
+        assert stats["alpha_vs_ew_universe"] is None
+        # Opt-in leg (parallel to ew_high_vol): omitted kwarg is NOT a
+        # null_legs entry — only "requested but failed to compute" is.
+        assert "ew_universe_return" not in stats.get("null_legs", [])
+        assert "alpha_vs_ew_universe" not in stats.get("null_legs", [])
+
+    def test_emits_total_return_and_alpha(self):
+        try:
+            from vectorbt_bridge import _compute_active_window, portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        basket = pd.Series(0.001, index=pf.wrapper.index, name="ew_universe")
+        stats = portfolio_stats(pf, ew_universe_basket_returns=basket)
+        assert stats["ew_universe_return"] is not None
+        assert stats["alpha_vs_ew_universe"] is not None
+
+        window = _compute_active_window(pf)
+        assert window is not None
+        active_dates = pf.wrapper.index[
+            (pf.wrapper.index >= window[0]) & (pf.wrapper.index <= window[1])
+        ]
+        expected_basket_total = float((1.001 ** len(active_dates)) - 1.0)
+        assert stats["ew_universe_return"] == pytest.approx(
+            expected_basket_total, rel=1e-6,
+        )
+        assert stats["alpha_vs_ew_universe"] == pytest.approx(
+            stats["total_return"] - expected_basket_total, rel=1e-6,
+        )
+
+    def test_insufficient_overlap_returns_none_and_flags_null_legs(self):
+        """Requested-but-uncomputable: basket dates don't overlap the
+        portfolio's active window at all — degrades to None AND is flagged
+        in null_legs (contrast with the omitted-kwarg case above)."""
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        non_overlap_dates = pd.date_range(
+            pf.wrapper.index[-1] + pd.Timedelta(days=30),
+            periods=5, freq="B",
+        )
+        basket = pd.Series(0.001, index=non_overlap_dates, name="ew_universe")
+        stats = portfolio_stats(pf, ew_universe_basket_returns=basket)
+        assert stats["ew_universe_return"] is None
+        assert stats["alpha_vs_ew_universe"] is None
+        null_legs = stats.get("null_legs", [])
+        assert "ew_universe_return" in null_legs
+        assert "alpha_vs_ew_universe" in null_legs
+
+    def test_compounds_over_active_window_not_full_wrapper(self):
+        """Active-window-anchoring fix (2026-05-24) must cover the new leg
+        too, not just SPY/ew_high_vol — this is the issue's explicit
+        non-inferable gotcha."""
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_flat_prefix_portfolio(n_flat=20, n_active=10)
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        basket = pd.Series(0.001, index=pf.wrapper.index, name="ew_universe")
+        stats = portfolio_stats(pf, ew_universe_basket_returns=basket)
+
+        ten_day_compound = (1.001 ** 10) - 1.0
+        thirty_day_compound = (1.001 ** 30) - 1.0
+        emitted = stats["ew_universe_return"]
+        assert emitted is not None
+        assert abs(emitted - ten_day_compound) < abs(emitted - thirty_day_compound), (
+            f"ew_universe_return={emitted} is closer to the 30-day compound "
+            f"{thirty_day_compound} than the 10-day compound {ten_day_compound} "
+            "— active-window narrowing is not in effect for the new leg"
+        )
+
+
+class TestSectorEtfLegs:
+    """config#834: per-sector-ETF benchmark legs.
+
+    One ``alpha_vs_sector_<TICKER>`` (+ ``sector_<TICKER>_return``) pair per
+    entry in the ``sector_etf_basket_returns`` dict — sector-relative alpha
+    ("does the system's healthcare picks beat XLV?"). Same fixtures +
+    conventions as ``TestPortfolioStatsExtensions``/``TestEwUniverseLeg``.
+    """
+
+    def _build_portfolio(self):
+        import vectorbt as vbt
+
+        dates = pd.date_range("2026-01-02", periods=10, freq="B")
+        prices = pd.DataFrame(
+            {
+                "AAA": np.linspace(100.0, 110.0, num=10),
+                "BBB": np.linspace(50.0, 48.0, num=10),
+            },
+            index=dates,
+        )
+        entries = pd.DataFrame(False, index=dates, columns=["AAA", "BBB"])
+        exits = pd.DataFrame(False, index=dates, columns=["AAA", "BBB"])
+        sizes = pd.DataFrame(0.0, index=dates, columns=["AAA", "BBB"])
+        entries.iloc[0] = True
+        sizes.iloc[0] = [100.0, 100.0]
+        exits.iloc[-1] = True
+
+        return vbt.Portfolio.from_signals(
+            close=prices,
+            entries=entries,
+            exits=exits,
+            size=sizes,
+            size_type="Amount",
+            init_cash=100_000.0,
+            cash_sharing=True,
+            group_by=True,
+            fees=0.0,
+            freq="D",
+        )
+
+    def _build_flat_prefix_portfolio(self, n_flat: int = 20, n_active: int = 10):
+        import vectorbt as vbt
+
+        total = n_flat + n_active
+        dates = pd.date_range("2026-01-02", periods=total, freq="B")
+        prices = pd.DataFrame(
+            {
+                "AAA": np.concatenate([
+                    np.full(n_flat, 100.0),
+                    np.linspace(100.0, 110.0, num=n_active),
+                ]),
+            },
+            index=dates,
+        )
+        entries = pd.DataFrame(False, index=dates, columns=["AAA"])
+        exits = pd.DataFrame(False, index=dates, columns=["AAA"])
+        sizes = pd.DataFrame(0.0, index=dates, columns=["AAA"])
+        entries.iloc[n_flat] = True
+        sizes.iloc[n_flat] = [100.0]
+        exits.iloc[-1] = True
+
+        return vbt.Portfolio.from_signals(
+            close=prices,
+            entries=entries,
+            exits=exits,
+            size=sizes,
+            size_type="Amount",
+            init_cash=100_000.0,
+            cash_sharing=True,
+            group_by=True,
+            fees=0.0,
+            freq="D",
+        )
+
+    def test_one_key_pair_per_sector_etf_present(self):
+        """One alpha_vs_sector_<TICKER> key per ETF present in the run's
+        universe — the acceptance criteria's headline assertion. Uses a
+        3-sector subset of SECTOR_ETF_MAP/DEFAULT_SECTOR_ETF_MAP's ticker
+        vocabulary (XLK/XLV/XLF) to prove the fan-out is driven by dict
+        contents, not a hardcoded ticker list."""
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+
+        sector_baskets = {
+            "XLK": pd.Series(0.001, index=pf.wrapper.index, name="XLK"),
+            "XLV": pd.Series(0.0005, index=pf.wrapper.index, name="XLV"),
+            "XLF": pd.Series(-0.0003, index=pf.wrapper.index, name="XLF"),
+        }
+        stats = portfolio_stats(pf, sector_etf_basket_returns=sector_baskets)
+
+        for ticker in ("XLK", "XLV", "XLF"):
+            assert f"alpha_vs_sector_{ticker}" in stats
+            assert f"sector_{ticker}_return" in stats
+            assert stats[f"sector_{ticker}_return"] is not None
+            assert stats[f"alpha_vs_sector_{ticker}"] is not None
+
+        # A sector ETF NOT in the run's universe must not appear at all.
+        assert "alpha_vs_sector_XLE" not in stats
+        assert "sector_XLE_return" not in stats
+
+        # Distinct input series (0.001 vs 0.0005 vs -0.0003 daily) must
+        # produce distinct compounded totals per ticker.
+        returns = {t: stats[f"sector_{t}_return"] for t in ("XLK", "XLV", "XLF")}
+        assert len(set(round(v, 8) for v in returns.values())) == 3
+
+    def test_default_empty_when_kwarg_omitted(self):
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        stats = portfolio_stats(pf)
+        assert not any(k.startswith("alpha_vs_sector_") for k in stats)
+        assert not any(
+            k.startswith("sector_") and k.endswith("_return") for k in stats
+        )
+        assert stats.get("null_legs", []) == [] or all(
+            not k.startswith(("alpha_vs_sector_", "sector_"))
+            for k in stats.get("null_legs", [])
+        )
+
+    def test_empty_dict_same_as_omitted(self):
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        stats = portfolio_stats(pf, sector_etf_basket_returns={})
+        assert not any(k.startswith("alpha_vs_sector_") for k in stats)
+
+    def test_per_ticker_emits_total_return_and_alpha(self):
+        try:
+            from vectorbt_bridge import _compute_active_window, portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        basket = pd.Series(0.0015, index=pf.wrapper.index, name="XLV")
+        stats = portfolio_stats(pf, sector_etf_basket_returns={"XLV": basket})
+
+        window = _compute_active_window(pf)
+        assert window is not None
+        active_dates = pf.wrapper.index[
+            (pf.wrapper.index >= window[0]) & (pf.wrapper.index <= window[1])
+        ]
+        expected_total = float((1.0015 ** len(active_dates)) - 1.0)
+        assert stats["sector_XLV_return"] == pytest.approx(expected_total, rel=1e-6)
+        assert stats["alpha_vs_sector_XLV"] == pytest.approx(
+            stats["total_return"] - expected_total, rel=1e-6,
+        )
+
+    def test_insufficient_overlap_returns_none_and_flags_null_legs(self):
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        non_overlap_dates = pd.date_range(
+            pf.wrapper.index[-1] + pd.Timedelta(days=30),
+            periods=5, freq="B",
+        )
+        basket = pd.Series(0.001, index=non_overlap_dates, name="XLF")
+        stats = portfolio_stats(pf, sector_etf_basket_returns={"XLF": basket})
+        assert stats["sector_XLF_return"] is None
+        assert stats["alpha_vs_sector_XLF"] is None
+        null_legs = stats.get("null_legs", [])
+        assert "sector_XLF_return" in null_legs
+        assert "alpha_vs_sector_XLF" in null_legs
+
+    def test_compounds_over_active_window_not_full_wrapper(self):
+        """Active-window-anchoring fix must cover sector legs too."""
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_flat_prefix_portfolio(n_flat=20, n_active=10)
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        basket = pd.Series(0.001, index=pf.wrapper.index, name="XLK")
+        stats = portfolio_stats(pf, sector_etf_basket_returns={"XLK": basket})
+
+        ten_day_compound = (1.001 ** 10) - 1.0
+        thirty_day_compound = (1.001 ** 30) - 1.0
+        emitted = stats["sector_XLK_return"]
+        assert emitted is not None
+        assert abs(emitted - ten_day_compound) < abs(emitted - thirty_day_compound), (
+            f"sector_XLK_return={emitted} is closer to the 30-day compound "
+            f"{thirty_day_compound} than the 10-day compound {ten_day_compound} "
+            "— active-window narrowing is not in effect for sector legs"
+        )
+
+    def test_one_sector_null_does_not_null_another(self):
+        """A sector ETF whose data doesn't overlap the active window emits
+        None for its own pair without affecting a sibling sector ETF whose
+        data does overlap — legs are independent, not all-or-nothing."""
+        try:
+            from vectorbt_bridge import portfolio_stats
+            pf = self._build_portfolio()
+        except Exception:
+            pytest.skip("vectorbt unavailable in this test env")
+        non_overlap_dates = pd.date_range(
+            pf.wrapper.index[-1] + pd.Timedelta(days=30),
+            periods=5, freq="B",
+        )
+        stats = portfolio_stats(
+            pf,
+            sector_etf_basket_returns={
+                "XLF": pd.Series(0.001, index=non_overlap_dates, name="XLF"),
+                "XLV": pd.Series(0.001, index=pf.wrapper.index, name="XLV"),
+            },
+        )
+        assert stats["sector_XLF_return"] is None
+        assert stats["sector_XLV_return"] is not None
+        assert stats["alpha_vs_sector_XLV"] is not None
+
+
+class TestComputeBenchmarkLegIndependentOfPortfolioGaps:
+    """Regression pin (caught in review): a benchmark leg's total return
+    must depend ONLY on the benchmark series' own aligned dates within the
+    active window — never on the portfolio's own daily-returns coverage.
+
+    ``compute_alpha_vs_benchmark`` inner-joins its two Series arguments
+    before computing totals. An earlier version of ``_compute_benchmark_leg``
+    passed the REAL portfolio daily-returns series as that function's
+    ``portfolio_daily_returns`` argument; if the portfolio's returns had any
+    gap inside the active window relative to the benchmark's dates, the join
+    would silently truncate ``benchmark_total_return`` to the shorter
+    overlap — even though the benchmark series itself had complete data for
+    the window. Fixed by self-joining the benchmark against itself (the
+    portfolio side of that inner call is irrelevant to `benchmark_total_return`,
+    which is why ``_compute_benchmark_leg`` no longer accepts a
+    ``portfolio_daily_returns`` argument at all).
+    """
+
+    def test_benchmark_total_return_unaffected_by_hypothetical_portfolio_gap(self):
+        from vectorbt_bridge import _compute_benchmark_leg
+
+        dates = pd.bdate_range("2026-01-01", periods=20)
+        bench = pd.Series(0.001, index=dates, name="bench")
+        active_window = (dates[0], dates[-1])
+
+        bench_return, alpha = _compute_benchmark_leg(
+            total_return=0.05,
+            active_window=active_window,
+            benchmark_daily_returns=bench,
+            label="regression_pin",
+        )
+        expected = float((1.001 ** len(dates)) - 1.0)
+        assert bench_return == pytest.approx(expected, rel=1e-9), (
+            f"benchmark_total_return={bench_return} does not match the "
+            f"benchmark-only compound {expected} — a portfolio-side "
+            "dependency has crept back into the benchmark-total computation"
+        )
+        assert alpha == pytest.approx(0.05 - expected, rel=1e-9)
+
+    def test_signature_has_no_portfolio_daily_returns_param(self):
+        """Guards against silently reintroducing the portfolio-coupling: if
+        a future refactor adds a `portfolio_daily_returns` parameter back to
+        `_compute_benchmark_leg`, this test forces a conscious decision
+        (update this test + re-verify the gap-independence property) rather
+        than a silent behavior change."""
+        import inspect
+
+        from vectorbt_bridge import _compute_benchmark_leg
+
+        params = set(inspect.signature(_compute_benchmark_leg).parameters)
+        assert "portfolio_daily_returns" not in params, (
+            "_compute_benchmark_leg regained a portfolio_daily_returns "
+            "parameter — re-verify it can't truncate benchmark_total_return "
+            "via compute_alpha_vs_benchmark's inner join (see "
+            "test_benchmark_total_return_unaffected_by_hypothetical_portfolio_gap)"
+        )
