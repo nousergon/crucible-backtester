@@ -52,6 +52,7 @@ import tempfile
 import os
 import time as _time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
