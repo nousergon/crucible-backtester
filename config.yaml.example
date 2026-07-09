@@ -190,14 +190,14 @@ weight_optimizer:
   # resulting weights land:
   #   - false → SHADOW: candidates write only to
   #     config/scoring_weights_shadow_history/ (+ latest.json); live
-  #     config/scoring_weights.json is untouched. The staged-rollout default
-  #     for a fresh deployment (shadow since 2026-07-06).
+  #     config/scoring_weights.json is untouched.
   #   - true → ENFORCE: IC-derived weights write live scoring_weights.json.
   # The LIVE system (alpha-engine-config/backtester/config.yaml, private)
   # has run use=true + enforce=true since 2026-05-09, backstopped since
-  # 2026-07-01 by enforce_significance below.
-  use_skill_composite_target: true   # shadow since 2026-07-06
-  enforce_skill_composite: false
+  # 2026-07-01 by enforce_significance below. Decision 2026-07-08:
+  # KEEP enforce=true (ratified live posture, defended by significance floor).
+  use_skill_composite_target: true
+  enforce_skill_composite: true
   # config#1426 Phase 4 — per-gate significance-enforce flag, default OFF.
   # When true, a promotion the live guardrails already allow is additionally
   # required to clear a signed, canonical-21d-horizon IC floor
