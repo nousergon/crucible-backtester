@@ -2132,6 +2132,35 @@ def _main_impl() -> None:
                 "",
             ])
 
+        # 10y rolling-window regime-parameter STABILITY section (config#952).
+        # Slides a true 10-year window across score_performance and re-
+        # identifies each regime's best stance parameterization per window,
+        # then reports cross-window stability (a sign-flipping parameter is
+        # regime noise, not a durable regime parameter). Observability only —
+        # never auto-applied to the factor blend (curve-fitting firewall).
+        # Self-loads from research_db and never raises; guarded to match the
+        # calibration/cost section contract.
+        try:
+            from analysis.rolling_regime_params import (
+                build_rolling_regime_params_report_section,
+            )
+            report_md = report_md + "\n" + build_rolling_regime_params_report_section(
+                config.get("research_db")
+            )
+        except Exception as rrp_err:  # noqa: BLE001 — see cost section above
+            logger.error(
+                "[rolling_regime_params] section render failed: %s — emitting "
+                "error placeholder so operators see the regression",
+                rrp_err,
+            )
+            report_md = report_md + "\n" + "\n".join([
+                "## 10y rolling regime parameters (stability)",
+                "",
+                f"- _Rolling-regime-params render failed: `{rrp_err}`._",
+                "  Investigate `analysis/rolling_regime_params.py`.",
+                "",
+            ])
+
         # Attribution sample-adequacy PERSISTENCE section (config#946 part 2).
         # sample_size_adequacy grades the per-cycle snapshot; this watches the
         # cross-cycle trailing run of attribution `insufficient_data` and warns
