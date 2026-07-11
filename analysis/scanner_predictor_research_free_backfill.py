@@ -21,6 +21,23 @@ module is the WRITE side.
 
 Design notes / deliberate scope decisions:
 
+- **The S3 parquet (``ARTIFACT_KEY``), not research.db, is the durable output.**
+  Every spot stage pulls research.db from S3 to a throwaway temp copy and never
+  pushes it back (``pipeline_common.init_research_db`` — push-back would race
+  the research module's own S3 backups of a DB it owns). The producer
+  (PredictorBacktest box) and consumer (Evaluator box, ``evaluate.py`` ->
+  ``end_to_end._scanner_then_predictor_topN``) are SEPARATE instances with
+  separate pulls, so the sqlite table is only ever a local materialization of
+  the artifact: ``run_backfill`` seeds from it (idempotency) and re-exports
+  after writing; the consumer hydrates via ``materialize_from_s3`` before
+  reading. First live run 2026-07-11 shipped without this and the producer's
+  writes could never have reached the consumer.
+- **Weights come from S3, never a checkout-relative path.** The deployed
+  champion artifacts (``predictor/weights/meta/meta_model.pkl`` /
+  ``volatility_model.txt``) are retrained every Saturday and live in S3; the
+  sibling predictor checkout on the spot box carries code only — no synced
+  ``weights/`` dir (the 2026-07-11 first live run failed in 0.01s on exactly
+  that assumption). ``predictor_path`` is used solely for ``sys.path`` imports.
 - **Model-schema-driven, not META_FEATURES-hardcoded.** The live deployed
   ``meta_model.pkl`` is free to swap Layer-1 components (e.g. the 2026-06-15
   cutover from ``momentum_score``/``expected_move`` to ``residual_momentum_score``
@@ -60,10 +77,13 @@ from __future__ import annotations
 import logging
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
+import boto3
 import numpy as np
 import pandas as pd
+from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +114,25 @@ _BASELINE_VOLATILITY_FEATURES = (
 )
 
 TABLE_NAME = "predictor_outcomes_research_free"
+
+# Canonical S3 persistence for the backfill output. research.db is pulled from
+# S3 to a THROWAWAY temp copy on every spot stage (pipeline_common.init_research_db)
+# and NEVER pushed back — the PredictorBacktest box (producer, backtest.py
+# --mode=predictor-backtest) and the Evaluator box (consumer, evaluate.py ->
+# end_to_end._scanner_then_predictor_topN) each pull their OWN copy. A row
+# written only to the producer's local sqlite therefore evaporates with the
+# box; this parquet is the durable wire contract between the two stages. Both
+# sides materialize it into their local research.db copy via
+# materialize_from_s3().
+ARTIFACT_KEY = "predictor/research_free_backfill/predictor_outcomes_research_free.parquet"
+
+# Deployed champion weight artifacts (retrained every Saturday by
+# PredictorTraining). The S3 objects ARE the champion; a sibling-checkout
+# weights/ dir is not synced on the backtester spot box (first live run
+# 2026-07-11 failed on exactly that assumption in 0.01s), so weights are
+# always fetched from S3 here — same posture as
+# synthetic/predictor_backtest.py::download_gbm_model.
+_WEIGHTS_PREFIX = "predictor/weights/meta/"
 
 
 def _ensure_table(conn: sqlite3.Connection) -> None:
@@ -144,33 +183,80 @@ def _pending_universe(conn: sqlite3.Connection) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def _load_meta_model(predictor_path: str):
-    """Load the deployed MetaModel artifact via the standard sibling-checkout
-    ``sys.path.insert`` idiom every other predictor-consuming phase in this repo
-    uses (``synthetic/predictor_backtest.py``, ``backtest.py::run_predictor_backtest``).
+def _download_weights_to_temp(
+    bucket: str,
+    filename: str,
+    *,
+    region: str | None = None,
+    s3_client=None,
+    sidecar: bool = True,
+) -> Path:
+    """Download ``predictor/weights/meta/{filename}`` from S3 to a temp dir and
+    return the local path. ``sidecar=True`` also fetches ``{filename}.meta.json``
+    beside it, best-effort (``MetaModel.load`` reads the sidecar when present;
+    v3 pickles embed feature_names so a missing sidecar is harmless).
+
+    Raises RuntimeError on a failed primary download — the deployed champion
+    artifact being unreachable is a PredictorTraining/S3 problem the caller
+    must see, never a silent zero-output backfill.
+    """
+    s3 = s3_client or boto3.client("s3", **({"region_name": region} if region else {}))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="research_free_weights_"))
+    local = tmp_dir / filename
+    key = _WEIGHTS_PREFIX + filename
+    try:
+        s3.download_file(bucket, key, str(local))
+        logger.info("Downloaded deployed weight artifact s3://%s/%s", bucket, key)
+    except (ClientError, BotoCoreError, OSError) as exc:
+        raise RuntimeError(
+            f"failed to download deployed weight artifact s3://{bucket}/{key}: {exc}"
+        ) from exc
+    if sidecar:
+        try:
+            s3.download_file(bucket, key + ".meta.json", str(local) + ".meta.json")
+        except (ClientError, BotoCoreError, OSError) as exc:
+            logger.warning(
+                "sidecar %s.meta.json not fetched (non-fatal, embedded schema wins): %s",
+                key, exc,
+            )
+    return local
+
+
+def _load_meta_model(
+    predictor_path: str,
+    bucket: str,
+    *,
+    region: str | None = None,
+    s3_client=None,
+):
+    """Load the deployed MetaModel: code via the standard sibling-checkout
+    ``sys.path.insert`` idiom (``synthetic/predictor_backtest.py``,
+    ``backtest.py::run_predictor_backtest``), weights via S3 download — the
+    checkout carries no synced ``weights/`` dir on the spot box.
     """
     if predictor_path not in sys.path:
         sys.path.insert(0, predictor_path)
     from model.meta_model import MetaModel  # noqa: E402
 
-    weights_dir = Path(predictor_path) / "weights" / "meta"
-    pkl_path = weights_dir / "meta_model.pkl"
-    if not pkl_path.exists():
-        raise FileNotFoundError(
-            f"meta_model.pkl not found at {pkl_path} — expected a local sync of "
-            f"s3://<bucket>/predictor/weights/meta/meta_model.pkl. This producer "
-            f"does not train a model; it serves the deployed champion artifact."
-        )
+    pkl_path = _download_weights_to_temp(
+        bucket, "meta_model.pkl", region=region, s3_client=s3_client,
+    )
     mm = MetaModel.load(str(pkl_path))
     if not mm.is_fitted:
-        raise RuntimeError(f"MetaModel loaded from {pkl_path} is not fitted")
+        raise RuntimeError(f"MetaModel loaded from s3 ({pkl_path}) is not fitted")
     return mm
 
 
-def _load_volatility_scorer(predictor_path: str):
+def _load_volatility_scorer(
+    predictor_path: str,
+    bucket: str,
+    *,
+    region: str | None = None,
+    s3_client=None,
+):
     """Best-effort load of the deployed volatility GBM (expected_move input).
 
-    None on any failure (missing artifact, lightgbm not installed) — callers
+    None on any failure (missing S3 artifact, lightgbm not installed) — callers
     treat that as "expected_move unavailable -> 0.0", the same neutral default
     ``inference/stages/run_inference.py`` uses when ``vol_scorer is None``.
     """
@@ -179,15 +265,106 @@ def _load_volatility_scorer(predictor_path: str):
             sys.path.insert(0, predictor_path)
         from model.gbm_scorer import GBMScorer
 
-        weights_dir = Path(predictor_path) / "weights" / "meta"
-        path = weights_dir / "volatility_model.txt"
-        if not path.exists():
-            logger.warning("volatility_model.txt not found at %s — expected_move will be 0.0", path)
-            return None
+        path = _download_weights_to_temp(
+            bucket, "volatility_model.txt",
+            region=region, s3_client=s3_client, sidecar=False,
+        )
         return GBMScorer.load(str(path))
     except Exception as exc:  # noqa: BLE001 - graceful degrade, never fatal
         logger.warning("volatility scorer load failed (expected_move -> 0.0): %s", exc)
         return None
+
+
+def materialize_from_s3(
+    conn: sqlite3.Connection,
+    bucket: str = "alpha-engine-research",
+    *,
+    region: str | None = None,
+    s3_client=None,
+) -> int:
+    """Materialize the canonical S3 backfill artifact into ``conn``'s
+    ``predictor_outcomes_research_free`` table. Returns the number of rows
+    materialized; 0 when the artifact doesn't exist yet (first ever run).
+
+    Called on BOTH sides of the producer/consumer seam (see ARTIFACT_KEY
+    comment): ``run_backfill`` seeds its idempotency set from it, and the
+    e2e-lift consumer (``analysis/end_to_end.py``, running on the separate
+    Evaluator box against its own freshly pulled research.db copy) hydrates
+    the table before ``_scanner_then_predictor_topN`` reads it.
+
+    A missing artifact is a clean 0 (nothing produced yet — the consumer's
+    honest ``skipped``); any OTHER failure (download, parse, insert) raises —
+    a corrupt/unreadable artifact must surface, not silently demote the
+    counterfactual back to ``skipped``.
+    """
+    _ensure_table(conn)
+    s3 = s3_client or boto3.client("s3", **({"region_name": region} if region else {}))
+    tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+    tmp.close()
+    try:
+        s3.download_file(bucket, ARTIFACT_KEY, tmp.name)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            logger.info(
+                "no backfill artifact at s3://%s/%s yet — 0 rows materialized",
+                bucket, ARTIFACT_KEY,
+            )
+            return 0
+        raise RuntimeError(
+            f"failed to download backfill artifact s3://{bucket}/{ARTIFACT_KEY}: {exc}"
+        ) from exc
+    df = pd.read_parquet(tmp.name)
+    if df.empty:
+        return 0
+    conn.executemany(
+        f"INSERT OR REPLACE INTO {TABLE_NAME} "
+        "(ticker, prediction_date, predicted_alpha, n_research_features_missing) "
+        "VALUES (?,?,?,?)",
+        list(
+            df[
+                ["ticker", "prediction_date", "predicted_alpha", "n_research_features_missing"]
+            ].itertuples(index=False, name=None)
+        ),
+    )
+    conn.commit()
+    logger.info(
+        "materialized %d rows from s3://%s/%s into %s", len(df), bucket, ARTIFACT_KEY, TABLE_NAME,
+    )
+    return int(len(df))
+
+
+def _export_artifact(
+    conn: sqlite3.Connection,
+    bucket: str,
+    *,
+    region: str | None = None,
+    s3_client=None,
+) -> str:
+    """Export the FULL local table to the canonical S3 parquet. Raises on any
+    failure: a computed-but-unpersisted backfill is indistinguishable from a
+    never-run one on the consumer box — exactly the silent failure mode this
+    artifact exists to kill.
+    """
+    df = pd.read_sql_query(
+        f"SELECT ticker, prediction_date, predicted_alpha, n_research_features_missing "
+        f"FROM {TABLE_NAME}",
+        conn,
+    )
+    tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+    tmp.close()
+    df.to_parquet(tmp.name, index=False)
+    s3 = s3_client or boto3.client("s3", **({"region_name": region} if region else {}))
+    try:
+        s3.upload_file(tmp.name, bucket, ARTIFACT_KEY)
+    except (ClientError, BotoCoreError, OSError) as exc:
+        raise RuntimeError(
+            f"failed to upload backfill artifact s3://{bucket}/{ARTIFACT_KEY}: {exc}"
+        ) from exc
+    logger.info(
+        "exported %d rows to s3://%s/%s", len(df), bucket, ARTIFACT_KEY,
+    )
+    return ARTIFACT_KEY
 
 
 def _compute_momentum_scores(rows: dict[str, pd.Series]) -> dict[str, float]:
@@ -394,16 +571,24 @@ def run_backfill(
     from nousergon_lib.arcticdb import load_universe_ohlcv, load_macro_series
 
     _ensure_table(conn)
+    # Idempotency seed: the local research.db is a fresh throwaway pull (see
+    # ARTIFACT_KEY comment), so previously computed rows live ONLY in the S3
+    # artifact — hydrate them first or every Saturday recomputes the full
+    # history from scratch.
+    n_seeded = materialize_from_s3(conn, bucket=bucket, region=region)
     try:
         pending = _pending_universe(conn)
     except sqlite3.OperationalError as exc:
         return {"status": "skipped", "reason": str(exc)}
 
     if pending.empty:
-        return {"status": "ok", "n_written": 0, "n_dates": 0, "n_errors": 0}
+        return {
+            "status": "ok", "n_written": 0, "n_dates": 0, "n_errors": 0,
+            "n_seeded_from_artifact": n_seeded,
+        }
 
-    mm = _load_meta_model(predictor_path)
-    vol_scorer = _load_volatility_scorer(predictor_path)
+    mm = _load_meta_model(predictor_path, bucket, region=region)
+    vol_scorer = _load_volatility_scorer(predictor_path, bucket, region=region)
     feat_names = list(mm._feature_names)  # the LOADED model's own schema — source of truth
     research_feats_present = [f for f in feat_names if f in RESEARCH_META_FEATURES]
     n_research_missing = len(research_feats_present)
@@ -545,6 +730,7 @@ def run_backfill(
             to_insert.append((t, d, alpha, n_research_missing))
             n_written += 1
 
+    artifact_key = None
     if to_insert:
         conn.executemany(
             f"INSERT OR REPLACE INTO {TABLE_NAME} "
@@ -553,12 +739,17 @@ def run_backfill(
             to_insert,
         )
         conn.commit()
+        # Persist to the canonical S3 artifact — the local research.db copy is
+        # discarded with the box; raises on failure (see _export_artifact).
+        artifact_key = _export_artifact(conn, bucket, region=region)
 
     return {
         "status": "ok",
         "n_written": n_written,
         "n_dates": len(dates),
         "n_errors": n_errors,
+        "n_seeded_from_artifact": n_seeded,
+        "artifact_key": artifact_key,
         "feature_names": feat_names,
         "n_research_features_missing": n_research_missing,
     }
