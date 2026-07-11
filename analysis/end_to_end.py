@@ -388,6 +388,7 @@ def compute_lift_metrics(
     factor_loadings: dict | None = None,
     pillar_profiles: dict | None = None,
     trajectory_scores: dict | None = None,
+    bucket: str = "alpha-engine-research",
 ) -> dict:
     """
     Compute lift at each decision boundary for the given eval_date(s).
@@ -398,6 +399,8 @@ def compute_lift_metrics(
         trades_db_path: path to trades.db (trades, executor_shadow_book).
                         Optional — executor lift is skipped if not available.
         eval_date: optional filter. If None, computes across all available dates.
+        bucket: signals bucket — source of the research-free backfill parquet
+                hydrated for the 3d scanner→predictor counterfactual.
 
     Returns dict with:
         status: "ok" | "insufficient_data" | "error"
@@ -538,10 +541,17 @@ def compute_lift_metrics(
 
         # 3d. Scanner -> research-free predictor direct (arm 4, config#1405): does
         # ranking the scanner-passing pool by a research-free predicted_alpha beat
-        # the live agentic CIO path? Reads predictor_outcomes_research_free (the
-        # Saturday spot-box backfill); skips until that table is populated.
+        # the live agentic CIO path? The backfill runs on the PredictorBacktest
+        # box against ITS OWN throwaway research.db pull — its rows only reach
+        # this box through the canonical S3 parquet, hydrated here before the
+        # read (materialize_from_s3 docstring has the full seam explanation).
         # Fail-soft so it can never break the existing e2e_lift contract.
         try:
+            from analysis.scanner_predictor_research_free_backfill import (
+                materialize_from_s3 as _rf_materialize,
+            )
+
+            _rf_materialize(conn, bucket=bucket)
             result["scanner_then_predictor_counterfactual"] = _scanner_then_predictor_topN(conn)
         except Exception as _stp:  # pragma: no cover - defensive
             logger.warning("scanner_then_predictor_topN failed (non-fatal): %s", _stp)

@@ -411,11 +411,11 @@ def _run_diagnostics(
     factor_loadings: dict = {}
     pillar_profiles: dict = {}
     trajectory_scores: dict = {}
+    bucket = config.get("signals_bucket", "alpha-engine-research")
     if avail.get("research_db"):
         try:
             import sqlite3 as _sqlite3
 
-            bucket = config.get("signals_bucket", "alpha-engine-research")
             _conn = _sqlite3.connect(db_path)
             try:
                 eval_dates = [
@@ -451,7 +451,7 @@ def _run_diagnostics(
         lambda: end_to_end.compute_lift_metrics(
             research_db_path=db_path, trades_db_path=trades_db,
             factor_loadings=factor_loadings, pillar_profiles=pillar_profiles,
-            trajectory_scores=trajectory_scores,
+            trajectory_scores=trajectory_scores, bucket=bucket,
         ),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
