@@ -171,8 +171,11 @@ def classify_loop(
             error-isolated by ``CompletenessTracker.run_module`` — a raising
             loop arrives here as ``{"status": "error", ...}``).
         assembler_summary: compact assembler outcome (executor_params only,
-            under cutover): ``{"status", "writers", "notes"}`` or None when
-            the assembler did not complete.
+            under cutover): ``{"status", "cutover_status", "writers",
+            "notes"}`` or None when the assembler did not complete.
+            ``cutover_status`` (not ``status``) is authoritative for
+            whether the live key was actually written — see
+            ``optimizer.assembler.AssemblerResult.cutover_status``.
         run_error: when the optimizer stage itself aborted before this loop
             produced a result, the exception text (→ outcome "error").
     """
@@ -251,7 +254,11 @@ def classify_loop(
 
     if reason.startswith("cutover_mode"):
         # The assembler is the sole live writer for this config_type; the
-        # loop's true live-key outcome is the assembler's.
+        # loop's true live-key outcome is the assembler's — NOT its merge
+        # status. ``cutover_status`` is keyed on whether the live-key
+        # put_object actually succeeded (see assembler.CutoverApplyError);
+        # ``status`` only says whether the merge produced promotable output
+        # and must never by itself be read as "the live key changed".
         if assembler_summary is None:
             record["detail"] = (
                 "cutover delegated the live write to the assembler, but the "
@@ -259,7 +266,18 @@ def classify_loop(
             )
             return record
         a_status = assembler_summary.get("status")
-        if a_status == "ok":
+        cutover_status = assembler_summary.get("cutover_status")
+        if cutover_status == "failed":
+            # Live-key put_object raised. The live config is UNCHANGED —
+            # this is an error, never "promoted", and must NOT reset
+            # consecutive_blocked_weeks (config#2331).
+            record["outcome"] = "error"
+            record["detail"] = (
+                "cutover assembler FAILED the live-key write — live config "
+                f"unchanged this run: {assembler_summary.get('notes', '')}"
+            )
+            return record
+        if cutover_status == "applied" and a_status == "ok":
             record["outcome"] = "promoted"
             record["detail"] = (
                 "live key written by assembler cutover "
@@ -270,7 +288,8 @@ def classify_loop(
         record["outcome"] = "blocked"
         record["blocked_by"] = ["assembler_skip"]
         record["detail"] = (
-            f"cutover assembler made no live write (status={a_status}): "
+            f"cutover assembler made no live write (status={a_status}, "
+            f"cutover_status={cutover_status}): "
             f"{assembler_summary.get('notes', '')}"
         )
         return record
@@ -387,13 +406,19 @@ def summarize_assembler(assemble_result) -> dict | None:
         writers = sorted({v.get("writer") for v in merge_summary.values() if isinstance(v, dict)})
         return {
             "status": getattr(assemble_result, "status", None),
+            "cutover_status": getattr(assemble_result, "cutover_status", "not_attempted"),
             "writers": writers,
             "notes": getattr(assemble_result, "notes", ""),
         }
     except Exception as e:  # noqa: BLE001 — summarization must not mask the
         # audit emission; an unreadable assembler result is recorded as such.
         logger.warning("Assembler summary extraction failed: %s", e)
-        return {"status": None, "writers": [], "notes": f"summary extraction failed: {e}"}
+        return {
+            "status": None,
+            "cutover_status": "failed",
+            "writers": [],
+            "notes": f"summary extraction failed: {e}",
+        }
 
 
 def emit_apply_audit(
