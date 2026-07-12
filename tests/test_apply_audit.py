@@ -465,7 +465,15 @@ class TestEvaluateWiring:
         src = (REPO_ROOT / "evaluate.py").read_text()
         assert "emit_apply_audit(" in src
         assert "raise opt_stage_error" in src
-        # The upload gate mirrors sibling artifacts (args.upload + not freeze).
+        # The upload gate mirrors sibling artifacts (args.upload + not
+        # freeze). config#2332 hoisted the gate into a named
+        # `apply_audit_upload` variable (reused by the post-optimizer live-
+        # key reconciliation step) — pin the gate's definition and its use
+        # at the emit_apply_audit call site rather than requiring the
+        # expression to be inlined there.
+        assert (
+            'apply_audit_upload = bool(getattr(args, "upload", False)) '
+            "and not args.freeze"
+        ) in src
         emit_call = src.split("emit_apply_audit(")[-1].split("run_error=")[0]
-        assert 'getattr(args, "upload", False)' in emit_call
-        assert "not args.freeze" in emit_call
+        assert "upload=apply_audit_upload" in emit_call
