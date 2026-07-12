@@ -92,6 +92,7 @@ from optimizer import (
 )
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
 from optimizer import factor_blend_optimizer
+from optimizer import pillar_weight_optimizer
 from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_digest_email
 from reporter import build_digest, build_report, save, upload_to_s3
@@ -1146,6 +1147,21 @@ def _run_optimizers(
         skip_if_missing=["factor_blend_sensitivity"],
     )
 
+    # Pillar-weight optimizer (config#789 Phase 6) — SHADOW-ONLY. Sweeps the
+    # 6-pillar composite weight space (Σ pillar weights == 1) + within-pillar
+    # qual_weight + legacy_blend, ranks by Sortino-on-skilled-risk under the
+    # alpha-floor constraint, and archives the recommendation to the shadow
+    # history prefix ONLY (config/scoring_weights_shadow_history). It NEVER
+    # writes the live scoring-weights key and has no live-cutover path — pure
+    # observability. Mirrors weight_optimizer's df_base dependency + the
+    # compute-then-apply(shadow) contract of the other optimizers.
+    results["pillar_weight_opt"] = tracker.run_module(
+        "pillar_weight_optimizer",
+        lambda: _run_pillar_weight_opt(config, df_base, freeze),
+        required_inputs={"research_db": avail["research_db"], "df_base": df_base is not None},
+        skip_if_missing=["df_base"],
+    )
+
     # Executor optimizer (needs sweep_df from simulation)
     sweep_df = config.get("_sweep_df")
     predictor_sweep_df = config.get("_predictor_sweep_df")
@@ -1558,6 +1574,27 @@ def _run_factor_blend_optimizer(
     return result
 
 
+def _run_pillar_weight_opt(config: dict, df_base, freeze: bool) -> dict:
+    """Run pillar_weight_optimizer compute + shadow-archive path (config#789 Phase 6).
+
+    SHADOW-ONLY: the recommend() sweep-then-rank never touches live config, and
+    apply() writes exclusively to the shadow-history prefix. ``freeze=True``
+    short-circuits apply() so ``--freeze`` runs produce zero S3 side effects.
+    The optimizer scores candidate pillar-weight vectors against the persisted
+    ``investment_thesis.composite_breakdown`` pillar contributions on df_base and
+    ranks by Sortino-on-skilled-risk under the alpha-floor constraint.
+    """
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    current_weights = config.get("pillar_weight_optimizer", {}).get("current_weights")
+    result = pillar_weight_optimizer.recommend(df_base, current_weights=current_weights)
+    if freeze:
+        result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+    elif result.get("status") == "ok":
+        # Shadow-archive only — apply() never writes the live scoring-weights key.
+        result["apply_result"] = pillar_weight_optimizer.apply(result, bucket)
+    return result
+
+
 def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
     """Fire a named alert when ``executor_optimizer.recommend()`` returns
     a non-``ok`` status — closes 5/23-SF P0 sweep item (c).
@@ -1755,6 +1792,7 @@ def _main_impl() -> None:
     research_optimizer.init_config(config)
     tech_weight_ablation.init_config(config)
     factor_blend_optimizer.init_config(config)
+    pillar_weight_optimizer.init_config(config)
 
     # Set the assembler-cutover flag from config — when true, individual
     # optimizers' apply() skip their legacy live-key writes and the
@@ -1869,18 +1907,38 @@ def _main_impl() -> None:
     # rides the same args.upload gate as sibling artifacts (--freeze /
     # local runs build + log the audit without persisting); build/log is
     # unconditional so a blocked apply can never again be silent.
+    apply_audit_upload = bool(getattr(args, "upload", False)) and not args.freeze
     if run_optimizers:
         from optimizer.apply_audit import emit_apply_audit
-        emit_apply_audit(
+        apply_audit_result = emit_apply_audit(
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=args.date,
             opt_results=opt_results,
             assembler_result=assemble_result,
-            upload=bool(getattr(args, "upload", False)) and not args.freeze,
+            upload=apply_audit_upload,
             run_error=opt_stage_error,
         )
         if opt_stage_error is not None:
             raise opt_stage_error
+
+        # ── Post-optimizer live-key reconciliation (config#2332) ─────────
+        # Complements config#2331 (assembler fail-loud at the write site):
+        # this catches ANY path that produces the config#2054 orphaned-write
+        # shape — a config type apply_audit grades "promoted" this run
+        # whose live S3 key was not actually refreshed. Only meaningful
+        # against the real bucket, so it rides the same upload gate as the
+        # audit write itself (--freeze / local runs have no live key to
+        # reconcile against). Failure to page must not break the pipeline —
+        # see live_key_reconciliation.run_reconciliation's fail-loud-but-
+        # non-aborting contract.
+        if apply_audit_upload:
+            from optimizer.live_key_reconciliation import run_reconciliation
+            run_reconciliation(
+                bucket=config.get("signals_bucket", "alpha-engine-research"),
+                audit=apply_audit_result,
+                run_start=datetime.fromtimestamp(_health_start, tz=timezone.utc),
+                run_date=args.date,
+            )
 
     # ── Regression detection ─────────────────────────────────────────────
     regression_result = _run_regression(
