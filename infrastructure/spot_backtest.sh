@@ -877,7 +877,10 @@ command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m p
 # downgrade note). Alignment fixes the instance; the GUARD below fixes the CLASS.
 cd /home/ec2-user/alpha-engine-predictor
 if [ -f requirements.txt ]; then
-    \$PIP install -q -r requirements.txt 2>/dev/null || true
+    \$PIP install -r requirements.txt || {
+        echo "FATAL: predictor requirements.txt install failed" >&2
+        exit 1
+    }
 fi
 
 # Fail-loud dependency GUARD (L4513 class fix). Assert the nousergon-lib
@@ -898,6 +901,12 @@ PYBIN="\${PIP% -m pip}"
     exit 1
 }
 \$PIP show nousergon-lib | grep -E '^Version:'
+
+# Also verify predictor modules used by backtest.py
+\$PYBIN -c "from synthetic.predictor_backtest import run; from synthetic.production_signal_backtest import build_production_signal_inputs" || {
+    echo "FATAL: predictor modules missing or failed to import" >&2
+    exit 1
+}
 
 # Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)
 \$PIP install -q 'numpy<2'
