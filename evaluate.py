@@ -1934,6 +1934,25 @@ def _main_impl() -> None:
                 logger.exception(
                     "Champion-promotion error-audit write ALSO failed — "
                     "liveness proxy may be stale this week",
+
+    # ── Post-optimizer live-key reconciliation (config#2332) ─────────
+    # Complements config#2331 (assembler fail-loud at the write site):
+    # this catches ANY path that produces the config#2054 orphaned-write
+    # shape — a config type apply_audit grades "promoted" this run
+    # whose live S3 key was not actually refreshed. Only meaningful
+    # against the real bucket, so it rides the same upload gate as the
+    # audit write itself (--freeze / local runs have no live key to
+    # reconcile against). Failure to page must not break the pipeline —
+    # see live_key_reconciliation.run_reconciliation's fail-loud-but-
+    # non-aborting contract.
+    if apply_audit_upload:
+        from optimizer.live_key_reconciliation import run_reconciliation
+        run_reconciliation(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            audit=apply_audit_result,
+            run_start=datetime.fromtimestamp(_health_start, tz=timezone.utc),
+            run_date=args.date,
+        )
                 )
 
     # ── Regression detection ─────────────────────────────────────────────

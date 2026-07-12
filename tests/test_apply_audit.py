@@ -92,7 +92,22 @@ def _all_results(**overrides):
     return results
 
 
-_ASSEMBLER_OK = {"status": "ok", "writers": ["executor_optimizer"], "notes": "cutover writes ok"}
+_ASSEMBLER_OK = {
+    "status": "ok",
+    "cutover_status": "applied",
+    "writers": ["executor_optimizer"],
+    "notes": "cutover writes ok",
+}
+
+# config#2331: merge succeeded (status=ok) but the live-key put_object
+# raised — cutover_status is the field classify_loop must key on. A record
+# built from this fixture must NEVER classify as "promoted".
+_ASSEMBLER_CUTOVER_FAILED = {
+    "status": "ok",
+    "cutover_status": "failed",
+    "writers": ["executor_optimizer"],
+    "notes": "cutover_failed: live write to s3://bucket/config/executor_params.json — S3 disconnected",
+}
 
 
 # ── Classification ───────────────────────────────────────────────────────────
@@ -192,6 +207,32 @@ class TestClassifyLoop:
     def test_executor_cutover_assembler_missing_is_error(self):
         rec = classify_loop("executor_params", _executor_cutover(), assembler_summary=None)
         assert rec["outcome"] == "error"
+
+    def test_executor_cutover_live_write_failure_is_error_not_promoted(self):
+        """config#2331: a failed live-key put_object (assembler merge status
+        stays "ok", only cutover_status flips to "failed") must classify as
+        outcome "error" — NEVER "promoted". This is the exact defect: before
+        the fix, classify_loop keyed on assembler_summary["status"] alone,
+        so a swallowed live-write failure (status still "ok") graded as
+        promoted and reset consecutive_blocked_weeks."""
+        rec = classify_loop(
+            "executor_params", _executor_cutover(),
+            assembler_summary=_ASSEMBLER_CUTOVER_FAILED,
+        )
+        assert rec["outcome"] == "error"
+        assert rec["outcome"] != "promoted"
+        assert "FAILED" in rec["detail"] or "failed" in rec["detail"]
+
+    def test_executor_cutover_status_missing_key_does_not_promote(self):
+        """Defense in depth: an assembler_summary dict that predates the
+        cutover_status field (e.g. a stale caller) must not default to
+        "promoted" — absence of cutover_status must never be silently
+        treated as success."""
+        rec = classify_loop(
+            "executor_params", _executor_cutover(),
+            assembler_summary={"status": "ok", "writers": [], "notes": "no cutover_status key"},
+        )
+        assert rec["outcome"] != "promoted"
 
     def test_shadow_mode_is_disabled(self):
         result = _weight_promoted()
@@ -296,6 +337,21 @@ class TestCarryForward:
         )
         assert audit["loops"]["scoring_weights"]["outcome"] == "disabled"
         assert audit["loops"]["scoring_weights"]["consecutive_blocked_weeks"] == 4
+
+    def test_cutover_live_write_failure_preserves_blocked_counter(self):
+        """config#2331 acceptance: a mocked live-key put failure must
+        classify as outcome "error" AND leave consecutive_blocked_weeks
+        untouched (error carries forward unchanged — it is neither evidence
+        of blocking nor of unblocking). Before the fix, this scenario
+        classified as "promoted", which RESET the counter — exactly the
+        silent-recovery-from-failure bug the issue describes."""
+        audit = build_audit(
+            "2026-07-05", _all_results(),
+            assembler_summary=_ASSEMBLER_CUTOVER_FAILED,
+            prior=self._prior(executor_params=5),
+        )
+        assert audit["loops"]["executor_params"]["outcome"] == "error"
+        assert audit["loops"]["executor_params"]["consecutive_blocked_weeks"] == 5
 
 
 # ── Frozen-schema conformance ────────────────────────────────────────────────
@@ -465,7 +521,15 @@ class TestEvaluateWiring:
         src = (REPO_ROOT / "evaluate.py").read_text()
         assert "emit_apply_audit(" in src
         assert "raise opt_stage_error" in src
-        # The upload gate mirrors sibling artifacts (args.upload + not freeze).
+        # The upload gate mirrors sibling artifacts (args.upload + not
+        # freeze). config#2332 hoisted the gate into a named
+        # `apply_audit_upload` variable (reused by the post-optimizer live-
+        # key reconciliation step) — pin the gate's definition and its use
+        # at the emit_apply_audit call site rather than requiring the
+        # expression to be inlined there.
+        assert (
+            'apply_audit_upload = bool(getattr(args, "upload", False)) '
+            "and not args.freeze"
+        ) in src
         emit_call = src.split("emit_apply_audit(")[-1].split("run_error=")[0]
-        assert 'getattr(args, "upload", False)' in emit_call
-        assert "not args.freeze" in emit_call
+        assert "upload=apply_audit_upload" in emit_call
