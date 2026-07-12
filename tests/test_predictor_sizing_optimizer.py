@@ -4,17 +4,22 @@
 Part of the optimizer-artifact-assembler arc (PR 2).
 """
 import json
+import sqlite3
+import tempfile
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from optimizer.assembler import set_cutover_enabled
 from optimizer.predictor_sizing_optimizer import (
     S3_PARAMS_KEY,
     _build_overlay_params,
+    analyze,
     apply,
     produce_artifact,
 )
+from pipeline_common import ACTIVE_HORIZON_DAYS
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +36,106 @@ def _set_module_cfg(extra: dict | None = None):
     mod._cfg = {"blend_factor": 0.3}
     if extra:
         mod._cfg.update(extra)
+
+
+def _make_db(rows: list[tuple]) -> str:
+    """rows: (prediction_date, symbol, p_up, actual_log_alpha)."""
+    f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    conn = sqlite3.connect(f.name)
+    conn.execute(
+        "CREATE TABLE predictor_outcomes (prediction_date TEXT, symbol TEXT, "
+        "p_up REAL, actual_log_alpha REAL, actual_5d_return REAL, horizon_days INTEGER)"
+    )
+    for pred_date, sym, p_up, alpha in rows:
+        conn.execute(
+            "INSERT INTO predictor_outcomes "
+            "(prediction_date, symbol, p_up, actual_log_alpha, actual_5d_return, horizon_days) "
+            "VALUES (?,?,?,?,?,?)",
+            (pred_date, sym, p_up, alpha, None, ACTIVE_HORIZON_DAYS),
+        )
+    conn.commit()
+    conn.close()
+    return f.name
+
+
+def _random_panel_rows(n: int, seed: int) -> list[tuple]:
+    """A single-date random panel: n symbols, uncorrelated p_up / alpha.
+
+    One prediction_date so pandas' groupby-by-week collapses to a single
+    week's IC (matches ``overall_ic`` exactly — no cross-week mixing) —
+    keeps the cross-check a direct apples-to-apples read of the same
+    (p_up, canonical_actual) vectors analyze() feeds into pandas' Spearman.
+    """
+    rng = np.random.default_rng(seed)
+    p_up = rng.uniform(0.0, 1.0, size=n)
+    alpha = rng.normal(0.0, 0.02, size=n)
+    return [
+        ("2026-06-01", f"T{i}", float(p_up[i]), float(alpha[i]))
+        for i in range(n)
+    ]
+
+
+# ── spearmanr cross-check (config#1958 deliverable 5e) ──────────────────────
+
+
+class TestSpearmanCrossCheck:
+    """analyze()'s ``overall_rank_ic`` is pandas' ``Series.corr(method="spearman")``
+    — a different code path from ``scipy.stats.spearmanr`` (config#1958's
+    anchor for the predictor's rank-correlation cross-check). This pins that
+    the two independent implementations agree on random panels, so a future
+    swap of either implementation can't silently drift the promotion-gating
+    IC without a test noticing.
+    """
+
+    @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+    def test_overall_rank_ic_matches_scipy_spearmanr_on_random_panels(self, seed):
+        from scipy.stats import spearmanr
+
+        rows = _random_panel_rows(n=60, seed=seed)
+        db = _make_db(rows)
+        result = analyze(db)
+        assert result["status"] == "ok"
+
+        p_up = np.array([r[2] for r in rows])
+        alpha = np.array([r[3] for r in rows])
+        expected_rho, _p = spearmanr(p_up, alpha)
+
+        assert result["overall_rank_ic"] == pytest.approx(float(expected_rho), abs=1e-4)
+
+    def test_matches_scipy_with_tied_ranks(self):
+        # Ties in p_up (repeated values) exercise pandas'/scipy's tie-handling
+        # (average-rank) — both must still agree.
+        from scipy.stats import spearmanr
+
+        rng = np.random.default_rng(42)
+        n = 50
+        p_up = rng.choice([0.1, 0.2, 0.3, 0.4, 0.5], size=n)  # heavy ties
+        alpha = rng.normal(0.0, 0.02, size=n)
+        rows = [("2026-06-01", f"T{i}", float(p_up[i]), float(alpha[i])) for i in range(n)]
+        db = _make_db(rows)
+        result = analyze(db)
+        assert result["status"] == "ok"
+
+        expected_rho, _p = spearmanr(p_up, alpha)
+        assert result["overall_rank_ic"] == pytest.approx(float(expected_rho), abs=1e-4)
+
+    def test_matches_scipy_on_strongly_correlated_panel(self):
+        # A non-trivial (non-near-zero) rho, so the cross-check also covers
+        # the "clearly enable" regime, not just noise-around-zero panels.
+        from scipy.stats import spearmanr
+
+        rng = np.random.default_rng(7)
+        n = 80
+        p_up = rng.uniform(0.0, 1.0, size=n)
+        alpha = 0.05 * p_up + rng.normal(0.0, 0.005, size=n)  # strong positive rank relation
+        rows = [("2026-06-01", f"T{i}", float(p_up[i]), float(alpha[i])) for i in range(n)]
+        db = _make_db(rows)
+        result = analyze(db)
+        assert result["status"] == "ok"
+        assert result["overall_rank_ic"] > 0.5  # sanity: genuinely correlated
+
+        expected_rho, _p = spearmanr(p_up, alpha)
+        assert result["overall_rank_ic"] == pytest.approx(float(expected_rho), abs=1e-4)
 
 
 # ── _build_overlay_params ────────────────────────────────────────────────────
