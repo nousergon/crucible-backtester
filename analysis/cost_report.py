@@ -597,13 +597,22 @@ def build_cost_section(
     anomaly = detect_anomaly(
         cost_label_date, current_total, bucket=bucket, s3_client=client,
     )
-    if anomaly.get("status") == "anomaly":
+    status = anomaly.get("status")
+    if status == "anomaly":
         _emit_changelog_anomaly_entry(
             anomaly, run_date=cost_label_date, bucket=bucket, s3_client=client,
         )
         _publish_anomaly_alert(
             anomaly, run_date=cost_label_date,
             bucket=bucket, s3_client=client,
+        )
+    elif status == "ok":
+        # config#867: the anomaly ledger only ever carries a genuine
+        # observation (status="ok" means the baseline comparison actually
+        # ran and cleared) — "no_baseline"/"alerting_disabled" are non-
+        # observations and must not be treated as a recovery signal.
+        _maybe_emit_changelog_recovery_entry(
+            run_date=cost_label_date, bucket=bucket, s3_client=client,
         )
     return main_md + "\n" + render_anomaly_section(anomaly)
 
@@ -767,10 +776,163 @@ def _emit_changelog_anomaly_entry(
             "[cost_report] changelog auto-emit: s3://%s/%s ratio=%s threshold=%s",
             bucket, key, ratio_str, threshold_str,
         )
+        # config#867: remember this incident's event_id so the next
+        # status="ok" run can emit a paired `recovery` entry instead of
+        # leaving the corpus "newest event wins" forever. Best-effort —
+        # a ledger write failure only costs the recovery pairing, never
+        # the incident entry itself (already durably written above).
+        _write_anomaly_ledger(
+            {"open_event_id": event_id, "opened_run_date": run_date},
+            bucket=bucket, s3_client=s3_client,
+        )
         return key
     except Exception as e:
         logger.warning(
             "[cost_report] changelog auto-emit failed (best-effort, swallowed): %s",
+            e,
+        )
+        return None
+
+
+# config#867: stateful incident↔recovery pairing (Brian's 2026-07-08 ruling
+# — "keep P3, clear gate ... auto-emit Lambdas track fired event_ids in S3,
+# emit recovery on clear"). This is the only real auto-emit producer in the
+# org today that fires an `incident` outside the SNS/CloudWatch mirrors
+# (verified 2026-07-09 groom pass — "eval-regression" has no producer yet;
+# the cost-anomaly emitter here is the sole candidate). One key holds at
+# most one open incident — matches the corpus's existing "newest event
+# wins" semantics; this repo only ever has one anomaly condition (the
+# rolling-baseline ratio) so there is never more than one to track.
+_ANOMALY_LEDGER_KEY = "changelog/_state/cost_anomaly_ledger.json"
+
+
+def _read_anomaly_ledger(*, bucket: str, s3_client: Any) -> Optional[dict]:
+    """Return the ledger dict, or ``None`` if absent/corrupt/unreadable.
+
+    Best-effort: any failure (no ledger yet, transient S3 error, corrupt
+    JSON) is treated the same as "no open incident" — recovery pairing is
+    a nicety, never allowed to block the cost-report render.
+    """
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=_ANOMALY_LEDGER_KEY)
+        body = obj["Body"].read()
+        return json.loads(body)
+    except ClientError:
+        return None
+    except Exception as e:
+        logger.warning(
+            "[cost_report] anomaly ledger read failed (best-effort, swallowed): %s",
+            e,
+        )
+        return None
+
+
+def _write_anomaly_ledger(payload: dict, *, bucket: str, s3_client: Any) -> None:
+    """Overwrite the ledger. Best-effort — swallows + logs on failure."""
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=_ANOMALY_LEDGER_KEY,
+            Body=json.dumps(payload).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as e:
+        logger.warning(
+            "[cost_report] anomaly ledger write failed (best-effort, swallowed): %s",
+            e,
+        )
+
+
+def _maybe_emit_changelog_recovery_entry(
+    *, run_date: str, bucket: str, s3_client: Any,
+) -> Optional[str]:
+    """If the ledger has an open incident, emit a paired `recovery` entry
+    and clear it. No-op (returns ``None``) when there's nothing open.
+    """
+    ledger = _read_anomaly_ledger(bucket=bucket, s3_client=s3_client)
+    open_event_id = (ledger or {}).get("open_event_id")
+    if not open_event_id:
+        return None
+    key = _emit_changelog_recovery_entry(
+        open_event_id, run_date=run_date, bucket=bucket, s3_client=s3_client,
+    )
+    # Clear the ledger regardless of the write outcome above — a swallowed
+    # emit failure is already logged; re-trying every subsequent "ok" run
+    # would just spam duplicate recovery entries once the S3 issue clears,
+    # which is worse than the (rare) chance of missing one pairing.
+    _write_anomaly_ledger(
+        {"open_event_id": None, "closed_run_date": run_date},
+        bucket=bucket, s3_client=s3_client,
+    )
+    return key
+
+
+def _emit_changelog_recovery_entry(
+    open_event_id: str, *, run_date: str, bucket: str, s3_client: Any,
+) -> Optional[str]:
+    """Write one schema-1.0.0 `recovery` entry back-referencing the
+    original incident's ``event_id`` via ``git_refs`` (the field the
+    SNS-mirror Lambda's own docstring already earmarks for this: "an
+    `investigation` entry whose `git_refs` reference the original
+    event_id"). ``severity="informational"`` + no ``root_cause_category``
+    mirrors ``classify.py``'s ``non_incident()`` convention for the SNS
+    OK-transition recovery path, so both recovery-emit paths in the org
+    read identically to consumers.
+
+    Best-effort: any S3 write failure is logged at WARN and swallowed —
+    same failure posture as the incident emit this pairs with.
+    """
+    try:
+        ts = datetime.now(timezone.utc)
+        ts_utc = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+        actor = "alpha-engine-cost-telemetry"
+        event_hash = sha1(f"{run_date}|{open_event_id}".encode()).hexdigest()[:7]
+        event_id = f"cost_recovery_{run_date}_{actor}_{event_hash}"
+        entry = {
+            "schema_version": _CHANGELOG_SCHEMA_VERSION,
+            "event_id": event_id,
+            "ts_utc": ts_utc,
+            "event_type": "recovery",
+            "severity": "informational",
+            "subsystem": "telemetry",
+            "root_cause_category": None,
+            "resolution_type": None,
+            "started_at": None,
+            "detected_at": ts_utc,
+            "resolved_at": ts_utc,
+            "verified_at": None,
+            "summary": f"LLM cost back within baseline (recovers {open_event_id})",
+            "description": (
+                f"Run date: {run_date}\n"
+                f"Cost anomaly {open_event_id} cleared — this run's total "
+                f"is back within the rolling-baseline threshold.\n"
+                f"Detected by: alpha-engine-backtester analysis/cost_report.py::detect_anomaly"
+            ),
+            "resolution_notes": None,
+            "actor": actor,
+            "machine": "backtester:analysis/cost_report.py",
+            "source": "cost-anomaly-autoemit",
+            "auto_emitted": True,
+            "git_refs": [open_event_id],
+            "prompt_version": None,
+            "run_id": run_date,
+            "eval_run_ref": None,
+        }
+        key = f"{_CHANGELOG_PREFIX}/{run_date}/{event_id}.json"
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(entry).encode("utf-8"),
+            ContentType="application/json",
+        )
+        logger.info(
+            "[cost_report] changelog recovery auto-emit: s3://%s/%s resolves=%s",
+            bucket, key, open_event_id,
+        )
+        return key
+    except Exception as e:
+        logger.warning(
+            "[cost_report] changelog recovery auto-emit failed (best-effort, swallowed): %s",
             e,
         )
         return None
