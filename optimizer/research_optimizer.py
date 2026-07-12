@@ -93,7 +93,12 @@ DEFAULT_SWEEP_GRID = {
 }
 
 # ── Fallback defaults (override via research_optimizer section in config.yaml) ──
-_MIN_SAMPLES = 200  # deferred until 6+ months of live data for reliable correlations
+_MIN_SAMPLES = 200  # min resolved score_performance samples for reliable correlations
+# (satisfied since ~2026-06: 376+ resolved samples). The loop's real block was
+# never sample count — signals.json emitted no boost columns, so
+# compute_boost_correlations returned no_boost_data every run. Fixed by
+# crucible-research scoring/boost_signals.py emitting short_interest_adj /
+# institutional_boost (config#1857).
 _MIN_IMPROVEMENT = 0.05  # 5% improvement in hit rate to recommend
 _MAX_SINGLE_CHANGE_PCT = 0.50  # max 50% change in any single param value
 _BLEND_FACTOR = 0.30  # conservative: 30% data-driven, 70% current
