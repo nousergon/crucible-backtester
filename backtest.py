@@ -5967,6 +5967,16 @@ def _main_impl() -> None:
                 report_prefix=config.get("output_prefix", "backtest"),
                 status="ok" if (production_stats or {}).get("status") == "ok" else "error",
                 s3_bucket=config.get("output_bucket") if args.upload else None,
+                # config#2291: the Saturday SF's PredictorBacktest,
+                # PortfolioOptimizerBacktest, and main-backtest states (plus
+                # any watch-rerun of one of them) each invoke this same
+                # backtest.py --upload code path independently for the SAME
+                # trading_day — without a dedup_key that was one "Backtester"
+                # digest email PER STATE instead of one per trading_day
+                # (Brian got 3 near-identical emails 2026-07-11). Keyed on
+                # run_date only (not mode) so all states/reruns collapse to
+                # the single email the operator actually wants.
+                dedup_key=f"backtester-digest:{args.date}",
             )
         else:
             logger.warning("No email_sender/email_recipients in config — skipping email")

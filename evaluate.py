@@ -2323,6 +2323,12 @@ def _main_impl() -> None:
                 report_prefix=config.get("output_prefix", "evaluation"),
                 status=sq_result.get("status", "ok"),
                 s3_bucket=config.get("output_bucket") if args.upload else None,
+                # config#2291: same dedup rationale as backtest.py's digest
+                # call — a watch-rerun of the Evaluator SF state for the same
+                # trading_day must not re-send this email. Keyed on run_date
+                # only, own "evaluator-digest" namespace so it never collides
+                # with the Backtester's dedup_key for the same date.
+                dedup_key=f"evaluator-digest:{args.date}",
             )
 
         report_ok = True
