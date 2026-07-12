@@ -627,6 +627,7 @@ class TestAssembleCutoverMode:
 
         # Notes capture cutover application
         assert "cutover_applied" in result.notes
+        assert result.cutover_status == "applied"
 
     def test_cutover_disabled_does_not_touch_live(self):
         # Explicit cutover_enabled=False: shadow-only — no live key write.
@@ -692,6 +693,7 @@ class TestAssembleCutoverMode:
         ]
         assert len(live_writes) == 1
         assert "cutover_applied" in result.notes
+        assert result.cutover_status == "applied"
 
     def test_cutover_skips_when_status_not_ok(self):
         # status=all_skip → cutover branch should NOT write live (the
@@ -717,6 +719,13 @@ class TestAssembleCutoverMode:
         assert s3.copy_object.call_args_list == []
 
     def test_cutover_live_write_failure_recorded_in_notes(self):
+        # config#2331: a failed live-key put must NEVER look like a quiet
+        # success. assemble() catches CutoverApplyError internally (so a
+        # transient S3 blip doesn't crash the whole evaluate run) but must
+        # surface the failure via cutover_status="failed" — never via a
+        # note-string-only signal that classify_loop could mistake for
+        # "promoted" (status alone stays "ok" since the MERGE succeeded;
+        # only the live WRITE failed).
         current_live = {"atr_multiplier": 2.0}
         artifacts = {
             "executor_optimizer": _make_executor_artifact({"atr_multiplier": 3.0}),
@@ -724,8 +733,6 @@ class TestAssembleCutoverMode:
         s3 = _stub_s3_for_assemble(current_live, artifacts)
 
         # Make ONLY the live-key put fail; audit + history put succeed.
-        original_put = s3.put_object.side_effect
-
         def fail_live_put(*args, **kwargs):
             if kwargs.get("Key") == "config/executor_params.json":
                 raise Exception("S3 disconnected on live write")
@@ -737,8 +744,31 @@ class TestAssembleCutoverMode:
             "test-bucket", "executor_params", "2026-05-09",
             s3_client=s3, write_assembled=False, cutover_enabled=True,
         )
-        # Result still status=ok; the failure is captured in notes for
-        # operator visibility (the audit artifact is the authoritative record
-        # if it was written).
+        assert result.status == "ok"
+        assert result.cutover_status == "failed"
         assert "cutover_failed" in result.notes
         assert "S3 disconnected" in result.notes
+
+    def test_cutover_live_write_failure_is_loud_not_swallowed(self, caplog):
+        # The live-key put failure must be logged at ERROR level (fail-loud)
+        # — not just captured in a note string nobody reads.
+        current_live = {"atr_multiplier": 2.0}
+        artifacts = {
+            "executor_optimizer": _make_executor_artifact({"atr_multiplier": 3.0}),
+        }
+        s3 = _stub_s3_for_assemble(current_live, artifacts)
+
+        def fail_live_put(*args, **kwargs):
+            if kwargs.get("Key") == "config/executor_params.json":
+                raise Exception("S3 disconnected on live write")
+            return MagicMock()
+
+        s3.put_object.side_effect = fail_live_put
+        with caplog.at_level("ERROR"):
+            result = assemble(
+                "test-bucket", "executor_params", "2026-05-09",
+                s3_client=s3, write_assembled=False, cutover_enabled=True,
+            )
+        assert result.cutover_status == "failed"
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert any("CRITICAL" in r.message for r in error_records)
