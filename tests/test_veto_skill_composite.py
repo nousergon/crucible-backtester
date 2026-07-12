@@ -197,6 +197,23 @@ class TestApplyShadowVsProduction:
             "recommendation_reason": "test",
         }
 
+    def _ok_result_with_threshold(self, threshold: float) -> dict:
+        """Helper for bootstrap tests — no significance verdict."""
+        result = self._ok_result("precision_minus_alpha_cost_legacy", threshold)
+        return result
+
+    def _ok_result_with_verdict(self, verdict: dict) -> dict:
+        """Helper for significance tests."""
+        result = self._ok_result("precision_minus_alpha_cost_legacy")
+        result["significance_observe"] = verdict
+        return result
+
+    def _ok_result_with_threshold_and_verdict(self, threshold: float, verdict: dict) -> dict:
+        """Helper for bootstrap + significance tests."""
+        result = self._ok_result("precision_minus_alpha_cost_legacy", threshold)
+        result["significance_observe"] = verdict
+        return result
+
     @patch("analysis.veto_analysis.boto3")
     def test_legacy_writes_to_production_key(self, mock_boto3):
         _init_config()
@@ -255,11 +272,6 @@ class TestApplyShadowVsProduction:
         assert not any(S3_SHADOW_PREFIX in k for k in keys_written)
 
     # ── config#1426 Phase 4 — significance ENFORCE (default OFF) ─────────────
-
-    def _ok_result_with_verdict(self, verdict) -> dict:
-        r = self._ok_result("precision_minus_alpha_cost_legacy")
-        r["significance_observe"] = verdict
-        return r
 
     @patch("analysis.veto_analysis.boto3")
     def test_enforce_default_off_applies_even_when_would_block(self, mock_boto3):
@@ -334,3 +346,195 @@ class TestApplyShadowVsProduction:
         body = json.loads(live_call.kwargs["Body"])
         assert body["fit_target"] == "skill_composite"
         assert body["veto_confidence"] == 0.70
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_bootstrap_seed_write_when_no_prior_artifact(self, mock_boto3):
+        """Bootstrap: first write occurs even when recommendation = default (fixed-point trap fix)."""
+        _init_config({"enforce_significance": False})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")  # No prior S3 artifact
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            # Recommendation = 0.65 (the default) — normally blocked by min_threshold_change
+            # But bootstrap allows it when artifact doesn't exist
+            outcome = apply(
+                self._ok_result_with_threshold(0.65),
+                bucket="test-bucket",
+            )
+        assert outcome["applied"] is True
+        live_call = next(
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == S3_PARAMS_KEY
+        )
+        body = json.loads(live_call.kwargs["Body"])
+        assert body["veto_confidence"] == 0.65
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_bootstrap_seed_blocked_by_significance_floor(self, mock_boto3):
+        """Bootstrap seed respects significance floor when enforce_significance=true."""
+        _init_config({"enforce_significance": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")  # No prior artifact
+        mock_boto3.client.return_value = s3
+        outcome = apply(
+            self._ok_result_with_threshold_and_verdict(0.65, {"would_block": True}),
+            bucket="test-bucket",
+        )
+        assert outcome["applied"] is False
+        assert "bootstrap seed blocked by significance enforce" in outcome["reason"]
+        assert S3_PARAMS_KEY not in [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_bootstrap_seed_allowed_when_significance_passes(self, mock_boto3):
+        """Bootstrap seed writes when significance verdict is clean."""
+        _init_config({"enforce_significance": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")  # No prior artifact
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(
+                self._ok_result_with_threshold_and_verdict(0.65, {"would_block": False}),
+                bucket="test-bucket",
+            )
+        assert outcome["applied"] is True
+
+
+class TestApplyPerSectorShadowSoak:
+    """config#921 shadow soak (Brian's ruling 2026-07-07): fitted per-sector
+    overrides get attached to the SAME predictor_params.json / shadow-history
+    artifact veto_confidence already writes to — gated behind
+    ``veto_sector_shadow_enabled`` (default False), never a new S3 prefix.
+    """
+
+    def _ok_result_with_overrides(self, overrides: dict | None) -> dict:
+        result = {
+            "status": "ok",
+            "fit_target": "precision_minus_alpha_cost_legacy",
+            "current_threshold": 0.55,
+            "base_rate": 0.50,
+            "n_down_predictions": 30,
+            "thresholds": [
+                {"confidence": 0.65, "precision": 0.65, "n_vetoes": 12},
+            ],
+            "recommended_threshold": 0.65,
+            "recommendation_reason": "test",
+        }
+        if overrides is not None:
+            result["per_sector_thresholds"] = {
+                "status": "ok",
+                "overrides": overrides,
+            }
+        return result
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_flag_off_omits_per_sector_overrides(self, mock_boto3):
+        """Default (flag unset → False): payload never gets a
+        per_sector_overrides key, even when overrides were computed."""
+        _init_config()  # veto_sector_shadow_enabled defaults False
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            apply(
+                self._ok_result_with_overrides({"Energy": 0.70}),
+                bucket="test-bucket",
+            )
+        live_call = next(
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == S3_PARAMS_KEY
+        )
+        body = json.loads(live_call.kwargs["Body"])
+        assert "per_sector_overrides" not in body
+        # Live scalar threshold is unaffected either way.
+        assert body["veto_confidence"] == 0.65
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_flag_on_no_overrides_computed_omits_key(self, mock_boto3):
+        """Flag on but compute_per_sector_thresholds produced an empty
+        overrides map — nothing to attach, key stays absent."""
+        _init_config({"veto_sector_shadow_enabled": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            apply(
+                self._ok_result_with_overrides({}),
+                bucket="test-bucket",
+            )
+        live_call = next(
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == S3_PARAMS_KEY
+        )
+        body = json.loads(live_call.kwargs["Body"])
+        assert "per_sector_overrides" not in body
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_flag_on_missing_per_sector_thresholds_key_is_noop(self, mock_boto3):
+        """Graceful degrade: result dict without a per_sector_thresholds block
+        at all (e.g. no sector column upstream) must not raise."""
+        _init_config({"veto_sector_shadow_enabled": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(
+                self._ok_result_with_overrides(None),
+                bucket="test-bucket",
+            )
+        assert outcome["applied"] is True
+        live_call = next(
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == S3_PARAMS_KEY
+        )
+        body = json.loads(live_call.kwargs["Body"])
+        assert "per_sector_overrides" not in body
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_flag_on_with_overrides_attaches_to_production_payload(self, mock_boto3):
+        """Flag on + non-empty overrides: attached verbatim to the live
+        predictor_params.json write, alongside the unchanged scalar
+        veto_confidence."""
+        _init_config({"veto_sector_shadow_enabled": True})
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = s3
+        overrides = {"Financial Services": 0.60, "Industrials": 0.55}
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(
+                self._ok_result_with_overrides(overrides),
+                bucket="test-bucket",
+            )
+        assert outcome["applied"] is True
+        live_call = next(
+            c for c in s3.put_object.call_args_list
+            if c.kwargs["Key"] == S3_PARAMS_KEY
+        )
+        body = json.loads(live_call.kwargs["Body"])
+        assert body["per_sector_overrides"] == overrides
+        # Live scalar decision path is untouched by the shadow attachment.
+        assert body["veto_confidence"] == 0.65
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_flag_on_with_overrides_attaches_to_shadow_payload(self, mock_boto3):
+        """Same attachment behavior on the shadow-archive write path
+        (skill_composite computed, enforce_skill_composite still False)."""
+        _init_config({
+            "veto_sector_shadow_enabled": True,
+            "use_skill_composite_target": True,
+            "enforce_skill_composite": False,
+        })
+        s3 = MagicMock()
+        s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = s3
+        overrides = {"Energy": 0.65}
+        result = self._ok_result_with_overrides(overrides)
+        result["fit_target"] = "skill_composite"
+        outcome = apply(result, bucket="test-bucket")
+        assert outcome["applied"] is False
+        assert "shadow mode" in outcome["reason"].lower()
+        shadow_call = next(
+            c for c in s3.put_object.call_args_list
+            if S3_SHADOW_PREFIX in c.kwargs["Key"]
+        )
+        body = json.loads(shadow_call.kwargs["Body"])
+        assert body["per_sector_overrides"] == overrides

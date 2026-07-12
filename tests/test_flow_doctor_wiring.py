@@ -181,7 +181,7 @@ class TestSetupLoggingAttach:
 
     def test_disabled_attaches_no_flow_doctor_handler(self, monkeypatch, reset_root_logger):
         monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "0")
-        from alpha_engine_lib.logging import setup_logging
+        from nousergon_lib.logging import setup_logging
         setup_logging(
             "backtester-test-disabled",
             flow_doctor_yaml=str(REPO_ROOT / "flow-doctor.yaml"),
@@ -195,7 +195,7 @@ class TestSetupLoggingAttach:
     def test_enabled_attaches_flow_doctor_handler(
         self, stub_flow_doctor_env, reset_root_logger, temp_flow_doctor_yaml
     ):
-        from alpha_engine_lib.logging import setup_logging, get_flow_doctor
+        from nousergon_lib.logging import setup_logging, get_flow_doctor
         setup_logging(
             "backtester-test-enabled",
             flow_doctor_yaml=temp_flow_doctor_yaml,
@@ -210,7 +210,7 @@ class TestSetupLoggingAttach:
     def test_exclude_patterns_plumbed_to_handler(
         self, stub_flow_doctor_env, reset_root_logger, temp_flow_doctor_yaml
     ):
-        from alpha_engine_lib.logging import setup_logging
+        from nousergon_lib.logging import setup_logging
         patterns = [r"vectorbt fold warning", r"arcticdb retry transient"]
         setup_logging(
             "backtester-test-patterns",
@@ -396,11 +396,10 @@ class TestLibVersionPin:
         # Either tagged version, or unpinned via @main (we explicitly
         # forbid @main here — it floats and breaks reproducible builds).
         assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
-        assert "@v0.83.0" in text, (
-            "nousergon-lib should pin to v0.83.0 (flow-doctor>=0.8.0 notify_on_category "
-            "for config#1695; lockstep with crucible-predictor at v0.83.0 — "
-            "merge predictor PR before or with this PR (LibPinDriftCheck). "
-            "Prior: v0.77.1 — the HorizonPolicy chokepoint "
+        assert "@v0.96.0" in text, (
+            "nousergon-lib should pin to v0.96.0 (nousergon_lib.health enrichment "
+            "writer for config#1727 Phase C; lockstep with fleet at v0.96.0). "
+            "Prior: v0.86.0 — flow-doctor>=0.8.0 notify_on_category for config#1695. "
             "(nousergon_lib.quant.horizons + the outcome_record contract, "
             "config#1483 Phase 1 / nousergon-lib#147) consumed by the "
             "config#1528 optimizer cutover. "

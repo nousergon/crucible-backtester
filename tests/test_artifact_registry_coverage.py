@@ -71,7 +71,25 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # cov_sweep/gamma_sweep), OBSERVE-only, grandfathered like the other per-run
     # diagnostics rather than added to the freshness-SLA registry.
     "backtest.py": 11,
-    "health_status.py": 1,
+    # config#1405 research-free backfill parquet (predictor/research_free_backfill/
+    # predictor_outcomes_research_free.parquet) — the durable producer→consumer wire
+    # for the scanner→predictor-direct counterfactual (research.db pulls are
+    # throwaway per-box copies, never pushed back). REGISTERED in
+    # ARTIFACT_REGISTRY.yaml (weekly SLA) rather than grandfathered: silent
+    # absence of this artifact is indistinguishable from "backfill never ran",
+    # which is the exact 2026-07-11 first-live-run failure mode.
+    "analysis/scanner_predictor_research_free_backfill.py": 1,
+    # config#1726: optimizer_run/{trading_day}.json liveness proxy for event_driven
+    # config_* rows — registered as optimizer_run_manifest in ARTIFACT_REGISTRY.yaml.
+    "evaluate.py": 1,
+    # config#1841 apply-audit — 2 PUTs (config/apply_audit/{date}.json + the
+    # latest.json mirror): the per-run outcome record for the four auto-apply
+    # loops (promoted / blocked-by-guardrail / insufficient_data / disabled /
+    # error). A weekly per-run report-card INPUT read by crucible-evaluator
+    # (absence ⇒ optimizer stage never ran), like optimizer_run/{date}.json
+    # above — registering a freshness SLA row in ARTIFACT_REGISTRY.yaml is the
+    # config-repo follow-up owned by the filing session (config#1841 parent).
+    "optimizer/apply_audit.py": 2,
     "optimizer/assembler.py": 5,
     "optimizer/barrier_sizing_optimizer.py": 1,
     "optimizer/config_archive.py": 1,

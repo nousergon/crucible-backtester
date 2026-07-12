@@ -943,6 +943,73 @@ class TestSaveB1dOptimizerArtifacts:
             assert not (out / fn).exists()
 
 
+# ── save() — risk_ratio_ci wiring (config#976) ────────────────────────────────
+
+
+class TestSaveRiskRatioCI:
+    """risk_ratio_ci (config#976, L4558's magnitude-certainty monitor) mirrors
+    sample_size.json's always-emit contract: written whenever evaluate.py passes
+    a non-None dict, even on an "insufficient_data" status, so the evaluator can
+    distinguish "producer didn't run" from "ran, magnitude not yet certain"."""
+
+    def _save(self, tmp_path, **kw):
+        from reporter import save
+        return save(
+            report_md="# r",
+            signal_quality={},
+            score_analysis=[],
+            run_date="2026-06-04",
+            results_dir=str(tmp_path),
+            **kw,
+        )
+
+    def test_ok_status_persisted(self, tmp_path):
+        import json
+        out = self._save(
+            tmp_path,
+            risk_ratio_ci={
+                "status": "ok",
+                "n_samples": 200,
+                "sample_floor": 126,
+                "n_adequate": True,
+                "ratios": {
+                    "sharpe_ratio": {"point": 1.2, "ci_95": [0.5, 1.9],
+                                     "straddles_zero": False, "magnitude_certain": True},
+                },
+                "all_magnitude_certain": True,
+                "note": "x",
+            },
+        )
+        assert (out / "risk_ratio_ci.json").exists()
+        body = json.loads((out / "risk_ratio_ci.json").read_text())
+        assert body["status"] == "ok"
+        assert body["all_magnitude_certain"] is True
+        assert body["ratios"]["sharpe_ratio"]["magnitude_certain"] is True
+
+    def test_insufficient_data_status_still_persisted(self, tmp_path):
+        import json
+        out = self._save(
+            tmp_path,
+            risk_ratio_ci={
+                "status": "insufficient_data",
+                "n_samples": 12,
+                "sample_floor": 126,
+                "n_adequate": False,
+                "ratios": {},
+                "all_magnitude_certain": False,
+                "note": "Fewer than 2 aligned daily returns — no ratio estimable.",
+            },
+        )
+        assert (out / "risk_ratio_ci.json").exists()
+        body = json.loads((out / "risk_ratio_ci.json").read_text())
+        assert body["status"] == "insufficient_data"
+        assert body["all_magnitude_certain"] is False
+
+    def test_none_not_written(self, tmp_path):
+        out = self._save(tmp_path, risk_ratio_ci=None)
+        assert not (out / "risk_ratio_ci.json").exists()
+
+
 # ── _section_deployed_strategy / fail-loud headline (config#1053) ─────────────
 
 

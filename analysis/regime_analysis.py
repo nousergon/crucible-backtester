@@ -14,8 +14,10 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
-from analysis.signal_quality import _compute_slice_metrics, MIN_SAMPLES
+from analysis.outcome_store import attach_outcomes
+from analysis.signal_quality import _BEAT_5D, _BEAT_21D, _compute_slice_metrics, MIN_SAMPLES
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +45,13 @@ def load_with_regime(db_path: str) -> pd.DataFrame:
         df = pd.read_sql_query(
             "SELECT * FROM score_performance ORDER BY score_date",
             conn,
-            parse_dates=["score_date", "eval_date_10d", "eval_date_30d"],
+            parse_dates=["score_date"],
         )
     finally:
         conn.close()
+
+    # Re-source outcome columns from the long-format store (config#1529).
+    df = attach_outcomes(df, str(path), policy=DEFAULT_POLICY)
 
     if "market_regime" not in df.columns:
         # Pre-migration #12 schema. Inject the column as all-NULL so
@@ -72,14 +77,14 @@ def accuracy_by_regime(df: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> list
     if "market_regime" not in df.columns:
         return []
 
-    populated_5d = df[df["beat_spy_5d"].notna()] if "beat_spy_5d" in df.columns else pd.DataFrame()
+    populated_5d = df[df[_BEAT_5D].notna()] if _BEAT_5D in df.columns else pd.DataFrame()
     # config#1456: canonical 21d horizon (10d/30d outcomes retired).
-    populated_21d = df[df["beat_spy_21d"].notna()] if "beat_spy_21d" in df.columns else pd.DataFrame()
+    populated_21d = df[df[_BEAT_21D].notna()] if _BEAT_21D in df.columns else pd.DataFrame()
 
     if len(populated_21d) < min_samples:
         logger.warning(
-            "Only %d rows with beat_spy_21d populated — regime analysis deferred until Week 4.",
-            len(populated_21d),
+            "Only %d rows with %s populated — regime analysis deferred until Week 4.",
+            len(populated_21d), _BEAT_21D,
         )
         return []
 

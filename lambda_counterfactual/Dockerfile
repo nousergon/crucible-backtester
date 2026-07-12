@@ -24,7 +24,7 @@ RUN microdnf install -y git && microdnf clean all
 # flow-doctor's logging integration. No [arcticdb] / [rag] — counter-
 # factual reads decision artifacts from S3 only.
 COPY lambda_counterfactual/requirements-counterfactual.txt requirements-counterfactual.txt
-RUN pip install --no-cache-dir "nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0" "krepis>=0.3.0" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.96.0" "krepis>=0.3.0" && \
     pip install --no-cache-dir -r requirements-counterfactual.txt && \
     rm -rf /root/.cache/pip
 

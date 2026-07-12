@@ -20,10 +20,24 @@ import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
 
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
 from analysis.lookahead_disclosure import build_disclosure as _build_lookahead
 from analysis.lookahead_disclosure import render_section as _render_lookahead
+from analysis.outcome_store import primary_beat_counts
 
 logger = logging.getLogger(__name__)
+
+# Primary-horizon outcome dict-key names resolve from the fleet HorizonPolicy
+# (config#1483/#1529). Names are unchanged (beat_spy_21d / beat_spy_5d) — they
+# are the attribution-artifact keys reporter renders — but the underlying data
+# is now sourced from score_performance_outcomes upstream. The raw
+# score_performance beat-SPY COUNT/SUM aggregates below likewise read the
+# long-format store via analysis.outcome_store.primary_beat_counts.
+_PRIMARY_H = DEFAULT_POLICY.primary_horizon
+_SHORT_H = DEFAULT_POLICY.diagnostic_horizons[0]
+_BEAT_PRIMARY = DEFAULT_POLICY.outcome_columns(_PRIMARY_H).beat_spy  # beat_spy_21d
+_BEAT_SHORT = DEFAULT_POLICY.outcome_columns(_SHORT_H).beat_spy      # beat_spy_5d
 
 
 def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
@@ -38,10 +52,11 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
 
         # score_performance counts
         sp_total = conn.execute("SELECT COUNT(*) FROM score_performance").fetchone()[0]
-        # config#1456: canonical 21d horizon (10d/30d outcomes retired).
-        sp_with_21d = conn.execute(
-            "SELECT COUNT(*) FROM score_performance WHERE beat_spy_21d IS NOT NULL"
-        ).fetchone()[0]
+        # config#1456/#1529: canonical primary horizon (10d/30d outcomes
+        # retired). The resolved-count + beat-sum now come from the long-format
+        # score_performance_outcomes store (primary horizon), not the wide
+        # beat-SPY column — byte-identical (beat_spy is 0/1 in both).
+        sp_with_21d, sp_beat_21d = primary_beat_counts(conn, policy=DEFAULT_POLICY)
         sp_dates = conn.execute("SELECT COUNT(DISTINCT score_date) FROM score_performance").fetchone()[0]
         sp_earliest = conn.execute("SELECT MIN(score_date) FROM score_performance").fetchone()[0] or "—"
         sp_latest = conn.execute("SELECT MAX(score_date) FROM score_performance").fetchone()[0] or "—"
@@ -83,19 +98,12 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
         f"| Research params | Signals | {_bar(sp_total, 200)} | {'**Active**' if sp_total >= 200 else 'Deferred'} |",
     ]
 
-    # Add accuracy preview if we have any data
+    # Add accuracy preview if we have any data. beat-sum comes from the
+    # long-format store (primary horizon), read alongside sp_with_21d above.
     if sp_with_21d > 0:
-        try:
-            import sqlite3
-            conn = sqlite3.connect(db_path)
-            beat = conn.execute(
-                "SELECT SUM(beat_spy_21d) FROM score_performance WHERE beat_spy_21d IS NOT NULL"
-            ).fetchone()[0] or 0
-            acc = beat / sp_with_21d * 100
-            lines.append(f"| **21d accuracy** | **Beat SPY** | **{acc:.0f}% ({int(beat)}/{sp_with_21d})** | {'✓ Above 55%' if acc >= 55 else '⚠ Below 55%'} |")
-            conn.close()
-        except Exception:
-            pass
+        beat = sp_beat_21d
+        acc = beat / sp_with_21d * 100
+        lines.append(f"| **21d accuracy** | **Beat SPY** | **{acc:.0f}% ({int(beat)}/{sp_with_21d})** | {'✓ Above 55%' if acc >= 55 else '⚠ Below 55%'} |")
 
     return lines
 
@@ -549,11 +557,14 @@ def _section_provenance_grounding(grounding: dict) -> list[str]:
 def _section_quant_rank_quality(quality: dict) -> list[str]:
     """Build Quant Rank Quality section.
 
-    Per-sector ``corr(quant_rank, return_5d)`` over a rolling 8-week
-    window. Negative correlations = skilled (rank #1 → highest return);
-    positive = anti-skill (rank #1 → lowest return). The 2026-05-09
-    post-mortem found healthcare/industrials/tech at +0.33-0.36 — this
-    section surfaces that drift weekly so it doesn't recur in silence.
+    Per-sector ``corr(quant_rank, realized return)`` over a rolling 8-week
+    window, at BOTH policy horizons — the diagnostic short horizon (legacy
+    unsuffixed keys) and the canonical primary horizon (suffixed keys,
+    config#1529). Negative correlations = skilled (rank #1 → highest
+    return); positive = anti-skill (rank #1 → lowest return). The
+    2026-05-09 post-mortem found healthcare/industrials/tech at +0.33-0.36
+    — this section surfaces that drift weekly so it doesn't recur in
+    silence.
     """
     lines = ["## Quant Rank Quality", ""]
 
@@ -567,13 +578,18 @@ def _section_quant_rank_quality(quality: dict) -> list[str]:
         lines.append("")
         return lines
 
+    p_suf = f"{_PRIMARY_H}d"
+    d_suf = f"{_SHORT_H}d"
     win_start = quality.get("window_start", "?")
     win_end = quality.get("window_end", "?")
     overall_rank = quality.get("overall_rank_corr")
     overall_score = quality.get("overall_score_corr")
+    overall_rank_p = quality.get(f"overall_rank_corr_{p_suf}")
+    overall_score_p = quality.get(f"overall_score_corr_{p_suf}")
     n_obs = quality.get("n_total_obs", 0)
     threshold = quality.get("anti_skill_threshold", 0.10)
     anti_skill = quality.get("anti_skill_teams", []) or []
+    anti_skill_p = quality.get(f"anti_skill_teams_{p_suf}", []) or []
 
     overall_flag = "✅" if (overall_rank is not None and overall_rank < 0) else (
         "⚠️" if (overall_rank is not None and overall_rank > threshold) else "🟡"
@@ -583,9 +599,18 @@ def _section_quant_rank_quality(quality: dict) -> list[str]:
         f"- Window: **{win_start}** → **{win_end}** ({n_obs} obs)"
     )
     lines.append(
-        f"- {overall_flag} Overall rank corr: **{overall_str}** "
+        f"- {overall_flag} Overall rank corr ({d_suf}): **{overall_str}** "
         f"(score corr: {overall_score:+.3f})" if overall_score is not None
-        else f"- {overall_flag} Overall rank corr: **{overall_str}**"
+        else f"- {overall_flag} Overall rank corr ({d_suf}): **{overall_str}**"
+    )
+    overall_p_flag = "✅" if (overall_rank_p is not None and overall_rank_p < 0) else (
+        "⚠️" if (overall_rank_p is not None and overall_rank_p > threshold) else "🟡"
+    )
+    overall_p_str = f"{overall_rank_p:+.3f}" if overall_rank_p is not None else "—"
+    lines.append(
+        f"- {overall_p_flag} Overall rank corr ({p_suf}, canonical): **{overall_p_str}** "
+        f"(score corr: {overall_score_p:+.3f})" if overall_score_p is not None
+        else f"- {overall_p_flag} Overall rank corr ({p_suf}, canonical): **{overall_p_str}**"
     )
     lines.append(
         f"  *Negative = skilled ranker; positive = anti-skill (top picks "
@@ -593,30 +618,41 @@ def _section_quant_rank_quality(quality: dict) -> list[str]:
     )
 
     if anti_skill:
-        lines.append(f"- ⚠️ Anti-skill teams (corr > +{threshold:.2f}): "
+        lines.append(f"- ⚠️ Anti-skill teams ({d_suf} corr > +{threshold:.2f}): "
                      f"**{', '.join(anti_skill)}**")
+    if anti_skill_p:
+        lines.append(f"- ⚠️ Anti-skill teams ({p_suf} corr > +{threshold:.2f}): "
+                     f"**{', '.join(anti_skill_p)}**")
 
-    # Per-team table.
+    # Per-team table — both horizons side by side.
     per_team = quality.get("per_team", []) or []
     if per_team:
         lines.append("")
-        lines.append("| Team | Rank corr | Score corr | Top-3 hit-rate | n_obs |")
-        lines.append("|---|---|---|---|---|")
+        lines.append(
+            f"| Team | Rank corr {d_suf} | Rank corr {p_suf} | "
+            f"Score corr {d_suf} | Top-3 hit {d_suf} | Top-3 hit {p_suf} | n_obs |"
+        )
+        lines.append("|---|---|---|---|---|---|---|")
         for entry in per_team:
             rc = entry.get("rank_corr")
+            rc_p = entry.get(f"rank_corr_{p_suf}")
             sc = entry.get("score_corr")
             hr = entry.get("hit_rate_top3")
+            hr_p = entry.get(f"hit_rate_top3_{p_suf}")
             n = entry.get("n_obs", 0)
             rc_str = f"{rc:+.3f}" if rc is not None else "—"
+            rc_p_str = f"{rc_p:+.3f}" if rc_p is not None else "—"
             sc_str = f"{sc:+.3f}" if sc is not None else "—"
             hr_str = f"{hr:.0f}%" if hr is not None else "—"
+            hr_p_str = f"{hr_p:.0f}%" if hr_p is not None else "—"
             flag = ""
             if rc is not None and rc > threshold:
                 flag = " ⚠️"
             elif rc is not None and rc < -threshold:
                 flag = " ✅"
             lines.append(
-                f"| {entry['team_id']}{flag} | {rc_str} | {sc_str} | {hr_str} | {n} |"
+                f"| {entry['team_id']}{flag} | {rc_str} | {rc_p_str} | "
+                f"{sc_str} | {hr_str} | {hr_p_str} | {n} |"
             )
 
     lines.append("")
@@ -1504,6 +1540,7 @@ def save(
     barrier_coherence: dict | None = None,
     score_calibration: dict | None = None,
     macro_eval: dict | None = None,
+    attractiveness_eval: dict | None = None,
     team_metrics: dict | None = None,
     calibration_diagnostics: dict | None = None,
     excursion_summary: dict | None = None,
@@ -1513,6 +1550,7 @@ def save(
     cio_opt: dict | None = None,
     behavioral_anomaly: dict | None = None,
     sample_size: dict | None = None,
+    risk_ratio_ci: dict | None = None,
     action_entropy: dict | None = None,
     optimizer_churn: dict | None = None,
     walk_forward_stability: dict | None = None,
@@ -1662,6 +1700,12 @@ def save(
         # Sample-size adequacy (config#1151 Batch C) — always-emit from birth so
         # the evaluator distinguishes "producer didn't run" from "ran, too few".
         ("sample_size.json", sample_size),
+        # Risk-ratio magnitude-certainty monitor (config#976, L4558) —
+        # always-emit from birth so the evaluator distinguishes "producer
+        # didn't run" from "ran, magnitude not yet certain at this sample
+        # size" (the no-action monitor's whole point per the Director's
+        # ruling). Same rationale as sample_size.json above.
+        ("risk_ratio_ci.json", risk_ratio_ci),
         # Decision-stream action entropy (config#1151 Batch C, executor tile) —
         # always-emit so the evaluator distinguishes "producer didn't run" from
         # "ran, decision distribution collapsed / no labelled decision stream".
@@ -1680,6 +1724,13 @@ def save(
         # N/A on any non-"ok" status, so emitting the non-ok body is safe.
         ("score_calibration.json", score_calibration),
         ("macro_eval.json", macro_eval),
+        # Universe-board attractiveness eval (config#1389/#1392/#1398) —
+        # always-emit from birth: the crucible-evaluator consumer grades a
+        # non-"ok" body as an honest N/A-with-reason, and absence must
+        # unambiguously mean "producer never ran" (same rationale as the
+        # freshness-monitored artifacts above). Frozen cross-repo schema v1:
+        # contracts/attractiveness_eval.schema.json.
+        ("attractiveness_eval.json", attractiveness_eval),
         ("portfolio_calibration.json", calibration_diagnostics),
         # Optimizer churn / walk-forward stability (config#1151 Batch C) —
         # always-emit so the evaluator's backtester tile distinguishes "producer
@@ -1970,10 +2021,10 @@ def _section_attribution(attr: dict) -> list[str]:
     mv = attr.get("multivariate") or {}
     mv_targets = mv.get("targets") or {}
     if mv.get("status") == "ok" and mv_targets:
-        b21 = mv_targets.get("beat_spy_21d", {})
+        b21 = mv_targets.get(_BEAT_PRIMARY, {})
         lines += [
             "",
-            "### Multivariate attribution (joint regression → beat_spy_21d)",
+            f"### Multivariate attribution (joint regression → {_BEAT_PRIMARY})",
             "",
             "Standardized partial coefficients from a joint OLS on sub-scores "
             "+ market_regime (each input held against the others).",
@@ -1990,7 +2041,7 @@ def _section_attribution(attr: dict) -> list[str]:
                 lines += ["", f"R² (21d): {_fmt(b21.get('r_squared'))}"]
         else:
             lines += [
-                f"> beat_spy_21d fell back to univariate: {b21.get('note', '')}",
+                f"> {_BEAT_PRIMARY} fell back to univariate: {b21.get('note', '')}",
             ]
         fell_back = mv.get("targets_fell_back_to_univariate")
         if fell_back:
@@ -2018,8 +2069,8 @@ def _section_attribution(attr: dict) -> list[str]:
         "|-----------|------------|---------------|",
     ]
     for label, corrs in attr.get("correlations", {}).items():
-        c21 = corrs.get("beat_spy_21d")
-        fdr_21 = "Yes" if corrs.get("beat_spy_21d_fdr_significant") else "No"
+        c21 = corrs.get(_BEAT_PRIMARY)
+        fdr_21 = "Yes" if corrs.get(f"{_BEAT_PRIMARY}_fdr_significant") else "No"
         lines.append(f"| {label} | {_fmt(c21)} | {fdr_21} |")
 
     ranking_21d = attr.get("ranking_21d", [])
@@ -2422,8 +2473,8 @@ def _section_weight_recommendation(result: dict) -> list[str]:
     ]
     for k in ("news", "research"):
         corr = correlations.get(k, {})
-        c5 = corr.get("beat_spy_5d")
-        c21 = corr.get("beat_spy_21d")
+        c5 = corr.get(_BEAT_SHORT)
+        c21 = corr.get(_BEAT_PRIMARY)
         chg = changes.get(k, 0)
         chg_str = f"+{chg:.1%}" if chg > 0 else f"{chg:.1%}"
         lines.append(

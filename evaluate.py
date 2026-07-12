@@ -40,7 +40,7 @@ import json
 import logging
 import os
 import time as _time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
@@ -52,6 +52,7 @@ from pathlib import Path
 #
 # exclude_patterns starts empty by deliberate convention.
 from nousergon_lib.logging import setup_logging, guard_entrypoint
+from nousergon_lib.quant.horizons import DEFAULT_POLICY as _HORIZON_POLICY
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
 setup_logging(
@@ -67,6 +68,7 @@ import yaml
 
 from analysis import signal_quality, regime_analysis, score_analysis, attribution
 from analysis.sample_size_adequacy import compute_sample_size_adequacy
+from analysis.risk_ratio_ci import compute_risk_ratio_ci
 from analysis.action_entropy import compute_action_entropy_artifact
 from analysis.optimizer_churn import compute_optimizer_churn
 from analysis.walk_forward_stability import compute_walk_forward_stability
@@ -77,6 +79,7 @@ from analysis import decision_capture_coverage, executor_decision_capture_covera
 from analysis import cio_rule_tag_precision
 from analysis import agent_justification
 from analysis import end_to_end
+from analysis import attractiveness_eval as attractiveness_eval_analysis
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
 from analysis import behavioral_anomaly as behavioral_anomaly_analysis
@@ -263,13 +266,12 @@ def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict)
         return sq_result, [], [], {"status": "skipped"}, None
 
     # Load df_base for downstream modules. Outcome columns are re-sourced from
-    # the long-format score_performance_outcomes store (config#1483/#1528) via
-    # the repo's single accessor — every downstream consumer of df_base reads
-    # long-format outcome data under the HorizonPolicy-derived column names.
+    # the long-format score_performance_outcomes store (config#1483/#1528/#1529)
+    # inside load_score_performance (the repo's single accessor) — every
+    # downstream consumer of df_base reads long-format outcome data under the
+    # HorizonPolicy-derived column names.
     try:
-        from analysis.outcome_store import attach_outcomes
         df_base = signal_quality.load_score_performance(db_path)
-        df_base = attach_outcomes(df_base, db_path)
     except Exception:
         df_base = None
 
@@ -310,21 +312,54 @@ def _check_data_freshness(db_path: str) -> None:
     them (corrupt DB, missing table, etc.) but do not raise — the caller's
     main pipeline should continue. Previously this caught all exceptions
     silently with ``pass``, which hid real DB corruption and SQL errors.
+
+    config#1483/#1529: "resolved" is now determined by the long-format
+    score_performance_outcomes store, not the wide return_Nd columns. Staleness
+    is gated on the PRIMARY horizon only — that is the canonical resolution the
+    Phase-2 producer must deliver. The DIAGNOSTIC horizon (5d) is intentionally
+    optional (an unproduced diagnostic horizon yields no store rows by design),
+    so its absence is NOT a freshness defect and would raise spurious warnings.
+    The retired 10d/30d horizons are DROPPED (config#1456 — dead columns). A row
+    is stale if its score_date is old enough that the primary horizon should have
+    resolved (its trading-day window + a producer-lag grace), yet no primary-
+    horizon store row exists. Gating on one horizon also avoids double-counting a
+    row across horizons.
     """
     import sqlite3
+
+    from analysis.outcome_store import store_exists
+
+    policy = _HORIZON_POLICY
+    primary_h = int(policy.primary_horizon)
+    # Calendar-day staleness threshold: the primary horizon's trading-day window
+    # (~1.4 calendar days per trading day) plus a producer-lag grace, preserving
+    # the spirit of the legacy 21d→~30d threshold.
+    threshold_days = int(round(primary_h * 1.4)) + 2
     try:
         conn = sqlite3.connect(db_path)
-        stale = conn.execute(
-            "SELECT COUNT(*) FROM score_performance "
-            "WHERE (return_5d IS NULL AND score_date <= date('now', '-10 days')) "
-            "   OR (return_10d IS NULL AND score_date <= date('now', '-14 days')) "
-            "   OR (return_30d IS NULL AND score_date <= date('now', '-45 days'))"
-        ).fetchone()[0]
-        conn.close()
+        try:
+            if not store_exists(conn):
+                logger.warning(
+                    "Data freshness: score_performance_outcomes store absent — "
+                    "long-format producer (signal_returns Step 2c) has not run"
+                )
+                return
+            stale = conn.execute(
+                "SELECT COUNT(*) FROM score_performance sp "
+                "WHERE sp.score_date <= date('now', ?) "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM score_performance_outcomes o "
+                "    WHERE o.symbol = sp.symbol AND o.score_date = sp.score_date "
+                "      AND o.horizon_days = ?)",
+                (f"-{threshold_days} days", primary_h),
+            ).fetchone()[0]
+        finally:
+            conn.close()
         if stale > 0:
             logger.warning(
-                "Data freshness: %d score_performance rows have missing returns "
-                "(data module may not have run signal_returns collector)", stale,
+                "Data freshness: %d score_performance rows have no resolved "
+                "primary-horizon (%dd) outcome (data module may not have run "
+                "signal_returns collector)", stale, primary_h,
             )
     except Exception as exc:
         logger.error(
@@ -377,11 +412,11 @@ def _run_diagnostics(
     factor_loadings: dict = {}
     pillar_profiles: dict = {}
     trajectory_scores: dict = {}
+    bucket = config.get("signals_bucket", "alpha-engine-research")
     if avail.get("research_db"):
         try:
             import sqlite3 as _sqlite3
 
-            bucket = config.get("signals_bucket", "alpha-engine-research")
             _conn = _sqlite3.connect(db_path)
             try:
                 eval_dates = [
@@ -417,7 +452,27 @@ def _run_diagnostics(
         lambda: end_to_end.compute_lift_metrics(
             research_db_path=db_path, trades_db_path=trades_db,
             factor_loadings=factor_loadings, pillar_profiles=pillar_profiles,
-            trajectory_scores=trajectory_scores,
+            trajectory_scores=trajectory_scores, bucket=bucket,
+        ),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Universe-board attractiveness composite vs realized forward alpha
+    # (config#1389 per-pillar IC + suggested 1/N-shrunk weights, config#1392
+    # trajectory forward-IC, config#1398 top-N counterfactual vs the live
+    # tech_score gate). Read-only measurement — emits SUGGESTED weights inside
+    # the artifact only, never writes config/factor_attractiveness_weights.json.
+    # Reuses the trajectory_scores dict loaded above for e2e_lift (no second
+    # S3 read); frozen cross-repo schema v1 in
+    # contracts/attractiveness_eval.schema.json.
+    results["attractiveness_eval"] = tracker.run_module(
+        "attractiveness_eval",
+        lambda: attractiveness_eval_analysis.compute_attractiveness_eval(
+            db_path,
+            as_of=config.get("_run_date") or date.today().isoformat(),
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            trajectory_scores=trajectory_scores or None,
         ),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
@@ -675,8 +730,10 @@ def _run_diagnostics(
         required_inputs={},
     )
 
-    # Quant rank quality — per-sector corr(quant_rank, return_5d) over a
-    # rolling 8-week window. Surfaces "is the technical scorer's
+    # Quant rank quality — per-sector corr(quant_rank, realized return) over a
+    # rolling 8-week window, at both policy horizons (diagnostic 5d legacy
+    # keys + canonical 21d suffixed keys, config#1529). Surfaces "is the
+    # technical scorer's
     # ranking even ordering correctly?" before drift compounds. The
     # 2026-05-09 evaluator-email post-mortem found healthcare/industrials/
     # tech rank-correlations at +0.33-0.36 (anti-skill); without this
@@ -930,12 +987,23 @@ def _read_current_weights(config: dict) -> dict:
             with open(universe_yaml) as f:
                 universe = yaml.safe_load(f)
             weights = universe.get("scoring_weights", {})
-            if weights:
-                return weights
         except Exception:
-            pass
+            weights = {}
+        if weights:
+            # Fail-loud key guard (config#1842): a drifted scoring_weights
+            # block in research's universe.yaml would reproduce the phantom
+            # 0.0 baseline downstream. Raise (isolated per-module by
+            # tracker.run_module) instead of returning drifted keys.
+            from optimizer.config_guards import validate_keyed_block
+            validate_keyed_block(
+                weights, weight_optimizer.SUB_SCORES,
+                config_path="crucible-research config/universe.yaml scoring_weights",
+            )
+            return weights
 
-    return weight_optimizer._cfg.get("default_weights", weight_optimizer._DEFAULT_WEIGHTS).copy()
+    # Validated chokepoint (config#1842): raises ConfigKeyDriftError on a
+    # stale default_weights block instead of silently zero-filling.
+    return weight_optimizer.configured_default_weights()
 
 
 def _run_optimizers(
@@ -1109,7 +1177,126 @@ def _run_optimizers(
         skip_if_missing=None,  # runs in degraded mode, doesn't skip
     )
 
+    if not freeze:
+        manifest_date = run_date or config.get("_run_date")
+        if not manifest_date:
+            from nousergon_lib.dates import today_iso
+            manifest_date = today_iso()
+        write_optimizer_run_manifest(
+            bucket,
+            manifest_date,
+            results,
+            freeze=freeze,
+        )
+
     return results
+
+
+def _summarize_optimizer_module(name: str, result: dict | None) -> dict:
+    """Compact per-optimizer row for the optimizer_run freshness proxy."""
+    if not result:
+        return {"ran": False, "applied": False, "reason": "no_result"}
+    status = result.get("status")
+    if status == "skipped":
+        return {
+            "ran": False,
+            "applied": False,
+            "reason": result.get("degradation_reason") or "skipped",
+        }
+    if status == "error":
+        return {"ran": True, "applied": False, "reason": result.get("error", "error")}
+
+    apply = result.get("apply_result")
+    if apply is None:
+        apply = result.get("apply")
+    if isinstance(apply, dict):
+        applied = bool(apply.get("applied"))
+        reason = apply.get("reason") or result.get("status", "ok")
+        return {"ran": True, "applied": applied, "reason": reason}
+
+    return {"ran": True, "applied": False, "reason": result.get("status", "ok")}
+
+
+def write_optimizer_run_manifest(
+    bucket: str,
+    run_date: str,
+    results: dict,
+    *,
+    freeze: bool,
+    s3_client=None,
+) -> str:
+    """Write the Saturday optimizer-stage liveness proxy (config#1726).
+
+    Unconditionally records which optimizers ran/applied/declined. Raises on
+    S3 failure — this artifact is load-bearing for event_driven config rows.
+    """
+    if freeze:
+        return ""
+
+    import boto3
+
+    client = s3_client or boto3.client("s3")
+    key = f"optimizer_run/{run_date}.json"
+    payload = {
+        "trading_day": run_date,
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "freeze": freeze,
+        "optimizers": {
+            name: _summarize_optimizer_module(name, result)
+            for name, result in results.items()
+        },
+    }
+    client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    logger.info("Wrote optimizer run manifest s3://%s/%s", bucket, key)
+    return key
+
+
+def _portfolio_daily_returns_from_team_lift(team_lift: list[dict], prices, horizon_days: int = 10):
+    """Portfolio-wide aligned daily-return series from the e2e team-lift picks.
+
+    ``risk_ratio_ci`` (config#976) needs a single portfolio-level daily-return
+    series (mirroring the ``pf_returns_aligned`` series ``backtest.py``'s
+    deployed-strategy headline computes via ``_simulate_and_measure`` — a
+    process-separate, JSON-only artifact that does not carry raw series back
+    to evaluate.py). Rather than re-simulate the MVO solver here, this
+    aggregates every team's picks (already loaded for ``compute_team_metrics``
+    a few lines above) into one equal-weight portfolio sleeve via the same
+    ``compute_team_daily_returns`` helper each team already uses, stamping a
+    single synthetic ``team_id="portfolio"`` across all picks.
+
+    Returns ``None`` when there are no usable picks (caller degrades to
+    ``risk_ratio_ci`` reporting ``insufficient_data``, matching the module's
+    own always-emit contract).
+    """
+    if not team_lift or prices is None or getattr(prices, "empty", True):
+        return None
+
+    from analysis.team_daily_returns import compute_team_daily_returns
+
+    all_picks: list[dict] = []
+    for team in team_lift:
+        for pick in team.get("picks") or []:
+            all_picks.append({**pick, "team_id": "portfolio"})
+    if not all_picks:
+        return None
+
+    picks_df = pd.DataFrame(all_picks)
+    try:
+        portfolio_returns = compute_team_daily_returns(
+            picks_df, prices, horizon_days=horizon_days,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort; risk_ratio_ci degrades gracefully
+        logger.warning("[risk_ratio_ci] portfolio daily-returns aggregation failed: %s", e)
+        return None
+    series = portfolio_returns.get("portfolio")
+    if series is None or series.empty:
+        return None
+    return series
 
 
 def _run_weight_opt(config: dict, df_base, freeze: bool) -> dict:
@@ -1656,12 +1843,25 @@ def _main_impl() -> None:
         # This is handled by the diagnostics dict being empty
 
     # ── Optimizers ───────────────────────────────────────────────────────
+    # config#1841: the optimizer stage is wrapped so the apply-audit artifact
+    # below is emitted even when the stage itself raises (per-LOOP errors are
+    # already isolated by tracker.run_module; this catches stage-level raises
+    # such as write_optimizer_run_manifest's load-bearing S3 failure). The
+    # original error re-raises after emission — except-log-emit-reraise, no
+    # swallow.
+    opt_stage_error: BaseException | None = None
     if run_optimizers:
-        opt_results = _run_optimizers(
-            config, tracker, avail, df_base,
-            freeze=args.freeze,
-            diagnostics=diagnostics,
-        )
+        try:
+            opt_results = _run_optimizers(
+                config, tracker, avail, df_base,
+                freeze=args.freeze,
+                diagnostics=diagnostics,
+            )
+        except Exception as e:
+            opt_stage_error = e
+            logger.error(
+                "Optimizer stage raised: %s — emitting apply-audit before re-raising", e,
+            )
 
     # ── Assembler (optimizer-artifact-assembler arc) ────────────────────
     # Reads the per-optimizer recommendation artifacts written by each
@@ -1672,7 +1872,8 @@ def _main_impl() -> None:
     # individual optimizers' apply() paths skip their legacy live writes
     # (gated by ``optimizer.assembler.is_cutover_enabled()``).
     # Failure is non-fatal: the assembler must not break the pipeline.
-    if run_optimizers and not args.freeze:
+    assemble_result = None
+    if run_optimizers and opt_stage_error is None and not args.freeze:
         try:
             from optimizer.assembler import assemble, is_cutover_enabled
             bucket = config.get("signals_bucket", "alpha-engine-research")
@@ -1697,6 +1898,46 @@ def _main_impl() -> None:
             # Assembler failure must not break the pipeline.
             logger.warning(
                 "Assembler run failed (non-fatal — pipeline continues): %s", e,
+            )
+
+    # ── Apply-audit artifact (config#1841) ───────────────────────────────
+    # Unconditional per-loop outcome record for the four auto-apply loops
+    # (promoted / blocked-by-guardrail / insufficient_data / disabled /
+    # error) → config/apply_audit/{date}.json + latest.json. The S3 write
+    # rides the same args.upload gate as sibling artifacts (--freeze /
+    # local runs build + log the audit without persisting); build/log is
+    # unconditional so a blocked apply can never again be silent.
+    apply_audit_upload = bool(getattr(args, "upload", False)) and not args.freeze
+    if run_optimizers:
+        from optimizer.apply_audit import emit_apply_audit
+        apply_audit_result = emit_apply_audit(
+            bucket=config.get("signals_bucket", "alpha-engine-research"),
+            run_date=args.date,
+            opt_results=opt_results,
+            assembler_result=assemble_result,
+            upload=apply_audit_upload,
+            run_error=opt_stage_error,
+        )
+        if opt_stage_error is not None:
+            raise opt_stage_error
+
+        # ── Post-optimizer live-key reconciliation (config#2332) ─────────
+        # Complements config#2331 (assembler fail-loud at the write site):
+        # this catches ANY path that produces the config#2054 orphaned-write
+        # shape — a config type apply_audit grades "promoted" this run
+        # whose live S3 key was not actually refreshed. Only meaningful
+        # against the real bucket, so it rides the same upload gate as the
+        # audit write itself (--freeze / local runs have no live key to
+        # reconcile against). Failure to page must not break the pipeline —
+        # see live_key_reconciliation.run_reconciliation's fail-loud-but-
+        # non-aborting contract.
+        if apply_audit_upload:
+            from optimizer.live_key_reconciliation import run_reconciliation
+            run_reconciliation(
+                bucket=config.get("signals_bucket", "alpha-engine-research"),
+                audit=apply_audit_result,
+                run_start=datetime.fromtimestamp(_health_start, tz=timezone.utc),
+                run_date=args.date,
             )
 
     # ── Regression detection ─────────────────────────────────────────────
@@ -1739,6 +1980,13 @@ def _main_impl() -> None:
         team_metrics = {}
         portfolio_calibration = {"status": "insufficient_data"}
         portfolio_excursion = {"status": "insufficient_data"}
+        risk_ratio_ci_result = {
+            "status": "insufficient_data",
+            "n_samples": 0,
+            "ratios": {},
+            "all_magnitude_certain": False,
+            "note": "evaluator-revamp metric bundle did not run",
+        }
         try:
             team_lift_for_metrics = (
                 diagnostics.get("e2e_lift") or {}
@@ -1761,6 +2009,19 @@ def _main_impl() -> None:
             portfolio_calibration = compute_portfolio_calibration(df_base)
             portfolio_excursion = compute_portfolio_excursion_summary(
                 df_base, ohlc_for_metrics, horizon_days=10,
+            )
+
+            # Risk-ratio magnitude-certainty monitor (config#976, L4558): block-
+            # bootstrap CIs for Sharpe/Sortino/Information Ratio over the same
+            # portfolio-wide daily-return sleeve derived from team_lift picks
+            # above (no new data read). ALWAYS-EMIT — compute_risk_ratio_ci's own
+            # insufficient_data/no_benchmark degrade paths handle thin data; this
+            # try/except only guards the aggregation step itself.
+            pf_returns_for_risk_ratio = _portfolio_daily_returns_from_team_lift(
+                team_lift_for_metrics, prices_for_metrics, horizon_days=10,
+            )
+            risk_ratio_ci_result = compute_risk_ratio_ci(
+                pf_returns_for_risk_ratio, spy_returns_for_metrics,
             )
         except Exception as e:
             logger.warning("evaluator-revamp metric bundle failed: %s", e)
@@ -1929,6 +2190,35 @@ def _main_impl() -> None:
                 "",
             ])
 
+        # 10y rolling-window regime-parameter STABILITY section (config#952).
+        # Slides a true 10-year window across score_performance and re-
+        # identifies each regime's best stance parameterization per window,
+        # then reports cross-window stability (a sign-flipping parameter is
+        # regime noise, not a durable regime parameter). Observability only —
+        # never auto-applied to the factor blend (curve-fitting firewall).
+        # Self-loads from research_db and never raises; guarded to match the
+        # calibration/cost section contract.
+        try:
+            from analysis.rolling_regime_params import (
+                build_rolling_regime_params_report_section,
+            )
+            report_md = report_md + "\n" + build_rolling_regime_params_report_section(
+                config.get("research_db")
+            )
+        except Exception as rrp_err:  # noqa: BLE001 — see cost section above
+            logger.error(
+                "[rolling_regime_params] section render failed: %s — emitting "
+                "error placeholder so operators see the regression",
+                rrp_err,
+            )
+            report_md = report_md + "\n" + "\n".join([
+                "## 10y rolling regime parameters (stability)",
+                "",
+                f"- _Rolling-regime-params render failed: `{rrp_err}`._",
+                "  Investigate `analysis/rolling_regime_params.py`.",
+                "",
+            ])
+
         # Attribution sample-adequacy PERSISTENCE section (config#946 part 2).
         # sample_size_adequacy grades the per-cycle snapshot; this watches the
         # cross-cycle trailing run of attribution `insufficient_data` and warns
@@ -1990,6 +2280,7 @@ def _main_impl() -> None:
             exit_timing=diagnostics.get("exit_timing"),
             behavioral_anomaly=diagnostics.get("behavioral_anomaly"),
             sample_size=compute_sample_size_adequacy(sq_result, attr_result),
+            risk_ratio_ci=risk_ratio_ci_result,
             action_entropy=action_entropy_result,
             optimizer_churn=optimizer_churn_result,
             walk_forward_stability=walk_forward_stability_result,
@@ -2009,6 +2300,7 @@ def _main_impl() -> None:
             barrier_coherence=diagnostics.get("barrier_coherence"),
             score_calibration=diagnostics.get("score_calibration"),
             macro_eval=diagnostics.get("macro_eval"),
+            attractiveness_eval=diagnostics.get("attractiveness_eval"),
             team_metrics=team_metrics or None,
             calibration_diagnostics=portfolio_calibration,
             excursion_summary=portfolio_excursion,
@@ -2104,7 +2396,7 @@ def _main_impl() -> None:
     finally:
         # Health status
         try:
-            from health_status import write_health
+            from nousergon_lib.health import Deliverable, write_health
             summary = tracker.summary()
             configs_applied = []
             for label, key in [
@@ -2116,23 +2408,27 @@ def _main_impl() -> None:
                 if res and res.get("apply_result", {}).get("applied"):
                     configs_applied.append(label)
 
-            status = "ok"
+            stage_warnings = []
             if summary.get("error", 0) > 0:
-                status = "degraded"
-            if summary.get("ok", 0) == 0:
-                status = "failed"
-            if not report_ok:
-                # Report build / upload / email crashed. The tracker's
-                # per-stage summary doesn't capture this because the crash
-                # happens after all [OK] stages finish. Mark the run failed
-                # so the health marker matches reality.
-                status = "failed"
+                stage_warnings.append(
+                    f"{summary.get('error', 0)} evaluation stage(s) errored"
+                )
 
             bucket = config.get("signals_bucket", "alpha-engine-research")
             write_health(
-                bucket=bucket,
                 module_name="evaluator",
-                status=status,
+                deliverables=[
+                    Deliverable(
+                        name="evaluation_stages",
+                        required=True,
+                        produced=summary.get("ok", 0) > 0,
+                    ),
+                    Deliverable(
+                        name="evaluation_report",
+                        required=True,
+                        produced=report_ok,
+                    ),
+                ],
                 run_date=args.date,
                 duration_seconds=_time.time() - _health_start,
                 summary={
@@ -2140,6 +2436,8 @@ def _main_impl() -> None:
                     "completeness": summary,
                     "configs_applied": configs_applied,
                 },
+                warnings=stage_warnings or None,
+                bucket=bucket,
             )
         except Exception as _he:
             logger.warning("Health status write failed: %s", _he)

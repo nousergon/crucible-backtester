@@ -555,6 +555,7 @@ def _select_best_threshold(
     if best_lift is not None and best_lift < min_lift:
         return {
             "status": "insufficient_lift",
+            "blocked_by": ["min_lift_over_base_rate"],
             "fit_target": fit_target,
             "current_threshold": current_default,
             "base_rate": round(base_rate, 4),
@@ -582,6 +583,7 @@ def _select_best_threshold(
         if ci_lower is not None and ci_lower <= base_rate:
             return {
                 "status": "insufficient_confidence",
+                "blocked_by": ["precision_ci_below_base_rate"],
                 "fit_target": fit_target,
                 "current_threshold": current_default,
                 "base_rate": round(base_rate, 4),
@@ -689,14 +691,41 @@ def apply(result: dict, bucket: str) -> dict:
     if recommended is None:
         return {"applied": False, "reason": "no recommended threshold"}
 
-    if abs(recommended - current) < min_change:
+    # Bootstrap: if no S3 artifact exists (s3_current is None), allow the first write
+    # even if it equals the default. The artifact's existence establishes the baseline
+    # for future min_threshold_change gates. Only write if significance verdict permits.
+    is_bootstrap = s3_current is None
+
+    if not is_bootstrap and abs(recommended - current) < min_change:
         return {
             "applied": False,
+            "blocked_by": ["min_threshold_change"],
             "reason": (
                 f"Recommended ({recommended:.2f}) too close to current "
                 f"({current:.2f}) — need {min_change}+ difference"
             ),
         }
+
+    # For bootstrap writes: check significance verdict first, block if failing
+    if is_bootstrap:
+        if bool(_cfg.get("enforce_significance", False)):
+            from optimizer.significance_observe import significance_would_block
+            verdict = result.get("significance_observe")
+            if significance_would_block(verdict):
+                logger.info(
+                    "veto_analysis: bootstrap seed BLOCKED by significance floor (config#1426)"
+                )
+                return {
+                    "applied": False,
+                    "blocked_by": ["significance_floor"],
+                    "reason": "veto_analysis: bootstrap seed blocked by significance enforce "
+                              "(config#1426) — undefended evidence",
+                    "observe_verdict": verdict,
+                }
+        logger.info(
+            "veto_analysis: bootstrap seed write (no prior S3 artifact) with "
+            "recommendation %.2f", recommended
+        )
 
     fit_target = result.get("fit_target", "precision_minus_alpha_cost_legacy")
     enforce_skill_composite = bool(_cfg.get("enforce_skill_composite", False))
@@ -716,6 +745,17 @@ def apply(result: dict, bucket: str) -> dict:
         "updated_at": str(date.today()),
         "recommendation_reason": result.get("recommendation_reason"),
     }
+
+    # Per-sector veto threshold shadow soak (config#921). Default OFF — mirrors
+    # the use_factor_blend_target naming/default-off convention. Brian's ruling
+    # (2026-07-07, config#921): "proceed with shadow soak" — attach the fitted
+    # overrides to the SAME artifact veto_confidence already writes to (no new
+    # S3 prefix) so the predictor can read+log a shadow decision, but nothing
+    # here changes what gets written for the live scalar threshold above.
+    if bool(_cfg.get("veto_sector_shadow_enabled", False)):
+        overrides = result.get("per_sector_thresholds", {}).get("overrides") or {}
+        if overrides:
+            payload["per_sector_overrides"] = overrides
 
     s3 = boto3.client("s3")
     body = json.dumps(payload, indent=2)
@@ -758,7 +798,8 @@ def apply(result: dict, bucket: str) -> dict:
     # precision lift is not statistically significant (Wilson lower bound not
     # above base rate → would_block). Missing verdict → conservative block.
     # Enforce can only BLOCK a promotion the live gate already allowed.
-    if bool(_cfg.get("enforce_significance", False)):
+    # NOTE: bootstrap writes already checked this above; skip for non-bootstrap.
+    if not is_bootstrap and bool(_cfg.get("enforce_significance", False)):
         from optimizer.significance_observe import significance_would_block
         verdict = result.get("significance_observe")
         if significance_would_block(verdict):
@@ -767,6 +808,7 @@ def apply(result: dict, bucket: str) -> dict:
             )
             return {
                 "applied": False,
+                "blocked_by": ["significance_floor"],
                 "reason": "veto_analysis: blocked by significance enforce "
                           "(config#1426) — undefended evidence",
                 "observe_verdict": verdict,

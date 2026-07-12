@@ -156,6 +156,10 @@ param_sweep:
 
 # ── Weight optimizer guardrails ──────────────────────────────────────────────
 weight_optimizer:
+  # Keys must EXACTLY match optimizer/weight_optimizer.py::SUB_SCORES —
+  # validated fail-loud at read (ConfigKeyDriftError on drift, config#1842):
+  # the pre-2026-03-29 news/research keys silently zero-filled the baseline
+  # and permanently tripped max_single_change.
   default_weights:
     quant: 0.50
     qual: 0.50
@@ -171,9 +175,29 @@ weight_optimizer:
   # 2026-07-01) — must match _SHORT_OUTCOME/_LONG_OUTCOME in
   # optimizer/weight_optimizer.py. A stale key here silently falls through to
   # the 0.50 default instead of raising (config#1426 flip finding, live repo).
+  # Keys must match the HorizonPolicy beat-SPY outcome columns — validated
+  # fail-loud (config#1842; the retired beat_spy_10d/30d keys silently made
+  # the tuned blend inert until 2026-07-01).
   horizon_blend:
     beat_spy_5d: 0.50
     beat_spy_21d: 0.50
+  # Skill-composite fit target (evaluator-revamp arc). When
+  # use_skill_composite_target is true the optimizer fits weights via
+  # Spearman IC against CONTINUOUS realized outcomes (canonical horizon:
+  # HorizonPolicy.skill_target_column → log-domain market-relative alpha;
+  # diagnostic horizon: raw return) instead of legacy Pearson against the
+  # binary beat-SPY flag. enforce_skill_composite then decides where the
+  # resulting weights land:
+  #   - false → SHADOW: candidates write only to
+  #     config/scoring_weights_shadow_history/ (+ latest.json); live
+  #     config/scoring_weights.json is untouched.
+  #   - true → ENFORCE: IC-derived weights write live scoring_weights.json.
+  # The LIVE system (alpha-engine-config/backtester/config.yaml, private)
+  # has run use=true + enforce=true since 2026-05-09, backstopped since
+  # 2026-07-01 by enforce_significance below. Decision 2026-07-08:
+  # KEEP enforce=true (ratified live posture, defended by significance floor).
+  use_skill_composite_target: true
+  enforce_skill_composite: true
   # config#1426 Phase 4 — per-gate significance-enforce flag, default OFF.
   # When true, a promotion the live guardrails already allow is additionally
   # required to clear a signed, canonical-21d-horizon IC floor

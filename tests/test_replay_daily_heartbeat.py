@@ -221,7 +221,7 @@ class TestReplayForDatesBootstrapDailyHeartbeat:
             patch.object(bt, "_load_initial_state_from_eod_pnl", return_value=bootstrap),
             patch("loaders.signal_loader.load", side_effect=_load),
             patch.object(bt, "_simulate_single_date", side_effect=_simulate_single_date_stub),
-            patch("alpha_engine_lib.arcticdb.get_universe_symbols", return_value={"AAPL", "MSFT"}),
+            patch("nousergon_lib.arcticdb.get_universe_symbols", return_value={"AAPL", "MSFT"}),
         ):
             bt.replay_for_dates(["2026-04-17"], {
                 "trades_db_path": "/tmp/fake.db",
@@ -279,7 +279,7 @@ class TestReplayForDatesBootstrapDailyHeartbeat:
             patch.object(bt, "_load_initial_state_from_eod_pnl", return_value=bootstrap),
             patch("loaders.signal_loader.load", side_effect=_load),
             patch.object(bt, "_simulate_single_date", side_effect=_simulate_single_date_stub),
-            patch("alpha_engine_lib.arcticdb.get_universe_symbols", return_value=set()),
+            patch("nousergon_lib.arcticdb.get_universe_symbols", return_value=set()),
         ):
             bt.replay_for_dates(["2026-04-16"], {
                 "trades_db_path": "/tmp/fake.db",
@@ -323,7 +323,7 @@ class TestReplayForDatesBootstrapDailyHeartbeat:
             patch.object(bt, "_load_initial_state_from_eod_pnl", return_value=bootstrap),
             patch("loaders.signal_loader.load", side_effect=_load),
             patch.object(bt, "_simulate_single_date", side_effect=_simulate_single_date_stub),
-            patch("alpha_engine_lib.arcticdb.get_universe_symbols", return_value=set()),
+            patch("nousergon_lib.arcticdb.get_universe_symbols", return_value=set()),
         ):
             captured = bt.replay_for_dates(["2026-04-15"], {
                 "trades_db_path": "/tmp/fake.db",
@@ -402,7 +402,7 @@ class TestReplayForDatesPerDateBootstrap:
             patch.object(bt, "_load_initial_state_from_eod_pnl",
                          side_effect=_bootstrap),
             patch.object(bt, "_simulate_single_date", side_effect=_simulate),
-            patch("alpha_engine_lib.arcticdb.get_universe_symbols",
+            patch("nousergon_lib.arcticdb.get_universe_symbols",
                   return_value={"AAPL"}),
         ):
             captured = bt.replay_for_dates(parity_dates, {
@@ -461,7 +461,7 @@ class TestReplayForDatesPerDateBootstrap:
             patch.object(bt, "_load_initial_state_from_eod_pnl",
                          side_effect=_bootstrap),
             patch.object(bt, "_simulate_single_date", side_effect=_simulate),
-            patch("alpha_engine_lib.arcticdb.get_universe_symbols",
+            patch("nousergon_lib.arcticdb.get_universe_symbols",
                   return_value=set()),
         ):
             captured = bt.replay_for_dates(parity_dates, {
@@ -505,7 +505,7 @@ class TestReplayForDatesPerDateBootstrap:
             patch.object(bt, "_load_initial_state_from_eod_pnl",
                          side_effect=_bootstrap),
             patch.object(bt, "_simulate_single_date", side_effect=_simulate),
-            patch("alpha_engine_lib.arcticdb.get_universe_symbols",
+            patch("nousergon_lib.arcticdb.get_universe_symbols",
                   return_value=set()),
         ):
             captured = bt.replay_for_dates(parity_dates, {

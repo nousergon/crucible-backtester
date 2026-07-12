@@ -4,7 +4,11 @@ ROADMAP L2222 PR 4.5. Pins the persistence contract:
 - writes per-date + latest JSON to s3://{bucket}/predictor/optimizer_gate/
 - adds a top-level ``passed`` boolean derived from the gate verdict
 - forwards ``legacy_metrics`` to the underlying gate runner
-- non-fatal on S3 write failure (returns payload anyway)
+- FATAL on S3 write failure: raises OptimizerGatePersistError (config#1234).
+  This artifact is the Saturday SF's SOLE predictor-weight promotion lever, so
+  a swallowed persist failure is the silent absence-of-artifact bug the
+  fleet-wide producer-write-swallow audit targets. Persist failure must fail
+  LOUD; only a gate-RUN/verdict failure remains observability-only.
 """
 
 from __future__ import annotations
@@ -145,25 +149,46 @@ class TestLegacyMetricsForwarding:
         assert mock_run_gate.call_args.kwargs["legacy_metrics"] is None
 
 
-class TestS3FailureIsNonFatal:
+class TestS3FailureIsFatal:
+    """config#1234 root-cause fix. A PERSIST failure of the load-bearing
+    optimizer-gate report must fail LOUD (previously swallowed to a WARNING —
+    the silent absence-of-artifact bug the audit targets). The report is the
+    Saturday SF's SOLE predictor-weight promotion lever, so a stale/absent write
+    that the backtester reports as success is exactly the failure mode to
+    prevent. Contrast: a gate-RUN/verdict failure remains observability-only,
+    handled by the outer phase block's generic except."""
+
     @patch("analysis.portfolio_optimizer_gate.run_gate_against_predictor_backtest")
-    def test_s3_put_failure_returns_payload(
+    def test_s3_put_failure_raises_persist_error(
         self, mock_run_gate, fake_gate_result_pass,
     ):
-        """S3 write failures must NOT raise — gate is observability, not a
-        backtester-pipeline blocker per the phase block's try/except."""
         mock_run_gate.return_value = fake_gate_result_pass
         s3 = MagicMock()
         s3.put_object.side_effect = Exception("simulated S3 error")
-        # Must not raise
-        result = bt.run_portfolio_optimizer_gate(
-            config={"signals_bucket": "b"},
-            run_date="2026-05-12",
-            s3_client=s3,
-        )
-        # Still returns the payload so the caller can log / report
-        assert result["passed"] is True
-        assert result["run_date"] == "2026-05-12"
+        with pytest.raises(bt.OptimizerGatePersistError):
+            bt.run_portfolio_optimizer_gate(
+                config={"signals_bucket": "b"},
+                run_date="2026-05-12",
+                s3_client=s3,
+            )
+
+    @patch("analysis.portfolio_optimizer_gate.run_gate_against_predictor_backtest")
+    def test_persist_error_chains_original_cause(
+        self, mock_run_gate, fake_gate_result_pass,
+    ):
+        """The raised error preserves the underlying S3 exception as __cause__
+        so operators see the root cause, not just the wrapper."""
+        mock_run_gate.return_value = fake_gate_result_pass
+        s3 = MagicMock()
+        original = Exception("simulated S3 error")
+        s3.put_object.side_effect = original
+        with pytest.raises(bt.OptimizerGatePersistError) as excinfo:
+            bt.run_portfolio_optimizer_gate(
+                config={"signals_bucket": "b"},
+                run_date="2026-05-12",
+                s3_client=s3,
+            )
+        assert excinfo.value.__cause__ is original
 
 
 class TestModeArgparseChoice:

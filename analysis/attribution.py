@@ -26,17 +26,28 @@ import logging
 
 import numpy as np
 import pandas as pd
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 from scipy.stats import pearsonr
 
 from analysis.stats_utils import benjamini_hochberg
 
 logger = logging.getLogger(__name__)
 
+# Primary-horizon outcome column names resolve from the fleet HorizonPolicy
+# rather than hardcoded `_Nd` literals (config#1483/#1529). The names are
+# unchanged (beat_spy_21d / return_21d) — these are also the artifact dict keys
+# reporter.py reads, so the identity is load-bearing — but the SOURCE df is now
+# re-sourced from score_performance_outcomes upstream (signal_quality loader).
+_PRIMARY_H = DEFAULT_POLICY.primary_horizon
+_PRIMARY_COLS = DEFAULT_POLICY.outcome_columns(_PRIMARY_H)
+_BEAT = _PRIMARY_COLS.beat_spy      # beat_spy_21d
+_RET = _PRIMARY_COLS.stock_return   # return_21d
+
 SUB_SCORES = ["quant", "qual"]
 PREDICTOR_COLS = ["p_up", "p_down", "prediction_confidence", "predicted_direction"]
 # config#1456: canonical 5d/21d horizons. The 10d/30d outcomes were retired in
 # the canonical-alpha cutover — attribution now regresses on the 21d target only.
-REGRESSION_TARGETS = ["beat_spy_21d", "return_21d"]
+REGRESSION_TARGETS = [_BEAT, _RET]
 
 # Multivariate-fit guards. A joint regression needs enough rows relative to
 # the number of regressors before its partial coefficients are stable, and
@@ -59,14 +70,16 @@ def compute_attribution(df: pd.DataFrame) -> dict:
         {
             "status": "ok" | "insufficient_data",
             "correlations": {
-                "quant": {"beat_spy_21d": 0.12, "return_21d": 0.09, ...},
+                # keys are the primary-horizon outcome column names
+                # (HorizonPolicy.outcome_columns): beat-SPY flag + stock return
+                "quant": {"<beat_spy>": 0.12, "<return>": 0.09, ...},
                 "qual": {...},
             },
             "ranking_21d": ["qual", "quant"],  # descending by correlation
             "note": "..."
         }
     """
-    populated = df[df["beat_spy_21d"].notna()].copy()
+    populated = df[df[_BEAT].notna()].copy()
 
     if len(populated) < 100:
         return {
@@ -95,7 +108,7 @@ def compute_attribution(df: pd.DataFrame) -> dict:
     for label, col in sub_score_cols.items():
         corr_row = {}
         pval_row = {}
-        for target in ["beat_spy_21d", "return_21d"]:
+        for target in [_BEAT, _RET]:
             valid = populated[[col, target]].dropna()
             if len(valid) >= 10:
                 r, p = pearsonr(valid[col], valid[target])
@@ -109,7 +122,7 @@ def compute_attribution(df: pd.DataFrame) -> dict:
 
     ranking_21d = sorted(
         correlations.keys(),
-        key=lambda k: correlations[k].get("beat_spy_21d") or 0,
+        key=lambda k: correlations[k].get(_BEAT) or 0,
         reverse=True,
     )
 
@@ -123,7 +136,7 @@ def compute_attribution(df: pd.DataFrame) -> dict:
             pd.to_numeric(populated["p_up"], errors="coerce").fillna(0)
             - pd.to_numeric(populated["p_down"], errors="coerce").fillna(0)
         )
-        for outcome_col in ["beat_spy_21d"]:
+        for outcome_col in [_BEAT]:
             if outcome_col in populated.columns:
                 valid = populated[["_net_pred", outcome_col]].dropna()
                 if len(valid) >= 10:
@@ -171,6 +184,22 @@ def compute_attribution(df: pd.DataFrame) -> dict:
             key = (label, target)
             correlations[label][f"{target}_fdr_significant"] = fdr_map.get(key, False)
 
+    # Merge predictor's correlation + FDR-significance into `correlations` too
+    # (config#2305 fix). predictor_pvals already participates in the SHARED
+    # BH-FDR correction pool above (`{**p_values, "predictor": predictor_pvals}`),
+    # but until this fix its resulting `fdr_map[("predictor", ...)]` flag was
+    # only ever read back into the separate `predictor_correlation` dict — NOT
+    # into `correlations` — so any downstream consumer that counts significant
+    # flags by scanning `correlations.values()` (e.g. crucible-evaluator's
+    # `fdr_surface_health` tile) silently undercounted the true surface by the
+    # predictor's own test. Folding it in here makes `correlations` the
+    # single, complete view of every test that fed the shared correction.
+    if predictor_corr:
+        correlations["predictor"] = dict(predictor_corr)
+        for target in list(predictor_corr.keys()):
+            key = ("predictor", target)
+            correlations["predictor"][f"{target}_fdr_significant"] = fdr_map.get(key, False)
+
     # Primary attribution (config#920): regress each target jointly on the
     # full input set so each input's contribution is estimated holding the
     # others fixed. Falls back to the univariate correlations above when the
@@ -191,6 +220,18 @@ def compute_attribution(df: pd.DataFrame) -> dict:
         "predictor_hit_rate": predictor_hit_rate,
         "predictor_hit_rate_ci_95": predictor_hit_rate_ci,
         "fdr_non_significant": fdr_non_significant if fdr_non_significant else None,
+        # n_fdr_tests (config#2305): the size of the shared BH-FDR correction
+        # pool (len(all_pvals) above) — persisted so downstream consumers can
+        # calibrate a significant-count band to the ACTUAL test surface rather
+        # than a stale absolute constant. The surface shrank from 8 tests
+        # (2 sub-scores x 4 horizons, pre-config#1456) to 4-5 (2 sub-scores x
+        # 2 canonical horizons, +1 optional predictor test) at the 2026-06-30
+        # canonical-alpha cutover; a fixed "3-15 significant" band calibrated
+        # for the old 8-9-test surface is unreachable on the new 4-5-test one
+        # (BH's rank-1 threshold at n=4 is already 0.0125 — a much taller bar
+        # than at n=8-9), which is why fdr_surface_health could read 0 for
+        # reasons having nothing to do with the underlying signal quality.
+        "n_fdr_tests": len(all_pvals),
         "note": (
             "Primary attribution is multivariate (standardized partial coefficients "
             "from a joint regression on sub-scores + market_regime); univariate "
@@ -389,7 +430,7 @@ def _compute_multivariate_attribution(
     # Ranking: order inputs by |standardized coefficient| on beat_spy_21d
     # when that target was fit jointly (the headline horizon).
     ranking_21d: list[str] = []
-    head = targets.get("beat_spy_21d", {})
+    head = targets.get(_BEAT, {})
     if head.get("method") == "multivariate_ols":
         ranking_21d = sorted(
             head["coefficients"],

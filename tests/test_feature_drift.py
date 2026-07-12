@@ -120,7 +120,7 @@ def test_load_features_from_arctic_uses_open_universe_lib():
     read_result.data = pd.DataFrame({"rsi_14": [50.0, 55.0]}, index=dates)
     lib.read.return_value = read_result
 
-    with patch("alpha_engine_lib.arcticdb.open_universe_lib", return_value=lib) as helper:
+    with patch("nousergon_lib.arcticdb.open_universe_lib", return_value=lib) as helper:
         result = _load_features_from_arctic("alpha-engine-research", ["AAPL"])
 
     helper.assert_called_once_with("alpha-engine-research")

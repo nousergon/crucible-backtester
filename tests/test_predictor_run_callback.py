@@ -85,7 +85,7 @@ class TestPersistFeaturesCallbackContract:
             patch("os.unlink"),
         ):
             result = predictor_run(
-                config={"predictor_paths": ["/tmp"]},
+                config={"predictor_paths": ["/tmp"], "walk_forward": False},
                 persist_features_callback=_capture,
             )
 
@@ -144,7 +144,7 @@ class TestPersistFeaturesCallbackContract:
             patch("os.unlink"),
         ):
             result = predictor_run(
-                config={"predictor_paths": ["/tmp"]},
+                config={"predictor_paths": ["/tmp"], "walk_forward": False},
                 keep_predictions=True,
             )
 
@@ -183,6 +183,6 @@ class TestPersistFeaturesCallbackContract:
         ):
             with pytest.raises(RuntimeError, match="S3 IAM denied"):
                 predictor_run(
-                    config={"predictor_paths": ["/tmp"]},
+                    config={"predictor_paths": ["/tmp"], "walk_forward": False},
                     persist_features_callback=_failing,
                 )
