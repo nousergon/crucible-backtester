@@ -71,6 +71,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # cov_sweep/gamma_sweep), OBSERVE-only, grandfathered like the other per-run
     # diagnostics rather than added to the freshness-SLA registry.
     "backtest.py": 11,
+    # config#1405 research-free backfill parquet (predictor/research_free_backfill/
+    # predictor_outcomes_research_free.parquet) — the durable producer→consumer wire
+    # for the scanner→predictor-direct counterfactual (research.db pulls are
+    # throwaway per-box copies, never pushed back). REGISTERED in
+    # ARTIFACT_REGISTRY.yaml (weekly SLA) rather than grandfathered: silent
+    # absence of this artifact is indistinguishable from "backfill never ran",
+    # which is the exact 2026-07-11 first-live-run failure mode.
+    "analysis/scanner_predictor_research_free_backfill.py": 1,
     # config#1726: optimizer_run/{trading_day}.json liveness proxy for event_driven
     # config_* rows — registered as optimizer_run_manifest in ARTIFACT_REGISTRY.yaml.
     "evaluate.py": 1,

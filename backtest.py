@@ -5639,6 +5639,58 @@ def _main_impl() -> None:
                     args, config, executor_rec, current_executor_params, fd,
                 )
 
+    # ── Scanner -> research-free predictor backfill (config#1405, build items 1+2) ─
+    # Arm 4 of the agentic-ablation ladder ("does the research/agentic layer add
+    # anything over the ML predictor on scanner candidates?"). Populates
+    # `predictor_outcomes_research_free` (ticker, prediction_date, predicted_alpha,
+    # n_research_features_missing) — the table
+    # `analysis/end_to_end.py::_scanner_then_predictor_topN` (shipped separately,
+    # crucible-backtester#419) reads to compute the counterfactual. Runs the FULL
+    # meta-ensemble (crucible-predictor's MetaModel.predict_single) with the 4
+    # research meta-features omitted -> 0.0, over the scanner-passing universe
+    # (scanner_evaluations.quant_filter_pass=1). Idempotent (skip-if-cached on
+    # (ticker, prediction_date)) — a normal weekly run only backfills the delta
+    # since the last pass. OBSERVE-only: gates nothing, feeds e2e_lift once run.
+    # Non-fatal — this is a measurement producer, not a promotion-critical gate;
+    # a failure here must never block the rest of the Saturday pipeline.
+    if args.mode in ("predictor-backtest", "all") and config.get("research_db"):
+        try:
+            with registry.phase("scanner_predictor_research_free_backfill", mode=args.mode):
+                import sqlite3
+
+                from analysis.scanner_predictor_research_free_backfill import run_backfill
+
+                predictor_paths = config.get("predictor_paths") or []
+                if isinstance(predictor_paths, str):
+                    predictor_paths = [predictor_paths]
+                predictor_path = next((p for p in predictor_paths if os.path.isdir(p)), None)
+                if not predictor_path:
+                    logger.warning(
+                        "scanner_predictor_research_free_backfill: no valid "
+                        "predictor_paths configured (%s) — skipping", predictor_paths,
+                    )
+                else:
+                    rf_conn = sqlite3.connect(config["research_db"])
+                    try:
+                        rf_result = run_backfill(
+                            rf_conn,
+                            predictor_path=predictor_path,
+                            bucket=config.get("signals_bucket", "alpha-engine-research"),
+                        )
+                        logger.info(
+                            "scanner_predictor_research_free_backfill: %s", rf_result,
+                        )
+                    finally:
+                        rf_conn.close()
+        except Exception as exc:
+            logger.warning(
+                "scanner_predictor_research_free_backfill phase failed (non-fatal, "
+                "OBSERVE-only — config#1405): %s", exc, exc_info=True,
+            )
+            if fd:
+                fd.report(exc, severity="warning", context={
+                    "site": "scanner_predictor_research_free_backfill", "mode": args.mode})
+
     # ── Portfolio-optimizer cutover gate ──────────────────────────────────
     # ROADMAP L2222 PR 4.5. Runs the constrained MVO optimizer over synthetic
     # predictor history + persists a per-run gate report. Saturday SF reads

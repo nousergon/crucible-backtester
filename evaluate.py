@@ -411,11 +411,11 @@ def _run_diagnostics(
     factor_loadings: dict = {}
     pillar_profiles: dict = {}
     trajectory_scores: dict = {}
+    bucket = config.get("signals_bucket", "alpha-engine-research")
     if avail.get("research_db"):
         try:
             import sqlite3 as _sqlite3
 
-            bucket = config.get("signals_bucket", "alpha-engine-research")
             _conn = _sqlite3.connect(db_path)
             try:
                 eval_dates = [
@@ -451,7 +451,7 @@ def _run_diagnostics(
         lambda: end_to_end.compute_lift_metrics(
             research_db_path=db_path, trades_db_path=trades_db,
             factor_loadings=factor_loadings, pillar_profiles=pillar_profiles,
-            trajectory_scores=trajectory_scores,
+            trajectory_scores=trajectory_scores, bucket=bucket,
         ),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
@@ -1869,18 +1869,38 @@ def _main_impl() -> None:
     # rides the same args.upload gate as sibling artifacts (--freeze /
     # local runs build + log the audit without persisting); build/log is
     # unconditional so a blocked apply can never again be silent.
+    apply_audit_upload = bool(getattr(args, "upload", False)) and not args.freeze
     if run_optimizers:
         from optimizer.apply_audit import emit_apply_audit
-        emit_apply_audit(
+        apply_audit_result = emit_apply_audit(
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=args.date,
             opt_results=opt_results,
             assembler_result=assemble_result,
-            upload=bool(getattr(args, "upload", False)) and not args.freeze,
+            upload=apply_audit_upload,
             run_error=opt_stage_error,
         )
         if opt_stage_error is not None:
             raise opt_stage_error
+
+        # ── Post-optimizer live-key reconciliation (config#2332) ─────────
+        # Complements config#2331 (assembler fail-loud at the write site):
+        # this catches ANY path that produces the config#2054 orphaned-write
+        # shape — a config type apply_audit grades "promoted" this run
+        # whose live S3 key was not actually refreshed. Only meaningful
+        # against the real bucket, so it rides the same upload gate as the
+        # audit write itself (--freeze / local runs have no live key to
+        # reconcile against). Failure to page must not break the pipeline —
+        # see live_key_reconciliation.run_reconciliation's fail-loud-but-
+        # non-aborting contract.
+        if apply_audit_upload:
+            from optimizer.live_key_reconciliation import run_reconciliation
+            run_reconciliation(
+                bucket=config.get("signals_bucket", "alpha-engine-research"),
+                audit=apply_audit_result,
+                run_start=datetime.fromtimestamp(_health_start, tz=timezone.utc),
+                run_date=args.date,
+            )
 
     # ── Regression detection ─────────────────────────────────────────────
     regression_result = _run_regression(
@@ -2129,6 +2149,35 @@ def _main_impl() -> None:
                 f"- _Calibration report render failed: `{cal_err}`._",
                 "  Investigate `analysis/calibration_report.py` + the report at "
                 "`s3://alpha-engine-research/decision_artifacts/_calibration/_report/latest/kappa.md`.",
+                "",
+            ])
+
+        # 10y rolling-window regime-parameter STABILITY section (config#952).
+        # Slides a true 10-year window across score_performance and re-
+        # identifies each regime's best stance parameterization per window,
+        # then reports cross-window stability (a sign-flipping parameter is
+        # regime noise, not a durable regime parameter). Observability only —
+        # never auto-applied to the factor blend (curve-fitting firewall).
+        # Self-loads from research_db and never raises; guarded to match the
+        # calibration/cost section contract.
+        try:
+            from analysis.rolling_regime_params import (
+                build_rolling_regime_params_report_section,
+            )
+            report_md = report_md + "\n" + build_rolling_regime_params_report_section(
+                config.get("research_db")
+            )
+        except Exception as rrp_err:  # noqa: BLE001 — see cost section above
+            logger.error(
+                "[rolling_regime_params] section render failed: %s — emitting "
+                "error placeholder so operators see the regression",
+                rrp_err,
+            )
+            report_md = report_md + "\n" + "\n".join([
+                "## 10y rolling regime parameters (stability)",
+                "",
+                f"- _Rolling-regime-params render failed: `{rrp_err}`._",
+                "  Investigate `analysis/rolling_regime_params.py`.",
                 "",
             ])
 

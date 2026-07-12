@@ -69,6 +69,16 @@ def test_scanner_21d_block_present_and_perfect(tmp_path):
     assert sl["lift_21d_log"]["lift"] > 0  # selected 21d alpha > universe
 
 
+def test_scanner_lift_labels_retired_baseline_arm(tmp_path):
+    # config#2318: scanner_lift replays scanner_evaluations.quant_filter_pass,
+    # which is the retired tech_score gate post the 2026-06-29 champion-feed
+    # cutover — it must carry an explicit `arm` label so report-card/Director
+    # consumers cannot present it as the live scanner unlabeled.
+    out = compute_lift_metrics(_build_research_db(tmp_path))
+    sl = out["scanner_lift"]
+    assert sl["arm"] == "tech_score_baseline (retired from live feed 2026-06-29)"
+
+
 def test_cio_21d_block_present(tmp_path):
     out = compute_lift_metrics(_build_research_db(tmp_path))
     cl = out["cio_lift"]

@@ -1,0 +1,23 @@
+# pip-audit ignore list (nousergon/alpha-engine-config#2342)
+# Every entry below MUST carry a dated rationale comment directly above it.
+# No blanket suppression — each accepted advisory is named individually.
+# Format:
+#   # <rationale> — accepted 2026-07-12, revisit <YYYY-MM-DD or "when a fix is released">
+#   <VULN-ID>
+
+# pyarrow 18.1.0 (pinned `pyarrow~=18.1` in requirements.txt): Use-After-Free
+# in Arrow C++'s RecordBatchFileReader::PreBufferMetadata, reachable only via
+# a C++-only pre-buffering API that is explicitly NOT exposed in the Python
+# bindings (per the advisory's own affected-usage note) — this repo only
+# touches pyarrow through pandas Parquet read/write (phase_artifacts.py,
+# analysis/attractiveness_eval.py, analysis/cost_report.py), never the Arrow
+# IPC file reader with pre-buffering enabled, so the vulnerable code path is
+# not reachable from here. No fix exists within the pinned 18.x line (18.1.0
+# is the last 18.x release); the fix version (23.0.1) is a 5-major-version
+# jump (18->23, skipping 19-22) with a large surface of behavior/API changes
+# across arcticdb/pandas/parquet interop that isn't safe to validate as a
+# drive-by bump in this change. Accepted — accepted 2026-07-12, revisit when
+# a fixed pyarrow release lands in a range reachable by a minor/patch bump
+# from 18.x, or when the pyarrow major bump is scheduled as its own tracked
+# upgrade.
+PYSEC-2026-113
