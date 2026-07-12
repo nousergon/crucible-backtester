@@ -92,6 +92,7 @@ from optimizer import (
 )
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
 from optimizer import factor_blend_optimizer
+from optimizer import champion_promotion
 from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_digest_email
 from reporter import build_digest, build_report, save, upload_to_s3
@@ -1755,6 +1756,7 @@ def _main_impl() -> None:
     research_optimizer.init_config(config)
     tech_weight_ablation.init_config(config)
     factor_blend_optimizer.init_config(config)
+    champion_promotion.init_config(config)
 
     # Set the assembler-cutover flag from config — when true, individual
     # optimizers' apply() skip their legacy live-key writes and the
@@ -1881,6 +1883,58 @@ def _main_impl() -> None:
         )
         if opt_stage_error is not None:
             raise opt_stage_error
+
+    # ── Champion promotion/demotion engine (config#2364 / config#2367) ────
+    # Gated weekly evaluation of config/producer_champion.json — the pointer
+    # the alpha-engine executor reads to choose its live entry-candidate
+    # producer arm (agentic vs scanner_predictor_direct). Runs AFTER the
+    # e2e_lift counterfactual (diagnostics, computed earlier in this run)
+    # and the apply-audit block above, per the issue's required ordering.
+    # A weekly audit record (config/apply_audit/producer_champion/{date}.json)
+    # is written UNCONDITIONALLY — including when this whole step raises —
+    # because that write IS the liveness proxy (config#2054): a correctly
+    # -held week must not be indistinguishable from a dead engine. --freeze
+    # suppresses the pointer write only, mirroring every other writer in
+    # this file; the audit record still records the (suppressed) decision.
+    if run_optimizers:
+        champion_bucket = config.get("signals_bucket", "alpha-engine-research")
+        champion_upload = bool(getattr(args, "upload", False)) and not args.freeze
+        try:
+            e2e_lift_diag = diagnostics.get("e2e_lift") if isinstance(diagnostics, dict) else None
+            leaderboard_inputs = champion_promotion.update_leaderboard_and_get_gate_inputs(
+                champion_bucket, args.date, e2e_lift_diag,
+                upload=champion_upload,
+            )
+            champion_promotion.run_weekly_evaluation(
+                bucket=champion_bucket,
+                run_date=args.date,
+                leaderboard=leaderboard_inputs,
+                freeze=args.freeze,
+                upload=champion_upload,
+            )
+        except Exception:
+            # The champion-promotion step must never take down the whole
+            # evaluate run (mirrors the assembler's non-fatal posture just
+            # above) — but an audit record must still land so this failure
+            # is provable, not silent. Best-effort emit with error=... ; if
+            # even THAT write fails, log loudly and move on (this step is
+            # not permitted to mask the primary evaluate-run outcome).
+            logger.exception(
+                "Champion-promotion evaluation raised — emitting error audit "
+                "record before continuing (pipeline must not break)",
+            )
+            try:
+                error_audit = champion_promotion.build_champion_audit(
+                    args.date, None, freeze=args.freeze,
+                    error="champion-promotion step raised — see evaluate.py logs",
+                )
+                if champion_upload:
+                    champion_promotion.write_champion_audit(champion_bucket, args.date, error_audit)
+            except Exception:
+                logger.exception(
+                    "Champion-promotion error-audit write ALSO failed — "
+                    "liveness proxy may be stale this week",
+                )
 
     # ── Regression detection ─────────────────────────────────────────────
     regression_result = _run_regression(
