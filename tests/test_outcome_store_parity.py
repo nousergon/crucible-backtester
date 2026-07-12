@@ -306,17 +306,17 @@ def test_load_outcomes_fails_loud_on_missing_primary(research_db):
         load_outcomes(research_db)
 
 
-def test_attach_outcomes_warns_on_wide_long_divergence(research_db, caplog):
-    """A row resolved in the wide columns but absent from the long store is a
-    producer bug — the coverage guard must surface it loudly."""
+def test_attach_outcomes_missing_long_row_yields_nan(research_db):
+    """A row absent from the long store yields NaN outcome columns — never a
+    fabricated value. (The dual-write soak divergence WARN that once flagged a
+    wide-resolved-but-store-missing row retired with the wide writes at Phase 4,
+    config#1550; the never-fabricate data contract stays.)"""
     conn = sqlite3.connect(research_db)
     conn.execute(
         "DELETE FROM score_performance_outcomes WHERE symbol = 'NVDA'"
     )
     conn.commit()
     conn.close()
-    with caplog.at_level(logging.WARNING):
-        attached = attach_outcomes(_wide_df(research_db), research_db)
-    assert any("outcome_store divergence" in r.message for r in caplog.records)
+    attached = attach_outcomes(_wide_df(research_db), research_db)
     nvda = attached[attached["symbol"] == "NVDA"]
     assert nvda["beat_spy_21d"].isna().all()  # missing → NaN, never fabricated
