@@ -39,10 +39,18 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
+      # Advisory-only: pip-audit's newer releases emit a GH Actions error
+      # annotation for any finding, which the runner honors as a step failure
+      # independent of the shell exit code — `|| true` no longer suppresses
+      # it (discovered 2026-07-13 when a newly-published langchain-core/
+      # pyarrow CVE tripped every PR's security-audit step red). continue-on-
+      # error is the runner-level equivalent of the `|| true` this step
+      # always intended: report findings, never block the job on them.
       - name: Security audit
+        continue-on-error: true
         run: |
           pip install pip-audit
-          pip-audit || true
+          pip-audit
 
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
   # branch. PR-branch reds — mid-fix commits, cross-repo lib-tag merge-order
