@@ -278,7 +278,20 @@ class TestReadChampionPointer:
         assert pointer["champion"] == "agentic"
 
 
-# ── Leaderboard artifact (research/producer_leaderboard/{date}.json) ───────
+# ── Leaderboard artifact (research/producer_leaderboard_champion_gate/{date}.json) ───────
+
+
+def test_leaderboard_key_distinct_from_research_producer_leaderboard():
+    """config#2452 regression guard: this module's leaderboard key must
+    never collide with crucible-research's scoring/leaderboard_producers.py
+    key (research/producer_leaderboard/{date}.json) -- a prior version of
+    this module shared that exact key with an incompatible schema, and per
+    the Saturday SF ordering (Research writes first, this Evaluator step
+    writes later in the same execution) that collision silently clobbered
+    crucible-research's real multi-arm producer leaderboard every week."""
+    from optimizer.champion_promotion import LEADERBOARD_KEY_TMPL
+    assert LEADERBOARD_KEY_TMPL != "research/producer_leaderboard/{date}.json"
+    assert LEADERBOARD_KEY_TMPL.format(date="2026-07-13") != "research/producer_leaderboard/2026-07-13.json"
 
 
 class _FakeS3:

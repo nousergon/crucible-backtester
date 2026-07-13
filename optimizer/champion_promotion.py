@@ -533,7 +533,7 @@ def run_weekly_evaluation(
          (or a frozen run) never touches the pointer — idempotent,
          bidirectional-safe.
 
-    ``leaderboard`` is the parsed ``research/producer_leaderboard/{date}.json``
+    ``leaderboard`` is the parsed ``research/producer_leaderboard_champion_gate/{date}.json``
     artifact (see ``build_leaderboard_entry`` / the leaderboard reader in
     this module) shaped as
     ``{"challenger_matured_cohorts": int, "challenger_weekly_sn_lift": [float, ...]}``
@@ -564,7 +564,7 @@ def run_weekly_evaluation(
     error = None
     if leaderboard is None:
         error = (
-            f"research/producer_leaderboard/{run_date}.json unavailable — "
+            f"research/producer_leaderboard_champion_gate/{run_date}.json unavailable — "
             "cannot evaluate champion-promotion gates this week"
         )
     else:
@@ -618,9 +618,9 @@ def run_weekly_evaluation(
     return result
 
 
-# ── research/producer_leaderboard/{date}.json ───────────────────────────────
+# ── research/producer_leaderboard_champion_gate/{date}.json ─────────────────
 #
-# This artifact did not exist anywhere in the repo prior to this change (the
+# This artifact did not exist anywhere in the repo prior to config#2367 (the
 # issue's description of it was aspirational — verified by grep, config#2367
 # groom notes). It is introduced here as the champion engine's own input:
 # a per-run snapshot of the challenger arm's weekly sector-neutral 21d lift
@@ -629,9 +629,22 @@ def run_weekly_evaluation(
 # counterfactual (methods block keyed 'scanner_then_predictor_topN' /
 # 'agentic_cio_advance'), APPENDED to a running history so the HAC gate has a
 # multi-week time series to test rather than a single point estimate.
+#
+# config#2452 (found 2026-07-13, same day as first live run post-merge): this
+# key was originally `research/producer_leaderboard/{date}.json` — the SAME
+# key crucible-research's `scoring/leaderboard_producers.py` already writes,
+# with an incompatible schema (`{"leaderboard_id": "producer", ...}` vs this
+# module's `{"weekly_points": [...]}`). Per the Saturday SF ordering
+# (Research writes in Branch A, this Evaluator step runs later in Branch B),
+# this module's write would silently clobber crucible-research's real
+# multi-arm producer leaderboard every week, AND this module's own
+# `read_prior_leaderboard_history` would never find its own prior weeks'
+# `weekly_points` in what Research had written — perpetual cold start.
+# Renamed to a distinct key before any collision occurred (verified via
+# `aws s3 ls` — nothing had landed under the old key yet).
 
 
-LEADERBOARD_KEY_TMPL = "research/producer_leaderboard/{date}.json"
+LEADERBOARD_KEY_TMPL = "research/producer_leaderboard_champion_gate/{date}.json"
 _LEADERBOARD_HISTORY_KEEP_WEEKS = 26  # ~6 months of weekly points is plenty for HAC lag=3
 
 
@@ -666,7 +679,7 @@ def build_leaderboard_artifact(run_date: str, history: list[dict], new_entry: di
     """Append ``new_entry`` (if any) to ``history`` (oldest-first list of
     ``{"date": ..., "sn_lift_vs_agentic_cio": ..., "n_picks": ..., "n_cycles": ...}``),
     trim to the retention window, and return the full artifact to write to
-    ``research/producer_leaderboard/{run_date}.json``.
+    ``research/producer_leaderboard_champion_gate/{run_date}.json``.
     """
     points = list(history)
     if new_entry is not None:
