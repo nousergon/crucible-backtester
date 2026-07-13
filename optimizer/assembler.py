@@ -522,25 +522,41 @@ def _cutover_apply(
     history_latest_key = eval_latest_key(history_prefix)
 
     # 1. Snapshot current live → _previous (rollback safety)
+    # Skip snapshot on rerun for the same trading_day — prevent clobbering prior snapshot.
+    skip_snapshot = False
     try:
-        s3_client.copy_object(
-            Bucket=bucket,
-            CopySource={"Bucket": bucket, "Key": live_key},
-            Key=previous_key,
-        )
-        logger.info(
-            "Cutover: snapshotted live → s3://%s/%s", bucket, previous_key,
-        )
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+        latest_artifact = s3_client.get_object(Bucket=bucket, Key=history_latest_key)
+        latest_data = json.loads(latest_artifact["Body"].read())
+        if latest_data.get("as_of") == result.run_date:
             logger.info(
-                "Cutover: no current live config to snapshot (first cutover run)",
+                "Cutover: skipping snapshot (rerun for same run_date=%s) — preserving prior rollback snapshot",
+                result.run_date,
             )
-        else:
-            logger.warning(
-                "Cutover: failed to snapshot live → _previous: %s "
-                "(continuing — live write below)", e,
+            skip_snapshot = True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey"):
+            logger.warning("Cutover: could not check history latest — proceeding with snapshot: %s", e)
+
+    if not skip_snapshot:
+        try:
+            s3_client.copy_object(
+                Bucket=bucket,
+                CopySource={"Bucket": bucket, "Key": live_key},
+                Key=previous_key,
             )
+            logger.info(
+                "Cutover: snapshotted live → s3://%s/%s", bucket, previous_key,
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                logger.info(
+                    "Cutover: no current live config to snapshot (first cutover run)",
+                )
+            else:
+                logger.warning(
+                    "Cutover: failed to snapshot live → _previous: %s "
+                    "(continuing — live write below)", e,
+                )
 
     # 2. Write assembled → live key (with updated_at stamp matching legacy
     #    payload shape so consumer Lambdas see no schema drift).

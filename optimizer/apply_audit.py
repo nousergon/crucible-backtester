@@ -362,6 +362,7 @@ def build_audit(
 ) -> dict:
     """Build the audit artifact body (schema v1) from the run's results."""
     prior_loops = (prior or {}).get("loops", {}) if isinstance(prior, dict) else {}
+    is_idempotent_rerun = isinstance(prior, dict) and prior.get("as_of") == as_of
     loops: dict[str, dict] = {}
     for loop, results_key in LOOPS.items():
         record = classify_loop(
@@ -370,9 +371,12 @@ def build_audit(
             assembler_summary=assembler_summary if loop == "executor_params" else None,
             run_error=run_error,
         )
-        record["consecutive_blocked_weeks"] = _carry_forward(
-            record["outcome"], prior_loops.get(loop),
-        )
+        if is_idempotent_rerun:
+            record["consecutive_blocked_weeks"] = prior_loops.get(loop, {}).get("consecutive_blocked_weeks", 0)
+        else:
+            record["consecutive_blocked_weeks"] = _carry_forward(
+                record["outcome"], prior_loops.get(loop),
+            )
         loops[loop] = record
     return {
         "schema_version": SCHEMA_VERSION,
