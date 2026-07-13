@@ -4,13 +4,19 @@ assembler.py — single-writer config-recommendation assembler.
 Reads all per-optimizer recommendation artifacts for a (config_type, run_date),
 applies merge precedence with explicit semantics per artifact's
 ``recommendation_kind``, and produces the assembled config that should be the
-sole content of the live S3 key. PR 3 of the optimizer-artifact-assembler arc
+sole content of the live S3 key. Originated as PR 3 of the
+optimizer-artifact-assembler arc
 (plan: ``~/Development/alpha-engine-docs/private/optimizer-artifact-assembler-260509.md``).
 
-This PR is **shadow-only**: writes ``config/{config_type}/assembled/{date}.json``
-for audit but does NOT write the live key. Individual optimizers still write
-the live key via their existing legacy paths. PR 4 flips the cutover so the
-assembler becomes the sole writer of the live key.
+**Cutover has been LIVE since ~2026-05-27** (PR 4): when
+``assembler.cutover_enabled`` is true, this module is the SOLE writer of
+``config/{config_type}.json`` — individual optimizers' legacy live-key
+writes are skipped (gated by ``is_cutover_enabled()``). Always writes
+``config/{config_type}/assembled/{date}.json`` for audit, live or shadow.
+Because this is the sole writer of live trading config under cutover, a
+live-key write failure raises ``CutoverApplyError`` (see ``_cutover_apply``)
+rather than being swallowed — a transient S3 failure must never be graded
+"promoted" by ``apply_audit.classify_loop``.
 
 ## Merge semantics
 
@@ -119,12 +125,38 @@ def is_cutover_enabled() -> bool:
 
 AssemblerStatus = Literal["ok", "no_artifacts", "all_skip"]
 
+# Structured cutover outcome — kept independent of ``AssemblerStatus`` so a
+# live-key write failure can never be conflated with "merge produced no
+# promotable artifact". ``classify_loop`` in apply_audit.py keys off this
+# field (not ``status``) to decide whether a cutover-mode loop actually
+# promoted.
+#   - ``not_attempted``: cutover was off, or ``status`` wasn't "ok" so no
+#     live write was attempted.
+#   - ``applied``: the live-key put_object succeeded (history mirror
+#     failures do NOT downgrade this — the live key is the source of truth).
+#   - ``failed``: the live-key put_object raised. The live config is
+#     UNCHANGED from before this run; this must never be graded "promoted".
+CutoverStatus = Literal["not_attempted", "applied", "failed"]
+
+
+class CutoverApplyError(RuntimeError):
+    """Raised when the assembler's live-key write fails under cutover mode.
+
+    Carries the underlying cause; callers that catch this must not treat the
+    run as promoted. ``assemble()`` catches this internally to populate
+    ``AssemblerResult.cutover_status="failed"`` (fail-loud via ERROR-level
+    log + this exception's chain) rather than letting a transient S3 blip
+    crash the whole evaluate run — but the *result* it returns can never be
+    mistaken for a successful promotion.
+    """
+
 
 @dataclass
 class AssemblerResult:
     """Outcome of an assembly run.
 
-    - ``status`` — overall outcome:
+    - ``status`` — overall MERGE outcome (says nothing about the live-key
+      write — see ``cutover_status`` for that):
         - ``ok``: at least one artifact contributed; ``assembled_params``
           reflects the merged config.
         - ``no_artifacts``: no per-optimizer artifacts found for the date.
@@ -141,6 +173,12 @@ class AssemblerResult:
       because they appeared in ``freeze_keys`` (operator override).
     - ``base_was_present`` — whether a current live config was found at the
       start (False on first-ever run).
+    - ``cutover_status`` — outcome of the live-key WRITE under cutover mode
+      (independent of ``status``, the merge outcome). ``"not_attempted"``
+      when cutover was off or the merge produced nothing to write.
+      ``"applied"`` only when the live-key ``put_object`` actually
+      succeeded. ``"failed"`` when it raised — the live config is
+      unchanged; this must be graded as an error, never "promoted".
     """
 
     status: AssemblerStatus
@@ -152,6 +190,7 @@ class AssemblerResult:
     frozen_keys_restored: list[str] = field(default_factory=list)
     base_was_present: bool = False
     notes: str = ""
+    cutover_status: CutoverStatus = "not_attempted"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -419,8 +458,27 @@ def assemble(
         is_cutover_enabled() if cutover_enabled is None else bool(cutover_enabled)
     )
     if cutover_active and result.status == "ok":
-        cutover_outcome = _cutover_apply(result, bucket, s3)
-        result.notes = (result.notes + " " + cutover_outcome).strip()
+        try:
+            cutover_outcome = _cutover_apply(result, bucket, s3)
+            result.cutover_status = "applied"
+            result.notes = (result.notes + " " + cutover_outcome).strip()
+        except CutoverApplyError as e:
+            # Fail LOUD: this is the sole writer of live trading config.
+            # A swallowed failure here previously left result.status="ok",
+            # which apply_audit.classify_loop graded as "promoted" — an
+            # executor could silently trade on stale params while the audit
+            # trail claimed success. cutover_status="failed" is what
+            # classify_loop keys on now; status/assembled_params are left
+            # alone since the MERGE itself succeeded — only the live WRITE
+            # didn't.
+            logger.error(
+                "Cutover: CRITICAL — live-key write failed for config_type=%s "
+                "run_date=%s; live config is UNCHANGED, executor may be "
+                "trading on stale params: %s",
+                config_type, run_date, e,
+            )
+            result.cutover_status = "failed"
+            result.notes = (result.notes + " " + str(e)).strip()
 
     return result
 
@@ -440,10 +498,18 @@ def _cutover_apply(
        (matches the legacy dated-history convention; preserves audit trail
        expected by operators inspecting weekly history).
 
-    Returns a human-readable note for ``result.notes``. All three writes
-    are best-effort — failures log warn and are recorded in the note;
-    they don't raise. The shadow audit artifact is the authoritative
-    record; live-key write failures are visible via that artifact.
+    Returns a human-readable note for ``result.notes`` on success.
+
+    Step 1 (rollback snapshot) failing is tolerated — it degrades rollback
+    safety but does not leave the live key stale, so it logs WARN and
+    continues. Step 2 (the live-key write) is THE load-bearing write of
+    this function — the whole point of cutover mode is that the assembler
+    is the sole writer of live trading config. A failure there RAISES
+    ``CutoverApplyError`` instead of being folded into a note string, so
+    the caller (``assemble()``) cannot return ``status="ok"``-shaped
+    success while the live key silently didn't change. Step 3 (history
+    mirror) failing after a successful live write is genuinely non-fatal —
+    the live key is already correct — so it stays log-and-continue.
     """
     config_type = result.config_type
     live_key = f"config/{config_type}.json"
@@ -511,7 +577,9 @@ def _cutover_apply(
             "Cutover: CRITICAL failure writing live key s3://%s/%s: %s",
             bucket, live_key, e,
         )
-        return f"cutover_failed: live write — {e}"
+        raise CutoverApplyError(
+            f"cutover_failed: live write to s3://{bucket}/{live_key} — {e}",
+        ) from e
 
     # 3. Mirror to dated history — canonical lib v0.8.0 archive layout
     # (flat + latest.json sidecar; YYMMDDHHMM run_id encodes the time).
@@ -548,9 +616,19 @@ def _write_assembled_audit(
         config/{config_type}/assembled/latest.json      ← single-fetch sidecar
 
     Run_id is YYMMDDHHMM (UTC) — same-minute re-runs collide by design;
-    typical Sat-SF cron cadence makes that effectively impossible. Failure
-    is non-fatal during the shadow-only PR 3 phase — logs warn, returns
-    empty string.
+    typical Sat-SF cron cadence makes that effectively impossible.
+
+    Failure here is non-fatal REGARDLESS of cutover mode — not because
+    cutover is shadow-only (it has been LIVE since ~2026-05-27; that
+    rationale is stale and no longer names a true condition). The real
+    reason: this artifact is secondary forensic provenance (answers "which
+    optimizer set this field?"), separate from and written independently
+    of the live trading key. The live key write is the load-bearing one and
+    lives in ``_cutover_apply``, which raises ``CutoverApplyError`` (not a
+    swallowed note) on failure so it can never be graded "promoted" by
+    apply_audit. Losing this audit artifact loses debuggability, not
+    correctness of live config — so it logs warn and returns empty string
+    rather than raising and aborting the run.
     """
     run_id = new_eval_run_id()
     prefix = f"config/{result.config_type}/assembled"
@@ -575,6 +653,8 @@ def _write_assembled_audit(
     except Exception as e:
         logger.warning(
             "Failed to write assembler audit artifact s3://%s/%s: %s "
-            "(non-fatal — shadow-only mode)", bucket, key, e,
+            "(non-fatal — this is the secondary provenance artifact, not "
+            "the live trading key; live-key write failures are fail-loud "
+            "via CutoverApplyError, not swallowed here)", bucket, key, e,
         )
         return ""

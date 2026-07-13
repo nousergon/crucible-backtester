@@ -75,6 +75,11 @@ def test_multifactor_beats_momentum_scanner(tmp_path):
     assert r["best_sleeve"] is not None, r
     # count-matched: 5 passed/cycle x 4 = 20
     assert mset["actual_scanner_pass"]["n_picks"] == 20, r
+    # config#2318: actual_scanner_pass replays the retired tech_score gate
+    # post the 2026-06-29 champion-feed cutover — must carry an explicit arm
+    # label; counterfactual methods (not the live/retired scanner) must not.
+    assert mset["actual_scanner_pass"]["arm"] == "tech_score_baseline (retired from live feed 2026-06-29)", r
+    assert "arm" not in mset["multifactor_topN"], r
 
 
 def _db_with_tech_and_gradient(tmp_path):

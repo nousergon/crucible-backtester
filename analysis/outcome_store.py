@@ -177,11 +177,10 @@ def attach_outcomes(
     Non-outcome columns (scores, stance, sector, price_{h}d, eval_date_{h}d)
     pass through untouched — they are not part of the outcome contract.
 
-    Coverage guard (fail-loud discipline): while the wide columns still exist
-    (dual-write soak, pre-Phase-4), any row that is resolved in the wide column
-    but missing from the long store is counted and WARNed — a divergence there
-    means the Phase-2 producer is skipping rows and must be investigated, not
-    silently absorbed.
+    (The dual-write soak coverage guard that cross-checked the wide outcome
+    columns against the long store retired at Phase 4 — the producer no longer
+    writes the wide outcome columns, so there is nothing left to reconcile
+    against. config#1550 / EPIC config#1483.)
 
     Pre-cutover DB (store table absent): the raw wide columns pass through
     UNCHANGED — a graceful no-op. Dropping+NaN-ing the wide columns when the
@@ -238,25 +237,10 @@ def attach_outcomes(
             else pd.DataFrame(columns=_LONG_COLUMNS)
         )
 
-        # Coverage guard against the still-present wide columns (soak window).
-        gate_col = cols.beat_spy
-        if gate_col in out.columns and not out[gate_col].isna().all():
-            wide_resolved = out.loc[out[gate_col].notna(), key]
-            if h_rows.empty:
-                missing = len(wide_resolved)
-            else:
-                merged_check = wide_resolved.merge(
-                    h_rows[key].drop_duplicates(), on=key, how="left", indicator=True
-                )
-                missing = int((merged_check["_merge"] == "left_only").sum())
-            if missing:
-                logger.warning(
-                    "outcome_store divergence: %d row(s) resolved in the wide "
-                    "%dd columns but ABSENT from %s — the Phase-2 producer is "
-                    "skipping rows; investigate before trusting this cycle "
-                    "(config#1483)",
-                    missing, h, _TABLE,
-                )
+        # (The dual-write soak coverage guard — which cross-checked the wide
+        # outcome columns against the long store — retired with the wide writes
+        # at Phase 4: the producer no longer writes return_/spy_*_return/beat_spy_
+        # so there is nothing to cross-check against. config#1550 / EPIC config#1483.)
 
         # Drop the wide-sourced columns, then join the long-sourced ones in
         # their place under the same (policy-derived) names.
