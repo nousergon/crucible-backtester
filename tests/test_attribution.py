@@ -116,6 +116,63 @@ def test_compute_attribution_with_predictor_columns():
     assert result["predictor_hit_rate_ci_95"] is not None
 
 
+def test_compute_attribution_predictor_merged_into_correlations(monkeypatch):
+    """config#2305 fix: predictor's FDR-significance flag must be visible on
+    `correlations` too — not just the separate `predictor_correlation` dict —
+    so a consumer that counts significant flags by scanning
+    `correlations.values()` (crucible-evaluator's fdr_surface_health tile)
+    sees the FULL test surface that fed the shared BH-FDR correction, not an
+    undercount missing the predictor's own test."""
+    df = _make_df(n=200, with_predictor=True, with_correct=True)
+    result = compute_attribution(df)
+
+    assert "predictor" in result["correlations"]
+    assert "beat_spy_21d" in result["correlations"]["predictor"]
+    assert "beat_spy_21d_fdr_significant" in result["correlations"]["predictor"]
+    assert isinstance(
+        result["correlations"]["predictor"]["beat_spy_21d_fdr_significant"],
+        (bool, np.bool_),
+    )
+    # And it must agree with the FDR flag the shared correction actually
+    # computed for the predictor label (not a hardcoded True/False).
+    from analysis.stats_utils import benjamini_hochberg
+
+    all_pvals_ordered = (
+        [result["p_values"]["quant"][t] for t in ("beat_spy_21d", "return_21d")]
+        + [result["p_values"]["qual"][t] for t in ("beat_spy_21d", "return_21d")]
+        + [result["predictor_p_values"]["beat_spy_21d"]]
+    )
+    expected_sig = benjamini_hochberg(all_pvals_ordered, alpha=0.05)[-1]
+    assert result["correlations"]["predictor"]["beat_spy_21d_fdr_significant"] == expected_sig
+
+
+def test_compute_attribution_no_predictor_columns_correlations_unaffected():
+    """When predictor columns are absent (the common case — see the live
+    2026-07-10 attribution.json), `correlations` must stay exactly
+    {"quant", "qual"} — the merge is a no-op, not a KeyError/empty-dict leak."""
+    df = _make_df(n=200)
+    result = compute_attribution(df)
+
+    assert set(result["correlations"].keys()) == {"quant", "qual"}
+    assert result["predictor_correlation"] == {}
+
+
+def test_compute_attribution_reports_n_fdr_tests():
+    """config#2305: n_fdr_tests persists the size of the shared BH-FDR
+    correction pool so a downstream consumer (the fdr_surface_health tile)
+    can calibrate its significant-count band to the ACTUAL surface instead
+    of a stale absolute constant calibrated for a since-shrunk surface."""
+    df = _make_df(n=200)
+    result = compute_attribution(df)
+    # 2 sub-scores x 2 canonical horizons, no predictor columns here.
+    assert result["n_fdr_tests"] == 4
+
+    df_with_pred = _make_df(n=200, with_predictor=True, with_correct=True)
+    result_with_pred = compute_attribution(df_with_pred)
+    # +1 for the predictor's own beat_spy_21d test.
+    assert result_with_pred["n_fdr_tests"] == 5
+
+
 def test_compute_attribution_resolves_sub_scores_from_dict_column():
     n = 150
     rng = np.random.default_rng(3)

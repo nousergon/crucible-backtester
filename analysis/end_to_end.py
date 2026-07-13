@@ -31,6 +31,15 @@ from analysis.classification_metrics import compute_binary_metrics
 
 logger = logging.getLogger(__name__)
 
+# config#2318: since the 2026-06-29 attractiveness champion-feed cutover, the
+# tech_score scanner (``scanner_evaluations.quant_filter_pass``) runs only as a
+# recorded BASELINE arm — it no longer feeds live candidate generation. Scanner-
+# edge metrics below still read that table, so they are explicitly labeled with
+# this arm so downstream report-card/Director surfaces cannot present a retired
+# gate's record as "the scanner" unlabeled. Additive-only field (S3 contract
+# discipline) — does not replace/rename any existing key.
+SCANNER_METRIC_ARM = "tech_score_baseline (retired from live feed 2026-06-29)"
+
 
 # ── Canonical-horizon research-edge helpers (ROADMAP L4551) ─────────────────
 #
@@ -877,6 +886,7 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
             "classification": clf,
             "classification_21d": clf_21d,
             "lift_21d_log": lift_21d,
+            "arm": SCANNER_METRIC_ARM,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "scanner_evaluations table not found"}
@@ -2213,6 +2223,11 @@ def _scanner_factor_counterfactual(
             ma = _mean(picked[k])
             sn = _mean(picked_sn[k])
             e = {"mean_alpha_21d": ma, "sector_neutral_mean_alpha_21d": sn, "n_picks": len(picked[k])}
+            if k == "actual_scanner_pass":
+                # config#2318: this method replays the retired tech_score gate
+                # (``scanner_evaluations.quant_filter_pass``), not the live
+                # champion-feed selection — label it explicitly (additive-only).
+                e["arm"] = SCANNER_METRIC_ARM
             if k != "actual_scanner_pass" and ma is not None and actual_mean is not None:
                 e["lift_vs_actual_scanner"] = round(ma - actual_mean, 5)
                 e["sn_lift_vs_actual_scanner"] = (

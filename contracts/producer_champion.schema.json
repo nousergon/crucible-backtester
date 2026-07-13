@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nousergon/crucible-backtester/contracts/producer_champion.schema.json",
+  "title": "producer_champion pointer artifact (v1)",
+  "description": "FROZEN cross-repo contract for config/producer_champion.json — the live pointer determining which entry-candidate producer arm the alpha-engine executor trades (config#2364 champion-promotion epic). Written by crucible-backtester optimizer/champion_promotion.py (gate engine, promotion_source='gate_engine') and, until the gate engine ships or as a one-shot correction, by an operator bootstrap script THROUGH THE SAME writer function (promotion_source='operator_bootstrap') — never a hand-edited S3 object. Consumed by alpha-engine executor's executor/champion.py::load_champion_pointer at planner start: an S3 404/NoSuchKey there defaults to champion='agentic' (pre-bootstrap state); any OTHER read/parse error or an unrecognized `champion` value is fail-loud (ChampionPointerError) — this pointer must never silently resolve to an ambiguous trading state. Additive-only evolution: new `champion` arm values may be added over time but existing values are NEVER renamed or removed; renames/removals require a schema_version bump coordinated with the executor consumer (config#2366).",
+  "type": "object",
+  "required": ["schema_version", "champion", "promoted_at", "promotion_source"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "champion": {
+      "enum": ["agentic", "scanner_predictor_direct"],
+      "description": "The live entry-candidate producer arm. 'agentic' = today's research pipeline (signals.json buy_candidates, unchanged). 'scanner_predictor_direct' = entries synthesized from the research-free predictor's outcome parquet, ranked by predicted_alpha (config#2366). Additive: new arms may be appended in future schema versions, existing values are stable identifiers other systems (Metron Showcase Portfolio, this pointer's audit trail) key off of."
+    },
+    "promoted_at": {
+      "type": "string",
+      "description": "UTC ISO-8601 timestamp of the write that produced this exact pointer state (session timestamp, not a trading day — the pointer moves at most every few weeks)."
+    },
+    "promotion_source": {
+      "type": "string",
+      "description": "Provenance of this pointer write. 'gate_engine' = written by the automated weekly gated promotion/demotion engine (optimizer/champion_promotion.py) after all gates passed. 'operator_bootstrap' = a human-ruled one-shot initial promotion (e.g. the 2026-07-13 bootstrap, Brian ruling config#2364), still routed through the same writer function and apply-audit path as the gate engine. Free-form beyond these two well-known values so future provenance sources remain representable without a schema bump (e.g. a manual operator override in an incident)."
+    }
+  }
+}
