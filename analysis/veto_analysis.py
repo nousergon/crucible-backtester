@@ -657,6 +657,57 @@ def _read_current_veto_threshold(bucket: str) -> float | None:
     return None
 
 
+def produce_artifact(
+    result: dict,
+    bucket: str,
+    promotion_intent: str,
+    recommended_params: dict,
+    notes: str = "",
+    run_id: str | None = None,
+    run_date: str | None = None,
+) -> dict:
+    """
+    Convert a veto_analysis decision into a typed ``RecommendationArtifact``
+    and write it to S3 at
+    ``config/predictor_params/recommendations/{date}/from_veto_analysis.json``.
+
+    Part of the optimizer-artifact-assembler arc (config#2054 follow-up —
+    extends the arc from ``executor_params`` to ``predictor_params``).
+    ``promotion_intent`` is passed in explicitly by the caller — see
+    ``weight_optimizer.produce_artifact`` for why this optimizer family
+    can't safely derive intent from ``result`` alone (guardrails live in
+    ``apply()`` itself, not baked into ``result["status"]``).
+    """
+    from optimizer.recommendation_artifact import RecommendationArtifact, today_iso, write_artifact
+
+    try:
+        diagnostic = {
+            k: result.get(k)
+            for k in ("status", "recommended_threshold", "current_threshold")
+            if result.get(k) is not None
+        }
+        artifact = RecommendationArtifact(
+            fit_target=result.get("fit_target", "precision_minus_alpha_cost_legacy"),
+            optimizer_name="veto_analysis",
+            run_date=run_date or today_iso(),
+            recommendation_kind="full_replace",
+            recommended_params=recommended_params,
+            promotion_intent=promotion_intent,
+            diagnostic=diagnostic,
+            notes=notes,
+        )
+        if run_id is not None:
+            artifact.run_id = run_id
+        key = write_artifact(artifact, bucket, config_type="predictor_params")
+        return {"written": True, "key": key, "run_id": artifact.run_id}
+    except Exception as e:
+        logger.warning(
+            "Failed to write veto_analysis recommendation artifact: %s "
+            "(non-fatal — legacy live write still proceeds)", e,
+        )
+        return {"written": False, "reason": str(e)}
+
+
 def apply(result: dict, bucket: str) -> dict:
     """
     Write recommended veto threshold to S3 if guardrails pass.
@@ -673,11 +724,16 @@ def apply(result: dict, bucket: str) -> dict:
       live config is unchanged. Lets the skill_composite ranking
       validate against a few Sat SF cycles before becoming authoritative.
 
+    Every decision path additionally produces a per-optimizer recommendation
+    artifact via ``produce_artifact()``, consumed by the assembler when
+    ``assembler.cutover_enabled`` is true (config#2054).
+
     Returns ``{"applied": True, ...}`` on production write,
     ``{"applied": False, "reason": ..., "shadow_key": ...}`` on shadow
     write or guardrail rejection.
     """
     if result.get("status") != "ok":
+        produce_artifact(result, bucket, "skip", {}, notes=f"status={result.get('status')}")
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
     config_default = _cfg.get("current_default_threshold", _CURRENT_DEFAULT_THRESHOLD)
@@ -689,6 +745,7 @@ def apply(result: dict, bucket: str) -> dict:
     current = s3_current if s3_current is not None else result.get("current_threshold", config_default)
 
     if recommended is None:
+        produce_artifact(result, bucket, "skip", {}, notes="no recommended threshold")
         return {"applied": False, "reason": "no recommended threshold"}
 
     # Bootstrap: if no S3 artifact exists (s3_current is None), allow the first write
@@ -697,6 +754,10 @@ def apply(result: dict, bucket: str) -> dict:
     is_bootstrap = s3_current is None
 
     if not is_bootstrap and abs(recommended - current) < min_change:
+        produce_artifact(
+            result, bucket, "skip", {"veto_confidence": recommended},
+            notes=f"min_threshold_change — |{recommended:.2f} - {current:.2f}| < {min_change}",
+        )
         return {
             "applied": False,
             "blocked_by": ["min_threshold_change"],
@@ -714,6 +775,10 @@ def apply(result: dict, bucket: str) -> dict:
             if significance_would_block(verdict):
                 logger.info(
                     "veto_analysis: bootstrap seed BLOCKED by significance floor (config#1426)"
+                )
+                produce_artifact(
+                    result, bucket, "skip", {"veto_confidence": recommended},
+                    notes="significance_floor — bootstrap seed blocked (config#1426)",
                 )
                 return {
                     "applied": False,
@@ -782,6 +847,10 @@ def apply(result: dict, bucket: str) -> dict:
         except Exception as e:
             logger.error("Failed to write veto threshold shadow archive: %s", e)
             return {"applied": False, "reason": f"shadow S3 write failed: {e}"}
+        produce_artifact(
+            result, bucket, "shadow", payload,
+            notes="shadow mode — fit_target=skill_composite, enforce_skill_composite=False",
+        )
         return {
             "applied": False,
             "reason": (
@@ -806,6 +875,10 @@ def apply(result: dict, bucket: str) -> dict:
             logger.info(
                 "veto_analysis: significance enforce BLOCKED promotion (config#1426)"
             )
+            produce_artifact(
+                result, bucket, "skip", payload,
+                notes="significance_floor — blocked by significance enforce (config#1426)",
+            )
             return {
                 "applied": False,
                 "blocked_by": ["significance_floor"],
@@ -813,6 +886,23 @@ def apply(result: dict, bucket: str) -> dict:
                           "(config#1426) — undefended evidence",
                 "observe_verdict": verdict,
             }
+
+    # All guardrails passed — this recommendation would be promoted.
+    # Produce the artifact BEFORE the cutover gate check so the assembler
+    # has it available.
+    produce_artifact(result, bucket, "promote", payload, notes=f"fit_target={fit_target}")
+
+    # Cutover gate: when assembler.cutover_enabled is true, the assembler
+    # is the sole writer of the live key. Skip the legacy live + history
+    # writes below.
+    from optimizer.assembler import is_cutover_enabled
+    if is_cutover_enabled():
+        return {
+            "applied": False,
+            "reason": "cutover_mode — assembler is sole live writer",
+            "fit_target": fit_target,
+            "veto_confidence": recommended,
+        }
 
     from optimizer.rollback import save_previous
     save_previous(bucket, "predictor_params")
