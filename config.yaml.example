@@ -312,3 +312,17 @@ veto_analysis:
   min_threshold_change: 0.10
   cost_penalty_weight: 0.30
   enforce_significance: false    # config#1426 Phase 4 — see weight_optimizer comment above
+
+# ── Champion promotion/demotion engine (config#2364 / config#2367) ─────────
+# Gates the weekly config/producer_champion.json pointer write — the pointer
+# determines which entry-candidate producer arm (agentic vs
+# scanner_predictor_direct) the LIVE alpha-engine executor trades, so these
+# guardrails are deliberately conservative. All gates below must pass for
+# the pointer to move (bidirectional — the same rule promotes and demotes).
+champion_promotion:
+  min_matured_cohorts: 4          # gate (a): challenger needs >= this many matured FORWARD weekly cohorts
+  significance_alpha: 0.05        # gate (b): two-sided significance level for the HAC-adjusted t-test
+  horizon_days: 21                # forward-alpha horizon (config#1405 basis) — feeds the HAC lag
+  cadence_days: 7                 # weekly evaluation cadence — feeds the HAC lag (lag = round(horizon/cadence))
+  hysteresis_weeks: 2             # gate (c): consecutive winning weekly evaluations required before a move
+  cooldown_weeks: 2               # gate (e): minimum weeks between pointer moves

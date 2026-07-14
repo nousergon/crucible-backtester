@@ -347,7 +347,7 @@ class TestCarryForward:
         silent-recovery-from-failure bug the issue describes."""
         audit = build_audit(
             "2026-07-05", _all_results(),
-            assembler_summary=_ASSEMBLER_CUTOVER_FAILED,
+            assembler_summaries={"executor_params": _ASSEMBLER_CUTOVER_FAILED},
             prior=self._prior(executor_params=5),
         )
         assert audit["loops"]["executor_params"]["outcome"] == "error"
@@ -370,7 +370,7 @@ def _validate(audit: dict) -> None:
 class TestSchemaConformance:
 
     def test_mixed_outcomes_conform(self):
-        audit = build_audit("2026-07-05", _all_results(), assembler_summary=_ASSEMBLER_OK)
+        audit = build_audit("2026-07-05", _all_results(), assembler_summaries={"executor_params": _ASSEMBLER_OK})
         _validate(audit)
         assert set(audit["loops"]) == set(LOOPS)
 
@@ -390,7 +390,7 @@ class TestSchemaConformance:
         audit = build_audit(
             "2026-07-05",
             _all_results(weight_result=_weight_promoted(), veto_result=frozen_veto),
-            assembler_summary=_ASSEMBLER_OK,
+            assembler_summaries={"executor_params": _ASSEMBLER_OK},
         )
         _validate(audit)
 
@@ -433,7 +433,7 @@ class TestEmit:
         s3.get_object.side_effect = _no_such_key()
         emit_apply_audit(
             bucket="b", run_date="2026-07-05", opt_results=_all_results(),
-            assembler_result=None, upload=True, s3_client=s3,
+            assembler_results=None, upload=True, s3_client=s3,
         )
         keys = [c.kwargs.get("Key") for c in s3.put_object.call_args_list]
         assert keys == [

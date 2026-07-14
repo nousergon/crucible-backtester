@@ -42,3 +42,7 @@ CLAUDE.md
 .gitleaks.toml
 
 .gitleaksbaseline.json
+
+# mutmut mutation-testing working directories (config#1958 deliverable 5h)
+mutants/
+.mutmut-cache
