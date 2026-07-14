@@ -2811,10 +2811,12 @@ def run_cov_estimator_sweep_stage(
     )
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
+    n_trials = len(sweep_report.get("cells") or {})
     key = f"backtest/{run_date}/cov_sweep.json"
     payload = {
         "run_date": run_date,
         "status": "ok",
+        "n_trials": n_trials,
         **sweep_report,
     }
     body = json.dumps(payload, default=str, indent=2).encode("utf-8")
@@ -2830,6 +2832,22 @@ def run_cov_estimator_sweep_stage(
         # recording surface for a missed write. Fail-soft here is intentional.
         logger.warning(
             "cov_estimator_sweep: S3 persist failed (non-fatal): %s", exc,
+        )
+
+    # config#2454: this cycle ran a real sweep (we're past the earlier
+    # "skipped" early-return above), so its n_trials cells count into the
+    # cumulative multiple-testing trial total DSR reads. Best-effort — the
+    # sweep artifact above is already valid regardless of whether the
+    # accumulator increment lands.
+    try:
+        from nousergon_lib.quant.stats.trial_accumulator import increment_trial_count
+        increment_trial_count(
+            "cov_estimator_sweep", n_trials, run_date, bucket=bucket, s3_client=s3,
+        )
+    except Exception as exc:
+        logger.warning(
+            "cov_estimator_sweep: cumulative trial-count increment failed "
+            "(non-fatal): %s", exc,
         )
 
     logger.info(
@@ -2977,12 +2995,14 @@ def run_gamma_sweep_stage(
         alpha_uncertainty_by_date=alpha_uncertainty_by_date,
     )
 
+    n_trials = len(sweep_report.get("cells") or {})
     key = f"backtest/{run_date}/gamma_sweep.json"
     payload = {
         "run_date": run_date,
         "status": "ok",
         "n_dates_with_uncertainty": len(alpha_uncertainty_by_date),
         "n_target_dates": len(target_dates),
+        "n_trials": n_trials,
         **sweep_report,
     }
     body = json.dumps(payload, default=str, indent=2).encode("utf-8")
@@ -2998,6 +3018,20 @@ def run_gamma_sweep_stage(
         # recording surface for a missed write. Fail-soft here is intentional.
         logger.warning(
             "gamma_sweep: S3 persist failed (non-fatal): %s", exc,
+        )
+
+    # config#2454: only reached on a real (non-skipped) sweep — the two
+    # earlier early-returns above cover the "insufficient coverage" and
+    # "predictor backtest failed" skip paths. Count this cycle's cells into
+    # the cumulative multiple-testing trial total DSR reads.
+    try:
+        from nousergon_lib.quant.stats.trial_accumulator import increment_trial_count
+        increment_trial_count(
+            "gamma_sweep", n_trials, run_date, bucket=bucket, s3_client=s3,
+        )
+    except Exception as exc:
+        logger.warning(
+            "gamma_sweep: cumulative trial-count increment failed (non-fatal): %s", exc,
         )
 
     logger.info(
@@ -3088,6 +3122,7 @@ def run_optimizer_param_sweep_stage(
         recommendation = {"status": "error", "reason": str(exc)}
         apply_result = {"applied": False, "reason": str(exc)}
 
+    n_trials = len(sweep_report.get("cells") or {})
     key = f"backtest/{run_date}/optimizer_param_sweep.json"
     payload = {
         "run_date": run_date,
@@ -3096,6 +3131,7 @@ def run_optimizer_param_sweep_stage(
         "n_production_dates": inputs.get("n_production_dates"),
         "recommendation": recommendation,
         "apply_result": apply_result,
+        "n_trials": n_trials,
         **sweep_report,
     }
     body = json.dumps(payload, default=str, indent=2).encode("utf-8")
@@ -3110,6 +3146,20 @@ def run_optimizer_param_sweep_stage(
         # ARTIFACT_REGISTRY.yaml, so the ENFORCE freshness-monitor is the
         # recording surface for a missed write. Fail-soft here is intentional.
         logger.warning("optimizer_param_sweep: S3 persist failed (non-fatal): %s", exc)
+
+    # config#2454: this cycle ran a real sweep (the "production inputs not
+    # ready" skip path above already returned early otherwise) — count its
+    # cells into the cumulative multiple-testing trial total DSR reads.
+    try:
+        from nousergon_lib.quant.stats.trial_accumulator import increment_trial_count
+        increment_trial_count(
+            "optimizer_param_sweep", n_trials, run_date, bucket=bucket, s3_client=s3,
+        )
+    except Exception as exc:
+        logger.warning(
+            "optimizer_param_sweep: cumulative trial-count increment failed "
+            "(non-fatal): %s", exc,
+        )
 
     logger.info(
         "optimizer_param_sweep: baseline=%s winner=%s ranking_top=%s",
@@ -3911,6 +3961,31 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                         bucket, registry.date, "predictor_param_sweep",
                         "sweep_df", sweep_df, preserve_index=False, s3_client=s3,
                     ))
+
+                # config#2454: only reached when ps_ctx.skipped is False —
+                # a real sweep ran this cycle (as opposed to the ``if
+                # ps_ctx.skipped`` branch above, which reuses a prior
+                # marker's sweep_df and generated ZERO new trials). Each row
+                # of sweep_df is one evaluated combo, so len(sweep_df) is
+                # this cycle's trial count. Gating the increment on this
+                # branch is the load-bearing bit — incrementing on a
+                # skipped/reused cycle would overstate the true trial count
+                # (the same combos would be double-counted every time the
+                # phase auto-skips and reuses the marker).
+                n_trials = 0 if sweep_df is None else len(sweep_df)
+                try:
+                    from nousergon_lib.quant.stats.trial_accumulator import (
+                        increment_trial_count,
+                    )
+                    increment_trial_count(
+                        "predictor_param_sweep", n_trials, registry.date,
+                        bucket=bucket, s3_client=s3,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "predictor_param_sweep: cumulative trial-count "
+                        "increment failed (non-fatal): %s", exc,
+                    )
 
     return single_stats, sweep_df
 
