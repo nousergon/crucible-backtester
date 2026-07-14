@@ -356,23 +356,37 @@ def build_audit(
     as_of: str,
     opt_results: dict,
     *,
-    assembler_summary: dict | None = None,
+    assembler_summaries: dict[str, dict | None] | None = None,
     prior: dict | None = None,
     run_error: str | None = None,
 ) -> dict:
-    """Build the audit artifact body (schema v1) from the run's results."""
+    """Build the audit artifact body (schema v1) from the run's results.
+
+    Args:
+        assembler_summaries: ``{config_type: compact_summary}`` — one entry
+            per config_type that ran under cutover this run (config#2054
+            extended cutover from ``executor_params`` alone to all four
+            config types, so this is keyed per-loop rather than a single
+            scalar). A loop absent from this dict gets ``None`` (matches
+            "cutover was off or the assembler did not run for this loop").
+    """
+    assembler_summaries = assembler_summaries or {}
     prior_loops = (prior or {}).get("loops", {}) if isinstance(prior, dict) else {}
+    is_idempotent_rerun = isinstance(prior, dict) and prior.get("as_of") == as_of
     loops: dict[str, dict] = {}
     for loop, results_key in LOOPS.items():
         record = classify_loop(
             loop,
             opt_results.get(results_key),
-            assembler_summary=assembler_summary if loop == "executor_params" else None,
+            assembler_summary=assembler_summaries.get(loop),
             run_error=run_error,
         )
-        record["consecutive_blocked_weeks"] = _carry_forward(
-            record["outcome"], prior_loops.get(loop),
-        )
+        if is_idempotent_rerun:
+            record["consecutive_blocked_weeks"] = prior_loops.get(loop, {}).get("consecutive_blocked_weeks", 0)
+        else:
+            record["consecutive_blocked_weeks"] = _carry_forward(
+                record["outcome"], prior_loops.get(loop),
+            )
         loops[loop] = record
     return {
         "schema_version": SCHEMA_VERSION,
@@ -426,7 +440,7 @@ def emit_apply_audit(
     run_date: str,
     opt_results: dict,
     *,
-    assembler_result=None,
+    assembler_results: dict[str, Any] | None = None,
     upload: bool,
     run_error: BaseException | None = None,
     s3_client=None,
@@ -437,12 +451,22 @@ def emit_apply_audit(
     including when the stage raised (``run_error`` set): the audit records
     ``error`` outcomes for the affected loops, and the caller re-raises so the
     failure still surfaces (except-log-emit-reraise; no swallow).
+
+    Args:
+        assembler_results: ``{config_type: AssemblerResult | None}`` — one
+            entry per config_type the assembler ran for this cycle
+            (config#2054: all four config types run under cutover, not just
+            ``executor_params``).
     """
     prior = load_prior(bucket, s3_client=s3_client) if upload else None
+    assembler_summaries = {
+        config_type: summarize_assembler(result)
+        for config_type, result in (assembler_results or {}).items()
+    }
     audit = build_audit(
         run_date,
         opt_results or {},
-        assembler_summary=summarize_assembler(assembler_result),
+        assembler_summaries=assembler_summaries,
         prior=prior,
         run_error=str(run_error) if run_error else None,
     )

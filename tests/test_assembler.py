@@ -538,6 +538,19 @@ class TestDefaultPrecedence:
         ]
         assert cfg["freeze_keys"] == []
 
+    def test_default_precedence_for_the_three_config2054_config_types(self):
+        # config#2054: scoring_weights/predictor_params/research_params each
+        # have exactly one live producer — single-entry precedence lists.
+        assert DEFAULT_PRECEDENCE["scoring_weights"] == {
+            "precedence": ["weight_optimizer"], "freeze_keys": [],
+        }
+        assert DEFAULT_PRECEDENCE["predictor_params"] == {
+            "precedence": ["veto_analysis"], "freeze_keys": [],
+        }
+        assert DEFAULT_PRECEDENCE["research_params"] == {
+            "precedence": ["research_optimizer"], "freeze_keys": [],
+        }
+
 
 class TestCutoverFlag:
 
