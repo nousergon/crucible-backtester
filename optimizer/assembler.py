@@ -98,6 +98,22 @@ DEFAULT_PRECEDENCE = {
         ],
         "freeze_keys": [],
     },
+    # config#2054: extends the cutover arc beyond executor_params. Each of
+    # these three config types has exactly one live producer (single-entry
+    # precedence, full_replace) — unlike executor_params' multi-writer overlay
+    # chain, there is no merge-order ambiguity to resolve here.
+    "scoring_weights": {
+        "precedence": ["weight_optimizer"],
+        "freeze_keys": [],
+    },
+    "predictor_params": {
+        "precedence": ["veto_analysis"],
+        "freeze_keys": [],
+    },
+    "research_params": {
+        "precedence": ["research_optimizer"],
+        "freeze_keys": [],
+    },
 }
 
 # Module-level cutover flag. Toggled via ``set_cutover_enabled()`` at
@@ -328,8 +344,8 @@ def assemble(
 
     Args:
         bucket: S3 bucket name.
-        config_type: Currently ``executor_params``. Will extend to
-            ``scoring_weights`` / ``predictor_params`` in a follow-up arc.
+        config_type: One of ``executor_params`` / ``scoring_weights`` /
+            ``predictor_params`` / ``research_params`` (config#2054).
         run_date: YYYY-MM-DD. Used to scope which artifacts to read.
         precedence_config: Override the default precedence + freeze_keys
             for this config_type. Shape::

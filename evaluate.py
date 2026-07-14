@@ -1873,34 +1873,43 @@ def _main_impl() -> None:
     # writes the live key + _previous snapshot + dated history — and the
     # individual optimizers' apply() paths skip their legacy live writes
     # (gated by ``optimizer.assembler.is_cutover_enabled()``).
-    # Failure is non-fatal: the assembler must not break the pipeline.
-    assemble_result = None
+    # Failure is non-fatal per config_type: one config type's assembler
+    # error must not block the other three (config#2054 — each is an
+    # independent single-writer precedence chain with no cross-type
+    # dependency).
+    assemble_results: dict = {}
     if run_optimizers and opt_stage_error is None and not args.freeze:
-        try:
-            from optimizer.assembler import assemble, is_cutover_enabled
-            bucket = config.get("signals_bucket", "alpha-engine-research")
-            assemble_result = assemble(
-                bucket=bucket,
-                config_type="executor_params",
-                run_date=args.date,
-                write_assembled=True,
-            )
-            logger.info(
-                "Assembler run: status=%s, promoting=%d, frozen_restored=%d, "
-                "cutover=%s",
-                assemble_result.status,
-                sum(
-                    1 for v in assemble_result.artifacts_seen.values()
-                    if v["promotion_intent"] == "promote"
-                ),
-                len(assemble_result.frozen_keys_restored),
-                "ON" if is_cutover_enabled() else "OFF (shadow)",
-            )
-        except Exception as e:
-            # Assembler failure must not break the pipeline.
-            logger.warning(
-                "Assembler run failed (non-fatal — pipeline continues): %s", e,
-            )
+        from optimizer.assembler import assemble, is_cutover_enabled
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        for config_type in (
+            "executor_params", "scoring_weights", "predictor_params", "research_params",
+        ):
+            try:
+                result = assemble(
+                    bucket=bucket,
+                    config_type=config_type,
+                    run_date=args.date,
+                    write_assembled=True,
+                )
+                assemble_results[config_type] = result
+                logger.info(
+                    "Assembler run [%s]: status=%s, promoting=%d, frozen_restored=%d, "
+                    "cutover=%s",
+                    config_type,
+                    result.status,
+                    sum(
+                        1 for v in result.artifacts_seen.values()
+                        if v["promotion_intent"] == "promote"
+                    ),
+                    len(result.frozen_keys_restored),
+                    "ON" if is_cutover_enabled() else "OFF (shadow)",
+                )
+            except Exception as e:
+                # Assembler failure must not break the pipeline.
+                logger.warning(
+                    "Assembler run failed for config_type=%s (non-fatal — "
+                    "pipeline continues): %s", config_type, e,
+                )
 
     # ── Apply-audit artifact (config#1841) ───────────────────────────────
     # Unconditional per-loop outcome record for the four auto-apply loops
@@ -1916,7 +1925,7 @@ def _main_impl() -> None:
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=args.date,
             opt_results=opt_results,
-            assembler_result=assemble_result,
+            assembler_results=assemble_results,
             upload=apply_audit_upload,
             run_error=opt_stage_error,
         )
