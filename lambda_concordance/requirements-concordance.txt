@@ -6,4 +6,4 @@ pyyaml>=6.0
 # against the canonical agent_schemas Pydantic contract (lib v0.4.0 — pulled in
 # above via the alpha-engine-lib install).
 langchain-anthropic~=0.3
-pydantic>=2.0
+pydantic>=2.13.4
