@@ -30,7 +30,7 @@ scikit-learn~=1.4
 # predictions. Same upper bound as alpha-engine (<1.8) to stay compatible with
 # numpy<2 above. Saturday SF spot venv picks this up via `pip install -r
 # requirements.txt`; local dev requires manual install.
-cvxpy>=1.4,<1.8
+cvxpy>=1.9.2,<1.10
 # alpha-engine-lib pulls in arcticdb + flow-doctor via extras; see
 # preflight.py and the `from alpha_engine_lib.logging import setup_logging`
 # call sites in backtest.py / evaluate.py / lambda_health/handler.py.
