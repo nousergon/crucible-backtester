@@ -1,80 +1,141 @@
-"""champion_promotion.py — gated weekly champion promotion/demotion engine
-(config#2364 champion-promotion epic, child 3 / config#2367).
+"""champion_promotion.py — weekly winner-take-all champion/challenger gate
+(config#2364 / config#2367 origin; redesigned alpha-engine-config-I2518 /
+epic I2515, 2026-07-14 ruling).
 
 Writes the live pointer ``config/producer_champion.json`` that the
 alpha-engine executor's ``executor/champion.py::load_champion_pointer``
-reads at planner start to decide whether entry candidates come from the
-``agentic`` research pipeline or the ``scanner_predictor_direct``
-research-free-predictor arm (config#2366). Statistical correctness matters
-here in a way it does not for the advisory optimizers elsewhere in this
-module: a wrong pointer move silently changes which strategy is LIVE.
+reads at planner start to decide which entry-candidate producer arm is
+LIVE. Statistical correctness matters here in a way it does not for the
+advisory optimizers elsewhere in this module: a wrong pointer move silently
+changes which strategy trades real (paper) capital.
 
-**Gates (all must pass to move the pointer — bidirectional, same rule
-promotes and demotes):**
+**2026-07-14 seat swap (Brian's ruling, config-I2518, binding on this
+issue):** the ``agentic`` seat retires with the multi-agent Research graph
+(epic config-I2515) and is replaced by ``thinktank_coverage`` — the Think
+Tank challenger arm (scanner top-~60 -> Think Tank full-coverage -> its
+own top-~20 by independent TT rating). ``scanner_predictor_direct`` is the
+new BASE-CASE champion (already live since 2026-07-13T22:07 UTC,
+config-I2364)::
 
-  (a) ``challenger_matured_cohorts >= min_matured_cohorts`` — the challenger
-      arm (whichever of the two VALID_CHAMPIONS is NOT the current
-      champion) must have at least this many matured FORWARD weekly
-      cohorts behind its lift estimate.
-  (b) Overlap-aware significance on sector-neutral 21d lift. 21d realized
-      alpha measured on a WEEKLY evaluation cadence means each week's
-      cohort overlaps ~3 prior weeks' holding windows (21 trading days /
-      ~7 calendar days per weekly cycle ≈ 3x overlap) — naive i.i.d. pooling
-      across weekly observations understates the true standard error and
-      manufactures significance the data does not have (the exact
-      pseudo-replication failure mode already documented and fixed for
-      pooled-vs-date-clustered IC in ``analysis/end_to_end.py``, config#1405
-      comment block). This gate uses the Newey-West (1994) HAC
-      (heteroskedasticity- and autocorrelation-consistent) standard error
-      of the mean weekly SN-lift, Bartlett kernel, lag = round(horizon_days
-      / cadence_days) = round(21/7) = 3 — matching the "~3x overlapping
-      windows" the issue names directly, rather than the estimator's
-      generic automatic lag rule (which is tuned for long daily P&L series,
-      not short weekly panels). See ``_hac_significance`` below. This
-      reuses ``nousergon_lib.quant.stats.intervals.newey_west_se`` (already
-      vendored + unit-tested in the shared lib; LV2-AE leverage arc,
-      2026-06-03) rather than a hand-rolled implementation.
-      config#1524's low-n estimator was evaluated as the issue's suggested
-      alternative but is not yet shipped anywhere in this codebase (no
-      ``newey``/``HAC``/``low_n_estimator`` module existed prior to this
-      change) — this PR does not block on it landing; per the issue this is
-      an either/or choice and HAC/Newey-West is a standard, well-documented
-      technique for exactly this overlapping-window problem.
-  (c) Hysteresis: the challenger must clear gate (b) on the SAME side
-      (challenger beats champion) on 2 CONSECUTIVE weekly evaluations
-      before the pointer moves. A single strong week is not enough — this
-      is the ``consecutive_wins`` carry-forward counter, reset to 0 the
-      moment the sign flips or the significance gate fails.
-  (d) Bidirectional: the identical rule set (a)-(c) applies whether the
-      challenger is beating the champion (→ promote) or the champion is
-      losing to the challenger from the other seat (→ demote) — there is
-      only one gate path, run once per week from the champion's point of
-      view.
-  (e) Cooldown: at least ``cooldown_weeks`` must have elapsed since the
-      last pointer move before another move is permitted, even if (a)-(c)
-      all clear.
-  ``--freeze`` (mirrors the posture of every other evaluate.py writer,
-  e.g. weight_optimizer / veto_analysis / research_optimizer): when set,
-  the pointer write is unconditionally suppressed even if every gate
-  cleared — but the weekly audit record is STILL written (with
-  ``blocked_by=["frozen"]`` when gates had otherwise cleared), because a
-  held week must never be indistinguishable from a dead engine.
+    VALID_CHAMPIONS = ("scanner_predictor_direct", "thinktank_coverage")
 
-**Liveness (config#2054 lesson, binding):** ``config/producer_champion.json``
-mtime alone cannot prove this engine is alive — a correctly-held week does
-not touch it. ``emit_champion_audit`` below is called UNCONDITIONALLY at the
-end of every weekly Evaluator run (mirroring ``optimizer/apply_audit.py``'s
-"the write is the liveness proxy" posture) and writes
-``config/apply_audit/producer_champion/{date}.json`` (+ ``latest.json``)
-regardless of outcome, including ``error``.
+``agentic`` is READ-TOLERATED (a historical pointer/audit value must never
+crash this engine — ``_normalize_champion_before`` below WARNs and treats
+it as ``scanner_predictor_direct``) but WRITE-FORBIDDEN
+(``write_champion_pointer`` raises on any value outside ``VALID_CHAMPIONS``,
+which no longer includes it). No real ``config/producer_champion.json``
+object was ever actually written with ``champion="agentic"`` — it was only
+ever an implicit pre-bootstrap default — but the 2026-07-13 bootstrap DID
+write a real audit record with ``champion_before="agentic"``
+(``config/apply_audit/producer_champion/2026-07-13.json``), so the
+read-tolerance is not purely defensive.
+
+**Weekly winner-take-all policy (supersedes the entire HAC-significance /
+2-week-hysteresis / 2-week-cooldown gated engine this module shipped with
+under config#2367 — INCLUDING the standing ``cooldown_until:
+2026-07-27`` carried in the prior ``latest.json``, which this policy no
+longer reads or honors):**
+
+    Each weekly evaluation compares the two arms' realized top-N alpha lift
+    for the trailing week and flips the pointer to whichever arm scores
+    higher, if that arm is not already champion. No significance test, no
+    consecutive-week hysteresis, no cooldown — "whichever performs best in
+    a given week is promoted at that time" (Brian's ruling, verbatim).
+
+**Validity guards (definitional NO-CONTEST, not a statistical gate) —
+``evaluate_gates`` below:** a week where either arm's realized-lift score
+is unavailable (no valid ``thinktank_coverage`` selections this week, no
+resolved/matured outcomes yet, the evidence artifact itself missing or
+stale) is a NO-CONTEST: the pointer is left unchanged and the outcome
+record says so explicitly via a machine-readable ``blocked_by`` slug. A
+no-contest NEVER defaults a win to either side.
+
+**Evidence sourcing — two different repos' artifacts, joined via a shared
+comparator (Bucher-style indirect/common-comparator comparison — standard
+in network meta-analysis when no directly-joined head-to-head dataset
+exists between two arms that were each measured against a common
+reference):**
+
+  - ``scanner_predictor_direct``'s weekly score is this run's
+    ``analysis.end_to_end.compute_lift_metrics()['scanner_then_predictor_counterfactual']
+    ['methods']['scanner_then_predictor_topN']['sn_lift_vs_agentic_cio']`` —
+    a backtester-internal counterfactual (research.db-derived) already
+    computed earlier in the same ``evaluate.py`` run, extracted via
+    ``leaderboard_entry_from_e2e_lift`` (unchanged from the pre-I2518
+    engine; this module's OWN ``research/producer_leaderboard_champion_gate/
+    {date}.json`` history artifact is STILL maintained for observability
+    and to keep config#2452's in-flight live-verification intact — see
+    ``update_leaderboard_and_get_gate_inputs`` — but its accumulated
+    ``weekly_points`` series is no longer consumed by the gate itself,
+    since winner-take-all needs only THIS week's point, not a multi-week
+    HAC-adjusted series).
+  - ``thinktank_coverage``'s weekly score is read DIRECTLY from
+    crucible-research's real champion/challenger producer leaderboard,
+    ``research/producer_leaderboard/{date}.json``
+    (``scoring/leaderboard_producers.py::build_producer_leaderboard``,
+    config#1221/#1223) — verified schema (2026-07-14, read from the
+    crucible-research checkout, NOT guessed): ``{"champion": <research
+    producer champion name>, "horizon_days": 21, "top_n": 50, "n_dates":
+    int, "specs": [{"name", "kind", "realized_rank_ic", "n_dates_scored",
+    "topn_alpha_vs_champion": {"mean","se","t_stat","n_dates"} | None},
+    ...]}``. We read the ``specs`` row named ``"thinktank_coverage"`` and
+    take its ``topn_alpha_vs_champion.mean``. ``coverage_complete``
+    validity (the full current-scan top-60 rule, Brian's ruling
+    config#1580) is enforced UPSTREAM at the artifact boundary —
+    crucible-research PR427 writes ``signals_shadow/thinktank_coverage/
+    {trading_day}/signals.json`` (the input this leaderboard scores) ONLY
+    when ``coverage_complete`` — so any date this spec contributed to
+    ``n_dates_scored`` was necessarily a full-coverage day; no separate
+    coverage_complete check is needed on this side of the boundary.
+
+  **Both scores share the SAME underlying reference** — crucible-research's
+  live ``agentic_sector_teams`` signal producer / the CIO ADVANCE
+  selection it feeds — even though one score is computed by this repo
+  (research.db-derived) and the other by crucible-research
+  (signals_shadow-derived): the Research module keeps running its full
+  agentic pipeline weekly regardless of which arm the EXECUTOR trades
+  (config-I2515's "champion being live does NOT mean Research is
+  consumer-less" finding), so ``agentic`` remains a valid, currently-live
+  common comparator for both sides. Winner-take-all only needs the two
+  point estimates compared directly (no combined-variance step, since no
+  significance test is performed) — whichever ``vs agentic`` lift is
+  larger this week is presumed the better arm, which is the standard,
+  well-documented logic of an indirect/common-comparator comparison
+  (Bucher et al., 1997) when a direct joint dataset isn't available.
+
+  **KNOWN, TRACKED GAP as of 2026-07-14 (filed
+  alpha-engine-config-I2519):** ``thinktank_coverage`` is NOT YET
+  registered in crucible-research's ``producers/registry.py::
+  RESEARCH_PRODUCERS`` / ``challenger_producers()`` — PR427's own commit
+  message explicitly deferred that wiring ("Not registered in
+  producers/registry.py ... being decided separately per config#1683's
+  fail-hard challenger-gap doctrine"). Until that registration lands,
+  ``research/producer_leaderboard/{date}.json``'s ``specs`` list will
+  NEVER contain a ``"thinktank_coverage"`` row, so
+  ``_score_thinktank_coverage`` below will correctly and honestly return
+  ``blocked_by=["thinktank_coverage_not_in_leaderboard"]`` (a NO-CONTEST)
+  every week until it does. This is expected, not a bug in this module —
+  see the filed issue for the concrete unblock.
+
+``hac_significance`` (Newey-West/HAC overlap-aware significance) is
+RETAINED below, unchanged and still independently unit-tested — it is no
+longer wired into the promotion decision (winner-take-all has no
+significance gate) but remains available as a possible future diagnostic
+(e.g. reporting whether a winning margin looks like signal or noise
+alongside the decision) without having to re-derive it.
 
 **Single writer function, dual caller (no parallel writer implementations):**
 ``write_champion_pointer`` is the ONLY code path that may write
 ``config/producer_champion.json``. The gate engine calls it with
-``promotion_source="gate_engine"``; a future one-shot operator bootstrap
-script (e.g. the 2026-07-13 bootstrap, Brian ruling config#2364) MUST call
-this same function with ``promotion_source="operator_bootstrap"`` — never a
-hand-edited S3 object.
+``promotion_source="gate_engine"``; the one-shot 2026-07-13 operator
+bootstrap (``bootstrap_champion_promotion.py``) called it with
+``promotion_source="operator_bootstrap"`` — never a hand-edited S3 object.
+
+**Liveness (config#2054 lesson, binding):** ``config/producer_champion.json``
+mtime alone cannot prove this engine is alive — a correctly-held
+(no-contest) week does not touch it. ``run_weekly_evaluation`` writes
+``config/apply_audit/producer_champion/{date}.json`` (+ ``latest.json``)
+UNCONDITIONALLY, including on ``outcome="error"``.
 """
 
 from __future__ import annotations
@@ -82,7 +143,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from datetime import date as _date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import boto3
@@ -90,99 +151,96 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 1          # config/producer_champion.json pointer — unchanged shape
+AUDIT_SCHEMA_VERSION = 2    # config/apply_audit/producer_champion/{date}.json — v2 shape (I2518)
 POINTER_KEY = "config/producer_champion.json"
 AUDIT_PREFIX = "config/apply_audit/producer_champion"
 
-VALID_CHAMPIONS = ("agentic", "scanner_predictor_direct")
+VALID_CHAMPIONS = ("scanner_predictor_direct", "thinktank_coverage")
 
-OUTCOMES = (
-    "promoted", "demoted", "held_insufficient_data", "held_cooldown",
-    "held_not_significant", "error",
+# Retired seat(s) — READ-TOLERATED (a historical pointer/audit artifact using
+# this value must never crash the engine) but WRITE-FORBIDDEN (excluded from
+# VALID_CHAMPIONS, so write_champion_pointer raises on it).
+_LEGACY_CHAMPIONS = ("agentic",)
+
+OUTCOMES = ("promoted", "no_contest", "unchanged_winner_already_champion", "error")
+
+# blocked_by slugs — union of the new winner-take-all vocabulary and the
+# retired HAC/hysteresis/cooldown-engine vocabulary (kept for read-tolerance
+# of historical audit records written under the pre-I2518 engine; no code
+# path in this module writes the retired slugs again).
+_BLOCKED_BY_SLUGS = (
+    # new (winner-take-all, I2518)
+    "no_valid_scanner_predictor_direct_selections",
+    "no_valid_thinktank_coverage_selections",
+    "scanner_predictor_direct_counterfactual_unavailable",
+    "thinktank_coverage_not_in_leaderboard",
+    "thinktank_coverage_no_resolved_outcomes",
+    "leaderboard_unavailable",
+    "leaderboard_stale",
+    "arm_score_unavailable",
+    "frozen",
+    "unclassified_error",
+    # retired (pre-I2518 HAC/hysteresis/cooldown engine) — historical read-only
+    "insufficient_matured_cohorts",
+    "cooldown_active",
+    "not_significant_hac_adjusted",
+    "hysteresis_not_satisfied",
 )
 
-# ── Guardrail constants (config#2367 — public-repo tier rule: guardrail
-# constants live in config, not code literals). These are the CODE DEFAULTS,
-# overridable via the ``champion_promotion`` config.yaml.example block below;
-# the live values ship from the separate alpha-engine-config repo. ─────────
-_MIN_MATURED_COHORTS = 4        # gate (a)
-_SIGNIFICANCE_ALPHA = 0.05      # gate (b) — two-sided test size
+# HAC lag helper constants — still consulted by hac_significance() below,
+# which is retained as an independent, tested utility (see module docstring)
+# even though it no longer gates the promotion decision.
 _HORIZON_DAYS = 21              # 21d forward-alpha horizon (config#1405 basis)
 _CADENCE_DAYS = 7               # weekly evaluation cadence
-_HYSTERESIS_WEEKS = 2           # gate (c) — consecutive winning weeks required
-_COOLDOWN_WEEKS = 2             # gate (e) — minimum weeks between pointer moves
 
 _cfg: dict = {}
 
 
 def init_config(config: dict) -> None:
+    """Called unconditionally by evaluate.py at optimizer-stage start. The
+    winner-take-all engine currently defines no configurable thresholds
+    (no significance level, no hysteresis/cooldown weeks) — this is kept as
+    a stable entry point for evaluate.py's wiring and for hac_significance's
+    still-configurable horizon/cadence (lag = round(horizon/cadence))."""
     global _cfg
     _cfg = config.get("champion_promotion", {})
 
 
 def _hac_lag() -> int:
-    """Bartlett-kernel lag = round(horizon_days / cadence_days).
-
-    21d horizon on a 7-day (weekly) cadence ⇒ round(21/7) = 3 — each weekly
-    SN-lift observation overlaps its ~2 immediate predecessors' holding
-    windows, matching the issue's "~3x overlapping windows" framing exactly.
-    Configurable so a future horizon/cadence change doesn't require a code
-    edit.
-    """
+    """Bartlett-kernel lag = round(horizon_days / cadence_days). Feeds
+    ``hac_significance`` only — not load-bearing for the winner-take-all
+    decision itself."""
     horizon = int(_cfg.get("horizon_days", _HORIZON_DAYS))
     cadence = int(_cfg.get("cadence_days", _CADENCE_DAYS))
     return max(0, round(horizon / cadence))
 
 
-# ── Statistical gate: HAC/Newey-West-adjusted overlap-aware significance ───
+# ── Retained utility: HAC/Newey-West-adjusted overlap-aware significance ───
+# Not wired into evaluate_gates() under the winner-take-all policy (see
+# module docstring) — kept as an independently unit-tested, available
+# diagnostic.
 
 
 def hac_significance(
-    weekly_sn_lift: list[float], *, alpha: float = _SIGNIFICANCE_ALPHA,
+    weekly_sn_lift: list[float], *, alpha: float = 0.05,
 ) -> dict:
-    """Overlap-aware two-sided significance test of whether the challenger's
-    weekly sector-neutral 21d lift series is significantly different from
-    zero, using the Newey-West (1994) HAC standard error of the mean
-    (Bartlett kernel; lag = ``_hac_lag()``) in place of the naive i.i.d.
-    ``s/sqrt(n)`` standard error.
-
-    **Why HAC and not a plain t-test:** each entry in ``weekly_sn_lift`` is
-    one week's mean sector-neutral 21d-forward alpha. Because the 21-trading
-    -day forward window is measured on names selected on a ~weekly cadence,
-    consecutive weekly observations share the majority of their realized
-    trading days — the series is NOT i.i.d., it's autocorrelated with an
-    induced overlap of order (horizon_days / cadence_days) ≈ 3. Pooling
-    weekly observations under the naive i.i.d. assumption understates the
-    true standard error of the mean lift and manufactures statistical
-    significance the panel does not actually have — this is the identical
-    pseudo-replication failure mode already diagnosed and fixed for pooled
-    -vs-date-clustered IC elsewhere in this codebase (see
-    ``analysis/end_to_end.py``'s Grinold-Kahn date-clustered IC t-stat
-    comment, config#1405). Newey & West (1987, "A Simple, Positive
-    Semi-Definite, Heteroskedasticity and Autocorrelation Consistent
-    Covariance Matrix", Econometrica 55(3)) is the standard, well-documented
-    correction: it inflates the long-run variance estimate by the
-    Bartlett-kernel-weighted autocovariances up to the chosen lag, which
-    both (i) reduces smoothly to the naive i.i.d. SE as the series'
-    autocorrelation → 0, and (ii) strictly inflates the SE (never shrinks
-    it) for a genuinely overlapping series — so this gate is provably more
-    conservative than an unadjusted t-test, never more permissive.
+    """Overlap-aware two-sided significance test of whether a weekly
+    sector-neutral lift series is significantly different from zero, using
+    the Newey-West (1994) HAC standard error of the mean (Bartlett kernel;
+    lag = ``_hac_lag()``) in place of the naive i.i.d. ``s/sqrt(n)`` standard
+    error. See the module history (git log) for the full derivation this
+    docstring previously carried in-line; unchanged behavior, retained as an
+    available utility (not currently gate-connected — see module docstring).
 
     Uses the vendored, independently-unit-tested
-    ``nousergon_lib.quant.stats.intervals.newey_west_se`` (LV2-AE leverage
-    arc, 2026-06-03) rather than a hand-rolled HAC implementation.
+    ``nousergon_lib.quant.stats.intervals.newey_west_se``.
 
     Returns a dict:
       ``{"status": "ok", "n": int, "mean": float, "se": float, "lags": int,
          "t_stat": float, "p_value": float, "significant": bool}``
       or ``{"status": "insufficient_data", "n": int}`` when fewer than 2
       finite observations are available.
-
-    The Student-t critical value (n - 1 degrees of freedom, matching
-    ``scipy.stats.ttest_1samp``'s convention used elsewhere in this
-    codebase) is used rather than the asymptotic normal, since weekly
-    cohort counts here are small (single/low-double-digit n) — the t
-    distribution's fatter tails are the conservative choice at low n.
     """
     from nousergon_lib.quant.stats.intervals import newey_west_se
 
@@ -198,9 +256,6 @@ def hac_significance(
     mean = nw["estimate"]
     se = nw["se"]
     if se <= 0:
-        # Degenerate (all-identical) series — cannot form a t-stat; treat as
-        # significant iff the constant mean itself is nonzero (no dispersion
-        # to test against is not the same as "not significant").
         return {
             "status": "ok", "n": n, "mean": mean, "se": 0.0, "lags": nw["lags"],
             "t_stat": math.inf if mean != 0 else 0.0,
@@ -225,7 +280,7 @@ def hac_significance(
     }
 
 
-# ── Gate engine ─────────────────────────────────────────────────────────────
+# ── Gate engine (weekly winner-take-all) ────────────────────────────────────
 
 
 def _other_champion(champion: str) -> str:
@@ -237,118 +292,107 @@ def _other_champion(champion: str) -> str:
     return others[0]
 
 
+def _normalize_champion_before(champion: str) -> str:
+    """Normalize a pointer/default champion value for GATE purposes only —
+    never mutates the pointer itself (a held/no-contest week must never
+    write). ``agentic`` (the retired seat, config-I2518 seat swap) WARNs and
+    is treated as ``scanner_predictor_direct`` — belt-and-braces: the live
+    pointer has been ``scanner_predictor_direct`` since 2026-07-13, so this
+    path is not expected to fire in practice, only to guarantee a stale or
+    hand-inspected historical pointer can never crash this engine. Any
+    other unrecognized value is treated the same way (WARN + default to the
+    base-case arm)."""
+    if champion in VALID_CHAMPIONS:
+        return champion
+    if champion in _LEGACY_CHAMPIONS:
+        logger.warning(
+            "Champion pointer had legacy champion=%r (retired seat, "
+            "alpha-engine-config-I2518 seat swap) — normalizing to %r for "
+            "gate purposes only; the pointer itself is left untouched unless "
+            "this week's gates clear a move.",
+            champion, VALID_CHAMPIONS[0],
+        )
+        return VALID_CHAMPIONS[0]
+    logger.warning(
+        "Champion pointer had unrecognized champion=%r — treating as %r for "
+        "gate purposes only (the pointer itself is left untouched unless "
+        "gates clear a move)", champion, VALID_CHAMPIONS[0],
+    )
+    return VALID_CHAMPIONS[0]
+
+
 def evaluate_gates(
     *,
     champion_before: str,
-    challenger_matured_cohorts: int,
-    challenger_weekly_sn_lift: list[float],
-    prior_consecutive_wins: int,
-    cooldown_until: str | None,
-    as_of: str,
+    arm_scores: dict,
     freeze: bool,
 ) -> dict:
-    """Run gates (a)-(e) and decide this week's outcome. Pure function — no
-    I/O — so the gate logic is independently unit-testable against synthetic
-    leaderboard fixtures without any S3/mock plumbing.
+    """Weekly winner-take-all decision (Brian's ruling, alpha-engine-config
+    -I2518, 2026-07-14) — supersedes the HAC-significance / 2-week hysteresis
+    / 2-week cooldown gates this module previously enforced, INCLUDING the
+    standing ``cooldown_until: 2026-07-27`` carried in a prior audit record
+    (no longer read or honored).
 
-    Args:
-        champion_before: current pointer champion value.
-        challenger_matured_cohorts: gate (a) input.
-        challenger_weekly_sn_lift: challenger's per-week sector-neutral 21d
-            lift-vs-champion series (most recent last), gate (b) input.
-        prior_consecutive_wins: gate (c) carry-forward counter from the
-            prior audit record (0 if none).
-        cooldown_until: gate (e) carry-forward — trading-day string or None.
-        as_of: this run's trading day (for cooldown comparison + the new
-            cooldown_until when a move happens).
-        freeze: --freeze flag.
+    ``arm_scores`` is the return of ``build_weekly_arm_scores`` below:
+    ``{"scores": {"scanner_predictor_direct": float|None,
+    "thinktank_coverage": float|None}, "unavailable_reasons": {arm: slug,
+    ...}}``. A ``None`` score means no valid evidence exists for that arm
+    THIS week — a definitional NO-CONTEST (validity guard), never a
+    statistical gate and never a default win for either side.
 
-    Returns a dict with keys: outcome, champion_after, challenger,
-    challenger_matured_cohorts, sn_lift_vs_champion, consecutive_wins,
-    cooldown_until, blocked_by.
+    Decision: whichever arm has the strictly higher score this week wins.
+    A tie (or either side missing) never flips the pointer — ties favor the
+    incumbent (``champion_before``) so the pointer never moves on a null or
+    exactly-equal signal.
+
+    Pure function — no I/O — independently unit-testable against synthetic
+    score fixtures.
+
+    Returns a dict with keys: outcome, champion_before, champion_after,
+    challenger, champion_score, challenger_score, blocked_by.
     """
-    min_cohorts = int(_cfg.get("min_matured_cohorts", _MIN_MATURED_COHORTS))
-    hysteresis_weeks = int(_cfg.get("hysteresis_weeks", _HYSTERESIS_WEEKS))
-    cooldown_weeks = int(_cfg.get("cooldown_weeks", _COOLDOWN_WEEKS))
-    alpha = float(_cfg.get("significance_alpha", _SIGNIFICANCE_ALPHA))
-
     challenger = _other_champion(champion_before)
+    scores = arm_scores.get("scores", {})
+    reasons = arm_scores.get("unavailable_reasons", {})
+    champ_score = scores.get(champion_before)
+    chall_score = scores.get(challenger)
 
     record: dict[str, Any] = {
         "champion_before": champion_before,
         "champion_after": champion_before,
         "challenger": challenger,
-        "challenger_matured_cohorts": int(challenger_matured_cohorts),
-        "sn_lift_vs_champion": None,
-        "consecutive_wins": 0,
-        "cooldown_until": cooldown_until,
+        "champion_score": champ_score,
+        "challenger_score": chall_score,
         "blocked_by": None,
     }
 
-    # Gate (a): matured cohort floor.
-    if challenger_matured_cohorts < min_cohorts:
-        record["outcome"] = "held_insufficient_data"
-        record["blocked_by"] = ["insufficient_matured_cohorts"]
-        record["consecutive_wins"] = 0  # thin data resets hysteresis honestly
+    if champ_score is None or chall_score is None:
+        blocked: list[str] = []
+        if champ_score is None:
+            blocked.append(reasons.get(champion_before, "arm_score_unavailable"))
+        if chall_score is None:
+            blocked.append(reasons.get(challenger, "arm_score_unavailable"))
+        record["outcome"] = "no_contest"
+        record["blocked_by"] = blocked
         return record
 
-    # Gate (b): overlap-aware significance.
-    sig = hac_significance(challenger_weekly_sn_lift, alpha=alpha)
-    if sig["status"] != "ok":
-        record["outcome"] = "held_insufficient_data"
-        record["blocked_by"] = ["insufficient_matured_cohorts"]
-        record["consecutive_wins"] = 0
+    winner = challenger if chall_score > champ_score else champion_before
+
+    if winner == champion_before:
+        record["outcome"] = "unchanged_winner_already_champion"
         return record
 
-    record["sn_lift_vs_champion"] = round(sig["mean"], 6)
-    challenger_winning = sig["significant"] and sig["mean"] > 0
-
-    if not challenger_winning:
-        record["outcome"] = "held_not_significant"
-        record["blocked_by"] = ["not_significant_hac_adjusted"]
-        record["consecutive_wins"] = 0  # a losing/insignificant week resets the streak
-        return record
-
-    # Gate (c): hysteresis — this is a winning week; extend the streak.
-    consecutive_wins = min(prior_consecutive_wins + 1, hysteresis_weeks)
-    record["consecutive_wins"] = consecutive_wins
-    if consecutive_wins < hysteresis_weeks:
-        record["outcome"] = "held_not_significant"
-        record["blocked_by"] = ["hysteresis_not_satisfied"]
-        return record
-
-    # Gate (e): cooldown.
-    if cooldown_until is not None and as_of < cooldown_until:
-        record["outcome"] = "held_cooldown"
-        record["blocked_by"] = ["cooldown_active"]
-        return record
-
-    # All stat/hysteresis/cooldown gates cleared — this is a promote/demote.
-    # Bidirectional (d): outcome label is "promoted" when the challenger is
-    # scanner_predictor_direct (moving toward the measured arm) and
-    # "demoted" when the challenger is agentic (moving back) — a fixed,
-    # symmetric convention, not a judgment call.
-    outcome = "promoted" if challenger == "scanner_predictor_direct" else "demoted"
-    new_cooldown = _add_weeks(as_of, cooldown_weeks)
-
+    # Challenger wins this week — a promotion, subject only to --freeze.
     if freeze:
-        record["outcome"] = outcome
+        record["outcome"] = "promoted"
         record["blocked_by"] = ["frozen"]
-        # champion_after / cooldown_until / consecutive_wins are NOT advanced
-        # to their post-move values — the pointer did not move, so the
-        # carry-forward state must reflect reality, not the suppressed move.
-        record["champion_after"] = champion_before
+        # champion_after is NOT advanced under freeze — the write is
+        # suppressed, so the carry-forward state must reflect reality.
         return record
 
-    record["outcome"] = outcome
-    record["champion_after"] = challenger
-    record["cooldown_until"] = new_cooldown
+    record["outcome"] = "promoted"
+    record["champion_after"] = winner
     return record
-
-
-def _add_weeks(as_of: str, weeks: int) -> str:
-    d = _date.fromisoformat(as_of)
-    return (d + timedelta(weeks=weeks)).isoformat()
 
 
 # ── config/producer_champion.json writer (single writer, dual caller) ──────
@@ -363,16 +407,18 @@ def write_champion_pointer(
     s3_client=None,
 ) -> dict:
     """THE single writer for ``config/producer_champion.json``. Both the
-    gate engine (``promotion_source="gate_engine"``) and any future one-shot
-    operator bootstrap script (``promotion_source="operator_bootstrap"``)
-    MUST call this function — never write the pointer directly. This is
-    what makes "no parallel writer implementations" true even though the
-    bootstrap script itself is out of scope for this module.
+    gate engine (``promotion_source="gate_engine"``) and the one-shot
+    2026-07-13 operator bootstrap (``promotion_source="operator_bootstrap"``)
+    call this function — never write the pointer directly.
+
+    ``champion`` MUST be in ``VALID_CHAMPIONS`` — this is the write-forbidden
+    half of the read-tolerated/write-forbidden posture for retired seats
+    (e.g. ``agentic``): raises ValueError for anything else, including every
+    ``_LEGACY_CHAMPIONS`` value.
 
     Idempotent / bidirectional-safe: callers only invoke this when a gate
-    decision has already determined the pointer SHOULD move (a held week
-    must never call this — see ``emit_champion_audit`` below, which only
-    calls this on outcome in {"promoted", "demoted"}).
+    decision has already determined the pointer SHOULD move (a no-contest or
+    unchanged week must never call this).
 
     Raises on S3 write failure when ``upload=True`` — a swallowed failure
     here would silently leave the live executor trading the wrong arm.
@@ -408,13 +454,13 @@ def write_champion_pointer(
 def read_champion_pointer(bucket: str, s3_client=None) -> dict | None:
     """Read the current pointer. Returns None on 404/NoSuchKey (pre-bootstrap
     — no promotion has ever been written; callers should treat champion as
-    'agentic', mirroring executor/champion.py's own default). Any other
-    error is NOT swallowed here (this is the producer side, not the fail
-    -loud executor consumer) but is logged and returns None so a transient
-    read hiccup degrades to "treat as agentic" rather than crashing the
-    whole weekly evaluate run — the outcome is recorded as
-    ``held_insufficient_data``/``error`` by the caller either way, never a
-    silent pointer write."""
+    the base-case arm, ``VALID_CHAMPIONS[0]`` == 'scanner_predictor_direct',
+    mirroring executor/champion.py's own default post-I2515). Any other
+    error is NOT swallowed here (this is the producer side, not the
+    fail-loud executor consumer) but is logged and returns None so a
+    transient read hiccup degrades to the base-case default rather than
+    crashing the whole weekly evaluate run — the outcome is recorded as
+    ``error`` by the caller either way, never a silent pointer write."""
     s3 = s3_client or boto3.client("s3")
     try:
         obj = s3.get_object(Bucket=bucket, Key=POINTER_KEY)
@@ -423,10 +469,16 @@ def read_champion_pointer(bucket: str, s3_client=None) -> dict | None:
         if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
             logger.info("No champion pointer at s3://%s/%s (pre-bootstrap)", bucket, POINTER_KEY)
         else:
-            logger.warning("Champion pointer read failed (%s) — treating as pre-bootstrap agentic", e)
+            logger.warning(
+                "Champion pointer read failed (%s) — treating as pre-bootstrap "
+                "base-case default", e,
+            )
         return None
     except Exception as e:  # noqa: BLE001 — degraded-read carve-out, see docstring.
-        logger.warning("Champion pointer read failed (%s) — treating as pre-bootstrap agentic", e)
+        logger.warning(
+            "Champion pointer read failed (%s) — treating as pre-bootstrap "
+            "base-case default", e,
+        )
         return None
 
 
@@ -434,11 +486,12 @@ def read_champion_pointer(bucket: str, s3_client=None) -> dict | None:
 
 
 def load_prior_audit(bucket: str, s3_client=None) -> dict | None:
-    """Read the prior weekly audit record (latest.json) for the
-    consecutive_wins / cooldown_until carry-forward. Mirrors
-    ``optimizer/apply_audit.py.load_prior`` exactly: absent artifact (first
-    -ever run) → None; any other read failure logs WARN and returns None
-    (state restarts honestly rather than crashing the run)."""
+    """Read the prior weekly audit record (latest.json). Retained for API
+    parity with the pre-I2518 engine (some callers/tests may still probe
+    prior-run state for observability) — no longer consulted by
+    evaluate_gates itself (winner-take-all carries no state forward:
+    no hysteresis counter, no cooldown date). Absent artifact (first-ever
+    run) -> None; any other read failure logs WARN and returns None."""
     s3 = s3_client or boto3.client("s3")
     key = f"{AUDIT_PREFIX}/latest.json"
     try:
@@ -462,36 +515,40 @@ def build_champion_audit(
     freeze: bool,
     error: str | None = None,
 ) -> dict:
-    """Build the weekly audit record (schema v1,
-    ``contracts/producer_champion_audit.schema.json``). Written every week
-    regardless of outcome — this IS the liveness proxy (config#2054)."""
+    """Build the weekly audit record (schema v2,
+    ``contracts/producer_champion_audit.schema.json`` — bumped from v1 under
+    alpha-engine-config-I2518: the HAC/hysteresis/cooldown fields
+    (``challenger_matured_cohorts``, ``sn_lift_vs_champion``,
+    ``consecutive_wins``, ``cooldown_until``) are retired in favor of
+    ``champion_score``/``challenger_score`` — no live consumer outside this
+    repo reads the audit record's fields (verified 2026-07-14), so no
+    cross-repo coordination was required for the bump; v1 historical
+    records remain valid documents under the frozen v1 shape and are not
+    revalidated against v2). Written every week regardless of outcome —
+    this IS the liveness proxy (config#2054)."""
     if error is not None or gate_result is None:
         return {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": AUDIT_SCHEMA_VERSION,
             "date": as_of,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "outcome": "error",
             "champion_before": None,
             "champion_after": None,
-            "challenger_matured_cohorts": 0,
-            "sn_lift_vs_champion": None,
-            "consecutive_wins": 0,
-            "cooldown_until": None,
+            "champion_score": None,
+            "challenger_score": None,
             "blocked_by": ["leaderboard_unavailable" if error else "unclassified_error"],
             "freeze": freeze,
             "detail": error or "gate evaluation did not run",
         }
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": AUDIT_SCHEMA_VERSION,
         "date": as_of,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "outcome": gate_result["outcome"],
         "champion_before": gate_result["champion_before"],
         "champion_after": gate_result["champion_after"],
-        "challenger_matured_cohorts": gate_result["challenger_matured_cohorts"],
-        "sn_lift_vs_champion": gate_result["sn_lift_vs_champion"],
-        "consecutive_wins": gate_result["consecutive_wins"],
-        "cooldown_until": gate_result["cooldown_until"],
+        "champion_score": gate_result["champion_score"],
+        "challenger_score": gate_result["challenger_score"],
         "blocked_by": gate_result["blocked_by"],
         "challenger": gate_result["challenger"],
         "freeze": freeze,
@@ -514,80 +571,141 @@ def write_champion_audit(bucket: str, run_date: str, audit: dict, s3_client=None
     return dated_key
 
 
+# ── Weekly arm-score sourcing ────────────────────────────────────────────────
+
+
+def _score_scanner_predictor_direct(e2e_lift: dict | None) -> tuple[float | None, str | None]:
+    """scanner_predictor_direct's weekly score: this run's backtester
+    -internal ``scanner_then_predictor_topN`` counterfactual lift vs the
+    shared agentic baseline (unchanged extraction from the pre-I2518
+    engine — see ``leaderboard_entry_from_e2e_lift``)."""
+    entry = leaderboard_entry_from_e2e_lift(e2e_lift)
+    if entry is None:
+        return None, "scanner_predictor_direct_counterfactual_unavailable"
+    return entry["sn_lift_vs_agentic_cio"], None
+
+
+def _score_thinktank_coverage(
+    tt_leaderboard: dict | None, run_date: str,
+) -> tuple[float | None, str | None]:
+    """thinktank_coverage's weekly score: read directly from
+    crucible-research's ``research/producer_leaderboard/{date}.json``
+    (see module docstring for the verified schema and the
+    coverage_complete-enforced-upstream reasoning)."""
+    if not isinstance(tt_leaderboard, dict):
+        return None, "leaderboard_unavailable"
+    lb_date = tt_leaderboard.get("date")
+    if lb_date is not None and lb_date != run_date:
+        # Defensive: an artifact keyed under run_date but self-labeled a
+        # different date is not trustworthy evidence for THIS week (there is
+        # no "latest.json" fallback for this artifact today, but a future
+        # upstream change could introduce one without this consumer noticing).
+        return None, "leaderboard_stale"
+    specs = tt_leaderboard.get("specs")
+    if not isinstance(specs, list):
+        return None, "leaderboard_unavailable"
+    row = next(
+        (s for s in specs if isinstance(s, dict) and s.get("name") == "thinktank_coverage"),
+        None,
+    )
+    if row is None:
+        # Expected until crucible-research registers thinktank_coverage in
+        # producers/registry.py::challenger_producers() — see module
+        # docstring "KNOWN, TRACKED GAP" / alpha-engine-config-I2519.
+        return None, "thinktank_coverage_not_in_leaderboard"
+    if not row.get("n_dates_scored"):
+        return None, "thinktank_coverage_no_resolved_outcomes"
+    alpha = row.get("topn_alpha_vs_champion")
+    if not isinstance(alpha, dict) or alpha.get("mean") is None:
+        return None, "thinktank_coverage_no_resolved_outcomes"
+    return float(alpha["mean"]), None
+
+
+def build_weekly_arm_scores(
+    e2e_lift: dict | None, tt_leaderboard: dict | None, *, run_date: str,
+) -> dict:
+    """Reduce this run's two evidence sources to the shape ``evaluate_gates``
+    expects: ``{"scores": {"scanner_predictor_direct": float|None,
+    "thinktank_coverage": float|None}, "unavailable_reasons": {arm: slug}}``.
+    Both scores are lift-vs-the-shared-agentic-baseline (see module
+    docstring's common-comparator reasoning) — comparable directly, no
+    combined-variance step needed since winner-take-all performs no
+    significance test."""
+    spd_score, spd_reason = _score_scanner_predictor_direct(e2e_lift)
+    tt_score, tt_reason = _score_thinktank_coverage(tt_leaderboard, run_date)
+    reasons: dict[str, str] = {}
+    if spd_reason is not None:
+        reasons["scanner_predictor_direct"] = spd_reason
+    if tt_reason is not None:
+        reasons["thinktank_coverage"] = tt_reason
+    return {
+        "scores": {
+            "scanner_predictor_direct": spd_score,
+            "thinktank_coverage": tt_score,
+        },
+        "unavailable_reasons": reasons,
+    }
+
+
 def run_weekly_evaluation(
     *,
     bucket: str,
     run_date: str,
-    leaderboard: dict | None,
+    e2e_lift: dict | None,
+    tt_leaderboard: dict | None,
     freeze: bool,
     upload: bool,
     s3_client=None,
 ) -> dict:
-    """Top-level entry point wired into evaluate.py. Runs the full gate
-    engine for this week and writes both artifacts:
+    """Top-level entry point wired into evaluate.py. Runs the weekly
+    winner-take-all decision and writes both artifacts:
 
       1. The weekly audit record (config/apply_audit/producer_champion/
          {date}.json + latest.json) — ALWAYS written, any outcome.
       2. The champion pointer (config/producer_champion.json) — written ONLY
-         on outcome in {"promoted", "demoted"} AND not freeze. A held week
-         (or a frozen run) never touches the pointer — idempotent,
-         bidirectional-safe.
+         on outcome="promoted" AND not freeze. A no-contest,
+         unchanged-winner-already-champion, or frozen run never touches the
+         pointer — idempotent, bidirectional-safe.
 
-    ``leaderboard`` is the parsed ``research/producer_leaderboard_champion_gate/{date}.json``
-    artifact (see ``build_leaderboard_entry`` / the leaderboard reader in
-    this module) shaped as
-    ``{"challenger_matured_cohorts": int, "challenger_weekly_sn_lift": [float, ...]}``
-    for the CURRENT champion's challenger. ``None`` (leaderboard missing or
-    unreadable) is treated as an ``error`` outcome — an engine that cannot
-    read its input must never guess at a pointer move.
+    ``e2e_lift`` is the ``diagnostics["e2e_lift"]`` dict already computed
+    earlier in the same evaluate.py run (scanner_predictor_direct's
+    evidence). ``tt_leaderboard`` is the parsed
+    ``research/producer_leaderboard/{run_date}.json`` artifact read from
+    crucible-research (thinktank_coverage's evidence) — see
+    ``read_research_producer_leaderboard``. Either being unavailable
+    degrades to a no-contest week for that arm (never an ``error`` outcome
+    by itself) via ``build_weekly_arm_scores``; only an exception raised
+    during evaluation itself produces ``outcome="error"``.
 
     Returns the audit record that was built (and, for callers that want it,
     it also carries the pointer dict under ``_pointer_write`` when a write
     happened — internal to evaluate.py wiring, not part of the frozen
     audit schema).
     """
-    prior_audit = load_prior_audit(bucket, s3_client=s3_client) if upload else None
-    prior_consecutive_wins = int((prior_audit or {}).get("consecutive_wins", 0) or 0)
-    cooldown_until = (prior_audit or {}).get("cooldown_until")
-
     pointer = read_champion_pointer(bucket, s3_client=s3_client)
-    champion_before = (pointer or {}).get("champion", "agentic")
-    if champion_before not in VALID_CHAMPIONS:
-        logger.warning(
-            "Champion pointer had unrecognized champion=%r — treating as 'agentic' "
-            "for gate purposes only (the pointer itself is left untouched unless "
-            "gates clear a move)", champion_before,
-        )
-        champion_before = "agentic"
+    champion_before = _normalize_champion_before(
+        (pointer or {}).get("champion", VALID_CHAMPIONS[0])
+    )
 
     gate_result = None
     error = None
-    if leaderboard is None:
-        error = (
-            f"research/producer_leaderboard_champion_gate/{run_date}.json unavailable — "
-            "cannot evaluate champion-promotion gates this week"
+    try:
+        arm_scores = build_weekly_arm_scores(e2e_lift, tt_leaderboard, run_date=run_date)
+        gate_result = evaluate_gates(
+            champion_before=champion_before,
+            arm_scores=arm_scores,
+            freeze=freeze,
         )
-    else:
-        try:
-            gate_result = evaluate_gates(
-                champion_before=champion_before,
-                challenger_matured_cohorts=int(leaderboard.get("challenger_matured_cohorts", 0)),
-                challenger_weekly_sn_lift=list(leaderboard.get("challenger_weekly_sn_lift", [])),
-                prior_consecutive_wins=prior_consecutive_wins,
-                cooldown_until=cooldown_until,
-                as_of=run_date,
-                freeze=freeze,
-            )
-        except Exception as e:  # noqa: BLE001 — gate evaluation must never
-            # crash the weekly evaluate run; record as an error outcome
-            # (still written, per the liveness posture) and move on.
-            logger.exception("Champion-promotion gate evaluation raised")
-            error = str(e)
+    except Exception as e:  # noqa: BLE001 — gate evaluation must never
+        # crash the weekly evaluate run; record as an error outcome
+        # (still written, per the liveness posture) and move on.
+        logger.exception("Champion-promotion gate evaluation raised")
+        error = str(e)
 
     audit = build_champion_audit(run_date, gate_result, freeze=freeze, error=error)
 
     pointer_written = None
-    if gate_result is not None and gate_result["outcome"] in ("promoted", "demoted") and not freeze:
+    if gate_result is not None and gate_result["outcome"] == "promoted" and not freeze:
         pointer_written = write_champion_pointer(
             bucket, gate_result["champion_after"],
             promotion_source="gate_engine", upload=upload, s3_client=s3_client,
@@ -595,9 +713,9 @@ def run_weekly_evaluation(
 
     logger.info(
         "producer_champion evaluation: outcome=%s champion_before=%s champion_after=%s "
-        "consecutive_wins=%s cooldown_until=%s blocked_by=%s",
+        "champion_score=%s challenger_score=%s blocked_by=%s",
         audit["outcome"], audit["champion_before"], audit["champion_after"],
-        audit["consecutive_wins"], audit["cooldown_until"], audit["blocked_by"],
+        audit.get("champion_score"), audit.get("challenger_score"), audit["blocked_by"],
     )
 
     if upload:
@@ -620,32 +738,28 @@ def run_weekly_evaluation(
 
 # ── research/producer_leaderboard_champion_gate/{date}.json ─────────────────
 #
-# This artifact did not exist anywhere in the repo prior to config#2367 (the
-# issue's description of it was aspirational — verified by grep, config#2367
-# groom notes). It is introduced here as the champion engine's own input:
-# a per-run snapshot of the challenger arm's weekly sector-neutral 21d lift
-# vs. the champion, derived from the existing
-# ``analysis.end_to_end.compute_lift_metrics()['scanner_then_predictor_counterfactual']``
-# counterfactual (methods block keyed 'scanner_then_predictor_topN' /
-# 'agentic_cio_advance'), APPENDED to a running history so the HAC gate has a
-# multi-week time series to test rather than a single point estimate.
+# This module's OWN observability artifact (config#2367) — a per-run
+# snapshot of scanner_predictor_direct's realized lift vs the agentic
+# baseline, appended to a running history. Under the pre-I2518 HAC engine
+# this fed the significance/hysteresis gate directly; under winner-take-all
+# it is NO LONGER consumed by the gate (which only needs THIS week's point,
+# taken straight from ``e2e_lift`` via ``_score_scanner_predictor_direct``
+# above) but is STILL MAINTAINED here for observability/history continuity
+# and because config#2452 (the key-collision fix that gave this artifact its
+# own distinct key, distinct from crucible-research's
+# research/producer_leaderboard/{date}.json) has an open live-verification
+# tail expecting this artifact to keep being written every Saturday.
 #
 # config#2452 (found 2026-07-13, same day as first live run post-merge): this
 # key was originally `research/producer_leaderboard/{date}.json` — the SAME
 # key crucible-research's `scoring/leaderboard_producers.py` already writes,
-# with an incompatible schema (`{"leaderboard_id": "producer", ...}` vs this
-# module's `{"weekly_points": [...]}`). Per the Saturday SF ordering
-# (Research writes in Branch A, this Evaluator step runs later in Branch B),
-# this module's write would silently clobber crucible-research's real
-# multi-arm producer leaderboard every week, AND this module's own
-# `read_prior_leaderboard_history` would never find its own prior weeks'
-# `weekly_points` in what Research had written — perpetual cold start.
-# Renamed to a distinct key before any collision occurred (verified via
-# `aws s3 ls` — nothing had landed under the old key yet).
+# with an incompatible schema. Renamed before any collision occurred.
 
 
 LEADERBOARD_KEY_TMPL = "research/producer_leaderboard_champion_gate/{date}.json"
-_LEADERBOARD_HISTORY_KEEP_WEEKS = 26  # ~6 months of weekly points is plenty for HAC lag=3
+_LEADERBOARD_HISTORY_KEEP_WEEKS = 26  # ~6 months of weekly points
+
+RESEARCH_PRODUCER_LEADERBOARD_KEY_TMPL = "research/producer_leaderboard/{date}.json"
 
 
 def leaderboard_entry_from_e2e_lift(e2e_lift: dict | None) -> dict | None:
@@ -654,7 +768,9 @@ def leaderboard_entry_from_e2e_lift(e2e_lift: dict | None) -> dict | None:
     the e2e_lift diagnostic already computed earlier in the same evaluate
     run. Returns None when the counterfactual is unavailable this week
     (skipped/insufficient_data/error/missing) — an honest "no new point this
-    week" rather than fabricating one.
+    week" rather than fabricating one. Unchanged from the pre-I2518 engine —
+    this extraction is also the current gate's scanner_predictor_direct
+    score source (see ``_score_scanner_predictor_direct``).
     """
     if not isinstance(e2e_lift, dict):
         return None
@@ -695,9 +811,10 @@ def build_leaderboard_artifact(run_date: str, history: list[dict], new_entry: di
 
 
 def leaderboard_gate_inputs(artifact: dict) -> dict:
-    """Reduce a leaderboard artifact to the shape ``run_weekly_evaluation``
-    expects: matured cohort count (weeks with a matured point) and the
-    weekly SN-lift series for the HAC gate."""
+    """Reduce a leaderboard artifact to matured cohort count + weekly SN-lift
+    series. Retained for API parity / observability (e.g. a future
+    diagnostic reusing hac_significance) — no longer consumed by
+    evaluate_gates under winner-take-all."""
     points = artifact.get("weekly_points", []) if isinstance(artifact, dict) else []
     lifts = [p["sn_lift_vs_agentic_cio"] for p in points if p.get("sn_lift_vs_agentic_cio") is not None]
     return {
@@ -725,12 +842,10 @@ def read_prior_leaderboard_history(bucket: str, run_date: str, s3_client=None) -
     backward from ``run_date`` — NOT wall-clock today, so a ``--date``
     backfill run seeds history relative to the backfilled trading day, not
     the day the backfill happens to execute) to seed ``weekly_points``
-    history. Falls back to an empty history (cold start) on any read
-    failure — the engine will simply need ``min_matured_cohorts`` fresh
-    weeks before it can promote/demote, which is the same honest starvation
-    posture as any other new leaderboard.
-    """
+    history."""
     s3 = s3_client or boto3.client("s3")
+    from datetime import date as _date, timedelta
+
     anchor = _date.fromisoformat(run_date)
     for back in range(1, 15):
         probe_date = (anchor - timedelta(days=back)).isoformat()
@@ -765,7 +880,9 @@ def update_leaderboard_and_get_gate_inputs(
     """Full leaderboard maintenance step: read prior history, append this
     week's point (if the counterfactual matured this run), write the
     updated artifact, and return the gate-ready reduction. Called once per
-    evaluate run, BEFORE ``run_weekly_evaluation``.
+    evaluate run, BEFORE ``run_weekly_evaluation`` — maintained for
+    observability / config#2452 continuity (see module docstring); its
+    return value is no longer fed into the gate decision.
     """
     history = read_prior_leaderboard_history(bucket, run_date, s3_client=s3_client) if upload else []
     new_entry = leaderboard_entry_from_e2e_lift(e2e_lift)
@@ -775,7 +892,42 @@ def update_leaderboard_and_get_gate_inputs(
             write_leaderboard(bucket, run_date, artifact, s3_client=s3_client)
         except Exception:
             logger.exception(
-                "producer_leaderboard write failed — champion gates will "
-                "evaluate against in-memory history only this run",
+                "producer_leaderboard write failed — this observability "
+                "artifact will be missing this week (non-fatal to the gate, "
+                "which no longer depends on it)",
             )
     return leaderboard_gate_inputs(artifact)
+
+
+def read_research_producer_leaderboard(bucket: str, run_date: str, s3_client=None) -> dict | None:
+    """Read crucible-research's REAL champion/challenger producer leaderboard
+    (``scoring/leaderboard_producers.py::build_producer_leaderboard``,
+    config#1221/#1223) for ``run_date`` — the evidence source for
+    thinktank_coverage's weekly score (see module docstring). Distinct key
+    from this module's OWN ``research/producer_leaderboard_champion_gate/
+    {date}.json`` (config#2452 collision fix) — this function only READS
+    the crucible-research-owned artifact, never writes it.
+
+    Returns None on 404/NoSuchKey (not yet written this week — e.g. before
+    the Saturday eval_rolling_mean Lambda step runs, or any week
+    crucible-research's build fails) or any other read/parse failure
+    (logged) — a missing/malformed leaderboard degrades to a no-contest week
+    for thinktank_coverage (``_score_thinktank_coverage``), never a crash
+    and never a fabricated score."""
+    s3 = s3_client or boto3.client("s3")
+    key = RESEARCH_PRODUCER_LEADERBOARD_KEY_TMPL.format(date=run_date)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            logger.info(
+                "No crucible-research producer_leaderboard at s3://%s/%s "
+                "(not yet written this week)", bucket, key,
+            )
+        else:
+            logger.warning("crucible-research producer_leaderboard read failed (%s)", e)
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("crucible-research producer_leaderboard read failed (%s)", e)
+        return None
