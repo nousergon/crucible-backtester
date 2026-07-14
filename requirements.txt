@@ -1,4 +1,4 @@
-vectorbt~=0.26.1
+vectorbt~=1.1.0
 numpy<2
 plotly<6
 pandas~=2.2
