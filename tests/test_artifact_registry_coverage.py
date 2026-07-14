@@ -92,6 +92,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "optimizer/apply_audit.py": 2,
     "optimizer/assembler.py": 5,
     "optimizer/barrier_sizing_optimizer.py": 1,
+    # config#2367 champion-promotion engine — 4 PUTs: config/producer_champion.json
+    # (live pointer, the config#2364 champion-loop consumer key), config/apply_audit/
+    # producer_champion/{date}.json + latest.json (weekly liveness-proxy audit record,
+    # written unconditionally per the config#2054 lesson), and research/producer_
+    # leaderboard/{date}.json (forward-cohort leaderboard, gate engine input). All
+    # four are load-bearing (pointer drives live executor trading path) — registered
+    # as freshness-SLA rows in ARTIFACT_REGISTRY.yaml, not grandfathered.
+    "optimizer/champion_promotion.py": 4,
     "optimizer/config_archive.py": 1,
     "optimizer/executor_optimizer.py": 5,
     # config#748 factor_blend_optimizer — 3 PUTs (live config/factor_blend_params.json

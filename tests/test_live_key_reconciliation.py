@@ -249,7 +249,7 @@ class TestEndToEndWithRealAuditBuilder:
             "notes": "cutover writes ok",
         }
         audit = build_audit(
-            "2026-07-12", opt_results, assembler_summary=assembler_summary,
+            "2026-07-12", opt_results, assembler_summaries={"executor_params": assembler_summary},
         )
         assert audit["loops"]["executor_params"]["outcome"] == "promoted"
 
@@ -288,7 +288,7 @@ class TestEndToEndWithRealAuditBuilder:
             "notes": "cutover writes ok",
         }
         audit = build_audit(
-            "2026-07-12", opt_results, assembler_summary=assembler_summary,
+            "2026-07-12", opt_results, assembler_summaries={"executor_params": assembler_summary},
         )
         s3 = MagicMock()
         s3.head_object.side_effect = _head_object_side_effect(

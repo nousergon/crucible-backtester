@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # config#1958 deliverable 5(h): weekly, NOT per-PR — a full mutmut pass
+    # over even the scoped apply-path modules (setup.cfg's [mutmut]
+    # only_mutate: rollback.py / apply_audit.py / assembler.py) runs well
+    # over a thousand mutants; putting that on the PR-blocking `test` job
+    # would make every PR pay a multi-minute-to-tens-of-minutes tax for a
+    # signal that doesn't change week to week. Runs Sunday 09:00 UTC —
+    # same day as the Saturday-evening weekly SF pipeline's Sunday-morning
+    # backtester follow-up window.
+    - cron: "0 9 * * 0"
 
 jobs:
   test:
@@ -39,7 +49,15 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
+      # Advisory-only: pip-audit's newer releases emit a GH Actions error
+      # annotation for any finding, which the runner honors as a step failure
+      # independent of the shell exit code — `|| true` no longer suppresses
+      # it (discovered 2026-07-13 when a newly-published langchain-core/
+      # pyarrow CVE tripped every PR's security-audit step red). continue-on-
+      # error is the runner-level equivalent of the `|| true` this step
+      # always intended: report findings, never block the job on them.
       - name: Security audit
+        continue-on-error: true
         run: |
           pip install pip-audit
           IGNORE_ARGS=()
@@ -60,3 +78,39 @@ jobs:
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
     secrets: inherit
+
+  # config#1958 deliverable 5(h): mutation testing on the risk-critical
+  # apply-path modules (scope + rationale in setup.cfg's [mutmut] section).
+  # Scheduled-only (see the `schedule` trigger above) — observational, does
+  # NOT gate merges; surviving-mutant counts are a coverage-quality signal
+  # to review, not a pass/fail contract. `mutmut results` output (which
+  # test survives vs. which line) is the actionable artifact, uploaded so
+  # Brian doesn't need to re-run locally to see WHICH mutants survived.
+  mutmut:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest hypothesis mutmut
+
+      - name: Run mutmut on apply-path modules (rollback / apply_audit / assembler)
+        run: mutmut run --max-children 4 || true
+
+      - name: Summarize results (survivors are the actionable signal)
+        run: mutmut results
+
+      - name: Upload mutmut cache for local `mutmut show <id>` triage
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutmut-cache
+          path: .mutmut-cache
+          retention-days: 14
