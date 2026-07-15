@@ -807,6 +807,8 @@ class TestCutoverApplyDirect:
             config_type="executor_params",
             run_date="2026-05-09",
             assembled_params={"atr_multiplier": 3.0, "min_score": 75},
+            merge_summary={},
+            artifacts_seen={},
             status="ok",
             cutover_status=None,  # Will be set after _cutover_apply
         )
@@ -845,6 +847,8 @@ class TestCutoverApplyDirect:
             config_type="scoring_weights",
             run_date="2026-05-09",
             assembled_params={"weight_a": 0.6},
+            merge_summary={},
+            artifacts_seen={},
             status="ok",
         )
 
@@ -870,6 +874,8 @@ class TestCutoverApplyDirect:
             config_type="executor_params",
             run_date="2026-05-09",
             assembled_params={"atr_multiplier": 3.0},
+            merge_summary={},
+            artifacts_seen={},
             status="ok",
         )
 
@@ -905,6 +911,8 @@ class TestCutoverApplyDirect:
             config_type="executor_params",
             run_date="2026-05-09",
             assembled_params={"atr_multiplier": 3.0},
+            merge_summary={},
+            artifacts_seen={},
             status="ok",
         )
 
@@ -930,6 +938,8 @@ class TestCutoverApplyDirect:
             config_type="executor_params",
             run_date="2026-05-09",
             assembled_params={"atr_multiplier": 3.0},
+            merge_summary={},
+            artifacts_seen={},
             status="ok",
         )
 
@@ -958,6 +968,8 @@ class TestCutoverApplyDirect:
             config_type="scoring_weights",
             run_date="2026-05-09",
             assembled_params={"a": 0.5},
+            merge_summary={},
+            artifacts_seen={},
             status="ok",
         )
 
@@ -988,6 +1000,8 @@ class TestCutoverApplyDirect:
             config_type="executor_params",
             run_date="2026-05-09",
             assembled_params={"atr_multiplier": 3.0},
+            merge_summary={},
+            artifacts_seen={},
             status="ok",
         )
 

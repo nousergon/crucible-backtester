@@ -561,6 +561,7 @@ class TestSummarizeAssembler:
                 "atr_multiplier": {"writer": "executor_optimizer", "reason": "full_replace"},
                 "min_score": {"writer": "executor_optimizer", "reason": "full_replace"},
             },
+            artifacts_seen={},
             notes="cutover_applied: live=...",
         )
 
@@ -585,6 +586,7 @@ class TestSummarizeAssembler:
                 "min_score": {"writer": "executor_optimizer"},
                 "threshold": {"writer": "weight_optimizer"},
             },
+            artifacts_seen={},
             notes="multi-writer merge",
         )
 
@@ -601,6 +603,7 @@ class TestSummarizeAssembler:
             status="ok",
             cutover_status="not_attempted",
             merge_summary=None,
+            artifacts_seen={},
             notes="shadow only",
         )
 
@@ -618,6 +621,7 @@ class TestSummarizeAssembler:
             assembled_params={"a": 1},
             status="ok",
             merge_summary={"a": {"writer": "test_optimizer"}},
+            artifacts_seen={},
             notes="shadow mode",
         )
         # Deliberately don't set cutover_status
@@ -643,6 +647,7 @@ class TestSummarizeAssembler:
                 "missing_writer": {"reason": "some reason"},
                 "none_writer": {"writer": None},
             },
+            artifacts_seen={},
             notes="mixed quality summary",
         )
 
@@ -679,6 +684,7 @@ class TestSummarizeAssembler:
             status="ok",
             cutover_status="failed",
             merge_summary={"a": {"writer": "executor_optimizer"}},
+            artifacts_seen={},
             notes="cutover_failed: S3 error",
         )
 
