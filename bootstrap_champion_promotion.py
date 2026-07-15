@@ -83,17 +83,13 @@ def main() -> None:
     )
     parser.add_argument("--upload", action="store_true", help="Actually write to S3 (default: dry-run, log only)")
     args = parser.parse_args()
-
-    if args.champion == "agentic":
-        print(
-            "Refusing to bootstrap-promote to 'agentic' -- that is the pre-bootstrap "
-            "default this script exists to move OFF of, not onto.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # Note: "agentic" cannot reach this point -- argparse's own `choices=
+    # VALID_CHAMPIONS` (config-I2518 seat swap: VALID_CHAMPIONS no longer
+    # includes "agentic") rejects it at parse time with SystemExit(2) before
+    # main()'s body runs. No separate refusal check is needed here.
 
     existing = read_champion_pointer(args.bucket)
-    champion_before = (existing or {}).get("champion", "agentic")
+    champion_before = (existing or {}).get("champion", "scanner_predictor_direct")
     if existing is not None:
         print(
             f"REFUSING: a champion pointer already exists (champion={champion_before!r}, "

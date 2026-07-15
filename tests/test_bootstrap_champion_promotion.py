@@ -29,14 +29,18 @@ def test_build_bootstrap_audit_shape():
     assert audit["promotion_source"] == "operator_bootstrap"
 
 
-def test_refuses_agentic_target(monkeypatch, capsys):
+def test_agentic_target_rejected_by_argparse_choices(monkeypatch, capsys):
+    """config-I2518 seat swap: VALID_CHAMPIONS no longer includes 'agentic',
+    so argparse's own `choices=VALID_CHAMPIONS` rejects it at parse time
+    (SystemExit(2), before main()'s body runs) -- there is no longer a
+    separate in-body refusal branch for this case."""
     monkeypatch.setattr(sys, "argv", [
         "bootstrap_champion_promotion.py", "--champion", "agentic", "--run-date", "2026-07-13",
     ])
     with pytest.raises(SystemExit) as exc:
         bootstrap.main()
-    assert exc.value.code == 1
-    assert "Refusing" in capsys.readouterr().err
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_refuses_when_pointer_already_exists(monkeypatch, capsys):
