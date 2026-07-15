@@ -69,8 +69,8 @@ reference):**
     ``weekly_points`` series is no longer consumed by the gate itself,
     since winner-take-all needs only THIS week's point, not a multi-week
     HAC-adjusted series).
-  - ``thinktank_coverage``'s weekly score is read DIRECTLY from
-    crucible-research's real champion/challenger producer leaderboard,
+  - ``thinktank_coverage``'s weekly score is read from crucible-research's
+    real champion/challenger producer leaderboard,
     ``research/producer_leaderboard/{date}.json``
     (``scoring/leaderboard_producers.py::build_producer_leaderboard``,
     config#1221/#1223) — verified schema (2026-07-14, read from the
@@ -87,6 +87,29 @@ reference):**
     when ``coverage_complete`` — so any date this spec contributed to
     ``n_dates_scored`` was necessarily a full-coverage day; no separate
     coverage_complete check is needed on this side of the boundary.
+
+    **LATEST-AVAILABLE read (alpha-engine-config-I2544, 2026-07-14 ruling,
+    same-session follow-up to I2518):** ``research/producer_leaderboard/
+    {date}.json`` is now written by an ASYNC advisory child Step Function
+    (config-I2518's persistent-dash rearchitecture) that may not have
+    finished — or may have failed outright — by the time this Evaluator
+    -stage gate runs in the MAIN weekly SF. An exact same-day key read is
+    therefore no longer a safe assumption. This module instead lists the
+    ``research/producer_leaderboard/`` prefix
+    (``find_latest_research_producer_leaderboard_date``) and reads the
+    LATEST artifact dated <= ``run_date`` (``read_latest_research_producer
+    _leaderboard``). This is the semantically CORRECT read, not a
+    compromise: the gate scores REALIZED (matured) outcomes of PRIOR
+    weeks' ``thinktank_coverage`` selections — a same-day leaderboard could
+    not contain resolved outcomes for same-day picks even if it existed on
+    time. An honest staleness bound still applies: a selected leaderboard
+    more than ``LEADERBOARD_STALENESS_DAYS`` (8) calendar days older than
+    ``run_date`` is treated as unavailable (``leaderboard_stale_gt_8d``,
+    a no-contest) rather than silently scored against stale evidence. The
+    date actually used is threaded through to the audit record as
+    ``leaderboard_date_used`` (additive, contracts/producer_champion_audit
+    .schema.json) so the audit trail always shows which week's evidence
+    decided (or declined to decide) a flip.
 
   **Both scores share the SAME underlying reference** — crucible-research's
   live ``agentic_sector_teams`` signal producer / the CIO ADVANCE
@@ -143,7 +166,8 @@ from __future__ import annotations
 import json
 import logging
 import math
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 from typing import Any
 
 import boto3
@@ -165,19 +189,21 @@ _LEGACY_CHAMPIONS = ("agentic",)
 
 OUTCOMES = ("promoted", "no_contest", "unchanged_winner_already_champion", "error")
 
-# blocked_by slugs — union of the new winner-take-all vocabulary and the
-# retired HAC/hysteresis/cooldown-engine vocabulary (kept for read-tolerance
-# of historical audit records written under the pre-I2518 engine; no code
-# path in this module writes the retired slugs again).
+# blocked_by slugs — union of the current winner-take-all vocabulary and two
+# retired vocabularies kept for read-tolerance of historical audit records:
+# the pre-I2518 HAC/hysteresis/cooldown engine, and the pre-I2544
+# exact-date-only leaderboard read (superseded same-day by the
+# latest-available read below; no code path in this module writes either
+# retired group again).
 _BLOCKED_BY_SLUGS = (
-    # new (winner-take-all, I2518)
+    # current (winner-take-all + latest-available leaderboard read, I2518/I2544)
     "no_valid_scanner_predictor_direct_selections",
     "no_valid_thinktank_coverage_selections",
     "scanner_predictor_direct_counterfactual_unavailable",
     "thinktank_coverage_not_in_leaderboard",
     "thinktank_coverage_no_resolved_outcomes",
     "leaderboard_unavailable",
-    "leaderboard_stale",
+    "leaderboard_stale_gt_8d",
     "arm_score_unavailable",
     "frozen",
     "unclassified_error",
@@ -186,6 +212,25 @@ _BLOCKED_BY_SLUGS = (
     "cooldown_active",
     "not_significant_hac_adjusted",
     "hysteresis_not_satisfied",
+    # retired (pre-I2544 exact-date-only leaderboard read) — historical
+    # read-only: this slug fired when the artifact's self-reported "date"
+    # field disagreed with an exact-match run_date key read; the
+    # latest-available read no longer requires an exact match, so this
+    # condition can no longer occur (superseded by leaderboard_stale_gt_8d
+    # for the age-bound case).
+    "leaderboard_stale",
+)
+
+# Honest staleness bound (alpha-engine-config-I2544, 2026-07-14): a selected
+# research/producer_leaderboard/{date}.json artifact older than this many
+# calendar days relative to run_date is treated as unavailable rather than
+# scored — see find_latest_research_producer_leaderboard_date /
+# _score_thinktank_coverage.
+LEADERBOARD_STALENESS_DAYS = 8
+
+RESEARCH_PRODUCER_LEADERBOARD_PREFIX = "research/producer_leaderboard/"
+_RESEARCH_PRODUCER_LEADERBOARD_KEY_RE = re.compile(
+    r"^research/producer_leaderboard/(\d{4}-\d{2}-\d{2})\.json$"
 )
 
 # HAC lag helper constants — still consulted by hac_significance() below,
@@ -336,9 +381,15 @@ def evaluate_gates(
     ``arm_scores`` is the return of ``build_weekly_arm_scores`` below:
     ``{"scores": {"scanner_predictor_direct": float|None,
     "thinktank_coverage": float|None}, "unavailable_reasons": {arm: slug,
-    ...}}``. A ``None`` score means no valid evidence exists for that arm
-    THIS week — a definitional NO-CONTEST (validity guard), never a
-    statistical gate and never a default win for either side.
+    ...}, "leaderboard_date_used": str|None}``. A ``None`` score means no
+    valid evidence exists for that arm THIS week — a definitional
+    NO-CONTEST (validity guard), never a statistical gate and never a
+    default win for either side. ``leaderboard_date_used`` (alpha-engine
+    -config-I2544) is the date of the ``research/producer_leaderboard/
+    {date}.json`` artifact actually selected (latest available <=
+    run_date) — carried through into every outcome record (promoted,
+    no_contest, and unchanged) so the audit trail always shows which
+    week's evidence decided (or declined to decide) a flip.
 
     Decision: whichever arm has the strictly higher score this week wins.
     A tie (or either side missing) never flips the pointer — ties favor the
@@ -349,7 +400,8 @@ def evaluate_gates(
     score fixtures.
 
     Returns a dict with keys: outcome, champion_before, champion_after,
-    challenger, champion_score, challenger_score, blocked_by.
+    challenger, champion_score, challenger_score, blocked_by,
+    leaderboard_date_used.
     """
     challenger = _other_champion(champion_before)
     scores = arm_scores.get("scores", {})
@@ -364,6 +416,7 @@ def evaluate_gates(
         "champion_score": champ_score,
         "challenger_score": chall_score,
         "blocked_by": None,
+        "leaderboard_date_used": arm_scores.get("leaderboard_date_used"),
     }
 
     if champ_score is None or chall_score is None:
@@ -525,7 +578,15 @@ def build_champion_audit(
     cross-repo coordination was required for the bump; v1 historical
     records remain valid documents under the frozen v1 shape and are not
     revalidated against v2). Written every week regardless of outcome —
-    this IS the liveness proxy (config#2054)."""
+    this IS the liveness proxy (config#2054).
+
+    ``leaderboard_date_used`` (additive, alpha-engine-config-I2544,
+    2026-07-14) is the date of the ``research/producer_leaderboard/
+    {date}.json`` artifact actually consulted this run (the latest
+    available <= ``as_of``, or None when no leaderboard was available at
+    all / evaluation aborted before scoring) — always present (nullable),
+    on every outcome including ``error``, so the audit trail is never
+    silent about which week's evidence decided a flip."""
     if error is not None or gate_result is None:
         return {
             "schema_version": AUDIT_SCHEMA_VERSION,
@@ -539,6 +600,7 @@ def build_champion_audit(
             "blocked_by": ["leaderboard_unavailable" if error else "unclassified_error"],
             "freeze": freeze,
             "detail": error or "gate evaluation did not run",
+            "leaderboard_date_used": None,
         }
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -552,6 +614,7 @@ def build_champion_audit(
         "blocked_by": gate_result["blocked_by"],
         "challenger": gate_result["challenger"],
         "freeze": freeze,
+        "leaderboard_date_used": gate_result.get("leaderboard_date_used"),
     }
 
 
@@ -586,21 +649,36 @@ def _score_scanner_predictor_direct(e2e_lift: dict | None) -> tuple[float | None
 
 
 def _score_thinktank_coverage(
-    tt_leaderboard: dict | None, run_date: str,
+    tt_leaderboard: dict | None, run_date: str, leaderboard_date_used: str | None,
 ) -> tuple[float | None, str | None]:
-    """thinktank_coverage's weekly score: read directly from
-    crucible-research's ``research/producer_leaderboard/{date}.json``
-    (see module docstring for the verified schema and the
-    coverage_complete-enforced-upstream reasoning)."""
-    if not isinstance(tt_leaderboard, dict):
+    """thinktank_coverage's weekly score: read from crucible-research's
+    ``research/producer_leaderboard/{date}.json`` (see module docstring for
+    the verified schema and the coverage_complete-enforced-upstream
+    reasoning).
+
+    ``leaderboard_date_used`` (alpha-engine-config-I2544) is the date of
+    the ``tt_leaderboard`` artifact actually selected by
+    ``find_latest_research_producer_leaderboard_date`` — the latest
+    available <= ``run_date``, never the same-day exact match this
+    function required before I2544. An honest staleness bound still
+    applies: more than ``LEADERBOARD_STALENESS_DAYS`` calendar days older
+    than ``run_date`` is treated as unavailable (this IS the semantically
+    correct behavior, not a compromise — the gate scores realized outcomes
+    of PRIOR weeks' selections, which a same-day leaderboard could not
+    contain anyway; see module docstring)."""
+    if not isinstance(tt_leaderboard, dict) or leaderboard_date_used is None:
         return None, "leaderboard_unavailable"
-    lb_date = tt_leaderboard.get("date")
-    if lb_date is not None and lb_date != run_date:
-        # Defensive: an artifact keyed under run_date but self-labeled a
-        # different date is not trustworthy evidence for THIS week (there is
-        # no "latest.json" fallback for this artifact today, but a future
-        # upstream change could introduce one without this consumer noticing).
-        return None, "leaderboard_stale"
+    age_days = (
+        date.fromisoformat(run_date) - date.fromisoformat(leaderboard_date_used)
+    ).days
+    if age_days < 0:
+        # Defensive: find_latest_research_producer_leaderboard_date never
+        # selects a date > run_date, but a caller passing
+        # leaderboard_date_used directly (bypassing that selection) must
+        # never have a "future" artifact trusted as this week's evidence.
+        return None, "leaderboard_unavailable"
+    if age_days > LEADERBOARD_STALENESS_DAYS:
+        return None, "leaderboard_stale_gt_8d"
     specs = tt_leaderboard.get("specs")
     if not isinstance(specs, list):
         return None, "leaderboard_unavailable"
@@ -622,17 +700,31 @@ def _score_thinktank_coverage(
 
 
 def build_weekly_arm_scores(
-    e2e_lift: dict | None, tt_leaderboard: dict | None, *, run_date: str,
+    e2e_lift: dict | None,
+    tt_leaderboard: dict | None,
+    *,
+    run_date: str,
+    leaderboard_date_used: str | None = None,
 ) -> dict:
     """Reduce this run's two evidence sources to the shape ``evaluate_gates``
     expects: ``{"scores": {"scanner_predictor_direct": float|None,
-    "thinktank_coverage": float|None}, "unavailable_reasons": {arm: slug}}``.
-    Both scores are lift-vs-the-shared-agentic-baseline (see module
-    docstring's common-comparator reasoning) — comparable directly, no
-    combined-variance step needed since winner-take-all performs no
-    significance test."""
+    "thinktank_coverage": float|None}, "unavailable_reasons": {arm: slug},
+    "leaderboard_date_used": str|None}``. Both scores are lift-vs-the-shared
+    -agentic-baseline (see module docstring's common-comparator reasoning)
+    — comparable directly, no combined-variance step needed since
+    winner-take-all performs no significance test.
+
+    ``leaderboard_date_used`` (alpha-engine-config-I2544) MUST be supplied
+    by the caller as the date actually selected via
+    ``find_latest_research_producer_leaderboard_date`` /
+    ``read_latest_research_producer_leaderboard`` — it is threaded straight
+    through into the returned dict (and from there into every
+    ``evaluate_gates`` outcome record) so the audit trail always shows
+    which week's evidence decided (or declined to decide) a flip."""
     spd_score, spd_reason = _score_scanner_predictor_direct(e2e_lift)
-    tt_score, tt_reason = _score_thinktank_coverage(tt_leaderboard, run_date)
+    tt_score, tt_reason = _score_thinktank_coverage(
+        tt_leaderboard, run_date, leaderboard_date_used,
+    )
     reasons: dict[str, str] = {}
     if spd_reason is not None:
         reasons["scanner_predictor_direct"] = spd_reason
@@ -644,6 +736,7 @@ def build_weekly_arm_scores(
             "thinktank_coverage": tt_score,
         },
         "unavailable_reasons": reasons,
+        "leaderboard_date_used": leaderboard_date_used,
     }
 
 
@@ -653,6 +746,7 @@ def run_weekly_evaluation(
     run_date: str,
     e2e_lift: dict | None,
     tt_leaderboard: dict | None,
+    tt_leaderboard_date_used: str | None = None,
     freeze: bool,
     upload: bool,
     s3_client=None,
@@ -670,12 +764,21 @@ def run_weekly_evaluation(
     ``e2e_lift`` is the ``diagnostics["e2e_lift"]`` dict already computed
     earlier in the same evaluate.py run (scanner_predictor_direct's
     evidence). ``tt_leaderboard`` is the parsed
-    ``research/producer_leaderboard/{run_date}.json`` artifact read from
-    crucible-research (thinktank_coverage's evidence) — see
-    ``read_research_producer_leaderboard``. Either being unavailable
-    degrades to a no-contest week for that arm (never an ``error`` outcome
-    by itself) via ``build_weekly_arm_scores``; only an exception raised
-    during evaluation itself produces ``outcome="error"``.
+    ``research/producer_leaderboard/{date}.json`` artifact for
+    ``tt_leaderboard_date_used`` (thinktank_coverage's evidence), read from
+    crucible-research via ``read_latest_research_producer_leaderboard`` —
+    the LATEST artifact available <= ``run_date`` (alpha-engine-config
+    -I2544: the writer is now an async advisory child SF that may not have
+    finished/may have failed by the time this gate runs; a same-day exact
+    match is no longer assumed). ``tt_leaderboard_date_used`` is the date
+    of that selected artifact (None if none was found <= run_date) —
+    threaded through to the audit record's ``leaderboard_date_used`` field
+    so the audit trail always shows which week's evidence decided a flip.
+    Either evidence source being unavailable, or the selected leaderboard
+    being more than ``LEADERBOARD_STALENESS_DAYS`` days stale, degrades to
+    a no-contest week for that arm (never an ``error`` outcome by itself)
+    via ``build_weekly_arm_scores``; only an exception raised during
+    evaluation itself produces ``outcome="error"``.
 
     Returns the audit record that was built (and, for callers that want it,
     it also carries the pointer dict under ``_pointer_write`` when a write
@@ -690,7 +793,10 @@ def run_weekly_evaluation(
     gate_result = None
     error = None
     try:
-        arm_scores = build_weekly_arm_scores(e2e_lift, tt_leaderboard, run_date=run_date)
+        arm_scores = build_weekly_arm_scores(
+            e2e_lift, tt_leaderboard, run_date=run_date,
+            leaderboard_date_used=tt_leaderboard_date_used,
+        )
         gate_result = evaluate_gates(
             champion_before=champion_before,
             arm_scores=arm_scores,
@@ -713,9 +819,10 @@ def run_weekly_evaluation(
 
     logger.info(
         "producer_champion evaluation: outcome=%s champion_before=%s champion_after=%s "
-        "champion_score=%s challenger_score=%s blocked_by=%s",
+        "champion_score=%s challenger_score=%s blocked_by=%s leaderboard_date_used=%s",
         audit["outcome"], audit["champion_before"], audit["champion_after"],
         audit.get("champion_score"), audit.get("challenger_score"), audit["blocked_by"],
+        audit.get("leaderboard_date_used"),
     )
 
     if upload:
@@ -931,3 +1038,100 @@ def read_research_producer_leaderboard(bucket: str, run_date: str, s3_client=Non
     except Exception as e:  # noqa: BLE001
         logger.warning("crucible-research producer_leaderboard read failed (%s)", e)
         return None
+
+
+def find_latest_research_producer_leaderboard_date(
+    bucket: str, run_date: str, s3_client=None,
+) -> str | None:
+    """List the ``research/producer_leaderboard/`` prefix (crucible-research
+    -owned, config#1221/#1223) and return the latest well-formed date <=
+    ``run_date`` found among its dated keys, or None if none exist at or
+    before ``run_date``.
+
+    alpha-engine-config-I2544 (2026-07-14 ruling): the ASYNC advisory child
+    SF that now writes this artifact may not have finished — or may have
+    failed outright — by the time this Evaluator-stage gate runs in the
+    MAIN weekly SF, so an exact same-day key read is no longer a safe
+    assumption. Reading the LATEST AVAILABLE leaderboard <= ``run_date`` is
+    the semantically CORRECT read, not a compromise: the gate scores
+    realized (matured) outcomes of PRIOR weeks' ``thinktank_coverage``
+    selections — a same-day leaderboard could not contain resolved
+    outcomes for same-day picks even if it existed on time.
+
+    A single ``list_objects_v2`` call (no pagination) is sufficient: this
+    prefix is written at most weekly, so even several years of history
+    stays far under the 1000-key single-page ceiling — mirrors
+    ``factor_blend_optimizer._read_recent_shadow_archives``'s identical
+    single-call reasoning for its own weekly-cadence prefix. Any key under
+    the prefix that doesn't match the ``{date}.json`` shape (e.g. a future
+    ``latest.json`` sidecar some other consumer adds) is silently skipped,
+    never crashes the scan. A list failure (ClientError or otherwise) is
+    logged and treated as "nothing available" — degrades to a no-contest
+    week downstream, never a crash.
+    """
+    s3 = s3_client or boto3.client("s3")
+    try:
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=RESEARCH_PRODUCER_LEADERBOARD_PREFIX)
+    except ClientError as e:
+        logger.warning(
+            "research/producer_leaderboard/ list failed (%s) — treating as "
+            "no leaderboard available", e,
+        )
+        return None
+    except Exception as e:  # noqa: BLE001 — list must never crash the gate
+        logger.warning(
+            "research/producer_leaderboard/ list failed (%s) — treating as "
+            "no leaderboard available", e,
+        )
+        return None
+
+    anchor = date.fromisoformat(run_date)
+    best: date | None = None
+    for obj in resp.get("Contents") or []:
+        m = _RESEARCH_PRODUCER_LEADERBOARD_KEY_RE.match(obj.get("Key", ""))
+        if not m:
+            continue
+        candidate = date.fromisoformat(m.group(1))
+        if candidate <= anchor and (best is None or candidate > best):
+            best = candidate
+    if best is None:
+        logger.info(
+            "No research/producer_leaderboard/ artifact <= %s found under "
+            "s3://%s/%s", run_date, bucket, RESEARCH_PRODUCER_LEADERBOARD_PREFIX,
+        )
+        return None
+    return best.isoformat()
+
+
+def read_latest_research_producer_leaderboard(
+    bucket: str, run_date: str, s3_client=None,
+) -> tuple[dict | None, str | None]:
+    """Combined list-then-read: find the latest
+    ``research/producer_leaderboard/{date}.json`` <= ``run_date``
+    (``find_latest_research_producer_leaderboard_date``) and read it
+    (``read_research_producer_leaderboard``, reused unchanged — it is
+    still the correct exact-date-read primitive once the date to read has
+    been selected).
+
+    THE production entry point for thinktank_coverage's evidence as of
+    alpha-engine-config-I2544 — supersedes calling
+    ``read_research_producer_leaderboard`` directly with ``run_date`` (an
+    exact-match read that assumed same-day availability the async advisory
+    child SF can no longer guarantee).
+
+    Returns ``(leaderboard_dict, leaderboard_date_used)``: ``(None, None)``
+    when no artifact <= ``run_date`` exists yet (or the list itself
+    failed); ``(None, None)`` also when a date was found but the S3 read
+    then failed (``read_research_producer_leaderboard`` already logs the
+    specifics) — never a partial/inconsistent pairing of a leaderboard
+    with the wrong date or a date with no leaderboard.
+    """
+    latest_date = find_latest_research_producer_leaderboard_date(
+        bucket, run_date, s3_client=s3_client,
+    )
+    if latest_date is None:
+        return None, None
+    leaderboard = read_research_producer_leaderboard(bucket, latest_date, s3_client=s3_client)
+    if leaderboard is None:
+        return None, None
+    return leaderboard, latest_date
