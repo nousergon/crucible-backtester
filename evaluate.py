@@ -1978,14 +1978,25 @@ def _main_impl() -> None:
                 champion_bucket, args.date, e2e_lift_diag,
                 upload=champion_upload,
             )
-            tt_leaderboard = champion_promotion.read_research_producer_leaderboard(
-                champion_bucket, args.date,
+            # LATEST-AVAILABLE read (alpha-engine-config-I2544, 2026-07-14
+            # ruling): research/producer_leaderboard/{date}.json is now
+            # written by an async advisory child SF that may not have
+            # finished (or may have failed) by the time this Evaluator
+            # stage runs — read the latest artifact <= args.date rather
+            # than assuming a same-day exact match. tt_leaderboard_date_used
+            # is threaded into the audit record so the trail always shows
+            # which week's evidence decided (or declined to decide) a flip.
+            tt_leaderboard, tt_leaderboard_date_used = (
+                champion_promotion.read_latest_research_producer_leaderboard(
+                    champion_bucket, args.date,
+                )
             )
             champion_promotion.run_weekly_evaluation(
                 bucket=champion_bucket,
                 run_date=args.date,
                 e2e_lift=e2e_lift_diag,
                 tt_leaderboard=tt_leaderboard,
+                tt_leaderboard_date_used=tt_leaderboard_date_used,
                 freeze=args.freeze,
                 upload=champion_upload,
             )
