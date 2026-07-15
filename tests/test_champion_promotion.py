@@ -12,7 +12,12 @@ not yet in the leaderboard, no resolved outcomes) is a NO-CONTEST, never a
 default win; (4) --freeze suppresses the pointer write but the audit record
 is still written every week (the liveness proxy, config#2054); (5)
 frozen-schema (v2) conformance against contracts/producer_champion.schema.json
-and contracts/producer_champion_audit.schema.json.
+and contracts/producer_champion_audit.schema.json; (6) alpha-engine-config
+-I2544 (2026-07-14, same-session follow-up) — thinktank_coverage's evidence
+is read as the LATEST research/producer_leaderboard/{date}.json available
+<= run_date (list+parse over the prefix, not an exact-key read), honestly
+bounded to LEADERBOARD_STALENESS_DAYS (8) calendar days, with the date
+actually used recorded on every outcome via leaderboard_date_used.
 """
 from __future__ import annotations
 
@@ -23,16 +28,19 @@ from unittest.mock import MagicMock
 import pytest
 
 from optimizer.champion_promotion import (
+    LEADERBOARD_STALENESS_DAYS,
     OUTCOMES,
     VALID_CHAMPIONS,
     build_champion_audit,
     build_leaderboard_artifact,
     build_weekly_arm_scores,
     evaluate_gates,
+    find_latest_research_producer_leaderboard_date,
     hac_significance,
     leaderboard_entry_from_e2e_lift,
     leaderboard_gate_inputs,
     read_champion_pointer,
+    read_latest_research_producer_leaderboard,
     read_prior_leaderboard_history,
     read_research_producer_leaderboard,
     run_weekly_evaluation,
@@ -140,28 +148,69 @@ class TestBuildWeeklyArmScores:
     def test_both_sides_valid(self):
         result = build_weekly_arm_scores(
             _e2e_lift_ok(sn_lift=0.02), _tt_leaderboard_ok(mean=0.015), run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
         )
         assert result["scores"]["scanner_predictor_direct"] == 0.02
         assert result["scores"]["thinktank_coverage"] == 0.015
         assert result["unavailable_reasons"] == {}
+        assert result["leaderboard_date_used"] == "2026-07-18"
 
     def test_missing_e2e_lift(self):
-        result = build_weekly_arm_scores(None, _tt_leaderboard_ok(), run_date="2026-07-18")
+        result = build_weekly_arm_scores(
+            None, _tt_leaderboard_ok(), run_date="2026-07-18",
+            leaderboard_date_used="2026-07-18",
+        )
         assert result["scores"]["scanner_predictor_direct"] is None
         assert result["unavailable_reasons"]["scanner_predictor_direct"] == (
             "scanner_predictor_direct_counterfactual_unavailable"
         )
 
     def test_missing_leaderboard(self):
-        result = build_weekly_arm_scores(_e2e_lift_ok(), None, run_date="2026-07-18")
+        """No leaderboard <= run_date was found at all (find_latest_...
+        returned None) -- leaderboard_date_used is also None, distinct from
+        the stale-but-found case below."""
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), None, run_date="2026-07-18", leaderboard_date_used=None,
+        )
         assert result["scores"]["thinktank_coverage"] is None
         assert result["unavailable_reasons"]["thinktank_coverage"] == "leaderboard_unavailable"
+        assert result["leaderboard_date_used"] is None
 
-    def test_stale_leaderboard_date_mismatch(self):
-        stale = _tt_leaderboard_ok(run_date="2026-07-11")
-        result = build_weekly_arm_scores(_e2e_lift_ok(), stale, run_date="2026-07-18")
+    def test_stale_beyond_8_days_is_no_contest(self):
+        """alpha-engine-config-I2544: the latest leaderboard available <=
+        run_date was found, but it's more than LEADERBOARD_STALENESS_DAYS
+        (8) calendar days older than run_date -- an honest no-contest, not
+        a fabricated score against evidence this old."""
+        stale = _tt_leaderboard_ok(run_date="2026-07-09")
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), stale, run_date="2026-07-18", leaderboard_date_used="2026-07-09",
+        )
         assert result["scores"]["thinktank_coverage"] is None
-        assert result["unavailable_reasons"]["thinktank_coverage"] == "leaderboard_stale"
+        assert result["unavailable_reasons"]["thinktank_coverage"] == "leaderboard_stale_gt_8d"
+        assert result["leaderboard_date_used"] == "2026-07-09"
+
+    def test_exactly_8_days_stale_is_still_scored(self):
+        """The boundary is inclusive: "more than 8 days" fails, exactly 8
+        days does not -- age_days > LEADERBOARD_STALENESS_DAYS, not >=."""
+        assert LEADERBOARD_STALENESS_DAYS == 8
+        lb = _tt_leaderboard_ok(run_date="2026-07-10", mean=0.02)
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18", leaderboard_date_used="2026-07-10",
+        )
+        assert result["scores"]["thinktank_coverage"] == 0.02
+        assert "thinktank_coverage" not in result["unavailable_reasons"]
+
+    def test_negative_age_is_leaderboard_unavailable(self):
+        """Defensive: a leaderboard_date_used somehow after run_date (never
+        produced by find_latest_research_producer_leaderboard_date itself,
+        but a caller could pass this directly) must never be trusted as
+        this week's evidence."""
+        lb = _tt_leaderboard_ok(run_date="2026-07-20", mean=0.02)
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18", leaderboard_date_used="2026-07-20",
+        )
+        assert result["scores"]["thinktank_coverage"] is None
+        assert result["unavailable_reasons"]["thinktank_coverage"] == "leaderboard_unavailable"
 
     def test_thinktank_coverage_not_registered_in_leaderboard(self):
         """The KNOWN, TRACKED GAP (module docstring / alpha-engine-config
@@ -170,7 +219,9 @@ class TestBuildWeeklyArmScores:
         specs -- must be an honest no-contest reason, not a crash."""
         lb = _tt_leaderboard_ok()
         lb["specs"] = [s for s in lb["specs"] if s["name"] != "thinktank_coverage"]
-        result = build_weekly_arm_scores(_e2e_lift_ok(), lb, run_date="2026-07-18")
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
         assert result["scores"]["thinktank_coverage"] is None
         assert result["unavailable_reasons"]["thinktank_coverage"] == (
             "thinktank_coverage_not_in_leaderboard"
@@ -181,7 +232,9 @@ class TestBuildWeeklyArmScores:
         for s in lb["specs"]:
             if s["name"] == "thinktank_coverage":
                 s["topn_alpha_vs_champion"] = None
-        result = build_weekly_arm_scores(_e2e_lift_ok(), lb, run_date="2026-07-18")
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
         assert result["scores"]["thinktank_coverage"] is None
         assert result["unavailable_reasons"]["thinktank_coverage"] == (
             "thinktank_coverage_no_resolved_outcomes"
@@ -189,7 +242,9 @@ class TestBuildWeeklyArmScores:
 
     def test_malformed_specs_is_leaderboard_unavailable(self):
         lb = {"date": "2026-07-18", "specs": "not-a-list"}
-        result = build_weekly_arm_scores(_e2e_lift_ok(), lb, run_date="2026-07-18")
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
         assert result["scores"]["thinktank_coverage"] is None
         assert result["unavailable_reasons"]["thinktank_coverage"] == "leaderboard_unavailable"
 
@@ -408,6 +463,15 @@ class _FakeS3:
         full = f"{Bucket}/{Key}"
         self.store[full] = Body if isinstance(Body, bytes) else Body.encode()
 
+    def list_objects_v2(self, Bucket, Prefix):
+        bucket_prefix = f"{Bucket}/{Prefix}"
+        contents = [
+            {"Key": full[len(f"{Bucket}/"):]}
+            for full in self.store
+            if full.startswith(bucket_prefix)
+        ]
+        return {"Contents": contents}
+
 
 class TestLeaderboardObservability:
     def test_entry_extraction_from_e2e_lift(self):
@@ -479,6 +543,114 @@ class TestReadResearchProducerLeaderboard:
         assert RESEARCH_PRODUCER_LEADERBOARD_KEY_TMPL == "research/producer_leaderboard/{date}.json"
 
 
+class TestFindLatestResearchProducerLeaderboardDate:
+    """alpha-engine-config-I2544 (2026-07-14): the async advisory child SF
+    writing research/producer_leaderboard/{date}.json may lag or fail, so
+    this gate lists the prefix and picks the latest date <= run_date rather
+    than assuming an exact same-day key exists."""
+
+    PREFIX = "research/producer_leaderboard"
+
+    def _seed(self, s3, bucket, *dates):
+        for d in dates:
+            s3.put_object(Bucket=bucket, Key=f"{self.PREFIX}/{d}.json", Body=b"{}")
+
+    def test_exact_date_present_is_selected(self):
+        s3 = _FakeS3()
+        self._seed(s3, "bucket", "2026-07-11", "2026-07-18")
+        assert find_latest_research_producer_leaderboard_date(
+            "bucket", "2026-07-18", s3_client=s3,
+        ) == "2026-07-18"
+
+    def test_falls_back_to_older_date_when_exact_missing(self):
+        s3 = _FakeS3()
+        self._seed(s3, "bucket", "2026-07-04", "2026-07-11")
+        assert find_latest_research_producer_leaderboard_date(
+            "bucket", "2026-07-18", s3_client=s3,
+        ) == "2026-07-11"
+
+    def test_picks_max_not_first_among_multiple_older_dates(self):
+        s3 = _FakeS3()
+        self._seed(s3, "bucket", "2026-06-20", "2026-07-11", "2026-06-27")
+        assert find_latest_research_producer_leaderboard_date(
+            "bucket", "2026-07-18", s3_client=s3,
+        ) == "2026-07-11"
+
+    def test_nothing_at_or_before_run_date_returns_none(self):
+        s3 = _FakeS3()
+        self._seed(s3, "bucket", "2026-07-25")  # only a date AFTER run_date
+        assert find_latest_research_producer_leaderboard_date(
+            "bucket", "2026-07-18", s3_client=s3,
+        ) is None
+
+    def test_empty_prefix_returns_none(self):
+        s3 = _FakeS3()
+        assert find_latest_research_producer_leaderboard_date(
+            "bucket", "2026-07-18", s3_client=s3,
+        ) is None
+
+    def test_future_dated_key_never_selected_over_valid_past_date(self):
+        s3 = _FakeS3()
+        self._seed(s3, "bucket", "2026-07-11", "2026-07-25")
+        assert find_latest_research_producer_leaderboard_date(
+            "bucket", "2026-07-18", s3_client=s3,
+        ) == "2026-07-11"
+
+    def test_malformed_keys_under_prefix_are_skipped_not_crashed(self):
+        s3 = _FakeS3()
+        s3.put_object(Bucket="bucket", Key=f"{self.PREFIX}/latest.json", Body=b"{}")
+        s3.put_object(Bucket="bucket", Key=f"{self.PREFIX}/README.md", Body=b"x")
+        self._seed(s3, "bucket", "2026-07-11")
+        assert find_latest_research_producer_leaderboard_date(
+            "bucket", "2026-07-18", s3_client=s3,
+        ) == "2026-07-11"
+
+    def test_list_failure_returns_none_not_raise(self):
+        s3 = MagicMock()
+        from botocore.exceptions import ClientError
+        s3.list_objects_v2.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "ListObjectsV2",
+        )
+        assert find_latest_research_producer_leaderboard_date(
+            "bucket", "2026-07-18", s3_client=s3,
+        ) is None
+
+
+class TestReadLatestResearchProducerLeaderboard:
+    """The combined list-then-read production entry point
+    (alpha-engine-config-I2544) wired into evaluate.py."""
+
+    def test_returns_leaderboard_and_date_used_for_exact_match(self):
+        s3 = _FakeS3()
+        lb = _tt_leaderboard_ok(run_date="2026-07-18")
+        s3.put_object(Bucket="bucket", Key="research/producer_leaderboard/2026-07-18.json",
+                       Body=json.dumps(lb).encode())
+        leaderboard, date_used = read_latest_research_producer_leaderboard(
+            "bucket", "2026-07-18", s3_client=s3,
+        )
+        assert date_used == "2026-07-18"
+        assert leaderboard["date"] == "2026-07-18"
+
+    def test_falls_back_to_older_leaderboard_and_reports_its_date(self):
+        s3 = _FakeS3()
+        lb = _tt_leaderboard_ok(run_date="2026-07-11")
+        s3.put_object(Bucket="bucket", Key="research/producer_leaderboard/2026-07-11.json",
+                       Body=json.dumps(lb).encode())
+        leaderboard, date_used = read_latest_research_producer_leaderboard(
+            "bucket", "2026-07-18", s3_client=s3,
+        )
+        assert date_used == "2026-07-11"
+        assert leaderboard["date"] == "2026-07-11"
+
+    def test_nothing_available_returns_none_none(self):
+        s3 = _FakeS3()
+        leaderboard, date_used = read_latest_research_producer_leaderboard(
+            "bucket", "2026-07-18", s3_client=s3,
+        )
+        assert leaderboard is None
+        assert date_used is None
+
+
 # ── Weekly audit record (config/apply_audit/producer_champion/{date}.json) ─
 
 
@@ -489,11 +661,13 @@ class TestBuildChampionAudit:
         assert audit["blocked_by"] == ["leaderboard_unavailable"]
         assert audit["champion_before"] is None
         assert audit["schema_version"] == 2
+        assert audit["leaderboard_date_used"] is None
 
     def test_no_contest_path_records_zero_pointer_movement(self):
         arm_scores = {
             "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": None},
             "unavailable_reasons": {"thinktank_coverage": "thinktank_coverage_not_in_leaderboard"},
+            "leaderboard_date_used": "2026-07-18",
         }
         gate_result = evaluate_gates(
             champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
@@ -501,6 +675,23 @@ class TestBuildChampionAudit:
         audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
         assert audit["outcome"] == "no_contest"
         assert audit["champion_before"] == audit["champion_after"] == "scanner_predictor_direct"
+        assert audit["leaderboard_date_used"] == "2026-07-18"
+
+    def test_promoted_path_records_leaderboard_date_used(self):
+        """leaderboard_date_used must be recorded on the PROMOTED path too
+        (not only no_contest) -- the audit trail must show which week's
+        evidence decided a flip."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "unavailable_reasons": {},
+            "leaderboard_date_used": "2026-07-11",
+        }
+        gate_result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+        audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
+        assert audit["outcome"] == "promoted"
+        assert audit["leaderboard_date_used"] == "2026-07-11"
 
     @pytest.mark.parametrize("outcome", OUTCOMES)
     def test_all_outcomes_are_in_frozen_vocabulary(self, outcome):
@@ -521,15 +712,38 @@ class TestRunWeeklyEvaluation:
             bucket=self.BUCKET, run_date="2026-07-18",
             e2e_lift=_e2e_lift_ok(sn_lift=0.01),
             tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-18", mean=0.03),
+            tt_leaderboard_date_used="2026-07-18",
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "promoted"
         assert result["champion_after"] == "thinktank_coverage"
+        assert result["leaderboard_date_used"] == "2026-07-18"
         pointer = json.loads(s3.store[f"{self.BUCKET}/config/producer_champion.json"])
         assert pointer["champion"] == "thinktank_coverage"
         assert pointer["promotion_source"] == "gate_engine"
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/latest.json" in s3.store
+        audit = json.loads(s3.store[f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json"])
+        assert audit["leaderboard_date_used"] == "2026-07-18"
+
+    def test_promotion_from_prior_weeks_leaderboard_records_that_date(self):
+        """alpha-engine-config-I2544: a promotion can be decided using a
+        leaderboard dated earlier than run_date (the latest available <=
+        run_date, e.g. because this week's async child SF write hasn't
+        landed yet) -- leaderboard_date_used must record the OLDER date
+        actually consulted, not run_date."""
+        s3 = _FakeS3()
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date="2026-07-18",
+            e2e_lift=_e2e_lift_ok(sn_lift=0.01),
+            tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-11", mean=0.03),
+            tt_leaderboard_date_used="2026-07-11",
+            freeze=False, upload=True, s3_client=s3,
+        )
+        assert result["outcome"] == "promoted"
+        assert result["leaderboard_date_used"] == "2026-07-11"
+        audit = json.loads(s3.store[f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json"])
+        assert audit["leaderboard_date_used"] == "2026-07-11"
 
     def test_champion_defends_no_pointer_write(self):
         s3 = _FakeS3()
@@ -537,6 +751,7 @@ class TestRunWeeklyEvaluation:
             bucket=self.BUCKET, run_date="2026-07-18",
             e2e_lift=_e2e_lift_ok(sn_lift=0.03),
             tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-18", mean=0.01),
+            tt_leaderboard_date_used="2026-07-18",
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "unchanged_winner_already_champion"
@@ -552,8 +767,11 @@ class TestRunWeeklyEvaluation:
         )
         assert result["outcome"] == "no_contest"
         assert result["blocked_by"] == ["leaderboard_unavailable"]
+        assert result["leaderboard_date_used"] is None
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
+        audit = json.loads(s3.store[f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json"])
+        assert audit["leaderboard_date_used"] is None
 
     def test_no_contest_thinktank_not_yet_registered(self):
         """Mirrors the CURRENT real-world state (2026-07-14): thinktank
@@ -566,10 +784,31 @@ class TestRunWeeklyEvaluation:
             bucket=self.BUCKET, run_date="2026-07-18",
             e2e_lift=_e2e_lift_ok(sn_lift=0.03),
             tt_leaderboard=lb,
+            tt_leaderboard_date_used="2026-07-18",
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "no_contest"
         assert result["blocked_by"] == ["thinktank_coverage_not_in_leaderboard"]
+        assert result["leaderboard_date_used"] == "2026-07-18"
+
+    def test_no_contest_leaderboard_stale_beyond_8_days(self):
+        """alpha-engine-config-I2544: the latest leaderboard found is more
+        than 8 calendar days older than run_date -- honest no-contest with
+        the new slug, leaderboard_date_used still recorded (the audit
+        trail shows what was found and rejected, not silence)."""
+        s3 = _FakeS3()
+        lb = _tt_leaderboard_ok(run_date="2026-07-09", mean=0.03)
+        result = run_weekly_evaluation(
+            bucket=self.BUCKET, run_date="2026-07-18",
+            e2e_lift=_e2e_lift_ok(sn_lift=0.01),
+            tt_leaderboard=lb,
+            tt_leaderboard_date_used="2026-07-09",
+            freeze=False, upload=True, s3_client=s3,
+        )
+        assert result["outcome"] == "no_contest"
+        assert result["blocked_by"] == ["leaderboard_stale_gt_8d"]
+        assert result["leaderboard_date_used"] == "2026-07-09"
+        assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
 
     def test_freeze_suppresses_pointer_write_but_audit_always_written(self):
         s3 = _FakeS3()
@@ -577,6 +816,7 @@ class TestRunWeeklyEvaluation:
             bucket=self.BUCKET, run_date="2026-07-18",
             e2e_lift=_e2e_lift_ok(sn_lift=0.01),
             tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-18", mean=0.03),
+            tt_leaderboard_date_used="2026-07-18",
             freeze=True, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "promoted"
@@ -603,6 +843,7 @@ class TestRunWeeklyEvaluation:
             bucket=self.BUCKET, run_date="2026-07-18",
             e2e_lift=_e2e_lift_ok(sn_lift=0.03),
             tt_leaderboard=_tt_leaderboard_ok(run_date="2026-07-18", mean=0.01),
+            tt_leaderboard_date_used="2026-07-18",
             freeze=False, upload=True, s3_client=s3,
         )
         # champion_before normalized to scanner_predictor_direct, which wins
@@ -625,11 +866,13 @@ class TestRunWeeklyEvaluation:
             bucket=self.BUCKET, run_date="2026-07-18",
             e2e_lift=_e2e_lift_ok(sn_lift=0.03),
             tt_leaderboard=lb,
+            tt_leaderboard_date_used="2026-07-18",
             freeze=False, upload=True, s3_client=s3,
         )
         assert result["outcome"] == "error"
         assert result["champion_before"] is None
         assert result["champion_after"] is None
+        assert result["leaderboard_date_used"] is None
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
 
@@ -732,3 +975,38 @@ class TestSchemaConformance:
         enum = set(schema["properties"]["champion"]["enum"])
         assert set(VALID_CHAMPIONS).issubset(enum)
         assert "agentic" in enum
+
+    def test_stale_no_contest_audit_conforms_and_carries_date_used(self):
+        """alpha-engine-config-I2544: the leaderboard_stale_gt_8d no-contest
+        record must both conform to the (additive) v2 schema and carry the
+        leaderboard_date_used field naming what was found and rejected."""
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": None},
+            "unavailable_reasons": {"thinktank_coverage": "leaderboard_stale_gt_8d"},
+            "leaderboard_date_used": "2026-07-09",
+        }
+        gate_result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+        audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
+        assert audit["blocked_by"] == ["leaderboard_stale_gt_8d"]
+        assert audit["leaderboard_date_used"] == "2026-07-09"
+        self._validate(AUDIT_SCHEMA_PATH, audit)
+
+    def test_promoted_audit_carries_leaderboard_date_used_and_conforms(self):
+        arm_scores = {
+            "scores": {"scanner_predictor_direct": 0.01, "thinktank_coverage": 0.03},
+            "unavailable_reasons": {},
+            "leaderboard_date_used": "2026-07-11",
+        }
+        gate_result = evaluate_gates(
+            champion_before="scanner_predictor_direct", arm_scores=arm_scores, freeze=False,
+        )
+        audit = build_champion_audit("2026-07-18", gate_result, freeze=False)
+        assert audit["leaderboard_date_used"] == "2026-07-11"
+        self._validate(AUDIT_SCHEMA_PATH, audit)
+
+    def test_leaderboard_stale_gt_8d_slug_in_schema_enum(self):
+        schema = json.loads(AUDIT_SCHEMA_PATH.read_text())
+        slugs = set(schema["properties"]["blocked_by"]["oneOf"][1]["items"]["enum"])
+        assert "leaderboard_stale_gt_8d" in slugs
