@@ -20,7 +20,9 @@ from optimizer.apply_audit import (
     build_audit,
     classify_loop,
     emit_apply_audit,
+    summarize_assembler,
 )
+from optimizer.assembler import AssemblerResult
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = REPO_ROOT / "contracts" / "apply_audit.schema.json"
@@ -533,3 +535,161 @@ class TestEvaluateWiring:
         ) in src
         emit_call = src.split("emit_apply_audit(")[-1].split("run_error=")[0]
         assert "upload=apply_audit_upload" in emit_call
+
+
+class TestSummarizeAssembler:
+    """Direct unit tests for apply_audit.summarize_assembler function.
+
+    Coverage target: improve mutation kill rate from 0% (no tests today)
+    to >70%. Tests the extraction of assembler result into JSON-safe
+    summary dict for classification.
+    """
+
+    def test_summarize_assembler_none_input(self):
+        # Null input: assemble_result is None
+        assert summarize_assembler(None) is None
+
+    def test_summarize_assembler_successful_cutover(self):
+        # Successful cutover: status=ok, cutover_status=applied, writers extracted
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            cutover_status="applied",
+            merge_summary={
+                "atr_multiplier": {"writer": "executor_optimizer", "reason": "full_replace"},
+                "min_score": {"writer": "executor_optimizer", "reason": "full_replace"},
+            },
+            artifacts_seen={},
+            notes="cutover_applied: live=...",
+        )
+
+        summary = summarize_assembler(result)
+
+        assert summary is not None
+        assert summary["status"] == "ok"
+        assert summary["cutover_status"] == "applied"
+        assert summary["writers"] == ["executor_optimizer"]
+        assert "cutover_applied" in summary["notes"]
+
+    def test_summarize_assembler_multiple_writers(self):
+        # Multiple writers in merge_summary: should extract and sort unique
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            cutover_status="applied",
+            merge_summary={
+                "weight_a": {"writer": "weight_optimizer"},
+                "min_score": {"writer": "executor_optimizer"},
+                "threshold": {"writer": "weight_optimizer"},
+            },
+            artifacts_seen={},
+            notes="multi-writer merge",
+        )
+
+        summary = summarize_assembler(result)
+
+        assert summary["writers"] == ["executor_optimizer", "weight_optimizer"]
+
+    def test_summarize_assembler_no_merge_summary(self):
+        # merge_summary is missing or None
+        result = AssemblerResult(
+            config_type="scoring_weights",
+            run_date="2026-05-09",
+            assembled_params={"a": 0.5},
+            status="ok",
+            cutover_status="not_attempted",
+            merge_summary=None,
+            artifacts_seen={},
+            notes="shadow only",
+        )
+
+        summary = summarize_assembler(result)
+
+        assert summary["status"] == "ok"
+        assert summary["writers"] == []
+        assert summary["cutover_status"] == "not_attempted"
+
+    def test_summarize_assembler_cutover_status_defaults_to_not_attempted(self):
+        # cutover_status attribute missing → defaults to "not_attempted"
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            merge_summary={"a": {"writer": "test_optimizer"}},
+            artifacts_seen={},
+            notes="shadow mode",
+        )
+        # Deliberately don't set cutover_status
+        if hasattr(result, "cutover_status"):
+            delattr(result, "cutover_status")
+
+        summary = summarize_assembler(result)
+
+        assert summary["cutover_status"] == "not_attempted"
+
+    def test_summarize_assembler_malformed_merge_summary_entry_skipped(self):
+        # merge_summary has non-dict entries or dict without "writer" key
+        # — should be skipped, not crash the extraction.
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            cutover_status="applied",
+            merge_summary={
+                "valid_key": {"writer": "executor_optimizer"},
+                "invalid_entry": "not a dict",
+                "missing_writer": {"reason": "some reason"},
+                "none_writer": {"writer": None},
+            },
+            artifacts_seen={},
+            notes="mixed quality summary",
+        )
+
+        summary = summarize_assembler(result)
+
+        # Only "valid_key" should be extracted
+        assert summary["writers"] == ["executor_optimizer"]
+        assert summary["status"] == "ok"
+
+    def test_summarize_assembler_extraction_exception_caught_and_logged(self):
+        # If extraction raises an exception, should be caught and returned
+        # as a degraded summary with failed status + error note.
+        class BrokenResult:
+            # Deliberate broken object that will fail on getattr-based extraction
+            def __getattribute__(self, name):
+                if name == "status":
+                    raise RuntimeError("Broken object simulation")
+                return super().__getattribute__(name)
+
+        summary = summarize_assembler(BrokenResult())
+
+        assert summary is not None
+        assert summary["status"] is None
+        assert summary["cutover_status"] == "failed"
+        assert summary["writers"] == []
+        assert "summary extraction failed" in summary["notes"]
+
+    def test_summarize_assembler_failed_cutover(self):
+        # cutover_status="failed": test that the failure status is preserved
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            cutover_status="failed",
+            merge_summary={"a": {"writer": "executor_optimizer"}},
+            artifacts_seen={},
+            notes="cutover_failed: S3 error",
+        )
+
+        summary = summarize_assembler(result)
+
+        assert summary["status"] == "ok"
+        assert summary["cutover_status"] == "failed"
+        assert "cutover_failed" in summary["notes"]
