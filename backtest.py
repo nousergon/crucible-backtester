@@ -5479,6 +5479,7 @@ def _main_impl() -> None:
     if args.pit_parity_pass:
         import pickle
         import resource
+        import sys as _sys
         if not args.config_json or not args.stats_out:
             raise SystemExit("--pit-parity-pass requires --config-json and --stats-out")
         with open(args.config_json) as _f:
@@ -5490,8 +5491,16 @@ def _main_impl() -> None:
         # Anti-degradation guard (L4487): each pass is its own process, so
         # ru_maxrss IS this pass's peak RSS. Alert LOUD if it exceeds the sized
         # envelope — converts silent OOM / right-size-drift (the "these always
-        # degrade" pattern) into an explicit signal. ru_maxrss is KiB on Linux.
-        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        # degrade" pattern) into an explicit signal. ru_maxrss is KiB on Linux
+        # but BYTES on Darwin/BSD (POSIX leaves the unit platform-defined) —
+        # unlike synthetic/predictor_backtest.py's RSS sampler, which hits this
+        # ambiguity only in tests, this guard's alert path is production-real,
+        # so a wrong unit here produces a false "exceeded budget" page (1024x
+        # inflated) whenever the child runs on a non-Linux host, e.g. a local
+        # smoke test on a Mac rather than the Linux Parity spot instance.
+        _raw_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_mb = (_raw_maxrss / (1024.0 * 1024.0) if _sys.platform == "darwin"
+                   else _raw_maxrss / 1024.0)
         budget_mb = float(os.environ.get("PIT_PARITY_PASS_RSS_BUDGET_MB", "4500"))
         logger.info("[pit_parity] pass=%s peak RSS=%.0f MB (budget %.0f MB)",
                     args.pit_parity_pass, peak_mb, budget_mb)
