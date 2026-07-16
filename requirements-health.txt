@@ -1,4 +1,4 @@
-numpy>=1.24.0,<2
+numpy>=2.5.1,<3
 pandas>=2.0
 # Upper bound is load-bearing, NOT cosmetic: scipy 1.18.0 is the first
 # scipy release whose wheels require numpy>=2.0.0, which conflicts with
