@@ -14,7 +14,9 @@ from botocore.exceptions import ClientError
 from optimizer.assembler import (
     DEFAULT_PRECEDENCE,
     AssemblerResult,
+    CutoverApplyError,
     _apply_artifact_to_base,
+    _cutover_apply,
     _read_current_live,
     assemble,
     is_cutover_enabled,
@@ -785,3 +787,229 @@ class TestAssembleCutoverMode:
         assert result.cutover_status == "failed"
         error_records = [r for r in caplog.records if r.levelname == "ERROR"]
         assert any("CRITICAL" in r.message for r in error_records)
+
+
+class TestCutoverApplyDirect:
+    """Direct unit tests for assembler._cutover_apply function.
+
+    These tests exercise _cutover_apply in isolation with mocked S3,
+    complementing the integration-level tests via assemble() above.
+    Coverage target: improve mutation kill rate from 33% to >70%.
+    """
+
+    def test_cutover_apply_successful_all_three_writes(self):
+        # Successful case: all 3 S3 writes succeed.
+        # 1. Snapshot live → _previous
+        # 2. Write assembled → live key
+        # 3. Mirror to dated history + latest sidecar
+        s3 = MagicMock()
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"atr_multiplier": 3.0, "min_score": 75},
+            merge_summary={},
+            artifacts_seen={},
+            status="ok",
+            cutover_status=None,  # Will be set after _cutover_apply
+        )
+
+        note = _cutover_apply(result, "test-bucket", s3)
+
+        # Verify all three S3 operations were called
+        assert s3.copy_object.called, "Should snapshot current live → _previous"
+        copy_call = s3.copy_object.call_args
+        assert copy_call.kwargs["Key"] == "config/executor_params_previous.json"
+
+        # Verify live-key put was called (two calls for live + history)
+        assert s3.put_object.call_count >= 2, "Should write live key + history"
+        put_calls = [c for c in s3.put_object.call_args_list]
+        live_key_calls = [c for c in put_calls if c.kwargs.get("Key") == "config/executor_params.json"]
+        assert len(live_key_calls) >= 1, "Should write to live key"
+
+        # Verify return note
+        assert "cutover_applied" in note
+        assert "executor_params" in note
+        assert "_previous" in note
+
+    def test_cutover_apply_live_key_write_failure_raises(self):
+        # Critical failure: live-key put_object raises exception.
+        # _cutover_apply should raise CutoverApplyError, not swallow.
+        s3 = MagicMock()
+        s3.put_object.side_effect = Exception("S3 disconnected")
+        # copy_object succeeds (snapshot step)
+        s3.copy_object.return_value = {}
+        # get_object for history-latest check succeeds (no prior)
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+        )
+
+        result = AssemblerResult(
+            config_type="scoring_weights",
+            run_date="2026-05-09",
+            assembled_params={"weight_a": 0.6},
+            merge_summary={},
+            artifacts_seen={},
+            status="ok",
+        )
+
+        with pytest.raises(CutoverApplyError) as exc_info:
+            _cutover_apply(result, "test-bucket", s3)
+
+        assert "cutover_failed" in str(exc_info.value)
+        assert "scoring_weights.json" in str(exc_info.value)
+
+    def test_cutover_apply_snapshot_failure_tolerated_continues_to_live_write(self):
+        # Non-critical failure: snapshot (copy_object) fails.
+        # Should log WARN and continue to live-key write.
+        s3 = MagicMock()
+        # Snapshot fails (but not 404)
+        s3.copy_object.side_effect = Exception("Snapshot copy failed")
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+        )
+        # Live write succeeds
+        s3.put_object.return_value = {}
+
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"atr_multiplier": 3.0},
+            merge_summary={},
+            artifacts_seen={},
+            status="ok",
+        )
+
+        note = _cutover_apply(result, "test-bucket", s3)
+
+        # Despite snapshot failure, live write should succeed and return note
+        assert "cutover_applied" in note
+        # Verify put_object was still called for live key
+        assert s3.put_object.called
+
+    def test_cutover_apply_history_write_failure_tolerated_after_successful_live_write(self):
+        # Non-critical failure: history mirror (put_object to history key) fails.
+        # Live write already succeeded, so return success note.
+        s3 = MagicMock()
+
+        call_count = [0]
+        def selective_put_fail(*args, **kwargs):
+            call_count[0] += 1
+            key = kwargs.get("Key", "")
+            # First put_object call: live key write — succeeds
+            # Second/third put_object calls: history writes — fail
+            if call_count[0] > 1 and "history" in key:
+                raise Exception("History write failed")
+            return {}
+
+        s3.put_object.side_effect = selective_put_fail
+        s3.copy_object.return_value = {}
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+        )
+
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"atr_multiplier": 3.0},
+            merge_summary={},
+            artifacts_seen={},
+            status="ok",
+        )
+
+        note = _cutover_apply(result, "test-bucket", s3)
+
+        # Despite history failure, live write succeeded → return success
+        assert "cutover_applied" in note
+
+    def test_cutover_apply_skips_snapshot_on_rerun_for_same_run_date(self):
+        # Idempotency: rerunning for the same run_date should skip snapshot
+        # to preserve the prior rollback snapshot.
+        s3 = MagicMock()
+
+        # First get_object (history-latest check) returns prior run with same run_date
+        history_latest_body = json.dumps({"as_of": "2026-05-09", "config": "old"})
+        s3.get_object.return_value = {
+            "Body": MagicMock(read=lambda: history_latest_body.encode())
+        }
+        # put_object for live + history writes succeed
+        s3.put_object.return_value = {}
+
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"atr_multiplier": 3.0},
+            merge_summary={},
+            artifacts_seen={},
+            status="ok",
+        )
+
+        note = _cutover_apply(result, "test-bucket", s3)
+
+        # Snapshot should NOT be called when rerunning for same run_date
+        s3.copy_object.assert_not_called()
+        # But live + history writes should still happen
+        assert s3.put_object.called
+        assert "cutover_applied" in note
+
+    def test_cutover_apply_first_run_no_prior_live_config(self):
+        # First cutover ever: no current live config to snapshot.
+        # Should handle NoSuchKey gracefully and continue to live write.
+        s3 = MagicMock()
+
+        # Both history-latest check and copy_object raise NoSuchKey
+        def raise_nosuchkey(*args, **kwargs):
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
+        s3.get_object.side_effect = raise_nosuchkey
+        s3.copy_object.side_effect = raise_nosuchkey
+        s3.put_object.return_value = {}
+
+        result = AssemblerResult(
+            config_type="scoring_weights",
+            run_date="2026-05-09",
+            assembled_params={"a": 0.5},
+            merge_summary={},
+            artifacts_seen={},
+            status="ok",
+        )
+
+        note = _cutover_apply(result, "test-bucket", s3)
+
+        # Should complete successfully despite no prior live config
+        assert "cutover_applied" in note
+        assert s3.put_object.called
+
+    def test_cutover_apply_payload_includes_metadata(self):
+        # Verify that the live-key payload includes required metadata:
+        # updated_at (matching run_date) and assembled_by marker.
+        s3 = MagicMock()
+        s3.copy_object.return_value = {}
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+        )
+
+        captured_body = [None]
+        def capture_put(*args, **kwargs):
+            if kwargs.get("Key") == "config/executor_params.json":
+                captured_body[0] = kwargs.get("Body")
+            return {}
+
+        s3.put_object.side_effect = capture_put
+
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"atr_multiplier": 3.0},
+            merge_summary={},
+            artifacts_seen={},
+            status="ok",
+        )
+
+        _cutover_apply(result, "test-bucket", s3)
+
+        # Parse captured body and verify metadata
+        assert captured_body[0] is not None
+        payload = json.loads(captured_body[0])
+        assert payload.get("updated_at") == "2026-05-09"
+        assert payload.get("assembled_by") == "optimizer.assembler"
+        assert payload.get("atr_multiplier") == 3.0

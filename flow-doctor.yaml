@@ -29,9 +29,15 @@ notify:
     disable_notification: false
     notify_on: [error, warning]
     notify_on_category: [TRANSIENT, EXTERNAL, INFRA]
+# DynamoDB-backed dedup store (alpha-engine-config#2418): the EC2 spot
+# process and the three Lambdas here are separate invocations each time,
+# so a /tmp SQLite store starts empty every run — dedup_cooldown_minutes
+# below never actually suppresses a repeat alert, it just looks like it
+# does. DynamoDB persists across those invocations so cooldowns hold.
 store:
-  type: sqlite
-  path: /tmp/flow_doctor.db
+  type: dynamodb
+  table_name: flow-doctor-store
+  region: us-east-1
 dedup_cooldown_minutes: 60
 dependencies:
   - predictor-training
