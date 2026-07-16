@@ -160,6 +160,77 @@ class TestComputeAccuracy:
 
 
 # ---------------------------------------------------------------------------
+# signal_quality._accuracy_by_score_bucket — bucket-boundary coverage
+# (config#2674: hit-rate stratified by score-bucket x horizon)
+# ---------------------------------------------------------------------------
+
+
+class TestAccuracyByScoreBucketBoundaries:
+    """Buckets are [60-70), [70-80), [80-90), [90-101) — verify each boundary
+    score lands in exactly the bucket the half-open interval implies, and that
+    every returned row carries both the 5d and 21d horizon (score-bucket x
+    horizon stratification)."""
+
+    def _row(self, score):
+        return {
+            "score": score,
+            "beat_spy_5d": 1.0,
+            "beat_spy_21d": 0.0,
+            "return_5d": 0.01,
+            "return_21d": 0.02,
+            "spy_5d_return": 0.005,
+            "spy_21d_return": 0.01,
+        }
+
+    def _df_for(self, scores):
+        df = pd.DataFrame([self._row(s) for s in scores])
+        return df, df  # same frame stands in for both the 5d and 21d slice
+
+    def _bucket_for_score(self, score):
+        from analysis.signal_quality import _accuracy_by_score_bucket
+        df_5d, df_21d = self._df_for([score])
+        rows = _accuracy_by_score_bucket(df_5d, df_21d)
+        assert len(rows) == 1, f"score {score} should land in exactly one bucket, got {rows}"
+        return rows[0]["bucket"]
+
+    @pytest.mark.parametrize("score,expected_bucket", [
+        (60.0, "60-70"),
+        (69.9, "60-70"),
+        (70.0, "70-80"),
+        (79.9, "70-80"),
+        (80.0, "80-90"),
+        (89.9, "80-90"),
+        (90.0, "90+"),
+        (100.0, "90+"),
+        (100.9, "90+"),
+    ])
+    def test_boundary_assignment(self, score, expected_bucket):
+        assert self._bucket_for_score(score) == expected_bucket
+
+    def test_below_lowest_bucket_excluded(self):
+        from analysis.signal_quality import _accuracy_by_score_bucket
+        df_5d, df_21d = self._df_for([59.9])
+        rows = _accuracy_by_score_bucket(df_5d, df_21d)
+        assert rows == []
+
+    def test_at_and_above_upper_edge_excluded(self):
+        from analysis.signal_quality import _accuracy_by_score_bucket
+        df_5d, df_21d = self._df_for([101.0, 105.0])
+        rows = _accuracy_by_score_bucket(df_5d, df_21d)
+        assert rows == []
+
+    def test_each_bucket_row_carries_both_horizons(self):
+        from analysis.signal_quality import _accuracy_by_score_bucket
+        df_5d, df_21d = self._df_for([65, 75, 85, 95])
+        rows = _accuracy_by_score_bucket(df_5d, df_21d)
+        buckets = {r["bucket"] for r in rows}
+        assert buckets == {"60-70", "70-80", "80-90", "90+"}
+        for row in rows:
+            assert "accuracy_5d" in row
+            assert "accuracy_21d" in row
+
+
+# ---------------------------------------------------------------------------
 # regime_analysis (without DB — use DataFrame directly)
 # ---------------------------------------------------------------------------
 
