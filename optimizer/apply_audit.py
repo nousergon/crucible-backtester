@@ -417,7 +417,11 @@ def summarize_assembler(assemble_result) -> dict | None:
         return None
     try:
         merge_summary = getattr(assemble_result, "merge_summary", {}) or {}
-        writers = sorted({v.get("writer") for v in merge_summary.values() if isinstance(v, dict)})
+        writers = sorted({
+            v.get("writer")
+            for v in merge_summary.values()
+            if isinstance(v, dict) and v.get("writer")
+        })
         return {
             "status": getattr(assemble_result, "status", None),
             "cutover_status": getattr(assemble_result, "cutover_status", "not_attempted"),

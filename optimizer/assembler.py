@@ -552,6 +552,12 @@ def _cutover_apply(
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey"):
             logger.warning("Cutover: could not check history latest — proceeding with snapshot: %s", e)
+    except Exception as e:
+        # Non-ClientError failures (malformed body, transient network error,
+        # etc.) must not block the load-bearing live write below — this is
+        # only a best-effort idempotency check for the (non-critical)
+        # rollback snapshot. Fall through and attempt the snapshot normally.
+        logger.warning("Cutover: could not check history latest — proceeding with snapshot: %s", e)
 
     if not skip_snapshot:
         try:
@@ -573,6 +579,14 @@ def _cutover_apply(
                     "Cutover: failed to snapshot live → _previous: %s "
                     "(continuing — live write below)", e,
                 )
+        except Exception as e:
+            # Any other snapshot failure (non-ClientError) is likewise
+            # non-critical — it degrades rollback safety but must not block
+            # the load-bearing live write below (see docstring).
+            logger.warning(
+                "Cutover: failed to snapshot live → _previous: %s "
+                "(continuing — live write below)", e,
+            )
 
     # 2. Write assembled → live key (with updated_at stamp matching legacy
     #    payload shape so consumer Lambdas see no schema drift).
