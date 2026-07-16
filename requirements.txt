@@ -1,7 +1,7 @@
 vectorbt~=0.26.1
 numpy<2
 plotly<6
-pandas~=2.2
+pandas~=3.0
 boto3~=1.34
 pyyaml~=6.0
 yfinance~=0.2.54
