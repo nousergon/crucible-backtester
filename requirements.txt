@@ -1,5 +1,5 @@
 vectorbt~=0.26.1
-numpy<2
+numpy<3
 plotly<6
 pandas~=2.2
 boto3~=1.34
@@ -28,7 +28,7 @@ scikit-learn~=1.4
 # cvxpy added 2026-05-11 for analysis/portfolio_optimizer_backtest.py — replays
 # the constrained MVO optimizer (alpha-engine PR #157) over historical synthetic
 # predictions. Same upper bound as alpha-engine (<1.8) to stay compatible with
-# numpy<2 above. Saturday SF spot venv picks this up via `pip install -r
+# numpy<3 above. Saturday SF spot venv picks this up via `pip install -r
 # requirements.txt`; local dev requires manual install.
 cvxpy>=1.4,<1.8
 # alpha-engine-lib pulls in arcticdb + flow-doctor via extras; see
