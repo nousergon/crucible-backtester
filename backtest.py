@@ -5999,6 +5999,21 @@ def _main_impl() -> None:
                 },
                 bucket=bucket,
             )
+            # config#646 (Option A): emit the flow's end-of-run status()
+            # snapshot to s3://alpha-engine-research/_flow_doctor/heartbeat/
+            # {flow_name}/{date}.json for the dashboard consumer, which reads
+            # heartbeats from the research bucket. Reuses `bucket` — the same
+            # config.get("signals_bucket", "alpha-engine-research") the health
+            # write above targets. emit_heartbeat() soft-fails (returns None,
+            # never raises); still placed inside the try/finally so a
+            # heartbeat failure can never crash the run or skip instance-stop.
+            # hasattr guard: the 5 producing repos deploy independently and
+            # emit_heartbeat only exists in flow-doctor >=0.6.2 (the #646 arc
+            # historically pinned 0.6.0rc3, which lacks it), so a version-
+            # skewed deploy must not AttributeError at end-of-run.
+            _fd = get_flow_doctor()
+            if _fd and hasattr(_fd, "emit_heartbeat"):
+                _fd.emit_heartbeat(bucket=bucket)
         except Exception as _he:
             logger.warning("Health status write failed: %s", _he)
 

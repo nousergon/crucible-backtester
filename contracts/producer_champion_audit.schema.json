@@ -1,16 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/nousergon/crucible-backtester/contracts/producer_champion_audit.schema.json",
-  "title": "producer_champion apply-audit artifact (v1)",
-  "description": "FROZEN contract for config/apply_audit/producer_champion/{date}.json (+ latest.json mirror) — produced by crucible-backtester optimizer/champion_promotion.py at the end of EVERY weekly Evaluator run, mirroring the config#1841 config/apply_audit/ per-optimizer pattern (see contracts/apply_audit.schema.json / optimizer/apply_audit.py). Written REGARDLESS of outcome (promoted / demoted / held-for-any-reason / error) — the config#2054 lesson is binding: a pointer-writer's liveness must be provable from day one, so this weekly write IS the liveness/freshness proxy for the champion-promotion engine (a held week correctly does not touch config/producer_champion.json, so pointer mtime alone cannot prove the engine is alive). Additive-only evolution: consumers MUST tolerate unknown extra fields; renames/removals require a schema_version bump.",
+  "title": "producer_champion apply-audit artifact (v2 — weekly winner-take-all)",
+  "description": "FROZEN contract for config/apply_audit/producer_champion/{date}.json (+ latest.json mirror) — produced by crucible-backtester optimizer/champion_promotion.py at the end of EVERY weekly Evaluator run, mirroring the config#1841 config/apply_audit/ per-optimizer pattern. Written REGARDLESS of outcome (promoted / no_contest / unchanged_winner_already_champion / error) — the config#2054 lesson is binding: a pointer-writer's liveness must be provable from day one, so this weekly write IS the liveness/freshness proxy for the champion-promotion engine (a correctly-held no-contest week does not touch config/producer_champion.json, so pointer mtime alone cannot prove the engine is alive). v2 (2026-07-14, alpha-engine-config-I2518): the champion-promotion policy moved from a HAC-significance/2-week-hysteresis/2-week-cooldown gated engine to weekly winner-take-all (Brian's ruling) — the v1 fields `challenger_matured_cohorts`, `sn_lift_vs_champion`, `consecutive_wins`, `cooldown_until` are RETIRED (no longer meaningful under winner-take-all, which carries no state forward between weeks) and replaced by `champion_score`/`challenger_score`. No live consumer of this artifact's fields exists outside this repo (verified 2026-07-14 by repo-wide grep across the dashboard/evaluator/executor repos), so this is a clean version bump requiring no cross-repo coordination. v1 records already written to S3 (schema_version=1) remain valid HISTORICAL documents under the frozen v1 shape (recoverable via this file's git history) and are never revalidated against v2 — new records always write schema_version=2. Additive-only evolution going forward: consumers MUST tolerate unknown extra fields; further renames/removals require another schema_version bump. ADDITIVE (same day, alpha-engine-config-I2544): `leaderboard_date_used` records which research/producer_leaderboard/{date}.json artifact was actually consulted this run, since the gate now reads the LATEST AVAILABLE leaderboard <= date (not necessarily an exact same-day match — see optimizer/champion_promotion.py module docstring) and the `leaderboard_stale_gt_8d` blocked_by slug can now fire. Optional (not in `required`) precisely so v2 records already written earlier today, before this addition, remain valid without a version bump — per this same additive-only policy.",
   "type": "object",
   "required": [
     "schema_version", "date", "outcome", "champion_before", "champion_after",
-    "challenger_matured_cohorts", "sn_lift_vs_champion", "consecutive_wins",
-    "cooldown_until", "blocked_by"
+    "champion_score", "challenger_score", "blocked_by", "freeze"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "date": {
       "type": "string",
       "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
@@ -21,36 +20,25 @@
       "description": "UTC ISO-8601 wall-clock write time."
     },
     "outcome": {
-      "enum": ["promoted", "demoted", "held_insufficient_data", "held_cooldown", "held_not_significant", "error"],
-      "description": "promoted/demoted = the pointer was moved this run (champion_before != champion_after). held_insufficient_data = challenger has fewer than the configured minimum matured FORWARD cohorts. held_cooldown = the stat gates passed but fewer than the configured cooldown weeks have elapsed since the last pointer move. held_not_significant = matured cohorts sufficient but the HAC/Newey-West-adjusted overlap-aware significance gate and/or the 2-consecutive-week hysteresis gate did not clear. error = the engine could not complete evaluation this run (e.g. leaderboard artifact missing/malformed) — the failure also surfaces via the pipeline's completeness tracker; this record is the durable trace."
+      "enum": ["promoted", "no_contest", "unchanged_winner_already_champion", "error",
+        "demoted", "held_insufficient_data", "held_cooldown", "held_not_significant"],
+      "description": "promoted = the pointer was moved this run (champion_before != champion_after) — the challenger's realized weekly score beat the champion's. no_contest = either arm's weekly score was unavailable this week (validity guard, e.g. thinktank_coverage not yet in the leaderboard, no resolved outcomes, or the leaderboard artifact missing/stale) — a definitional hold, never a default win for either side. unchanged_winner_already_champion = both scores were available and the incumbent champion still had the higher score, or scores tied. error = the engine could not complete evaluation this run (e.g. an unexpected exception during scoring) — the failure also surfaces via the pipeline's completeness tracker; this record is the durable trace. `demoted`/`held_insufficient_data`/`held_cooldown`/`held_not_significant` are RETIRED (pre-2026-07-14 HAC/hysteresis/cooldown engine) — read-tolerated for historical v1 records, never written by the current engine."
     },
     "champion_before": {
-      "enum": ["agentic", "scanner_predictor_direct", null],
-      "description": "The pointer's champion value read at the start of this evaluation (or the pre-bootstrap default 'agentic' when no pointer has ever been written). Null only on outcome='error' when evaluation aborted before the pointer could even be read (e.g. the leaderboard artifact itself was unavailable)."
+      "enum": ["agentic", "scanner_predictor_direct", "thinktank_coverage", null],
+      "description": "The pointer's champion value read at the start of this evaluation (or the base-case default 'scanner_predictor_direct' when no pointer has ever been written). 'agentic' is READ-TOLERATED for historical continuity (the 2026-07-13 bootstrap's own audit record carries champion_before='agentic') but is WRITE-FORBIDDEN going forward — see contracts/producer_champion.schema.json. Null only on outcome='error' when evaluation aborted before the pointer could even be read."
     },
     "champion_after": {
-      "enum": ["agentic", "scanner_predictor_direct", null],
-      "description": "The pointer's champion value at the end of this evaluation. Equal to champion_before on every held_*/error outcome — this artifact records a held week without ever mutating config/producer_champion.json. Null only alongside a null champion_before (outcome='error', pointer never read)."
+      "enum": ["agentic", "scanner_predictor_direct", "thinktank_coverage", null],
+      "description": "The pointer's champion value at the end of this evaluation. Equal to champion_before on every no_contest/unchanged_winner_already_champion/error outcome, and on a frozen promotion (blocked_by=['frozen']) — this artifact records a held week without ever mutating config/producer_champion.json. Null only alongside a null champion_before (outcome='error', pointer never read)."
     },
-    "challenger_matured_cohorts": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Count of matured FORWARD weekly cohorts available for the challenger arm (the arm that is NOT champion_before) as of this run — gate (a) in config#2367. A cohort is 'matured' once its 21d forward return has resolved."
-    },
-    "sn_lift_vs_champion": {
+    "champion_score": {
       "type": ["number", "null"],
-      "description": "Challenger's sector-neutral 21d mean-alpha lift over the champion arm, from the HAC/Newey-West-adjusted overlap-aware test this run. Null when challenger_matured_cohorts is below the minimum (no lift estimate was computed)."
+      "description": "champion_before arm's realized weekly top-N alpha lift vs the shared agentic-pipeline baseline (see champion_promotion.py module docstring — indirect/common-comparator comparison). Null when unavailable this week (no_contest, or outcome='error')."
     },
-    "consecutive_wins": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 2,
-      "description": "Hysteresis counter (gate c): consecutive weekly evaluations (including this one) where the challenger cleared the significance gate over the champion in the SAME direction. Carry-forward from the prior latest.json, reset to 0 whenever the sign of the leading arm flips or the significance gate fails. A pointer move requires this to reach 2."
-    },
-    "cooldown_until": {
-      "type": ["string", "null"],
-      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-      "description": "Date (trading-day) before which no further pointer move is permitted (gate e: >= 2 weeks after the last promote/demote). Carried forward unchanged from the prior record until a new pointer move resets it. Null before the first-ever pointer move."
+    "challenger_score": {
+      "type": ["number", "null"],
+      "description": "The challenger arm's (VALID_CHAMPIONS complement of champion_before) realized weekly top-N alpha lift vs the same shared baseline. Null when unavailable this week (no_contest, or outcome='error')."
     },
     "blocked_by": {
       "oneOf": [
@@ -60,26 +48,39 @@
           "minItems": 1,
           "items": {
             "enum": [
+              "no_valid_scanner_predictor_direct_selections",
+              "no_valid_thinktank_coverage_selections",
+              "scanner_predictor_direct_counterfactual_unavailable",
+              "thinktank_coverage_not_in_leaderboard",
+              "thinktank_coverage_no_resolved_outcomes",
+              "leaderboard_unavailable",
+              "leaderboard_stale_gt_8d",
+              "arm_score_unavailable",
+              "frozen",
+              "unclassified_error",
               "insufficient_matured_cohorts",
               "cooldown_active",
               "not_significant_hac_adjusted",
               "hysteresis_not_satisfied",
-              "frozen",
-              "leaderboard_unavailable",
-              "unclassified_error"
+              "leaderboard_stale"
             ]
           }
         }
       ],
-      "description": "Stable slugs naming the gate(s) that held the pointer this run: insufficient_matured_cohorts (gate a), cooldown_active (gate e), not_significant_hac_adjusted (gate b), hysteresis_not_satisfied (gate c — stat gate passed this week but not for 2 consecutive weeks yet), frozen (--freeze flag suppressed the write even though gates cleared), leaderboard_unavailable / unclassified_error (outcome=error). Non-null only on held_*/error outcomes; null on promoted/demoted."
+      "description": "Stable slugs naming why the pointer did not move this run (non-null only on no_contest/frozen-promoted/error outcomes; null on promoted-non-frozen/unchanged_winner_already_champion). thinktank_coverage_not_in_leaderboard/thinktank_coverage_no_resolved_outcomes/scanner_predictor_direct_counterfactual_unavailable/leaderboard_unavailable/arm_score_unavailable/no_valid_*_selections are the current winner-take-all validity-guard slugs (config-I2518). leaderboard_stale_gt_8d (config-I2544, 2026-07-14) = the latest research/producer_leaderboard/{date}.json available at or before `date` is more than 8 calendar days older than `date` — the gate now reads the LATEST AVAILABLE leaderboard (not an exact same-day match, since the writer is an async advisory child SF that may lag or fail), but still refuses to score against evidence this stale. frozen = --freeze suppressed the write even though the challenger won. unclassified_error = outcome=error with no more specific reason. insufficient_matured_cohorts/cooldown_active/not_significant_hac_adjusted/hysteresis_not_satisfied are RETIRED (pre-2026-07-14 HAC/hysteresis/cooldown engine) — read-tolerated for historical v1 records only. leaderboard_stale is RETIRED (pre-I2544 exact-date-only read, same day as the v2 bump) — fired when the artifact's self-reported date disagreed with an exact-match run_date key; the latest-available read no longer requires an exact match, so this condition can no longer occur (superseded by leaderboard_stale_gt_8d for the age-bound case) — read-tolerated only."
     },
     "challenger": {
-      "enum": ["agentic", "scanner_predictor_direct"],
-      "description": "Which arm was evaluated as the challenger this run (the complement of champion_before under the current two-arm VALID_CHAMPIONS set)."
+      "enum": ["agentic", "scanner_predictor_direct", "thinktank_coverage"],
+      "description": "Which arm was evaluated as the challenger this run (the complement of champion_before under the current two-arm VALID_CHAMPIONS set). 'agentic' is read-tolerated for historical v1 records only."
     },
     "freeze": {
       "type": "boolean",
-      "description": "Whether this run was invoked with --freeze. When true, the pointer write is always suppressed regardless of gate outcome (this record is still written unconditionally)."
+      "description": "Whether this run was invoked with --freeze. When true, the pointer write is always suppressed even if the challenger won this week (this record is still written unconditionally)."
+    },
+    "leaderboard_date_used": {
+      "type": ["string", "null"],
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "ADDITIVE (alpha-engine-config-I2544, 2026-07-14). The date of the research/producer_leaderboard/{date}.json artifact actually consulted this run — the latest available <= `date` (see optimizer/champion_promotion.py::find_latest_research_producer_leaderboard_date), or null when no artifact <= `date` was available at all, or when evaluation aborted before scoring (outcome=error). Optional/nullable so pre-I2544 v2 records (written earlier the same day, before this field existed) remain valid without a version bump. Always present (never omitted) on any record built by the current engine, on every outcome including error."
     }
   }
 }

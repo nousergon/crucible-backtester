@@ -7,6 +7,11 @@ pyyaml~=6.0
 yfinance~=0.2.54
 pyarrow~=18.1
 ib_insync~=0.9.86
+# setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
+# started failing 2026-07-14 against the default 79.0.1 bundled by the
+# GH Actions Python 3.11 image). Not a build-backend requirement here — direct
+# pin exists solely to satisfy the security-audit gate.
+setuptools>=83.0.0
 # Replay harness (replay/runner.py) re-invokes captured agents under a
 # different model. Uses langchain_anthropic.with_structured_output() —
 # matches the production-agent invocation pattern exactly so replay
