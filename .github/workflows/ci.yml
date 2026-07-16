@@ -109,7 +109,7 @@ jobs:
         run: mutmut results
 
       - name: Upload mutmut cache for local `mutmut show <id>` triage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mutmut-cache
           path: .mutmut-cache
