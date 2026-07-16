@@ -61,9 +61,11 @@ def reset_root_logger():
 
 @pytest.fixture
 def temp_flow_doctor_yaml(tmp_path):
-    """Write a copy of the production flow-doctor.yaml with store.path
-    redirected into the test's tmp_path AND the github notify channel
-    stripped.
+    """Write a copy of the production flow-doctor.yaml with store forced
+    to a local sqlite file in the test's tmp_path (regardless of what the
+    real flow-doctor.yaml's store.type is — production points at the
+    shared DynamoDB table per alpha-engine-config#2418, and wiring tests
+    must never touch live AWS) AND the github notify channel stripped.
 
     flow_doctor.init() preflights the GitHub token against api.github.com;
     the stub `FLOW_DOCTOR_GITHUB_TOKEN=stub-token` fails the 401 check
@@ -72,7 +74,7 @@ def temp_flow_doctor_yaml(tmp_path):
     import yaml as yamllib
     with open(REPO_ROOT / "flow-doctor.yaml") as f:
         cfg = yamllib.safe_load(f)
-    cfg["store"]["path"] = str(tmp_path / "flow_doctor_test.db")
+    cfg["store"] = {"type": "sqlite", "path": str(tmp_path / "flow_doctor_test.db")}
     cfg["notify"] = [n for n in cfg.get("notify", []) if n.get("type") != "github"]
     yaml_path = tmp_path / "flow-doctor.yaml"
     with open(yaml_path, "w") as f:
