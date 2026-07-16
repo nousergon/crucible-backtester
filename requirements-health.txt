@@ -1,6 +1,15 @@
 numpy>=1.24.0,<2
 pandas>=2.0
-scipy>=1.18.0
+# Upper bound is load-bearing, NOT cosmetic: scipy 1.18.0 is the first
+# scipy release whose wheels require numpy>=2.0.0, which conflicts with
+# the numpy<2 cap above. Without the ceiling, pip cannot satisfy the set
+# with wheels; in the compiler-less `public.ecr.aws/lambda/python:3.12`
+# base image it silently backtracks pandas to an ancient sdist (2.1.0,
+# pre-cp312) and fails trying to compile it (Deploy #525, 2026-07-16).
+# 1.17.x is the last scipy line compatible with numpy<2. Same numpy<2
+# coupling as `cvxpy>=1.4,<1.8` in requirements.txt — keep the two in
+# mind together when the fleet eventually lifts numpy<2.
+scipy>=1.10,<1.18
 boto3>=1.26.0
 # pipeline_common.py does `import yaml` at module import time (reads
 # labeling.forward_days to derive ACTIVE_HORIZON_DAYS). Pin explicitly
