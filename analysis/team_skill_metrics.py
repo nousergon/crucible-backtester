@@ -215,13 +215,26 @@ def compute_portfolio_calibration(
     score_performance_df: pd.DataFrame | None,
     score_col: str = "score",
     outcome_col: str = _BEAT_PRIMARY,
+    calibrate: bool = True,
+    n_folds: int = 5,
 ) -> dict:
-    """Reliability diagram on portfolio-wide (score → outcome) corpus.
+    """Reliability diagram on the portfolio-wide (score → outcome) corpus.
 
-    Normalizes ``score`` (0-100) to [0, 1] before computing, since
-    ``compute_calibration`` expects probabilities. The score column is a
-    composite-score proxy for "agent's probability this pick beats SPY";
-    its calibration as a probability is the question we're asking.
+    ``composite_scoring``'s raw 0-100 output is a *ranking* heuristic, not a
+    probability — it was never fit to hit-rates. Feeding ``score / 100`` straight
+    into the ECE gate therefore graded the wrong quantity and produced a spurious
+    RED (config#2304: 0.24 vs the 0.15 red-line). Per Brian's 2026-07-12 Option-A
+    ruling, an isotonic calibration layer now maps the score to a legitimate
+    ``P(beat SPY)`` before it is graded (``analysis.score_calibrator``).
+
+    ``calibrate=True`` (default): the calibrated probabilities are computed
+    **out-of-fold** — the calibrator that scores each pick never saw it during
+    fitting — so the ECE honestly measures whether the score's monotone signal
+    *generalizes*, rather than the ~0 in-sample ECE an on-corpus fit would trivially
+    yield (the config#2304 circularity guard). The raw-score ECE is still reported
+    as ``raw_score_ece`` for before/after visibility.
+
+    ``calibrate=False`` preserves the legacy raw ``score / 100`` behavior.
     """
     if score_performance_df is None or score_performance_df.empty:
         return {"status": "insufficient_data", "reason": "no score_performance"}
@@ -234,11 +247,35 @@ def compute_portfolio_calibration(
     if len(df) < 30:
         return {"status": "insufficient_data", "n": len(df)}
 
-    return compute_calibration(
-        predicted_probability=(df[score_col] / 100.0).to_numpy(),
-        realized_outcome=df[outcome_col].astype(float).to_numpy(),
+    scores = df[score_col].to_numpy(dtype=float)
+    outcomes = df[outcome_col].astype(float).to_numpy()
+
+    if not calibrate:
+        return compute_calibration(
+            predicted_probability=scores / 100.0,
+            realized_outcome=outcomes,
+            min_total_samples=30,
+        )
+
+    from analysis.score_calibrator import out_of_fold_calibrated_probabilities
+
+    probs = out_of_fold_calibrated_probabilities(scores, outcomes, n_folds=n_folds)
+    result = compute_calibration(
+        predicted_probability=probs,
+        realized_outcome=outcomes,
         min_total_samples=30,
     )
+    if result.get("status") == "ok":
+        result["calibration_method"] = "isotonic_oof"
+        # Before/after visibility: what the raw-score gate would have reported.
+        raw = compute_calibration(
+            predicted_probability=scores / 100.0,
+            realized_outcome=outcomes,
+            min_total_samples=30,
+        )
+        if raw.get("status") == "ok":
+            result["raw_score_ece"] = raw.get("ece")
+    return result
 
 
 def compute_portfolio_excursion_summary(
