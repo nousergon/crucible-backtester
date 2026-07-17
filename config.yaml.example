@@ -154,6 +154,18 @@ param_sweep:
   time_decay_exit_days: [10, 15, 20]
   profit_take_pct: [0.15, 0.20, 0.25, 0.30]
 
+# ── PIT-parity CSCV overfitting measurement (config#816) ─────────────────────
+# When true, the PIT (walk-forward) parity pass runs an opt-in config sweep
+# over the grid above and feeds the (n_blocks, n_combos) Sortino matrix to the
+# combinatorial CSCV PBO engine (Bailey/Borwein/López de Prado/Zhu 2014),
+# populating the real probability-of-backtest-overfitting distribution in
+# backtest/{date}/pit_parity.json. OBSERVE-only — gates nothing.
+# COST: this re-evaluates the sweep's top-K combos across M chronological
+# blocks on EVERY weekly pit_parity pass — the dominant cost of that stage
+# (~most of the pit_parity runtime). Leave false to keep pbo=null (the grid
+# still resolves via select_grid; only this flag turns the CSCV pass on).
+pit_parity_sweep: true
+
 # ── Weight optimizer guardrails ──────────────────────────────────────────────
 weight_optimizer:
   # Keys must EXACTLY match optimizer/weight_optimizer.py::SUB_SCORES —
