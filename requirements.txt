@@ -1,4 +1,24 @@
-vectorbt~=0.26.1
+# Bumped 0.26.1 -> 0.28.5 for numpy 2 compat (config#2815) — NOT a drive-by
+# bump, it's load-bearing: cvxpy>=1.9.2 below hard-requires numpy>=2.0.0
+# (every cvxpy release from 1.8.0 on does), and 0.26.1 is fundamentally
+# broken under numpy>=2 (`vectorbt/generic/enums.py` does `np.float_`,
+# removed outright in numpy 2.0 -> AttributeError at `import vectorbt`,
+# breaking vectorbt_bridge.py + every test importing it). The obvious next
+# patch, 0.26.2, only band-aids ONE of several numpy-2 breaks (it wraps
+# `numpy.lib.stride_tricks._broadcast_shape`, a removed private symbol, in a
+# try/except) and still declares `numpy<2.0.0` in its own wheel metadata —
+# pip correctly refuses to resolve it against numpy 2, and forcing the
+# combo anyway still hits the `np.float_` AttributeError above at import
+# time. 0.27.x+ removed all removed-numpy-alias usage; 0.27.3 specifically
+# was ruled out here because it AttributeErrors against pandas~=2.2's
+# `DatetimeIndex.freq` (unrelated pandas-side incompatibility, not numpy).
+# 0.28.5 has neither problem: clean `import vectorbt` under numpy 2.4.6,
+# functional Portfolio.from_signals()/.sharpe_ratio()/.sortino_ratio()
+# smoke-tested directly, and the full backtester suite passes at 0.28.5
+# (3103/3105; the other 2 failures are a pre-existing RAM-headroom guard
+# unrelated to this change — see PR). No API-signature diff found between
+# 0.26.x/0.27.x/0.28.x for the Portfolio methods vectorbt_bridge.py calls.
+vectorbt~=0.28.5
 numpy<3
 plotly<6
 pandas~=2.2
@@ -24,13 +44,22 @@ langchain-anthropic~=0.3
 # decision tree (max_depth=3) on (agent_input → agent_decision) pairs
 # extracted from the captured DecisionArtifact corpus. >85% match rate
 # ⇒ the LLM is likely just running that tree at $X per call.
+# `~=1.4` is PEP 440 shorthand for `>=1.4,==1.*` (NOT capped to the 1.4.x
+# patch line) — pip's resolver is free to pick any 1.x release, and with
+# numpy<3 above it lands on scikit-learn 1.9.0. Called out explicitly
+# because sklearn 1.4.0/1.4.1.post1 pin `numpy<2.0` in their own wheel
+# metadata (numpy-2 support landed at 1.4.2); a naive reading of `~=1.4`
+# as "1.4.x only" would wrongly assume this pin needs bumping for
+# numpy-2 compat. Verified via `pip install --dry-run`, config#2815.
 scikit-learn~=1.4
 # cvxpy added 2026-05-11 for analysis/portfolio_optimizer_backtest.py — replays
 # the constrained MVO optimizer (alpha-engine PR #157) over historical synthetic
-# predictions. Same upper bound as alpha-engine (<1.8) to stay compatible with
-# numpy<3 above. Saturday SF spot venv picks this up via `pip install -r
-# requirements.txt`; local dev requires manual install.
-cvxpy>=1.4,<1.8
+# predictions. Bumped to >=1.9.2,<1.10 for numpy 2 compat (config#2815) — same
+# target range as crucible-executor's parallel migration, kept identical
+# on purpose so the two repos don't drift apart. Saturday SF spot venv picks
+# this up via `pip install -r requirements.txt`; local dev requires manual
+# install.
+cvxpy>=1.9.2,<1.10
 # alpha-engine-lib pulls in arcticdb + flow-doctor via extras; see
 # preflight.py and the `from alpha_engine_lib.logging import setup_logging`
 # call sites in backtest.py / evaluate.py / lambda_health/handler.py.
