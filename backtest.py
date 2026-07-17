@@ -3194,7 +3194,7 @@ def run_predictor_backtest(config: dict) -> dict:
     # full M-block CSCV PBO engine. Self-contained (no _phase_registry), so it
     # runs in the isolated pit_parity walk-forward subprocess. Observational: any
     # failure leaves pbo=null (honest-N/A), never fabricated.
-    if config.get("pit_parity_sweep") and config.get("param_sweep"):
+    if config.get("pit_parity_sweep"):
         try:
             def _pit_sim_fn(combo_config: dict) -> dict:
                 return _run_simulation_loop(
@@ -3208,7 +3208,16 @@ def run_predictor_backtest(config: dict) -> dict:
                 )
 
             from analysis import param_sweep as _param_sweep
-            grid = config["param_sweep"]
+            trading_dates = sorted(signals_by_date.keys())
+            # Resolve the grid the same way run_param_sweep does (config#947):
+            # an explicit config["param_sweep"] still wins, otherwise a
+            # data-gated grid auto-selects. The prior code required an explicit
+            # top-level config["param_sweep"] AND gated the whole branch on it,
+            # so a missing/misplaced grid made the opt-in CSCV sweep SILENTLY
+            # no-op → pbo=null with no log — the exact symptom seen live
+            # (config#816 gap 1-2). Gating on the flag alone + select_grid means
+            # the sweep runs whenever pit_parity_sweep is set, never silently.
+            grid = _param_sweep.select_grid(trading_dates, config)
             sweep_settings = config.get("param_sweep_settings", {})
             logger.info(
                 "[pit_parity] opt-in CSCV sweep: grid=%s",
@@ -3217,12 +3226,22 @@ def run_predictor_backtest(config: dict) -> dict:
             pit_sweep_df = _param_sweep.sweep(
                 grid, _pit_sim_fn, config, sweep_settings=sweep_settings,
             )
-            trading_dates = sorted(signals_by_date.keys())
             if pit_sweep_df is not None and not pit_sweep_df.empty and trading_dates:
                 stats.update(
                     _build_pit_parity_cscv_matrix(
                         pit_sweep_df, _pit_sim_fn, trading_dates, config,
                     )
+                )
+            else:
+                # Close the last silent-null path: an empty sweep result (or no
+                # trading dates) previously skipped the matrix build with no
+                # trace. Make it loud so pbo=null is never unexplained again.
+                logger.error(
+                    "[pit_parity] opt-in CSCV sweep produced no usable matrix "
+                    "(sweep_df empty=%s, n_trading_dates=%d) — report will "
+                    "carry pbo=null",
+                    pit_sweep_df is None or getattr(pit_sweep_df, "empty", True),
+                    len(trading_dates),
                 )
         except Exception as exc:
             logger.error(
