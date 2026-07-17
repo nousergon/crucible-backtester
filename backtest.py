@@ -5479,6 +5479,7 @@ def _main_impl() -> None:
     if args.pit_parity_pass:
         import pickle
         import resource
+        import sys as _sys
         if not args.config_json or not args.stats_out:
             raise SystemExit("--pit-parity-pass requires --config-json and --stats-out")
         with open(args.config_json) as _f:
@@ -5490,8 +5491,16 @@ def _main_impl() -> None:
         # Anti-degradation guard (L4487): each pass is its own process, so
         # ru_maxrss IS this pass's peak RSS. Alert LOUD if it exceeds the sized
         # envelope — converts silent OOM / right-size-drift (the "these always
-        # degrade" pattern) into an explicit signal. ru_maxrss is KiB on Linux.
-        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        # degrade" pattern) into an explicit signal. ru_maxrss is KiB on Linux
+        # but BYTES on Darwin/BSD (POSIX leaves the unit platform-defined) —
+        # unlike synthetic/predictor_backtest.py's RSS sampler, which hits this
+        # ambiguity only in tests, this guard's alert path is production-real,
+        # so a wrong unit here produces a false "exceeded budget" page (1024x
+        # inflated) whenever the child runs on a non-Linux host, e.g. a local
+        # smoke test on a Mac rather than the Linux Parity spot instance.
+        _raw_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_mb = (_raw_maxrss / (1024.0 * 1024.0) if _sys.platform == "darwin"
+                   else _raw_maxrss / 1024.0)
         budget_mb = float(os.environ.get("PIT_PARITY_PASS_RSS_BUDGET_MB", "4500"))
         logger.info("[pit_parity] pass=%s peak RSS=%.0f MB (budget %.0f MB)",
                     args.pit_parity_pass, peak_mb, budget_mb)
@@ -5638,6 +5647,58 @@ def _main_impl() -> None:
                 predictor_stats, predictor_sweep_df, executor_rec = _run_predictor_pipeline(
                     args, config, executor_rec, current_executor_params, fd,
                 )
+
+    # ── Scanner -> research-free predictor backfill (config#1405, build items 1+2) ─
+    # Arm 4 of the agentic-ablation ladder ("does the research/agentic layer add
+    # anything over the ML predictor on scanner candidates?"). Populates
+    # `predictor_outcomes_research_free` (ticker, prediction_date, predicted_alpha,
+    # n_research_features_missing) — the table
+    # `analysis/end_to_end.py::_scanner_then_predictor_topN` (shipped separately,
+    # crucible-backtester#419) reads to compute the counterfactual. Runs the FULL
+    # meta-ensemble (crucible-predictor's MetaModel.predict_single) with the 4
+    # research meta-features omitted -> 0.0, over the scanner-passing universe
+    # (scanner_evaluations.quant_filter_pass=1). Idempotent (skip-if-cached on
+    # (ticker, prediction_date)) — a normal weekly run only backfills the delta
+    # since the last pass. OBSERVE-only: gates nothing, feeds e2e_lift once run.
+    # Non-fatal — this is a measurement producer, not a promotion-critical gate;
+    # a failure here must never block the rest of the Saturday pipeline.
+    if args.mode in ("predictor-backtest", "all") and config.get("research_db"):
+        try:
+            with registry.phase("scanner_predictor_research_free_backfill", mode=args.mode):
+                import sqlite3
+
+                from analysis.scanner_predictor_research_free_backfill import run_backfill
+
+                predictor_paths = config.get("predictor_paths") or []
+                if isinstance(predictor_paths, str):
+                    predictor_paths = [predictor_paths]
+                predictor_path = next((p for p in predictor_paths if os.path.isdir(p)), None)
+                if not predictor_path:
+                    logger.warning(
+                        "scanner_predictor_research_free_backfill: no valid "
+                        "predictor_paths configured (%s) — skipping", predictor_paths,
+                    )
+                else:
+                    rf_conn = sqlite3.connect(config["research_db"])
+                    try:
+                        rf_result = run_backfill(
+                            rf_conn,
+                            predictor_path=predictor_path,
+                            bucket=config.get("signals_bucket", "alpha-engine-research"),
+                        )
+                        logger.info(
+                            "scanner_predictor_research_free_backfill: %s", rf_result,
+                        )
+                    finally:
+                        rf_conn.close()
+        except Exception as exc:
+            logger.warning(
+                "scanner_predictor_research_free_backfill phase failed (non-fatal, "
+                "OBSERVE-only — config#1405): %s", exc, exc_info=True,
+            )
+            if fd:
+                fd.report(exc, severity="warning", context={
+                    "site": "scanner_predictor_research_free_backfill", "mode": args.mode})
 
     # ── Portfolio-optimizer cutover gate ──────────────────────────────────
     # ROADMAP L2222 PR 4.5. Runs the constrained MVO optimizer over synthetic
@@ -5947,6 +6008,21 @@ def _main_impl() -> None:
                 },
                 bucket=bucket,
             )
+            # config#646 (Option A): emit the flow's end-of-run status()
+            # snapshot to s3://alpha-engine-research/_flow_doctor/heartbeat/
+            # {flow_name}/{date}.json for the dashboard consumer, which reads
+            # heartbeats from the research bucket. Reuses `bucket` — the same
+            # config.get("signals_bucket", "alpha-engine-research") the health
+            # write above targets. emit_heartbeat() soft-fails (returns None,
+            # never raises); still placed inside the try/finally so a
+            # heartbeat failure can never crash the run or skip instance-stop.
+            # hasattr guard: the 5 producing repos deploy independently and
+            # emit_heartbeat only exists in flow-doctor >=0.6.2 (the #646 arc
+            # historically pinned 0.6.0rc3, which lacks it), so a version-
+            # skewed deploy must not AttributeError at end-of-run.
+            _fd = get_flow_doctor()
+            if _fd and hasattr(_fd, "emit_heartbeat"):
+                _fd.emit_heartbeat(bucket=bucket)
         except Exception as _he:
             logger.warning("Health status write failed: %s", _he)
 

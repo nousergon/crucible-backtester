@@ -22,7 +22,9 @@ from optimizer.apply_audit import (
     build_audit,
     classify_loop,
     emit_apply_audit,
+    summarize_assembler,
 )
+from optimizer.assembler import AssemblerResult
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # The schema now lives in nousergon_lib.contracts (config#1861 second-adoption
@@ -96,7 +98,22 @@ def _all_results(**overrides):
     return results
 
 
-_ASSEMBLER_OK = {"status": "ok", "writers": ["executor_optimizer"], "notes": "cutover writes ok"}
+_ASSEMBLER_OK = {
+    "status": "ok",
+    "cutover_status": "applied",
+    "writers": ["executor_optimizer"],
+    "notes": "cutover writes ok",
+}
+
+# config#2331: merge succeeded (status=ok) but the live-key put_object
+# raised — cutover_status is the field classify_loop must key on. A record
+# built from this fixture must NEVER classify as "promoted".
+_ASSEMBLER_CUTOVER_FAILED = {
+    "status": "ok",
+    "cutover_status": "failed",
+    "writers": ["executor_optimizer"],
+    "notes": "cutover_failed: live write to s3://bucket/config/executor_params.json — S3 disconnected",
+}
 
 
 # ── Classification ───────────────────────────────────────────────────────────
@@ -196,6 +213,32 @@ class TestClassifyLoop:
     def test_executor_cutover_assembler_missing_is_error(self):
         rec = classify_loop("executor_params", _executor_cutover(), assembler_summary=None)
         assert rec["outcome"] == "error"
+
+    def test_executor_cutover_live_write_failure_is_error_not_promoted(self):
+        """config#2331: a failed live-key put_object (assembler merge status
+        stays "ok", only cutover_status flips to "failed") must classify as
+        outcome "error" — NEVER "promoted". This is the exact defect: before
+        the fix, classify_loop keyed on assembler_summary["status"] alone,
+        so a swallowed live-write failure (status still "ok") graded as
+        promoted and reset consecutive_blocked_weeks."""
+        rec = classify_loop(
+            "executor_params", _executor_cutover(),
+            assembler_summary=_ASSEMBLER_CUTOVER_FAILED,
+        )
+        assert rec["outcome"] == "error"
+        assert rec["outcome"] != "promoted"
+        assert "FAILED" in rec["detail"] or "failed" in rec["detail"]
+
+    def test_executor_cutover_status_missing_key_does_not_promote(self):
+        """Defense in depth: an assembler_summary dict that predates the
+        cutover_status field (e.g. a stale caller) must not default to
+        "promoted" — absence of cutover_status must never be silently
+        treated as success."""
+        rec = classify_loop(
+            "executor_params", _executor_cutover(),
+            assembler_summary={"status": "ok", "writers": [], "notes": "no cutover_status key"},
+        )
+        assert rec["outcome"] != "promoted"
 
     def test_shadow_mode_is_disabled(self):
         result = _weight_promoted()
@@ -301,6 +344,21 @@ class TestCarryForward:
         assert audit["loops"]["scoring_weights"]["outcome"] == "disabled"
         assert audit["loops"]["scoring_weights"]["consecutive_blocked_weeks"] == 4
 
+    def test_cutover_live_write_failure_preserves_blocked_counter(self):
+        """config#2331 acceptance: a mocked live-key put failure must
+        classify as outcome "error" AND leave consecutive_blocked_weeks
+        untouched (error carries forward unchanged — it is neither evidence
+        of blocking nor of unblocking). Before the fix, this scenario
+        classified as "promoted", which RESET the counter — exactly the
+        silent-recovery-from-failure bug the issue describes."""
+        audit = build_audit(
+            "2026-07-05", _all_results(),
+            assembler_summaries={"executor_params": _ASSEMBLER_CUTOVER_FAILED},
+            prior=self._prior(executor_params=5),
+        )
+        assert audit["loops"]["executor_params"]["outcome"] == "error"
+        assert audit["loops"]["executor_params"]["consecutive_blocked_weeks"] == 5
+
 
 # ── Frozen-schema conformance ────────────────────────────────────────────────
 
@@ -318,7 +376,7 @@ def _validate(audit: dict) -> None:
 class TestSchemaConformance:
 
     def test_mixed_outcomes_conform(self):
-        audit = build_audit("2026-07-05", _all_results(), assembler_summary=_ASSEMBLER_OK)
+        audit = build_audit("2026-07-05", _all_results(), assembler_summaries={"executor_params": _ASSEMBLER_OK})
         _validate(audit)
         assert set(audit["loops"]) == set(LOOPS)
 
@@ -338,7 +396,7 @@ class TestSchemaConformance:
         audit = build_audit(
             "2026-07-05",
             _all_results(weight_result=_weight_promoted(), veto_result=frozen_veto),
-            assembler_summary=_ASSEMBLER_OK,
+            assembler_summaries={"executor_params": _ASSEMBLER_OK},
         )
         _validate(audit)
 
@@ -381,7 +439,7 @@ class TestEmit:
         s3.get_object.side_effect = _no_such_key()
         emit_apply_audit(
             bucket="b", run_date="2026-07-05", opt_results=_all_results(),
-            assembler_result=None, upload=True, s3_client=s3,
+            assembler_results=None, upload=True, s3_client=s3,
         )
         keys = [c.kwargs.get("Key") for c in s3.put_object.call_args_list]
         assert keys == [
@@ -469,7 +527,173 @@ class TestEvaluateWiring:
         src = (REPO_ROOT / "evaluate.py").read_text()
         assert "emit_apply_audit(" in src
         assert "raise opt_stage_error" in src
-        # The upload gate mirrors sibling artifacts (args.upload + not freeze).
+        # The upload gate mirrors sibling artifacts (args.upload + not
+        # freeze). config#2332 hoisted the gate into a named
+        # `apply_audit_upload` variable (reused by the post-optimizer live-
+        # key reconciliation step) — pin the gate's definition and its use
+        # at the emit_apply_audit call site rather than requiring the
+        # expression to be inlined there.
+        assert (
+            'apply_audit_upload = bool(getattr(args, "upload", False)) '
+            "and not args.freeze"
+        ) in src
         emit_call = src.split("emit_apply_audit(")[-1].split("run_error=")[0]
-        assert 'getattr(args, "upload", False)' in emit_call
-        assert "not args.freeze" in emit_call
+        assert "upload=apply_audit_upload" in emit_call
+
+
+class TestSummarizeAssembler:
+    """Direct unit tests for apply_audit.summarize_assembler function.
+
+    Coverage target: improve mutation kill rate from 0% (no tests today)
+    to >70%. Tests the extraction of assembler result into JSON-safe
+    summary dict for classification.
+    """
+
+    def test_summarize_assembler_none_input(self):
+        # Null input: assemble_result is None
+        assert summarize_assembler(None) is None
+
+    def test_summarize_assembler_successful_cutover(self):
+        # Successful cutover: status=ok, cutover_status=applied, writers extracted
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            cutover_status="applied",
+            merge_summary={
+                "atr_multiplier": {"writer": "executor_optimizer", "reason": "full_replace"},
+                "min_score": {"writer": "executor_optimizer", "reason": "full_replace"},
+            },
+            artifacts_seen={},
+            notes="cutover_applied: live=...",
+        )
+
+        summary = summarize_assembler(result)
+
+        assert summary is not None
+        assert summary["status"] == "ok"
+        assert summary["cutover_status"] == "applied"
+        assert summary["writers"] == ["executor_optimizer"]
+        assert "cutover_applied" in summary["notes"]
+
+    def test_summarize_assembler_multiple_writers(self):
+        # Multiple writers in merge_summary: should extract and sort unique
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            cutover_status="applied",
+            merge_summary={
+                "weight_a": {"writer": "weight_optimizer"},
+                "min_score": {"writer": "executor_optimizer"},
+                "threshold": {"writer": "weight_optimizer"},
+            },
+            artifacts_seen={},
+            notes="multi-writer merge",
+        )
+
+        summary = summarize_assembler(result)
+
+        assert summary["writers"] == ["executor_optimizer", "weight_optimizer"]
+
+    def test_summarize_assembler_no_merge_summary(self):
+        # merge_summary is missing or None
+        result = AssemblerResult(
+            config_type="scoring_weights",
+            run_date="2026-05-09",
+            assembled_params={"a": 0.5},
+            status="ok",
+            cutover_status="not_attempted",
+            merge_summary=None,
+            artifacts_seen={},
+            notes="shadow only",
+        )
+
+        summary = summarize_assembler(result)
+
+        assert summary["status"] == "ok"
+        assert summary["writers"] == []
+        assert summary["cutover_status"] == "not_attempted"
+
+    def test_summarize_assembler_cutover_status_defaults_to_not_attempted(self):
+        # cutover_status attribute missing → defaults to "not_attempted"
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            merge_summary={"a": {"writer": "test_optimizer"}},
+            artifacts_seen={},
+            notes="shadow mode",
+        )
+        # Deliberately don't set cutover_status
+        if hasattr(result, "cutover_status"):
+            delattr(result, "cutover_status")
+
+        summary = summarize_assembler(result)
+
+        assert summary["cutover_status"] == "not_attempted"
+
+    def test_summarize_assembler_malformed_merge_summary_entry_skipped(self):
+        # merge_summary has non-dict entries or dict without "writer" key
+        # — should be skipped, not crash the extraction.
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            cutover_status="applied",
+            merge_summary={
+                "valid_key": {"writer": "executor_optimizer"},
+                "invalid_entry": "not a dict",
+                "missing_writer": {"reason": "some reason"},
+                "none_writer": {"writer": None},
+            },
+            artifacts_seen={},
+            notes="mixed quality summary",
+        )
+
+        summary = summarize_assembler(result)
+
+        # Only "valid_key" should be extracted
+        assert summary["writers"] == ["executor_optimizer"]
+        assert summary["status"] == "ok"
+
+    def test_summarize_assembler_extraction_exception_caught_and_logged(self):
+        # If extraction raises an exception, should be caught and returned
+        # as a degraded summary with failed status + error note.
+        class BrokenResult:
+            # Deliberate broken object that will fail on getattr-based extraction
+            def __getattribute__(self, name):
+                if name == "status":
+                    raise RuntimeError("Broken object simulation")
+                return super().__getattribute__(name)
+
+        summary = summarize_assembler(BrokenResult())
+
+        assert summary is not None
+        assert summary["status"] is None
+        assert summary["cutover_status"] == "failed"
+        assert summary["writers"] == []
+        assert "summary extraction failed" in summary["notes"]
+
+    def test_summarize_assembler_failed_cutover(self):
+        # cutover_status="failed": test that the failure status is preserved
+        result = AssemblerResult(
+            config_type="executor_params",
+            run_date="2026-05-09",
+            assembled_params={"a": 1},
+            status="ok",
+            cutover_status="failed",
+            merge_summary={"a": {"writer": "executor_optimizer"}},
+            artifacts_seen={},
+            notes="cutover_failed: S3 error",
+        )
+
+        summary = summarize_assembler(result)
+
+        assert summary["status"] == "ok"
+        assert summary["cutover_status"] == "failed"
+        assert "cutover_failed" in summary["notes"]

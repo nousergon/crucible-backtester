@@ -331,6 +331,14 @@ def test_backtest_has_pit_parity_pass_child_submode_with_rss_guard():
     assert "ru_maxrss" in src and "PIT_PARITY_PASS_RSS_BUDGET_MB" in src, (
         "per-pass RSS-budget guard (the 'these always degrade' fix) missing"
     )
+    # ru_maxrss is KiB on Linux but BYTES on Darwin/BSD — a platform-blind
+    # /1024 divide reports Darwin peak RSS ~1024x too high, mislabeled as MB,
+    # producing a false "exceeded budget" alert (found live 2026-07-16 from a
+    # local Mac invocation: reported 4,108,352 "MB" for an actual ~3.9 GB run).
+    guard_src = src[src.index("if args.pit_parity_pass:"):src.index("if args.pit_parity_pass:") + 2000]
+    assert "darwin" in guard_src.lower(), (
+        "RSS guard must branch on sys.platform == 'darwin' vs Linux KiB semantics"
+    )
 
 
 def test_isolated_pass_surfaces_child_stderr_on_failure():
@@ -346,3 +354,160 @@ def test_isolated_pass_surfaces_child_stderr_on_failure():
         "non-zero child exit must raise with the captured stderr tail"
     )
     assert "proc.stderr" in src, "the raised error/log must include the child's stderr"
+
+
+# ── config#2449: prior_delta plumbing so step-change alarms aren't inert ─────
+#
+# evaluate_parity_alarms's step-change leg has always existed (analysis/
+# parity_alarms.py), but build_contamination_report never received a
+# prior_delta from its caller, so the leg silently evaluated against None on
+# every run — inert regardless of live drift. This does NOT touch
+# paging_enabled, which stays False (unchanged) per the issue's binding
+# constraint.
+
+
+class _RecordingPutGetS3:
+    """Fake boto3 S3 client: in-memory store, supports both put_object (report
+    upload) and get_object (read_prior_delta's backward probe)."""
+
+    def __init__(self, store: dict | None = None):
+        self.store: dict[str, bytes] = store if store is not None else {}
+        self.put_calls: list[dict] = []
+
+    def put_object(self, Bucket, Key, Body, ContentType=None):
+        self.put_calls.append({"Bucket": Bucket, "Key": Key, "Body": Body})
+        self.store[Key] = Body if isinstance(Body, bytes) else Body.encode()
+
+    def get_object(self, Bucket, Key):
+        from botocore.exceptions import ClientError
+        if Key not in self.store:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        return {"Body": types.SimpleNamespace(read=lambda: self.store[Key])}
+
+
+def test_read_prior_delta_first_run_returns_none_cold_start():
+    """No prior report anywhere in the probe window -> None (documented N/A,
+    not a silent pass): the caller forwards this straight to
+    evaluate_parity_alarms, whose step-change leg is empty ({}) when
+    prior_delta is None -- inert-but-explicit, matching today's behavior."""
+    s3 = _RecordingPutGetS3()
+    result = pp.read_prior_delta("bucket", "2026-07-18", s3_client=s3)
+    assert result is None
+
+
+def test_read_prior_delta_finds_most_recent_prior_report():
+    s3 = _RecordingPutGetS3()
+    prior_report = {
+        "schema": pp.SCHEMA, "run_date": "2026-07-11",
+        "delta_pit_minus_current": {"sortino_ratio": 0.02, "psr": -0.01},
+    }
+    s3.store["backtest/2026-07-11/pit_parity.json"] = __import__("json").dumps(prior_report).encode()
+    result = pp.read_prior_delta("bucket", "2026-07-18", s3_client=s3)
+    assert result == {"sortino_ratio": 0.02, "psr": -0.01}
+
+
+def test_read_prior_delta_skips_incomplete_status_reports_without_a_delta():
+    """A status='incomplete' report has no delta_pit_minus_current -- the probe
+    must keep walking backward rather than returning None/crashing on it."""
+    import json as _json
+    s3 = _RecordingPutGetS3()
+    s3.store["backtest/2026-07-11/pit_parity.json"] = _json.dumps(
+        {"schema": pp.SCHEMA, "run_date": "2026-07-11", "status": "incomplete"}
+    ).encode()
+    s3.store["backtest/2026-07-04/pit_parity.json"] = _json.dumps(
+        {"schema": pp.SCHEMA, "run_date": "2026-07-04",
+         "delta_pit_minus_current": {"sortino_ratio": 0.03}}
+    ).encode()
+    result = pp.read_prior_delta("bucket", "2026-07-18", s3_client=s3)
+    assert result == {"sortino_ratio": 0.03}
+
+
+def test_build_contamination_report_first_run_step_leg_is_empty_not_erroring():
+    """(a) first-ever run has no prior: the report still builds; the alarms
+    block's step_breaches is empty ({}) — inert, and explicitly distinguishable
+    from a "checked and clean" run via band_breaches/step_breaches being
+    separate keys, not a silent pass baked into a single boolean."""
+    cur = _stats(1.20, 0.96, -0.030, -0.12, [0.012, 0.004], 0.05)
+    pit = _stats(1.18, 0.95, -0.031, -0.13, [0.011, 0.004], 0.049)
+    rep = pp.build_contamination_report(
+        cur, pit, run_date="2026-07-18", prior_delta=None,
+    )
+    assert rep["alarms"]["step_breaches"] == {}
+    assert rep["alarms"]["mode"] == "observe"
+
+
+def test_build_contamination_report_synthetic_step_change_fires_alarm_leg():
+    """(b) a synthetic second run whose delta jumps far beyond the prior run's
+    delta DOES fire the step-change alarm leg once prior_delta is wired in --
+    the plumbing this issue exists to add. Without prior_delta wired (the
+    pre-fix state), step_breaches would be {} on every run regardless of how
+    large this jump is."""
+    # Prior run: ~flat parity (small delta).
+    prior_delta = {"sortino_ratio": 0.01}
+
+    # This run: a large synthetic Δsortino step (run-over-run jump of 0.46,
+    # more than double the 0.20 step band).
+    cur = _stats(1.00, 0.90, -0.03, -0.12, [0.01, 0.0], 0.03)
+    pit = _stats(0.55, 0.89, -0.031, -0.13, [0.009, 0.0], 0.029)  # Δsortino = -0.45
+
+    rep = pp.build_contamination_report(
+        cur, pit, run_date="2026-07-18", prior_delta=prior_delta,
+    )
+    step_breaches = rep["alarms"]["step_breaches"]
+    assert "sortino_ratio" in step_breaches
+    assert step_breaches["sortino_ratio"]["breach"] is True
+    assert rep["alarms"]["status"] == "breach"
+    assert rep["alarms"]["mode"] == "observe"  # never pages regardless of breach
+    assert rep["alarms"]["paged"] is False
+
+
+def test_run_pit_parity_wires_read_prior_delta_into_report(monkeypatch):
+    """End-to-end: run_pit_parity reads back the prior run's delta via
+    read_prior_delta and the resulting report's step_breaches reflect it --
+    proving the orchestration-level wiring (not just the pure builder)."""
+    def fake_pass(safe_config, which, run_date):
+        wf = (which == "walkforward")
+        # Large synthetic Δsortino step vs. the seeded prior (0.0).
+        s = _stats(1.0 if not wf else 0.5, 0.9, -0.03, -0.15, [0.01, 0.0], 0.03)
+        if wf:
+            s["predictor_metadata"] = {"walk_forward": {"n_folds": 10}}
+        return s
+
+    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", fake_pass)
+
+    import json as _json
+    s3 = _RecordingPutGetS3()
+    s3.store["backtest/2026-07-11/pit_parity.json"] = _json.dumps(
+        {"schema": pp.SCHEMA, "run_date": "2026-07-11",
+         "delta_pit_minus_current": {"sortino_ratio": 0.0}}
+    ).encode()
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: s3
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    rep = pp.run_pit_parity({"signals_bucket": "b", "_run_date": "2026-07-18"})
+
+    assert rep["delta_pit_minus_current"]["sortino_ratio"] == pytest.approx(-0.5)
+    assert rep["alarms"]["step_breaches"]["sortino_ratio"]["breach"] is True
+    assert rep["alarms"]["status"] == "breach"
+    # Binding constraint: paging_enabled is untouched by this wiring — still
+    # observe-only, never pages, regardless of the breach.
+    assert rep["alarms"]["mode"] == "observe"
+    assert rep["alarms"]["paged"] is False
+
+
+def test_paging_enabled_default_untouched_by_prior_delta_wiring():
+    """Binding constraint (config#2449): this issue's plumbing must not flip
+    paging_enabled. build_contamination_report's evaluate_parity_alarms call
+    does not pass paging_enabled at all (so it always takes the default),
+    and evaluate_parity_alarms's own default stays False."""
+    import inspect
+    src = inspect.getsource(pp.build_contamination_report)
+    call_line = next(l for l in src.splitlines() if "evaluate_parity_alarms(" in l)
+    assert "paging_enabled" not in call_line, (
+        "build_contamination_report's evaluate_parity_alarms call must not "
+        "pass paging_enabled — the paging flip is a separate, Brian-gated decision"
+    )
+    from analysis.parity_alarms import evaluate_parity_alarms as _epa
+    assert inspect.signature(_epa).parameters["paging_enabled"].default is False

@@ -93,7 +93,12 @@ DEFAULT_SWEEP_GRID = {
 }
 
 # ── Fallback defaults (override via research_optimizer section in config.yaml) ──
-_MIN_SAMPLES = 200  # deferred until 6+ months of live data for reliable correlations
+_MIN_SAMPLES = 200  # min resolved score_performance samples for reliable correlations
+# (satisfied since ~2026-06: 376+ resolved samples). The loop's real block was
+# never sample count — signals.json emitted no boost columns, so
+# compute_boost_correlations returned no_boost_data every run. Fixed by
+# crucible-research scoring/boost_signals.py emitting short_interest_adj /
+# institutional_boost (config#1857).
 _MIN_IMPROVEMENT = 0.05  # 5% improvement in hit rate to recommend
 _MAX_SINGLE_CHANGE_PCT = 0.50  # max 50% change in any single param value
 _BLEND_FACTOR = 0.30  # conservative: 30% data-driven, 70% current
@@ -336,18 +341,73 @@ def recommend(
     }
 
 
+def produce_artifact(
+    result: dict,
+    bucket: str,
+    promotion_intent: str,
+    recommended_params: dict,
+    notes: str = "",
+    run_id: str | None = None,
+    run_date: str | None = None,
+) -> dict:
+    """
+    Convert a research_optimizer decision into a typed ``RecommendationArtifact``
+    and write it to S3 at
+    ``config/research_params/recommendations/{date}/from_research_optimizer.json``.
+
+    Part of the optimizer-artifact-assembler arc (config#2054 follow-up).
+    ``promotion_intent`` is passed in explicitly by the caller — see
+    ``weight_optimizer.produce_artifact`` for why this optimizer family
+    can't safely derive intent from ``result`` alone.
+    """
+    from optimizer.recommendation_artifact import RecommendationArtifact, today_iso, write_artifact
+
+    try:
+        diagnostic = {
+            k: result.get(k)
+            for k in ("status", "n_samples")
+            if result.get(k) is not None
+        }
+        artifact = RecommendationArtifact(
+            fit_target="beat_spy_boost_correlation",
+            optimizer_name="research_optimizer",
+            run_date=run_date or today_iso(),
+            recommendation_kind="full_replace",
+            recommended_params=recommended_params,
+            promotion_intent=promotion_intent,
+            diagnostic=diagnostic,
+            notes=notes,
+        )
+        if run_id is not None:
+            artifact.run_id = run_id
+        key = write_artifact(artifact, bucket, config_type="research_params")
+        return {"written": True, "key": key, "run_id": artifact.run_id}
+    except Exception as e:
+        logger.warning(
+            "Failed to write research_optimizer recommendation artifact: %s "
+            "(non-fatal — legacy live write still proceeds)", e,
+        )
+        return {"written": False, "reason": str(e)}
+
+
 def apply(result: dict, bucket: str) -> dict:
     """
     Write recommended research params to S3 if recommendation is valid.
 
     Writes to s3://{bucket}/config/research_params.json and archives
     to config/research_params_history/{date}.json.
+
+    Every decision path additionally produces a per-optimizer recommendation
+    artifact via ``produce_artifact()``, consumed by the assembler when
+    ``assembler.cutover_enabled`` is true (config#2054).
     """
     if result.get("status") != "ok":
+        produce_artifact(result, bucket, "skip", result.get("recommended_params", {}), notes=f"status={result.get('status')}")
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
     recommended = result.get("recommended_params", {})
     if not recommended:
+        produce_artifact(result, bucket, "skip", {}, notes="no recommended params")
         return {"applied": False, "reason": "no recommended params"}
 
     payload = {
@@ -356,6 +416,23 @@ def apply(result: dict, bucket: str) -> dict:
         "n_samples": result.get("n_samples"),
         "correlations": result.get("correlations"),
     }
+
+    # All guardrails passed (min_meaningful_change is enforced upstream in
+    # recommend(), which returns status="no_improvement" otherwise) — this
+    # recommendation would be promoted. Produce the artifact BEFORE the
+    # cutover gate check so the assembler has it available.
+    produce_artifact(result, bucket, "promote", recommended, notes=f"n_samples={result.get('n_samples')}")
+
+    # Cutover gate: when assembler.cutover_enabled is true, the assembler
+    # is the sole writer of the live key. Skip the legacy live + history
+    # writes below.
+    from optimizer.assembler import is_cutover_enabled
+    if is_cutover_enabled():
+        return {
+            "applied": False,
+            "reason": "cutover_mode — assembler is sole live writer",
+            "params": recommended,
+        }
 
     from optimizer.rollback import save_previous
     save_previous(bucket, "research_params")

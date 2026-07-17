@@ -5,15 +5,65 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # config#1958 deliverable 5(h): weekly, NOT per-PR — a full mutmut pass
+    # over even the scoped apply-path modules (setup.cfg's [mutmut]
+    # only_mutate: rollback.py / apply_audit.py / assembler.py) runs well
+    # over a thousand mutants; putting that on the PR-blocking `test` job
+    # would make every PR pay a multi-minute-to-tens-of-minutes tax for a
+    # signal that doesn't change week to week. Runs Sunday 09:00 UTC —
+    # same day as the Saturday-evening weekly SF pipeline's Sunday-morning
+    # backtester follow-up window.
+    - cron: "0 9 * * 0"
 
 jobs:
+  # config#2758: pre-merge wheels-only dependency-resolution guard for the
+  # three Lambda requirements files. Each Lambda builds from the
+  # compiler-less `public.ecr.aws/lambda/python:3.12` base image (no cc/gcc),
+  # so any pin bump (dependabot or hand-edited) that can only be satisfied by
+  # falling back to an sdist is a build-time failure there — but a clean,
+  # instant `pip install` success everywhere else, including this repo's own
+  # `test` job (requirements.txt, not the Lambda files, and no --only-binary
+  # constraint). Deploy #525 (2026-07-16, scipy>=1.18.0 vs the numpy<2 cap in
+  # requirements-health.txt) surfaced this as a confusing meson compiler
+  # error at deploy time, fixed at the instance layer by #529. This job
+  # catches the whole CLASS pre-merge: `--dry-run --only-binary=:all:`
+  # mirrors the Lambda image's real constraint (wheels must resolve under
+  # cp312) and turns a violating bump into pip's clean `ResolutionImpossible`
+  # on the PR, instead of a deploy-time compiler error on main.
+  lambda-deps-resolve:
+    name: Lambda deps wheels-only resolve (${{ matrix.target.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - label: health
+            requirements: requirements-health.txt
+          - label: concordance
+            requirements: lambda_concordance/requirements-concordance.txt
+          - label: counterfactual
+            requirements: lambda_counterfactual/requirements-counterfactual.txt
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Wheels-only resolution dry-run (matches the Lambda build image's compiler-less constraint)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --dry-run --only-binary=:all: --ignore-installed -r ${{ matrix.target.requirements }}
+
   test:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -39,10 +89,24 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
+      # Advisory-only: pip-audit's newer releases emit a GH Actions error
+      # annotation for any finding, which the runner honors as a step failure
+      # independent of the shell exit code — `|| true` no longer suppresses
+      # it (discovered 2026-07-13 when a newly-published langchain-core/
+      # pyarrow CVE tripped every PR's security-audit step red). continue-on-
+      # error is the runner-level equivalent of the `|| true` this step
+      # always intended: report findings, never block the job on them.
       - name: Security audit
+        continue-on-error: true
         run: |
           pip install pip-audit
-          pip-audit || true
+          IGNORE_ARGS=()
+          if [ -f .github/pip-audit-ignore.txt ]; then
+            while IFS= read -r vuln_id; do
+              IGNORE_ARGS+=(--ignore-vuln "$vuln_id")
+            done < <(grep -vE '^\s*#|^\s*$' .github/pip-audit-ignore.txt)
+          fi
+          pip-audit "${IGNORE_ARGS[@]}"
 
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
   # branch. PR-branch reds — mid-fix commits, cross-repo lib-tag merge-order
@@ -50,7 +114,43 @@ jobs:
   # since GitHub's built-in failure email can't distinguish transient from
   # real. Reusable workflow + transport live in nousergon-lib.
   notify-main-failure:
-    needs: [test]
+    needs: [test, lambda-deps-resolve]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
     secrets: inherit
+
+  # config#1958 deliverable 5(h): mutation testing on the risk-critical
+  # apply-path modules (scope + rationale in setup.cfg's [mutmut] section).
+  # Scheduled-only (see the `schedule` trigger above) — observational, does
+  # NOT gate merges; surviving-mutant counts are a coverage-quality signal
+  # to review, not a pass/fail contract. `mutmut results` output (which
+  # test survives vs. which line) is the actionable artifact, uploaded so
+  # Brian doesn't need to re-run locally to see WHICH mutants survived.
+  mutmut:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest hypothesis mutmut
+
+      - name: Run mutmut on apply-path modules (rollback / apply_audit / assembler)
+        run: mutmut run --max-children 4 || true
+
+      - name: Summarize results (survivors are the actionable signal)
+        run: mutmut results
+
+      - name: Upload mutmut cache for local `mutmut show <id>` triage
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutmut-cache
+          path: .mutmut-cache
+          retention-days: 14

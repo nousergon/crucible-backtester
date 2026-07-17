@@ -181,6 +181,52 @@ def _write_artifact_to_s3(bucket: str, run_date: str, report: dict) -> str | Non
         return None
 
 
+def read_prior_delta(bucket: str, run_date: str, s3_client=None) -> dict | None:
+    """Read the most recent prior pit_parity report's
+    ``delta_pit_minus_current`` basket, probing backward from ``run_date``
+    (NOT wall-clock today — a ``--date`` backfill run must seed its prior
+    relative to the backfilled trading day, mirroring
+    ``champion_promotion.read_prior_leaderboard_history``'s same anchor
+    choice). Returns ``None`` (first-ever run / cold start — the caller
+    passes that straight through to ``evaluate_parity_alarms`` as
+    ``prior_delta=None``, which is documented as N/A, not silently-passing)
+    if no prior report is found within the probe window or any read fails.
+
+    Best-effort / never raises: pit_parity is observational (see
+    ``_write_artifact_to_s3``'s docstring) — a prior-delta lookup failure
+    must not fail the current run's own report.
+    """
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError:  # pragma: no cover - boto3 always available in prod
+        return None
+
+    s3 = s3_client or boto3.client("s3")
+    anchor = _dt.date.fromisoformat(run_date)
+    for back in range(1, 15):
+        probe_date = (anchor - _dt.timedelta(days=back)).isoformat()
+        key = f"backtest/{probe_date}/pit_parity.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            data = json.loads(obj["Body"].read())
+            delta = data.get("delta_pit_minus_current")
+            if delta is not None:
+                return delta
+            # Report exists but has no delta (e.g. an "incomplete" status
+            # report) — keep probing further back for a real prior delta.
+            continue
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                continue
+            logger.warning("[pit_parity] prior-delta probe failed at %s: %s", key, e)
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[pit_parity] prior-delta probe failed at %s: %s", key, e)
+            return None
+    return None
+
+
 # The skilled-risk basket (plan §3 invariant 4). Sortino is primary; PSR is
 # the basket's deflation member; CVaR + max-DD are the tail/drawdown legs.
 # Sharpe is deliberately absent.
@@ -288,8 +334,19 @@ def build_contamination_report(
     wf_meta: dict | None = None,
     cur_sweep_df=None,
     pit_sweep_df=None,
+    prior_delta: dict | None = None,
 ) -> dict:
-    """Assemble the skilled-risk-basket contamination report (pure)."""
+    """Assemble the skilled-risk-basket contamination report (pure).
+
+    ``prior_delta`` is the previous run's ``delta_pit_minus_current`` basket
+    (config#2449) — the caller (``run_pit_parity``) reads it back via
+    ``read_prior_delta`` and passes it in here; this function stays pure
+    (no S3 I/O) and simply forwards it to ``evaluate_parity_alarms`` so the
+    step-change alarm leg has a real baseline instead of always evaluating
+    against ``None``. ``None`` (first-ever run / lookup failure) still means
+    "no baseline yet" and the step-change leg stays inert for this run —
+    that is documented N/A behavior, not a regression.
+    """
     cur_b, pit_b = _basket(cur_stats), _basket(pit_stats)
     delta = _delta(pit_b, cur_b)
     pbo = _pbo_two_split(cur_sweep_df, pit_sweep_df)
@@ -302,12 +359,12 @@ def build_contamination_report(
         delta.get("sortino_ratio") is not None
         and abs(delta["sortino_ratio"]) >= 0.10
     )
-    # Leg (g) — tolerance-band alarms over the full basket delta, OBSERVE mode
-    # (computed + recorded in the report; never pages from the pure builder).
-    # Step-change tracking + paging are driven by the orchestration layer, which
-    # supplies the prior run's delta and flips paging_enabled post-soak.
+    # Leg (g) — tolerance-band + step-change alarms over the full basket delta,
+    # OBSERVE mode (computed + recorded in the report; never pages from the
+    # pure builder — paging_enabled stays False here regardless of prior_delta;
+    # the paging flip itself is a separate, Brian-gated decision, config#2449).
     report_date = run_date or _dt.date.today().isoformat()
-    alarms = evaluate_parity_alarms(delta, run_date=report_date)
+    alarms = evaluate_parity_alarms(delta, prior_delta, run_date=report_date)
     return {
         "schema": SCHEMA,
         "run_date": run_date or _dt.date.today().isoformat(),
@@ -407,8 +464,13 @@ def run_pit_parity(config: dict) -> dict:
         return report
 
     wf_meta = (pit_stats.get("predictor_metadata") or {}).get("walk_forward")
+    # config#2449: read back the most recent prior run's delta so the
+    # step-change alarm leg has a real baseline instead of always
+    # evaluating against None (which made it permanently inert).
+    prior_delta = read_prior_delta(bucket, run_date)
     report = build_contamination_report(
         cur_stats, pit_stats, run_date=run_date, wf_meta=wf_meta,
+        prior_delta=prior_delta,
     )
 
     key = _write_artifact_to_s3(bucket, run_date, report)

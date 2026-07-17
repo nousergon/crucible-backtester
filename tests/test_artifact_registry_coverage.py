@@ -71,6 +71,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # cov_sweep/gamma_sweep), OBSERVE-only, grandfathered like the other per-run
     # diagnostics rather than added to the freshness-SLA registry.
     "backtest.py": 11,
+    # config#1405 research-free backfill parquet (predictor/research_free_backfill/
+    # predictor_outcomes_research_free.parquet) — the durable producer→consumer wire
+    # for the scanner→predictor-direct counterfactual (research.db pulls are
+    # throwaway per-box copies, never pushed back). REGISTERED in
+    # ARTIFACT_REGISTRY.yaml (weekly SLA) rather than grandfathered: silent
+    # absence of this artifact is indistinguishable from "backfill never ran",
+    # which is the exact 2026-07-11 first-live-run failure mode.
+    "analysis/scanner_predictor_research_free_backfill.py": 1,
     # config#1726: optimizer_run/{trading_day}.json liveness proxy for event_driven
     # config_* rows — registered as optimizer_run_manifest in ARTIFACT_REGISTRY.yaml.
     "evaluate.py": 1,
@@ -84,6 +92,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "optimizer/apply_audit.py": 2,
     "optimizer/assembler.py": 5,
     "optimizer/barrier_sizing_optimizer.py": 1,
+    # config#2367 champion-promotion engine — 4 PUTs: config/producer_champion.json
+    # (live pointer, the config#2364 champion-loop consumer key), config/apply_audit/
+    # producer_champion/{date}.json + latest.json (weekly liveness-proxy audit record,
+    # written unconditionally per the config#2054 lesson), and research/producer_
+    # leaderboard/{date}.json (forward-cohort leaderboard, gate engine input). All
+    # four are load-bearing (pointer drives live executor trading path) — registered
+    # as freshness-SLA rows in ARTIFACT_REGISTRY.yaml, not grandfathered.
+    "optimizer/champion_promotion.py": 4,
     "optimizer/config_archive.py": 1,
     "optimizer/executor_optimizer.py": 5,
     # config#748 factor_blend_optimizer — 3 PUTs (live config/factor_blend_params.json
@@ -100,6 +116,9 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # + history×2), same config-write shape as optimizer/executor_optimizer.py;
     # config writes, not freshness-SLA artifacts, so pinned here (grandfathered).
     "optimizer/portfolio_optimizer_optimizer.py": 5,
+    # config#789 Phase 6: shadow-only pillar-weight optimizer — 2 PUTs (shadow
+    # leaderboard + audit artifact), not a freshness-SLA artifact, grandfathered.
+    "optimizer/pillar_weight_optimizer.py": 2,
     "optimizer/predictor_optimizer.py": 3,
     "optimizer/predictor_sizing_optimizer.py": 1,
     "optimizer/recommendation_artifact.py": 1,

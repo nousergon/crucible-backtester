@@ -31,6 +31,15 @@ from analysis.classification_metrics import compute_binary_metrics
 
 logger = logging.getLogger(__name__)
 
+# config#2318: since the 2026-06-29 attractiveness champion-feed cutover, the
+# tech_score scanner (``scanner_evaluations.quant_filter_pass``) runs only as a
+# recorded BASELINE arm — it no longer feeds live candidate generation. Scanner-
+# edge metrics below still read that table, so they are explicitly labeled with
+# this arm so downstream report-card/Director surfaces cannot present a retired
+# gate's record as "the scanner" unlabeled. Additive-only field (S3 contract
+# discipline) — does not replace/rename any existing key.
+SCANNER_METRIC_ARM = "tech_score_baseline (retired from live feed 2026-06-29)"
+
 
 # ── Canonical-horizon research-edge helpers (ROADMAP L4551) ─────────────────
 #
@@ -388,6 +397,7 @@ def compute_lift_metrics(
     factor_loadings: dict | None = None,
     pillar_profiles: dict | None = None,
     trajectory_scores: dict | None = None,
+    bucket: str = "alpha-engine-research",
 ) -> dict:
     """
     Compute lift at each decision boundary for the given eval_date(s).
@@ -398,6 +408,8 @@ def compute_lift_metrics(
         trades_db_path: path to trades.db (trades, executor_shadow_book).
                         Optional — executor lift is skipped if not available.
         eval_date: optional filter. If None, computes across all available dates.
+        bucket: signals bucket — source of the research-free backfill parquet
+                hydrated for the 3d scanner→predictor counterfactual.
 
     Returns dict with:
         status: "ok" | "insufficient_data" | "error"
@@ -538,10 +550,17 @@ def compute_lift_metrics(
 
         # 3d. Scanner -> research-free predictor direct (arm 4, config#1405): does
         # ranking the scanner-passing pool by a research-free predicted_alpha beat
-        # the live agentic CIO path? Reads predictor_outcomes_research_free (the
-        # Saturday spot-box backfill); skips until that table is populated.
+        # the live agentic CIO path? The backfill runs on the PredictorBacktest
+        # box against ITS OWN throwaway research.db pull — its rows only reach
+        # this box through the canonical S3 parquet, hydrated here before the
+        # read (materialize_from_s3 docstring has the full seam explanation).
         # Fail-soft so it can never break the existing e2e_lift contract.
         try:
+            from analysis.scanner_predictor_research_free_backfill import (
+                materialize_from_s3 as _rf_materialize,
+            )
+
+            _rf_materialize(conn, bucket=bucket)
             result["scanner_then_predictor_counterfactual"] = _scanner_then_predictor_topN(conn)
         except Exception as _stp:  # pragma: no cover - defensive
             logger.warning("scanner_then_predictor_topN failed (non-fatal): %s", _stp)
@@ -867,6 +886,7 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
             "classification": clf,
             "classification_21d": clf_21d,
             "lift_21d_log": lift_21d,
+            "arm": SCANNER_METRIC_ARM,
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "scanner_evaluations table not found"}
@@ -2203,6 +2223,11 @@ def _scanner_factor_counterfactual(
             ma = _mean(picked[k])
             sn = _mean(picked_sn[k])
             e = {"mean_alpha_21d": ma, "sector_neutral_mean_alpha_21d": sn, "n_picks": len(picked[k])}
+            if k == "actual_scanner_pass":
+                # config#2318: this method replays the retired tech_score gate
+                # (``scanner_evaluations.quant_filter_pass``), not the live
+                # champion-feed selection — label it explicitly (additive-only).
+                e["arm"] = SCANNER_METRIC_ARM
             if k != "actual_scanner_pass" and ma is not None and actual_mean is not None:
                 e["lift_vs_actual_scanner"] = round(ma - actual_mean, 5)
                 e["sn_lift_vs_actual_scanner"] = (
