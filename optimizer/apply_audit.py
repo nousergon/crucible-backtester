@@ -10,8 +10,9 @@ audit artifact recording, for each auto-apply loop, whether it promoted, was
 blocked (and by exactly which guardrail), was data-starved, was disabled
 (shadow/freeze/flag), or errored — regardless of outcome.
 
-**FROZEN cross-repo schema v1** (``contracts/apply_audit.schema.json``): the
-crucible-evaluator consumer is built in parallel against exactly this shape
+**FROZEN cross-repo schema v1** (``nousergon_lib.contracts`` ``apply_audit``,
+lifted from the repo-local copy on the second-adoption signal, config#1861):
+the crucible-evaluator consumer is built in parallel against exactly this shape
 (RED when a loop has been blocked N consecutive weeks with no human ack).
 Evolution is additive-only; renames/removals require a schema_version bump
 coordinated with the consumer.
@@ -61,8 +62,8 @@ OUTCOMES = ("promoted", "blocked", "insufficient_data", "error", "disabled")
 # ── Stable guardrail slugs ───────────────────────────────────────────────────
 # Derived from the REAL guardrail code (not invented): each slug names the
 # config knob / gate that refused the promotion. Enumerated (and documented)
-# in contracts/apply_audit.schema.json — additions are additive schema
-# evolution; renames are breaking.
+# in the ``apply_audit`` schema in nousergon_lib.contracts — additions are
+# additive schema evolution; renames are breaking.
 BLOCKED_BY_SLUGS = (
     # weight_optimizer.apply_weights
     "oos_degradation",            # _validate_oos failed (degradation >= 20%)
@@ -417,7 +418,11 @@ def summarize_assembler(assemble_result) -> dict | None:
         return None
     try:
         merge_summary = getattr(assemble_result, "merge_summary", {}) or {}
-        writers = sorted({v.get("writer") for v in merge_summary.values() if isinstance(v, dict)})
+        writers = sorted({
+            v.get("writer")
+            for v in merge_summary.values()
+            if isinstance(v, dict) and v.get("writer")
+        })
         return {
             "status": getattr(assemble_result, "status", None),
             "cutover_status": getattr(assemble_result, "cutover_status", "not_attempted"),

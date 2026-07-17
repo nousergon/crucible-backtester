@@ -7,4 +7,4 @@ pyyaml>=6.0.3
 # rows extracted from decision_artifacts/ via DictVectorizer + emits
 # tree structure via export_text.
 scikit-learn~=1.4
-numpy<2
+numpy<3

@@ -1,5 +1,5 @@
 vectorbt~=0.26.1
-numpy<2
+numpy<3
 plotly<6
 pandas~=2.2
 boto3~=1.34
@@ -28,7 +28,7 @@ scikit-learn~=1.4
 # cvxpy added 2026-05-11 for analysis/portfolio_optimizer_backtest.py — replays
 # the constrained MVO optimizer (alpha-engine PR #157) over historical synthetic
 # predictions. Same upper bound as alpha-engine (<1.8) to stay compatible with
-# numpy<2 above. Saturday SF spot venv picks this up via `pip install -r
+# numpy<3 above. Saturday SF spot venv picks this up via `pip install -r
 # requirements.txt`; local dev requires manual install.
 cvxpy>=1.4,<1.8
 # alpha-engine-lib pulls in arcticdb + flow-doctor via extras; see
@@ -70,5 +70,8 @@ nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.c
 # (krepis is published) — NOT a git pin, so it is outside the nousergon-lib
 # lockstep guard (which tracks only the lib git-tag pins). nousergon-lib >=
 # v0.66.0 also pulls krepis transitively, but the direct pin documents the
-# minimum. Bumped to >=0.4.0 for console_url.
-krepis>=0.4.0
+# minimum. Bumped to >=0.12.0 (config#2291): krepis.email_sender.send_email
+# gained dedup_key/dedup_window_min (S3-marker dedup) at v0.12.0 —
+# emailer.send_digest_email now passes dedup_key on every call, which would
+# TypeError against krepis <0.12.0 (dedup_key wasn't a recognized kwarg).
+krepis>=0.12.0
