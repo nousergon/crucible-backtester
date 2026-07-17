@@ -1396,6 +1396,15 @@ def _run_simulation_loop(
     else:
         sim_dates = dates
 
+    # config#816: restrict the sim to a single chronological CSCV block when
+    # pit_parity's block-matrix builder threads the block dates through config
+    # (``_cscv_block_dates``). Preserves in-scope amortized lookups; only the
+    # per-date iteration set shrinks. No-op for the normal sweep / simulate path.
+    _cscv_block_dates = config.get("_cscv_block_dates")
+    if _cscv_block_dates:
+        _block_set = set(_cscv_block_dates)
+        sim_dates = [d for d in sim_dates if d in _block_set]
+
     # Tier 3 Part A: if caller didn't precompute signal_lookups (i.e.
     # we're called from run_simulate, NOT from run_predictor_param_sweep),
     # build them ONCE here so the per-date loop within this combo gets
@@ -3176,6 +3185,70 @@ def run_predictor_backtest(config: dict) -> dict:
     # Merge metadata into stats for reporting
     stats["predictor_metadata"] = metadata
 
+    # ── config#816 (decision A + B): opt-in CSCV config sweep on the PIT pass ──
+    # When ``pit_parity_sweep`` is set (per-block flag; the look-ahead pass and
+    # every non-opting caller leave it unset → single backtest, pbo=null), run a
+    # config sweep over ``param_sweep`` here — inside the SELF-CONTAINED predictor
+    # backtest that has signals_by_date / prices / executor loaded — and build the
+    # (n_blocks, n_combos) Sortino CSCV block matrix that pit_parity feeds to the
+    # full M-block CSCV PBO engine. Self-contained (no _phase_registry), so it
+    # runs in the isolated pit_parity walk-forward subprocess. Observational: any
+    # failure leaves pbo=null (honest-N/A), never fabricated.
+    if config.get("pit_parity_sweep"):
+        try:
+            def _pit_sim_fn(combo_config: dict) -> dict:
+                return _run_simulation_loop(
+                    executor_run, SimulatedIBKRClient,
+                    dates=[],
+                    price_matrix=price_matrix,
+                    config=combo_config,
+                    ohlcv_by_ticker=ohlcv_by_ticker,
+                    signals_by_date=signals_by_date,
+                    spy_prices=spy_prices,
+                )
+
+            from analysis import param_sweep as _param_sweep
+            trading_dates = sorted(signals_by_date.keys())
+            # Resolve the grid the same way run_param_sweep does (config#947):
+            # an explicit config["param_sweep"] still wins, otherwise a
+            # data-gated grid auto-selects. The prior code required an explicit
+            # top-level config["param_sweep"] AND gated the whole branch on it,
+            # so a missing/misplaced grid made the opt-in CSCV sweep SILENTLY
+            # no-op → pbo=null with no log — the exact symptom seen live
+            # (config#816 gap 1-2). Gating on the flag alone + select_grid means
+            # the sweep runs whenever pit_parity_sweep is set, never silently.
+            grid = _param_sweep.select_grid(trading_dates, config)
+            sweep_settings = config.get("param_sweep_settings", {})
+            logger.info(
+                "[pit_parity] opt-in CSCV sweep: grid=%s",
+                {k: len(v) for k, v in grid.items()},
+            )
+            pit_sweep_df = _param_sweep.sweep(
+                grid, _pit_sim_fn, config, sweep_settings=sweep_settings,
+            )
+            if pit_sweep_df is not None and not pit_sweep_df.empty and trading_dates:
+                stats.update(
+                    _build_pit_parity_cscv_matrix(
+                        pit_sweep_df, _pit_sim_fn, trading_dates, config,
+                    )
+                )
+            else:
+                # Close the last silent-null path: an empty sweep result (or no
+                # trading dates) previously skipped the matrix build with no
+                # trace. Make it loud so pbo=null is never unexplained again.
+                logger.error(
+                    "[pit_parity] opt-in CSCV sweep produced no usable matrix "
+                    "(sweep_df empty=%s, n_trading_dates=%d) — report will "
+                    "carry pbo=null",
+                    pit_sweep_df is None or getattr(pit_sweep_df, "empty", True),
+                    len(trading_dates),
+                )
+        except Exception as exc:
+            logger.error(
+                "[pit_parity] opt-in CSCV sweep failed: %s — report will "
+                "carry pbo=null", exc, exc_info=True,
+            )
+
     # ── W3.4 (L4469, OBSERVE): turnover-adjusted net alpha per horizon ───────
     # Reuses the predictions/prices/ADV already computed above (no second 10y
     # inference). NET-of-cost is the horizon-cutover judge; gross IC (the
@@ -3913,6 +3986,86 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                     ))
 
     return single_stats, sweep_df
+
+
+def _build_pit_parity_cscv_matrix(
+    sweep_df: "pd.DataFrame", sim_fn, dates: list, config: dict,
+) -> dict:
+    """Build the ``(n_blocks, n_combos)`` Sortino CSCV block matrix for
+    pit_parity's full M-block CSCV PBO (config#816, decision B — PIT pass only).
+
+    Re-evaluates the sweep's top-K combos on each chronological CSCV block via
+    the already-constructed ``sim_fn`` closure (mirrors
+    ``optimizer/executor_optimizer.py::_compute_pbo``'s per-block re-evaluation),
+    returning ``{_cscv_block_matrix, _cscv_spec_ids, _cscv_n_trials}`` for the
+    walk-forward pass stats. NaN cells for a combo that failed on a block are
+    left in place — ``cscv_pbo`` drops non-finite rows honestly.
+    """
+    from optimizer.executor_optimizer import _chronological_blocks
+
+    n_blocks = int(config.get("pit_parity_cscv_n_blocks", 8))
+    top_k = int(config.get("pit_parity_cscv_top_k", 12))
+    metric_key = "sortino_ratio"
+
+    # Sweep param columns = grid keys; use them to reconstruct per-combo configs.
+    grid = config.get("param_sweep") or {}
+    param_cols = [k for k in grid.keys() if k in sweep_df.columns]
+    # sweep_df is already sorted by Sortino desc — top-K are the leading rows.
+    top_rows = sweep_df.head(top_k)
+    combos = [
+        {k: row[k] for k in param_cols}
+        for _, row in top_rows.iterrows()
+    ]
+    if len(combos) < 2:
+        return {}
+
+    blocks = [b for b in _chronological_blocks(list(dates), n_blocks) if len(b) >= 3]
+    if len(blocks) < 4:
+        logger.warning(
+            "pit_parity CSCV: %d usable blocks < 4 (cscv min_splits) — "
+            "report will carry pbo=insufficient", len(blocks),
+        )
+
+    matrix: list[list[float]] = []
+    for block in blocks:
+        rowvals: list[float] = []
+        for combo in combos:
+            # sim_fn (the sweep closure) expects a FULL config (base+params),
+            # matching param_sweep._run_combos' ``deepcopy(base); update(params)``.
+            combo_config = {**config, **combo}
+            try:
+                stats = _eval_combo_on_block(sim_fn, combo_config, block)
+                val = stats.get(metric_key)
+                rowvals.append(
+                    float(val) if val is not None and not pd.isna(val)
+                    else float("nan")
+                )
+            except Exception as exc:
+                logger.warning(
+                    "pit_parity CSCV block sim failed (combo on %d-date block): %s",
+                    len(block), exc,
+                )
+                rowvals.append(float("nan"))
+        matrix.append(rowvals)
+
+    return {
+        "_cscv_block_matrix": matrix,
+        "_cscv_spec_ids": list(range(len(combos))),
+        "_cscv_n_trials": int(len(sweep_df)),
+    }
+
+
+def _eval_combo_on_block(sim_fn, combo: dict, block_dates: list) -> dict:
+    """Run ``sim_fn`` for one combo restricted to a single chronological block.
+
+    ``sim_fn`` (the run_predictor_param_sweep closure) deep-copies the base
+    config and overlays the combo params, then reads its date grid from the
+    shared ``signals_by_date``; threading ``_cscv_block_dates`` through the
+    combo overlay makes ``_run_simulation_loop`` restrict iteration to the
+    block. Kept as a seam so tests can stub per-block evaluation without the
+    full pipeline.
+    """
+    return sim_fn({**combo, "_cscv_block_dates": list(block_dates)})
 
 
 # ── Infrastructure helpers ──────────────────────────────────────────────────
@@ -5484,7 +5637,14 @@ def _main_impl() -> None:
             raise SystemExit("--pit-parity-pass requires --config-json and --stats-out")
         with open(args.config_json) as _f:
             pass_cfg = json.load(_f)
-        pass_cfg["walk_forward"] = (args.pit_parity_pass == "walkforward")
+        is_walkforward = (args.pit_parity_pass == "walkforward")
+        pass_cfg["walk_forward"] = is_walkforward
+        # config#816 decision B: the opt-in CSCV config sweep runs on the PIT
+        # (walk-forward) pass ONLY — canonical López de Prado (CSCV runs on the
+        # strategy you deploy). Strip the flag off the look-ahead pass so it
+        # stays a single backtest; contamination is measured via the Δ-CI.
+        if not is_walkforward:
+            pass_cfg.pop("pit_parity_sweep", None)
         stats = run_predictor_backtest(pass_cfg)
         with open(args.stats_out, "wb") as _f:
             pickle.dump(stats, _f)
@@ -5531,7 +5691,7 @@ def _main_impl() -> None:
             print(json.dumps(
                 {k: report[k] for k in (
                     "schema", "run_date", "delta_pit_minus_current",
-                    "headline_log_alpha_delta", "materiality", "_s3_key",
+                    "headline_log_alpha_delta", "materiality", "pbo", "_s3_key",
                 ) if k in report},
                 indent=2, default=str,
             ))
