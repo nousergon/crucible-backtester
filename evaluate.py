@@ -1951,31 +1951,52 @@ def _main_impl() -> None:
                 run_date=args.date,
             )
 
-    # ── Champion promotion/demotion engine (config#2364 / config#2367) ────
-    # Gated weekly evaluation of config/producer_champion.json — the pointer
-    # the alpha-engine executor reads to choose its live entry-candidate
-    # producer arm (agentic vs scanner_predictor_direct). Runs AFTER the
-    # e2e_lift counterfactual (diagnostics, computed earlier in this run)
-    # and the apply-audit block above, per the issue's required ordering.
-    # A weekly audit record (config/apply_audit/producer_champion/{date}.json)
-    # is written UNCONDITIONALLY — including when this whole step raises —
-    # because that write IS the liveness proxy (config#2054): a correctly
-    # -held week must not be indistinguishable from a dead engine. --freeze
-    # suppresses the pointer write only, mirroring every other writer in
-    # this file; the audit record still records the (suppressed) decision.
+    # ── Champion promotion engine (weekly winner-take-all, alpha-engine-
+    # config-I2518 / epic I2515, 2026-07-14 ruling — supersedes the prior
+    # HAC-significance/hysteresis/cooldown gate, config#2364/#2367) ────────
+    # Weekly evaluation of config/producer_champion.json — the pointer the
+    # alpha-engine executor reads to choose its live entry-candidate
+    # producer arm (scanner_predictor_direct vs thinktank_coverage). Runs
+    # AFTER the e2e_lift counterfactual (diagnostics, computed earlier in
+    # this run) and the apply-audit block above, per the issue's required
+    # ordering. A weekly audit record (config/apply_audit/producer_champion/
+    # {date}.json) is written UNCONDITIONALLY — including when this whole
+    # step raises — because that write IS the liveness proxy (config#2054):
+    # a correctly-held (no-contest) week must not be indistinguishable from
+    # a dead engine. --freeze suppresses the pointer write only, mirroring
+    # every other writer in this file; the audit record still records the
+    # (suppressed) decision.
     if run_optimizers:
         champion_bucket = config.get("signals_bucket", "alpha-engine-research")
         champion_upload = bool(getattr(args, "upload", False)) and not args.freeze
         try:
             e2e_lift_diag = diagnostics.get("e2e_lift") if isinstance(diagnostics, dict) else None
-            leaderboard_inputs = champion_promotion.update_leaderboard_and_get_gate_inputs(
+            # Still maintained for observability / config#2452 continuity —
+            # no longer feeds the gate decision (see champion_promotion.py
+            # module docstring); the gate reads e2e_lift_diag directly.
+            champion_promotion.update_leaderboard_and_get_gate_inputs(
                 champion_bucket, args.date, e2e_lift_diag,
                 upload=champion_upload,
+            )
+            # LATEST-AVAILABLE read (alpha-engine-config-I2544, 2026-07-14
+            # ruling): research/producer_leaderboard/{date}.json is now
+            # written by an async advisory child SF that may not have
+            # finished (or may have failed) by the time this Evaluator
+            # stage runs — read the latest artifact <= args.date rather
+            # than assuming a same-day exact match. tt_leaderboard_date_used
+            # is threaded into the audit record so the trail always shows
+            # which week's evidence decided (or declined to decide) a flip.
+            tt_leaderboard, tt_leaderboard_date_used = (
+                champion_promotion.read_latest_research_producer_leaderboard(
+                    champion_bucket, args.date,
+                )
             )
             champion_promotion.run_weekly_evaluation(
                 bucket=champion_bucket,
                 run_date=args.date,
-                leaderboard=leaderboard_inputs,
+                e2e_lift=e2e_lift_diag,
+                tt_leaderboard=tt_leaderboard,
+                tt_leaderboard_date_used=tt_leaderboard_date_used,
                 freeze=args.freeze,
                 upload=champion_upload,
             )
