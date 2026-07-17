@@ -1,15 +1,19 @@
 numpy>=2.5.1,<3
 pandas>=2.0
-# Upper bound is load-bearing, NOT cosmetic: scipy 1.18.0 is the first
-# scipy release whose wheels require numpy>=2.0.0, which conflicts with
-# the numpy<2 cap above. Without the ceiling, pip cannot satisfy the set
-# with wheels; in the compiler-less `public.ecr.aws/lambda/python:3.12`
-# base image it silently backtracks pandas to an ancient sdist (2.1.0,
-# pre-cp312) and fails trying to compile it (Deploy #525, 2026-07-16).
-# 1.17.x is the last scipy line compatible with numpy<2. Same numpy<2
-# coupling as `cvxpy>=1.4,<1.8` in requirements.txt — keep the two in
-# mind together when the fleet eventually lifts numpy<2.
-scipy>=1.10,<1.18
+# Ceiling exists ONLY because scipy 1.18.0 was, at the time of Deploy #525
+# (2026-07-16), the first scipy release requiring numpy>=2.0.0 wheels, which
+# conflicted with the numpy<2 cap that was on the line above back then — pip
+# fell back to an ancient pandas sdist (2.1.0, pre-cp312) and failed to
+# compile it in the compiler-less `public.ecr.aws/lambda/python:3.12` base
+# image. That numpy<2 cap is gone (numpy>=2.5.1,<3 above, PR#531): scipy
+# 1.18.0 now installs cleanly as a manylinux_2_28_x86_64 cp312 wheel
+# alongside numpy 2.5.1/pandas 3.0.3 (verified via `pip download
+# --only-binary=:all: --platform manylinux_2_28_x86_64 --abi cp312`,
+# config#2815). Ceiling kept at <1.19, one line-release ahead of the
+# current latest (1.18.0), purely so dependabot's normal bump flow — not a
+# silent backtrack — is what picks up 1.19 and any releases after it.
+# Re-check wheel availability for cp312/manylinux before raising further.
+scipy>=1.10,<1.19
 boto3>=1.26.0
 # pipeline_common.py does `import yaml` at module import time (reads
 # labeling.forward_days to derive ACTIVE_HORIZON_DAYS). Pin explicitly
