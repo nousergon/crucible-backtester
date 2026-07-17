@@ -1728,8 +1728,8 @@ def save(
         # always-emit from birth: the crucible-evaluator consumer grades a
         # non-"ok" body as an honest N/A-with-reason, and absence must
         # unambiguously mean "producer never ran" (same rationale as the
-        # freshness-monitored artifacts above). Frozen cross-repo schema v1:
-        # contracts/attractiveness_eval.schema.json.
+        # freshness-monitored artifacts above). Frozen cross-repo schema v2:
+        # nousergon_lib.contracts "attractiveness_eval" (config#1861).
         ("attractiveness_eval.json", attractiveness_eval),
         ("portfolio_calibration.json", calibration_diagnostics),
         # Optimizer churn / walk-forward stability (config#1151 Batch C) —

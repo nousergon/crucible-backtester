@@ -48,7 +48,17 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # ARTIFACT_REGISTRY.yaml (a freshness SLA on a default-off monitor would
     # false-alarm; and the producer is not yet live).
     "analysis/attribution_persistence.py": 1,
-    "analysis/cost_report.py": 1,
+    # +2 (1→3) 2026-07-17: config#867 stateful incident<->recovery pairing (PR
+    # nousergon/crucible-backtester#497). Both new PUTs are grandfathered, not
+    # freshness-SLA registered: (1) changelog/_state/cost_anomaly_ledger.json
+    # is pure internal producer state (open-incident bookkeeping), the same
+    # shape as store/sim_checkpoint.py's transient checkpoint below; (2) the
+    # new `recovery` entry write reuses the SAME changelog/{date}/{event_id}.json
+    # prefix as the original `incident` entry (already covered by this file's
+    # baseline count of 1, dynamic per-event key per this file's own
+    # per-file-count design choice above) — it is the same corpus/artifact
+    # family, not a new artifact type.
+    "analysis/cost_report.py": 3,
     "analysis/feature_drift.py": 1,
     # L4471 L2 within-run sim checkpoint — transient (deleted on success), not a
     # freshness-tracked SLA artifact; the backtest/{trading_day}/_sim_checkpoint/

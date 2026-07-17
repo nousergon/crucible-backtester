@@ -435,6 +435,14 @@ def test_backtest_has_pit_parity_pass_child_submode_with_rss_guard():
     assert "ru_maxrss" in src and "PIT_PARITY_PASS_RSS_BUDGET_MB" in src, (
         "per-pass RSS-budget guard (the 'these always degrade' fix) missing"
     )
+    # ru_maxrss is KiB on Linux but BYTES on Darwin/BSD — a platform-blind
+    # /1024 divide reports Darwin peak RSS ~1024x too high, mislabeled as MB,
+    # producing a false "exceeded budget" alert (found live 2026-07-16 from a
+    # local Mac invocation: reported 4,108,352 "MB" for an actual ~3.9 GB run).
+    guard_src = src[src.index("if args.pit_parity_pass:"):src.index("if args.pit_parity_pass:") + 2000]
+    assert "darwin" in guard_src.lower(), (
+        "RSS guard must branch on sys.platform == 'darwin' vs Linux KiB semantics"
+    )
 
 
 def test_isolated_pass_surfaces_child_stderr_on_failure():

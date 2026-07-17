@@ -8,7 +8,7 @@ Covers:
 - config#1398 counterfactual (top-N variants, sector-balanced allocation,
   live tech_score survivor gate, ex-post winner capture),
 - producer-side conformance of the emitted artifact against the FROZEN
-  cross-repo JSON Schema (contracts/attractiveness_eval.schema.json) on BOTH
+  cross-repo JSON Schema (nousergon_lib.contracts "attractiveness_eval") on BOTH
   the ok and insufficient_data paths — the crucible-evaluator consumer is
   built against exactly this shape,
 - the read-only guarantee (no S3 writes, no live-config writes) as a static
@@ -38,10 +38,13 @@ from analysis.attractiveness_eval import (
     compute_attractiveness_eval,
     suggest_pillar_weights,
 )
+from nousergon_lib import contracts
 from nousergon_lib.quant.horizons import DEFAULT_POLICY
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_PATH = REPO_ROOT / "contracts" / "attractiveness_eval.schema.json"
+# The schema now lives in nousergon_lib.contracts (config#1861 second-adoption
+# lift); the producer validates the emitted artifact against that single
+# authority, not a repo-local copy.
 
 HORIZON = int(DEFAULT_POLICY.primary_horizon)
 RET_COL = f"log_return_{HORIZON}d"
@@ -306,7 +309,7 @@ class TestCounterfactual:
         assert lg["n_survivors"] == 10 * len(WEEKLY_DATES)
         assert lg["capture_rate"] == pytest.approx(0.0)
         expected_alpha = float(np.mean([0.30 - i * 0.005 for i in range(40, 50)]))
-        assert lg["mean_alpha_21d"] == pytest.approx(expected_alpha, abs=1e-6)
+        assert lg["mean_alpha"] == pytest.approx(expected_alpha, abs=1e-6)
 
         variants = {(e["n"], e["sector_balanced"]): e for e in cf["top_n"]}
         assert set(variants) == {(n, b) for n in COUNTERFACTUAL_TOP_NS
@@ -316,14 +319,14 @@ class TestCounterfactual:
         # nearly all ex-post top-60 winners and beats the live mid-pack gate
         assert top60["n_cycles"] == len(WEEKLY_DATES)
         assert top60["capture_rate"] > 0.85
-        assert top60["mean_alpha_21d"] > lg["mean_alpha_21d"]
+        assert top60["mean_alpha"] > lg["mean_alpha"]
         # universe of 100 scored names can't fill a top-120/200 variant —
         # skipped honestly (no truncated pseudo-variant), nulls in the entry
         for n in (120, 200):
             for b in (False, True):
                 assert variants[(n, b)]["n_cycles"] == 0
                 assert variants[(n, b)]["capture_rate"] is None
-                assert variants[(n, b)]["mean_alpha_21d"] is None
+                assert variants[(n, b)]["mean_alpha"] is None
 
     def test_sector_balanced_allocation_is_proportional(self):
         g = pd.DataFrame({
@@ -414,12 +417,13 @@ jsonschema = pytest.importorskip(
 
 class TestSchemaConformance:
     def _validate(self, artifact: dict) -> None:
-        schema = json.loads(SCHEMA_PATH.read_text())
+        schema = contracts.load_schema("attractiveness_eval")
         jsonschema.validate(instance=artifact, schema=schema)
 
-    def test_schema_file_is_v1(self):
-        schema = json.loads(SCHEMA_PATH.read_text())
-        assert schema["properties"]["schema_version"] == {"const": 1}
+    def test_schema_is_v2(self):
+        schema = contracts.load_schema("attractiveness_eval")
+        assert schema["properties"]["schema_version"]["const"] == 2
+        assert contracts.SCHEMA_VERSIONS["attractiveness_eval"] == 2
 
     def test_ok_artifact_conforms(self, ok_artifact):
         assert ok_artifact["status"] == "ok"
@@ -461,7 +465,7 @@ class TestReporterWiring:
 
     def test_always_emits_nonok_body(self, tmp_path):
         out = self._save(tmp_path, {"status": "insufficient_data",
-                                    "schema_version": 1})
+                                    "schema_version": 2})
         f = out / "attractiveness_eval.json"
         assert f.exists(), "attractiveness_eval.json must always-emit a non-ok body"
         assert json.loads(f.read_text())["status"] == "insufficient_data"
