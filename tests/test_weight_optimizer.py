@@ -1,15 +1,41 @@
 """Unit tests for optimizer.weight_optimizer — guardrail logic, no S3 calls."""
+import json
+
 import pytest
 from unittest.mock import patch, MagicMock
 
 import pandas as pd
 
+from optimizer.assembler import set_cutover_enabled
 from optimizer.weight_optimizer import (
     apply_weights,
     compute_weights,
     init_config,
     load_with_subscores,
+    produce_artifact,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_cutover_flag():
+    """Always reset the assembler cutover flag around each test so
+    set_cutover_enabled(True) in one test never leaks into the next."""
+    set_cutover_enabled(False)
+    yield
+    set_cutover_enabled(False)
+
+
+@pytest.fixture(autouse=True)
+def _mock_recommendation_artifact_s3():
+    """apply_weights() now unconditionally calls produce_artifact() (config#2054),
+    which writes to S3 via optimizer.recommendation_artifact — a module none of
+    the pre-existing tests in this file mock. Autouse so every test is
+    protected from making a real AWS call; tests that want to inspect the
+    artifact payload can still patch this explicitly (nested patch, no
+    conflict) to get a handle on the mock."""
+    with patch("optimizer.recommendation_artifact.boto3") as mock_boto3:
+        mock_boto3.client.return_value = MagicMock()
+        yield mock_boto3
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -780,3 +806,101 @@ class TestApplyReadRoundTrip:
             current = _read_current_weights({"signals_bucket": "test-bucket"})
 
         assert current == {"quant": 0.55, "qual": 0.45}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# config#2054: optimizer-artifact-assembler arc extended to scoring_weights
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _ok_weight_result():
+    return {
+        "status": "ok",
+        "confidence": "medium",
+        "oos_passed": True,
+        "suggested_weights": {"quant": 0.45, "qual": 0.55},
+        "changes": {"quant": -0.05, "qual": 0.05},
+        "n_samples": 200,
+    }
+
+
+class TestProduceArtifact:
+
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_writes_to_canonical_key(self, mock_boto3):
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        outcome = produce_artifact(
+            _ok_weight_result(), bucket="test-bucket", promotion_intent="promote",
+            recommended_params={"quant": 0.45, "qual": 0.55},
+        )
+        assert outcome["written"] is True
+        assert outcome["key"].startswith("config/scoring_weights/recommendations/")
+        assert outcome["key"].endswith("/from_weight_optimizer.json")
+        body = json.loads(s3.put_object.call_args.kwargs["Body"])
+        assert body["promotion_intent"] == "promote"
+        assert body["recommendation_kind"] == "full_replace"
+
+
+class TestApplyWeightsCutoverGate:
+    """When ``optimizer.assembler.is_cutover_enabled()`` returns True, the
+    legacy live-key write path is skipped — the assembler is the sole writer
+    of ``config/scoring_weights.json``. The recommendation artifact is
+    written either way (the assembler needs it to merge)."""
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_cutover_enabled_skips_legacy_live_write(self, mock_artifact_boto3, mock_legacy_boto3):
+        _init_default_config()
+        set_cutover_enabled(True)
+        legacy_s3 = MagicMock()
+        artifact_s3 = MagicMock()
+        mock_legacy_boto3.client.return_value = legacy_s3
+        mock_artifact_boto3.client.return_value = artifact_s3
+
+        outcome = apply_weights(_ok_weight_result(), bucket="test-bucket")
+
+        assert outcome["applied"] is False
+        assert "cutover_mode" in outcome["reason"]
+        assert legacy_s3.put_object.call_args_list == []
+        artifact_keys = [c.kwargs["Key"] for c in artifact_s3.put_object.call_args_list]
+        assert any(k.endswith("/from_weight_optimizer.json") for k in artifact_keys)
+        body = json.loads(artifact_s3.put_object.call_args_list[0].kwargs["Body"])
+        assert body["promotion_intent"] == "promote"
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_cutover_disabled_keeps_legacy_write(self, mock_artifact_boto3, mock_legacy_boto3):
+        _init_default_config()
+        legacy_s3 = MagicMock()
+        artifact_s3 = MagicMock()
+        mock_legacy_boto3.client.return_value = legacy_s3
+        mock_artifact_boto3.client.return_value = artifact_s3
+
+        with patch.dict("sys.modules", {"optimizer.rollback": MagicMock()}):
+            outcome = apply_weights(_ok_weight_result(), bucket="test-bucket")
+
+        assert outcome["applied"] is True
+        legacy_keys = [c.kwargs["Key"] for c in legacy_s3.put_object.call_args_list]
+        assert "config/scoring_weights.json" in legacy_keys
+
+    @patch("optimizer.weight_optimizer.boto3")
+    @patch("optimizer.recommendation_artifact.boto3")
+    def test_guardrail_blocked_path_still_produces_skip_artifact(self, mock_artifact_boto3, mock_legacy_boto3):
+        """Audit completeness: a blocked recommendation still writes a
+        recommendation artifact (promotion_intent=skip) — mirrors the
+        docstring contract that every optimizer invocation is recorded."""
+        _init_default_config()
+        artifact_s3 = MagicMock()
+        mock_artifact_boto3.client.return_value = artifact_s3
+
+        blocked = _ok_weight_result()
+        blocked["confidence"] = "low"
+        outcome = apply_weights(blocked, bucket="test-bucket")
+
+        assert outcome["applied"] is False
+        assert outcome["blocked_by"] == ["confidence_below_medium"]
+        artifact_keys = [c.kwargs["Key"] for c in artifact_s3.put_object.call_args_list]
+        assert any(k.endswith("/from_weight_optimizer.json") for k in artifact_keys)
+        body = json.loads(artifact_s3.put_object.call_args_list[0].kwargs["Body"])
+        assert body["promotion_intent"] == "skip"

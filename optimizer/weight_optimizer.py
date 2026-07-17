@@ -670,6 +670,79 @@ def _check_stability(suggested: dict, bucket: str | None = None) -> dict:
     }
 
 
+def produce_artifact(
+    result: dict,
+    bucket: str,
+    promotion_intent: str,
+    recommended_params: dict,
+    notes: str = "",
+    run_id: str | None = None,
+    run_date: str | None = None,
+) -> dict:
+    """
+    Convert a weight_optimizer decision into a typed ``RecommendationArtifact``
+    and write it to S3 at
+    ``config/scoring_weights/recommendations/{date}/from_weight_optimizer.json``.
+
+    Part of the optimizer-artifact-assembler arc (config#2054 follow-up —
+    extends the arc from ``executor_params`` to ``scoring_weights``). Unlike
+    ``executor_optimizer.produce_artifact`` (called unconditionally at the
+    top of ``apply()``, since ALL of that optimizer's guardrails are already
+    baked into ``recommend()``'s ``status``), this optimizer's guardrails
+    (confidence, OOS, max_single_change, min_meaningful_change,
+    significance_floor) live in ``apply_weights()`` itself — so
+    ``promotion_intent`` must be passed in explicitly by the caller at each
+    decision point rather than derived from ``result`` alone
+    (``derive_promotion_intent`` would default any ``status=="ok"`` result to
+    "promote", silently bypassing these guardrails under cutover).
+
+    Args:
+        result: dict from ``compute_weights()``.
+        bucket: S3 bucket name.
+        promotion_intent: "promote" / "shadow" / "skip" — the caller's
+            already-evaluated decision.
+        recommended_params: the weights payload this decision corresponds to.
+        notes: human-readable reason for this decision.
+        run_id: Optional run identifier (test injection).
+        run_date: Optional explicit run_date (defaults to trading-day today).
+
+    Returns:
+        ``{"written": True, "key": str}`` on success;
+        ``{"written": False, "reason": str}`` on non-fatal failure (logged
+        warn; caller continues with legacy live write).
+    """
+    from optimizer.recommendation_artifact import RecommendationArtifact, today_iso, write_artifact
+
+    try:
+        diagnostic = {
+            k: result.get(k)
+            for k in ("status", "confidence", "n_samples", "oos_passed", "oos_degradation")
+            if result.get(k) is not None
+        }
+        artifact = RecommendationArtifact(
+            fit_target=result.get("fit_target", "beat_spy_pearson"),
+            optimizer_name="weight_optimizer",
+            run_date=run_date or today_iso(),
+            recommendation_kind="full_replace",
+            recommended_params=recommended_params,
+            promotion_intent=promotion_intent,
+            diagnostic=diagnostic,
+            notes=notes,
+        )
+        if run_id is not None:
+            artifact.run_id = run_id
+        key = write_artifact(artifact, bucket, config_type="scoring_weights")
+        return {"written": True, "key": key, "run_id": artifact.run_id}
+    except Exception as e:
+        # Non-fatal during dual-write window: the legacy live write still
+        # happens via apply_weights()'s existing logic. The artifact is additive.
+        logger.warning(
+            "Failed to write weight_optimizer recommendation artifact: %s "
+            "(non-fatal — legacy live write still proceeds)", e,
+        )
+        return {"written": False, "reason": str(e)}
+
+
 def apply_weights(result: dict, bucket: str) -> dict:
     """
     Apply suggested weights to S3 if guardrails pass.
@@ -682,6 +755,12 @@ def apply_weights(result: dict, bucket: str) -> dict:
       - no single weight changes by more than MAX_SINGLE_CHANGE (15%)
       - at least one weight changes by more than MIN_MEANINGFUL_CHANGE (2%)
 
+    Every decision path — promoted, blocked, or shadowed — additionally
+    produces a per-optimizer recommendation artifact via ``produce_artifact()``
+    at ``config/scoring_weights/recommendations/{date}/from_weight_optimizer.json``.
+    Part of the optimizer-artifact-assembler arc; consumed by the assembler
+    when ``assembler.cutover_enabled`` is true (config#2054).
+
     Args:
         result: dict returned by compute_weights().
         bucket: S3 bucket (same as signals_bucket).
@@ -691,9 +770,14 @@ def apply_weights(result: dict, bucket: str) -> dict:
         or {"applied": False, "reason": str}
     """
     if result.get("status") != "ok":
+        produce_artifact(result, bucket, "skip", result.get("suggested_weights", {}), notes=f"status={result.get('status')}")
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
     if result.get("oos_passed") is False:
+        produce_artifact(
+            result, bucket, "skip", result.get("suggested_weights", {}),
+            notes=f"oos_degradation={result.get('oos_degradation', 0):.1%}",
+        )
         return {
             "applied": False,
             "blocked_by": ["oos_degradation"],
@@ -702,6 +786,7 @@ def apply_weights(result: dict, bucket: str) -> dict:
 
     confidence = result.get("confidence", "low")
     if confidence == "low":
+        produce_artifact(result, bucket, "skip", result.get("suggested_weights", {}), notes="confidence_below_medium")
         return {
             "applied": False,
             "blocked_by": ["confidence_below_medium"],
@@ -716,6 +801,10 @@ def apply_weights(result: dict, bucket: str) -> dict:
     meaningful = any(abs(v) >= min_meaningful for v in changes.values())
 
     if max_change > max_single:
+        produce_artifact(
+            result, bucket, "skip", result.get("suggested_weights", {}),
+            notes=f"max_single_change {max_change:.1%} > {max_single:.0%}",
+        )
         return {
             "applied": False,
             "blocked_by": ["max_single_change"],
@@ -723,6 +812,10 @@ def apply_weights(result: dict, bucket: str) -> dict:
         }
 
     if not meaningful:
+        produce_artifact(
+            result, bucket, "skip", result.get("suggested_weights", {}),
+            notes=f"all changes < {min_meaningful:.0%}",
+        )
         return {
             "applied": False,
             "blocked_by": ["min_meaningful_change"],
@@ -772,6 +865,7 @@ def apply_weights(result: dict, bucket: str) -> dict:
             )
         except Exception as e:
             logger.warning("Shadow weights write failed (non-fatal): %s", e)
+        produce_artifact(result, bucket, "shadow", suggested, notes="shadow mode — skill_composite enabled, enforce_skill_composite=False")
         return {
             "applied": False,
             "reason": "shadow mode — skill_composite enabled, enforce_skill_composite=False",
@@ -798,6 +892,10 @@ def apply_weights(result: dict, bucket: str) -> dict:
                 "(config#1426) — no significant positive canonical-horizon IC ≥ %.3f",
                 _WEIGHT_MIN_SIGNED_IC,
             )
+            produce_artifact(
+                result, bucket, "skip", suggested,
+                notes="significance_floor — blocked by significance enforce (config#1426)",
+            )
             return {
                 "applied": False,
                 "blocked_by": ["significance_floor"],
@@ -805,6 +903,24 @@ def apply_weights(result: dict, bucket: str) -> dict:
                           "(config#1426) — undefended evidence",
                 "observe_verdict": verdict,
             }
+
+    # All guardrails passed — this recommendation would be promoted.
+    # Produce the per-optimizer recommendation artifact BEFORE the cutover
+    # gate check so the assembler (when cutover is enabled) has it available.
+    produce_artifact(result, bucket, "promote", suggested, notes=f"confidence={confidence}, fit_target={fit_target}")
+
+    # Cutover gate: when assembler.cutover_enabled is true, the assembler
+    # is the sole writer of the live key. Skip the legacy live + history
+    # writes below. The artifact is already produced above; the assembler
+    # reads it during its merge.
+    from optimizer.assembler import is_cutover_enabled
+    if is_cutover_enabled():
+        return {
+            "applied": False,
+            "reason": "cutover_mode — assembler is sole live writer",
+            "fit_target": fit_target,
+            "weights": suggested,
+        }
 
     from optimizer.rollback import save_previous
     save_previous(bucket, "scoring_weights")

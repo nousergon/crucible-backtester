@@ -15,13 +15,35 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from optimizer.assembler import set_cutover_enabled
 from analysis.veto_analysis import (
     S3_PARAMS_KEY,
     S3_SHADOW_PREFIX,
     _select_best_threshold,
     apply,
     init_config,
+    produce_artifact,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_cutover_flag():
+    """Always reset the assembler cutover flag around each test so
+    set_cutover_enabled(True) in one test never leaks into the next."""
+    set_cutover_enabled(False)
+    yield
+    set_cutover_enabled(False)
+
+
+@pytest.fixture(autouse=True)
+def _mock_recommendation_artifact_s3():
+    """apply() now unconditionally calls produce_artifact() (config#2054),
+    which writes to S3 via optimizer.recommendation_artifact — a module none
+    of the pre-existing tests in this file mock. Autouse so every test is
+    protected from making a real AWS call."""
+    with patch("optimizer.recommendation_artifact.boto3") as mock_boto3:
+        mock_boto3.client.return_value = MagicMock()
+        yield mock_boto3
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -538,3 +560,96 @@ class TestApplyPerSectorShadowSoak:
         )
         body = json.loads(shadow_call.kwargs["Body"])
         assert body["per_sector_overrides"] == overrides
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# config#2054: optimizer-artifact-assembler arc extended to predictor_params
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _ok_veto_result(fit_target: str = "precision_minus_alpha_cost_legacy", threshold: float = 0.70) -> dict:
+    return {
+        "status": "ok",
+        "fit_target": fit_target,
+        "current_threshold": 0.55,
+        "base_rate": 0.50,
+        "n_down_predictions": 30,
+        "thresholds": [
+            {"confidence": threshold, "precision": 0.65, "n_vetoes": 12,
+             "f1": 0.55, "lift": 0.15},
+        ],
+        "recommended_threshold": threshold,
+        "recommendation_reason": "test",
+    }
+
+
+class TestProduceArtifact:
+
+    def test_writes_to_canonical_key(self, _mock_recommendation_artifact_s3):
+        outcome = produce_artifact(
+            _ok_veto_result(), bucket="test-bucket", promotion_intent="promote",
+            recommended_params={"veto_confidence": 0.70},
+        )
+        assert outcome["written"] is True
+        assert outcome["key"].startswith("config/predictor_params/recommendations/")
+        assert outcome["key"].endswith("/from_veto_analysis.json")
+        s3 = _mock_recommendation_artifact_s3.client.return_value
+        body = json.loads(s3.put_object.call_args.kwargs["Body"])
+        assert body["promotion_intent"] == "promote"
+        assert body["recommendation_kind"] == "full_replace"
+
+
+class TestApplyCutoverGate:
+    """When ``optimizer.assembler.is_cutover_enabled()`` returns True, the
+    legacy live-key write path is skipped — the assembler is the sole writer
+    of ``config/predictor_params.json``."""
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_cutover_enabled_skips_legacy_live_write(self, mock_boto3, _mock_recommendation_artifact_s3):
+        _init_config()
+        set_cutover_enabled(True)
+        legacy_s3 = MagicMock()
+        legacy_s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = legacy_s3
+
+        outcome = apply(_ok_veto_result(), bucket="test-bucket")
+
+        assert outcome["applied"] is False
+        assert "cutover_mode" in outcome["reason"]
+        assert legacy_s3.put_object.call_args_list == []
+        artifact_s3 = _mock_recommendation_artifact_s3.client.return_value
+        artifact_keys = [c.kwargs["Key"] for c in artifact_s3.put_object.call_args_list]
+        assert any(k.endswith("/from_veto_analysis.json") for k in artifact_keys)
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_cutover_disabled_keeps_legacy_write(self, mock_boto3, _mock_recommendation_artifact_s3):
+        _init_config()
+        legacy_s3 = MagicMock()
+        legacy_s3.get_object.side_effect = Exception("NoSuchKey")
+        mock_boto3.client.return_value = legacy_s3
+
+        with patch("optimizer.rollback.save_previous"):
+            outcome = apply(_ok_veto_result(), bucket="test-bucket")
+
+        assert outcome["applied"] is True
+        legacy_keys = [c.kwargs["Key"] for c in legacy_s3.put_object.call_args_list]
+        assert S3_PARAMS_KEY in legacy_keys
+
+    @patch("analysis.veto_analysis.boto3")
+    def test_min_threshold_change_block_still_produces_skip_artifact(self, mock_boto3, _mock_recommendation_artifact_s3):
+        """Audit completeness: a blocked recommendation still writes a
+        recommendation artifact (promotion_intent=skip)."""
+        _init_config()
+        legacy_s3 = MagicMock()
+        legacy_s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=json.dumps({"veto_confidence": 0.70}).encode())),
+        }
+        mock_boto3.client.return_value = legacy_s3
+
+        outcome = apply(_ok_veto_result(threshold=0.70), bucket="test-bucket")
+
+        assert outcome["applied"] is False
+        assert outcome["blocked_by"] == ["min_threshold_change"]
+        artifact_s3 = _mock_recommendation_artifact_s3.client.return_value
+        body = json.loads(artifact_s3.put_object.call_args.kwargs["Body"])
+        assert body["promotion_intent"] == "skip"

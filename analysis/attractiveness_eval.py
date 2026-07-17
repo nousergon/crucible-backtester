@@ -8,8 +8,8 @@ against realized forward market-relative log-alpha from ``universe_returns``
 — the SAME realized-return source and ``(eval_date, ticker)`` exact join the
 sibling producers use (``end_to_end._trajectory_forward_ic`` /
 ``_neutralized_live_forward_ic``). Emits ONE artifact,
-``backtest/{date}/attractiveness_eval.json`` (frozen cross-repo schema v1,
-``contracts/attractiveness_eval.schema.json``), alongside ``e2e_lift.json``.
+``backtest/{date}/attractiveness_eval.json`` (frozen cross-repo schema v2,
+``nousergon_lib.contracts`` ``attractiveness_eval``), alongside ``e2e_lift.json``.
 
 What it computes
 ----------------
@@ -81,8 +81,12 @@ from nousergon_lib.quant.horizons import DEFAULT_POLICY
 logger = logging.getLogger(__name__)
 
 # Frozen cross-repo schema version — bump ONLY with a coordinated consumer
-# change (crucible-evaluator is built against exactly this shape).
-SCHEMA_VERSION = 1
+# change (crucible-evaluator is built against exactly this shape). The schema
+# now lives in ``nousergon_lib.contracts`` (config#1861 second-adoption lift);
+# v2 renamed the counterfactual ``mean_alpha_21d`` field to ``mean_alpha``
+# (horizon-is-a-parameter, ARCHITECTURE §48 / config#1483 — the horizon is
+# carried by the top-level ``horizon_days``, never hardcoded in the field name).
+SCHEMA_VERSION = 2
 
 # Producer key of the attractiveness history parquet (crucible-research
 # scoring/attractiveness_history.HISTORY_KEY — schema authority).
@@ -334,7 +338,7 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
     tabs = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     empty = {"top_n": [], "live_gate": {"capture_rate": None,
-                                        "mean_alpha_21d": None,
+                                        "mean_alpha": None,
                                         "n_survivors": 0},
              "n_cycles": 0}
     if "scanner_evaluations" not in tabs:
@@ -399,14 +403,14 @@ def _counterfactual(conn, merged: pd.DataFrame, ur: pd.DataFrame) -> dict:
             "n": n,
             "sector_balanced": sector_balanced,
             "capture_rate": _mean(v["capture"]),
-            "mean_alpha_21d": _mean(v["alpha"]),
+            "mean_alpha": _mean(v["alpha"]),
             "n_cycles": len(v["alpha"]),
         })
     return {
         "top_n": top_n,
         "live_gate": {
             "capture_rate": _mean(live["capture"]),
-            "mean_alpha_21d": _mean(live["alpha"]),
+            "mean_alpha": _mean(live["alpha"]),
             "n_survivors": int(live["n_survivors"]),
         },
         "n_cycles": n_cycles,
@@ -462,8 +466,8 @@ def compute_attractiveness_eval(
     trajectory_scores: dict | None = None,
     s3_client=None,
 ) -> dict:
-    """Build the ``attractiveness_eval.json`` artifact (frozen schema v1 —
-    ``contracts/attractiveness_eval.schema.json``).
+    """Build the ``attractiveness_eval.json`` artifact (frozen schema v2 —
+    ``nousergon_lib.contracts`` ``attractiveness_eval``).
 
     Args:
         research_db_path: research.db (``universe_returns`` +
@@ -497,7 +501,7 @@ def compute_attractiveness_eval(
             },
             "counterfactual": {
                 "top_n": [],
-                "live_gate": {"capture_rate": None, "mean_alpha_21d": None,
+                "live_gate": {"capture_rate": None, "mean_alpha": None,
                               "n_survivors": 0},
                 "n_cycles": 0,
             },

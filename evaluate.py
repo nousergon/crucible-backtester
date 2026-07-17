@@ -92,6 +92,8 @@ from optimizer import (
 )
 from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablation
 from optimizer import factor_blend_optimizer
+from optimizer import champion_promotion
+from optimizer import pillar_weight_optimizer
 from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_digest_email
 from reporter import build_digest, build_report, save, upload_to_s3
@@ -463,8 +465,8 @@ def _run_diagnostics(
     # tech_score gate). Read-only measurement — emits SUGGESTED weights inside
     # the artifact only, never writes config/factor_attractiveness_weights.json.
     # Reuses the trajectory_scores dict loaded above for e2e_lift (no second
-    # S3 read); frozen cross-repo schema v1 in
-    # contracts/attractiveness_eval.schema.json.
+    # S3 read); frozen cross-repo schema v2 in
+    # nousergon_lib.contracts "attractiveness_eval" (config#1861).
     results["attractiveness_eval"] = tracker.run_module(
         "attractiveness_eval",
         lambda: attractiveness_eval_analysis.compute_attractiveness_eval(
@@ -1146,6 +1148,21 @@ def _run_optimizers(
         skip_if_missing=["factor_blend_sensitivity"],
     )
 
+    # Pillar-weight optimizer (config#789 Phase 6) — SHADOW-ONLY. Sweeps the
+    # 6-pillar composite weight space (Σ pillar weights == 1) + within-pillar
+    # qual_weight + legacy_blend, ranks by Sortino-on-skilled-risk under the
+    # alpha-floor constraint, and archives the recommendation to the shadow
+    # history prefix ONLY (config/scoring_weights_shadow_history). It NEVER
+    # writes the live scoring-weights key and has no live-cutover path — pure
+    # observability. Mirrors weight_optimizer's df_base dependency + the
+    # compute-then-apply(shadow) contract of the other optimizers.
+    results["pillar_weight_opt"] = tracker.run_module(
+        "pillar_weight_optimizer",
+        lambda: _run_pillar_weight_opt(config, df_base, freeze),
+        required_inputs={"research_db": avail["research_db"], "df_base": df_base is not None},
+        skip_if_missing=["df_base"],
+    )
+
     # Executor optimizer (needs sweep_df from simulation)
     sweep_df = config.get("_sweep_df")
     predictor_sweep_df = config.get("_predictor_sweep_df")
@@ -1558,6 +1575,27 @@ def _run_factor_blend_optimizer(
     return result
 
 
+def _run_pillar_weight_opt(config: dict, df_base, freeze: bool) -> dict:
+    """Run pillar_weight_optimizer compute + shadow-archive path (config#789 Phase 6).
+
+    SHADOW-ONLY: the recommend() sweep-then-rank never touches live config, and
+    apply() writes exclusively to the shadow-history prefix. ``freeze=True``
+    short-circuits apply() so ``--freeze`` runs produce zero S3 side effects.
+    The optimizer scores candidate pillar-weight vectors against the persisted
+    ``investment_thesis.composite_breakdown`` pillar contributions on df_base and
+    ranks by Sortino-on-skilled-risk under the alpha-floor constraint.
+    """
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    current_weights = config.get("pillar_weight_optimizer", {}).get("current_weights")
+    result = pillar_weight_optimizer.recommend(df_base, current_weights=current_weights)
+    if freeze:
+        result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
+    elif result.get("status") == "ok":
+        # Shadow-archive only — apply() never writes the live scoring-weights key.
+        result["apply_result"] = pillar_weight_optimizer.apply(result, bucket)
+    return result
+
+
 def _publish_executor_opt_rejection_alert(result: dict, config: dict) -> None:
     """Fire a named alert when ``executor_optimizer.recommend()`` returns
     a non-``ok`` status — closes 5/23-SF P0 sweep item (c).
@@ -1755,6 +1793,8 @@ def _main_impl() -> None:
     research_optimizer.init_config(config)
     tech_weight_ablation.init_config(config)
     factor_blend_optimizer.init_config(config)
+    champion_promotion.init_config(config)
+    pillar_weight_optimizer.init_config(config)
 
     # Set the assembler-cutover flag from config — when true, individual
     # optimizers' apply() skip their legacy live-key writes and the
@@ -1833,34 +1873,43 @@ def _main_impl() -> None:
     # writes the live key + _previous snapshot + dated history — and the
     # individual optimizers' apply() paths skip their legacy live writes
     # (gated by ``optimizer.assembler.is_cutover_enabled()``).
-    # Failure is non-fatal: the assembler must not break the pipeline.
-    assemble_result = None
+    # Failure is non-fatal per config_type: one config type's assembler
+    # error must not block the other three (config#2054 — each is an
+    # independent single-writer precedence chain with no cross-type
+    # dependency).
+    assemble_results: dict = {}
     if run_optimizers and opt_stage_error is None and not args.freeze:
-        try:
-            from optimizer.assembler import assemble, is_cutover_enabled
-            bucket = config.get("signals_bucket", "alpha-engine-research")
-            assemble_result = assemble(
-                bucket=bucket,
-                config_type="executor_params",
-                run_date=args.date,
-                write_assembled=True,
-            )
-            logger.info(
-                "Assembler run: status=%s, promoting=%d, frozen_restored=%d, "
-                "cutover=%s",
-                assemble_result.status,
-                sum(
-                    1 for v in assemble_result.artifacts_seen.values()
-                    if v["promotion_intent"] == "promote"
-                ),
-                len(assemble_result.frozen_keys_restored),
-                "ON" if is_cutover_enabled() else "OFF (shadow)",
-            )
-        except Exception as e:
-            # Assembler failure must not break the pipeline.
-            logger.warning(
-                "Assembler run failed (non-fatal — pipeline continues): %s", e,
-            )
+        from optimizer.assembler import assemble, is_cutover_enabled
+        bucket = config.get("signals_bucket", "alpha-engine-research")
+        for config_type in (
+            "executor_params", "scoring_weights", "predictor_params", "research_params",
+        ):
+            try:
+                result = assemble(
+                    bucket=bucket,
+                    config_type=config_type,
+                    run_date=args.date,
+                    write_assembled=True,
+                )
+                assemble_results[config_type] = result
+                logger.info(
+                    "Assembler run [%s]: status=%s, promoting=%d, frozen_restored=%d, "
+                    "cutover=%s",
+                    config_type,
+                    result.status,
+                    sum(
+                        1 for v in result.artifacts_seen.values()
+                        if v["promotion_intent"] == "promote"
+                    ),
+                    len(result.frozen_keys_restored),
+                    "ON" if is_cutover_enabled() else "OFF (shadow)",
+                )
+            except Exception as e:
+                # Assembler failure must not break the pipeline.
+                logger.warning(
+                    "Assembler run failed for config_type=%s (non-fatal — "
+                    "pipeline continues): %s", config_type, e,
+                )
 
     # ── Apply-audit artifact (config#1841) ───────────────────────────────
     # Unconditional per-loop outcome record for the four auto-apply loops
@@ -1876,7 +1925,7 @@ def _main_impl() -> None:
             bucket=config.get("signals_bucket", "alpha-engine-research"),
             run_date=args.date,
             opt_results=opt_results,
-            assembler_result=assemble_result,
+            assembler_results=assemble_results,
             upload=apply_audit_upload,
             run_error=opt_stage_error,
         )
@@ -1901,6 +1950,79 @@ def _main_impl() -> None:
                 run_start=datetime.fromtimestamp(_health_start, tz=timezone.utc),
                 run_date=args.date,
             )
+
+    # ── Champion promotion engine (weekly winner-take-all, alpha-engine-
+    # config-I2518 / epic I2515, 2026-07-14 ruling — supersedes the prior
+    # HAC-significance/hysteresis/cooldown gate, config#2364/#2367) ────────
+    # Weekly evaluation of config/producer_champion.json — the pointer the
+    # alpha-engine executor reads to choose its live entry-candidate
+    # producer arm (scanner_predictor_direct vs thinktank_coverage). Runs
+    # AFTER the e2e_lift counterfactual (diagnostics, computed earlier in
+    # this run) and the apply-audit block above, per the issue's required
+    # ordering. A weekly audit record (config/apply_audit/producer_champion/
+    # {date}.json) is written UNCONDITIONALLY — including when this whole
+    # step raises — because that write IS the liveness proxy (config#2054):
+    # a correctly-held (no-contest) week must not be indistinguishable from
+    # a dead engine. --freeze suppresses the pointer write only, mirroring
+    # every other writer in this file; the audit record still records the
+    # (suppressed) decision.
+    if run_optimizers:
+        champion_bucket = config.get("signals_bucket", "alpha-engine-research")
+        champion_upload = bool(getattr(args, "upload", False)) and not args.freeze
+        try:
+            e2e_lift_diag = diagnostics.get("e2e_lift") if isinstance(diagnostics, dict) else None
+            # Still maintained for observability / config#2452 continuity —
+            # no longer feeds the gate decision (see champion_promotion.py
+            # module docstring); the gate reads e2e_lift_diag directly.
+            champion_promotion.update_leaderboard_and_get_gate_inputs(
+                champion_bucket, args.date, e2e_lift_diag,
+                upload=champion_upload,
+            )
+            # LATEST-AVAILABLE read (alpha-engine-config-I2544, 2026-07-14
+            # ruling): research/producer_leaderboard/{date}.json is now
+            # written by an async advisory child SF that may not have
+            # finished (or may have failed) by the time this Evaluator
+            # stage runs — read the latest artifact <= args.date rather
+            # than assuming a same-day exact match. tt_leaderboard_date_used
+            # is threaded into the audit record so the trail always shows
+            # which week's evidence decided (or declined to decide) a flip.
+            tt_leaderboard, tt_leaderboard_date_used = (
+                champion_promotion.read_latest_research_producer_leaderboard(
+                    champion_bucket, args.date,
+                )
+            )
+            champion_promotion.run_weekly_evaluation(
+                bucket=champion_bucket,
+                run_date=args.date,
+                e2e_lift=e2e_lift_diag,
+                tt_leaderboard=tt_leaderboard,
+                tt_leaderboard_date_used=tt_leaderboard_date_used,
+                freeze=args.freeze,
+                upload=champion_upload,
+            )
+        except Exception:
+            # The champion-promotion step must never take down the whole
+            # evaluate run (mirrors the assembler's non-fatal posture just
+            # above) — but an audit record must still land so this failure
+            # is provable, not silent. Best-effort emit with error=... ; if
+            # even THAT write fails, log loudly and move on (this step is
+            # not permitted to mask the primary evaluate-run outcome).
+            logger.exception(
+                "Champion-promotion evaluation raised — emitting error audit "
+                "record before continuing (pipeline must not break)",
+            )
+            try:
+                error_audit = champion_promotion.build_champion_audit(
+                    args.date, None, freeze=args.freeze,
+                    error="champion-promotion step raised — see evaluate.py logs",
+                )
+                if champion_upload:
+                    champion_promotion.write_champion_audit(champion_bucket, args.date, error_audit)
+            except Exception:
+                logger.exception(
+                    "Champion-promotion error-audit write ALSO failed — "
+                    "liveness proxy may be stale this week",
+                )
 
     # ── Regression detection ─────────────────────────────────────────────
     regression_result = _run_regression(
@@ -2343,6 +2465,12 @@ def _main_impl() -> None:
                 report_prefix=config.get("output_prefix", "evaluation"),
                 status=sq_result.get("status", "ok"),
                 s3_bucket=config.get("output_bucket") if args.upload else None,
+                # config#2291: same dedup rationale as backtest.py's digest
+                # call — a watch-rerun of the Evaluator SF state for the same
+                # trading_day must not re-send this email. Keyed on run_date
+                # only, own "evaluator-digest" namespace so it never collides
+                # with the Backtester's dedup_key for the same date.
+                dedup_key=f"evaluator-digest:{args.date}",
             )
 
         report_ok = True
