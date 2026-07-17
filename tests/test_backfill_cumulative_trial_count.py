@@ -16,9 +16,14 @@ from __future__ import annotations
 
 import json
 
-import boto3
 import pytest
-from moto import mock_aws
+
+# moto/boto3 are optional test deps in this repo (see test_reporter.py) —
+# importorskip so the suite skips gracefully where they're absent instead of
+# erroring at collection.
+boto3 = pytest.importorskip("boto3")
+moto = pytest.importorskip("moto")
+mock_aws = moto.mock_aws
 
 from analysis.backfill_cumulative_trial_count import (
     main,
