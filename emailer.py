@@ -152,6 +152,8 @@ def send_digest_email(
     console_base_url: str | None = None,
     s3_bucket: str | None = None,
     region: str = "us-east-1",
+    dedup_key: str | None = None,
+    dedup_window_min: int | None = None,
 ) -> None:
     """Send ONE task's thin digest email — a short executive summary that
     deep-links to the console Analysis page for the full detail (mirroring the
@@ -173,6 +175,19 @@ def send_digest_email(
         status:       "ok" | "insufficient_data" | "error" — shown in subject.
         console_base_url: Override for the console base (tests); defaults to prod.
         s3_bucket:    When set, footer links to this task's full report.md.
+        dedup_key:    Optional key forwarded to
+                      ``nousergon_lib.email_sender.send_email``'s S3-marker
+                      dedup (config#2291). The Saturday SF's PredictorBacktest
+                      + PortfolioOptimizerBacktest + main-backtest states each
+                      invoke ``backtest.py --upload`` independently for the
+                      SAME trading_day, and each reaches this call — without a
+                      dedup_key that is one digest email PER SF STATE rather
+                      than one per trading_day (the "3 near-identical emails"
+                      incident). Callers should pass a key stable across those
+                      states, e.g. ``f"{product_name.lower()}-digest:{run_date}"``.
+        dedup_window_min: Forwarded to ``send_email``; ``None`` uses its own
+                      default (24h) — covers same-day re-invocations/watch-
+                      reruns without leaking into the next trading_day's email.
     """
     url = analysis_report_url(run_date, console_base_url)
     label = {
@@ -206,11 +221,18 @@ def send_digest_email(
         f"View the full {product_name} report on the console:\n{url}\n\n"
         f"{digest_md}\n{plain_links}"
     )
-    send_email(
-        subject, plain_body,
+    # dedup_window_min: only forward if the caller explicitly set it — the
+    # library's own default (24h) means something different from an explicit
+    # None (which means "forever" per send_email's contract), so omitting the
+    # kwarg entirely when unset lets send_email apply its own default rather
+    # than us silently downgrading every un-parameterized caller to "forever".
+    _send_kwargs = dict(
         recipients=recipients, html=html_body,
-        sender=sender, region=region,
+        sender=sender, region=region, dedup_key=dedup_key,
     )
+    if dedup_window_min is not None:
+        _send_kwargs["dedup_window_min"] = dedup_window_min
+    send_email(subject, plain_body, **_send_kwargs)
 
 
 def _md_table_row(line: str, is_header: bool = False) -> str:
