@@ -388,6 +388,30 @@ def test_apply_recommendations_signal_threshold(mock_boto):
     assert written["recommended_signal_threshold"] == 0.015
 
 
+@patch("optimizer.predictor_optimizer.boto3")
+def test_apply_recommendations_reraises_transient_s3_error(mock_boto):
+    """Verify transient S3 errors (throttle, AccessDenied) raise, don't silently truncate."""
+    from botocore.exceptions import ClientError
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+
+    # Simulate a transient S3 error (e.g., throttling)
+    error = ClientError(
+        {"Error": {"Code": "ThrottlingException"}},
+        "GetObject"
+    )
+    s3.get_object.side_effect = error
+
+    ensemble_result = {
+        "recommended_mode": "mse",
+        "date": "2026-04-07",
+        "recommendation_reason": "better Sharpe",
+    }
+
+    with pytest.raises(ClientError):
+        apply_recommendations(ensemble_result, None, "bucket")
+
+
 # ── _filter_predictions_by_alpha tests ───────────────────────────────────────
 
 def test_filter_predictions_no_filtering_at_zero():
