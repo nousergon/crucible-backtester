@@ -42,6 +42,7 @@ from nousergon_lib.eval_artifacts import (
 import boto3
 import numpy as np
 import pandas as pd
+from botocore.exceptions import ClientError
 
 from pipeline_common import phase
 
@@ -932,8 +933,9 @@ def apply_recommendations(
     try:
         obj = s3.get_object(Bucket=bucket, Key="config/predictor_params.json")
         existing = json.loads(obj["Body"].read())
-    except Exception:
-        pass
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey"):
+            raise
 
     # Archive before update
     try:
