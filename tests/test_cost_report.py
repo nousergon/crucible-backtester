@@ -1106,8 +1106,17 @@ class TestChangelogAutoEmitOnAnomaly:
                                       bucket="alpha-engine-research", s3_client=stub_a)
         _emit_changelog_anomaly_entry(anomaly, run_date="2026-05-09",
                                       bucket="alpha-engine-research", s3_client=stub_b)
-        key_a = stub_a.put_object.call_args.kwargs["Key"]
-        key_b = stub_b.put_object.call_args.kwargs["Key"]
+        # _emit_changelog_anomaly_entry also writes the config#867 anomaly
+        # ledger (a second put_object, to a different key) — pick out the
+        # changelog/entries/ call specifically rather than assuming it's
+        # the most recent one.
+        def _entry_key(stub):
+            calls = [c for c in stub.put_object.call_args_list
+                     if c.kwargs["Key"].startswith("changelog/entries/")]
+            assert len(calls) == 1
+            return calls[0].kwargs["Key"]
+        key_a = _entry_key(stub_a)
+        key_b = _entry_key(stub_b)
         assert key_a == key_b, (
             f"Same (run_date, ratio, current_total) must produce the "
             f"identical S3 key — re-runs MUST overwrite. Got:\n"
@@ -1125,6 +1134,161 @@ class TestChangelogAutoEmitOnAnomaly:
             f"event_id must anchor on run_date with no wall-clock "
             f"timestamp prefix; got {event_id!r}"
         )
+
+
+def _make_stateful_ledger_stub(date_to_df: dict) -> MagicMock:
+    """Like ``_make_multi_date_stub_with_put`` but the ledger key
+    (``changelog/_state/cost_anomaly_ledger.json``) is a real in-memory
+    object: a ``put_object`` to it is visible to a later ``get_object`` on
+    the same stub. Needed to test the config#867 incident->recovery
+    pairing across two ``build_cost_section`` calls on one stub, without
+    dragging in moto for a single JSON blob.
+    """
+    from analysis.cost_report import _ANOMALY_LEDGER_KEY
+
+    base = _make_multi_date_stub(date_to_df)
+    store: dict[str, bytes] = {}
+
+    def _get_object(*, Bucket: str, Key: str):
+        if Key == _ANOMALY_LEDGER_KEY:
+            if Key not in store:
+                raise ClientError(
+                    {"Error": {"Code": "NoSuchKey", "Message": "not found"}},
+                    "GetObject",
+                )
+            return {"Body": _StubBody(store[Key])}
+        return base.get_object(Bucket=Bucket, Key=Key)
+
+    def _put_object(*, Bucket: str, Key: str, Body: bytes, **kw):
+        if Key == _ANOMALY_LEDGER_KEY:
+            store[Key] = Body
+        return {"ETag": '"deadbeef"'}
+
+    stub = MagicMock()
+    stub.get_object = MagicMock(side_effect=_get_object)
+    stub.put_object = MagicMock(side_effect=_put_object)
+    return stub
+
+
+class TestChangelogRecoveryPairing:
+    """config#867: stateful incident<->recovery pairing for the cost-anomaly
+    auto-emitter — the only real auto-emit producer in the org outside the
+    SNS/CloudWatch mirrors (2026-07-09 groom finding: no eval-regression
+    producer exists anywhere; the SNS path's own OK->recovery routing
+    already covers CW-alarm clears independently, in nousergon-data).
+    """
+
+    def test_ok_after_anomaly_emits_paired_recovery_and_clears_ledger(self):
+        from analysis.cost_report import build_cost_section, _ANOMALY_LEDGER_KEY
+
+        anomaly_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=10.00),
+        ])
+        baseline_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        ok_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=1.00),
+        ])
+        # Second run_date is 5 weeks after the first so its own 4-week
+        # trailing baseline window (06-06/05-30/05-23/05-16) never
+        # overlaps 2026-05-09 (the anomaly date) — keeps the "ok" status
+        # on the second call unambiguous rather than an accident of the
+        # anomalous $10 baseline date dragging the ratio down.
+        stub = _make_stateful_ledger_stub({
+            "2026-05-09": anomaly_df,
+            "2026-05-02": baseline_df,
+            "2026-04-25": baseline_df,
+            "2026-04-18": baseline_df,
+            "2026-04-11": baseline_df,
+            "2026-06-13": ok_df,
+            "2026-06-06": ok_df,
+            "2026-05-30": ok_df,
+            "2026-05-23": ok_df,
+            "2026-05-16": ok_df,
+        })
+
+        build_cost_section("2026-05-09", s3_client=stub)
+        entry_calls = [c for c in stub.put_object.call_args_list
+                       if c.kwargs["Key"].startswith("changelog/entries/")]
+        assert len(entry_calls) == 1
+        incident_body = json.loads(entry_calls[0].kwargs["Body"].decode())
+        assert incident_body["event_type"] == "incident"
+        incident_event_id = incident_body["event_id"]
+        # Ledger now holds the open incident.
+        ledger = json.loads(stub.get_object(
+            Bucket=_BUCKET, Key=_ANOMALY_LEDGER_KEY)["Body"].read())
+        assert ledger["open_event_id"] == incident_event_id
+
+        build_cost_section("2026-06-13", s3_client=stub)
+
+        entry_calls = [c for c in stub.put_object.call_args_list
+                       if c.kwargs["Key"].startswith("changelog/entries/")]
+        assert len(entry_calls) == 2, (
+            "expected the original incident entry plus one paired recovery entry"
+        )
+        recovery_body = json.loads(entry_calls[1].kwargs["Body"].decode())
+        assert recovery_body["event_type"] == "recovery"
+        assert recovery_body["severity"] == "informational"
+        assert recovery_body["root_cause_category"] is None
+        assert recovery_body["git_refs"] == [incident_event_id], (
+            "recovery entry must back-reference the incident's event_id "
+            "via git_refs, per the SNS-mirror Lambda's own documented "
+            "convention for pairing"
+        )
+        assert incident_event_id in recovery_body["summary"] or \
+            incident_event_id in recovery_body["description"]
+
+        # Ledger cleared — a subsequent "ok" run must not re-emit.
+        ledger_after = json.loads(stub.get_object(
+            Bucket=_BUCKET, Key=_ANOMALY_LEDGER_KEY)["Body"].read())
+        assert ledger_after["open_event_id"] is None
+
+    def test_ok_with_no_open_incident_emits_nothing(self):
+        """No prior anomaly ever fired -> "ok" status is a true no-op, not
+        just a no-op relative to some ledger state (regression guard for
+        the pre-config#867 behavior: quiet weeks stay quiet)."""
+        from analysis.cost_report import build_cost_section
+
+        ok_df = pd.DataFrame([
+            _make_row(agent_id="ic_cio", sector_team_id=None,
+                     model_name="claude-sonnet-4-6", cost_usd=0.01),
+        ])
+        stub = _make_stateful_ledger_stub({
+            "2026-05-09": ok_df,
+            "2026-05-02": ok_df,
+            "2026-04-25": ok_df,
+            "2026-04-18": ok_df,
+            "2026-04-11": ok_df,
+        })
+        build_cost_section("2026-05-09", s3_client=stub)
+        assert stub.put_object.call_count == 0
+
+    def test_second_ok_run_after_recovery_does_not_double_emit(self):
+        """Once the ledger is cleared, further "ok" runs stay silent —
+        the recovery entry fires exactly once per incident."""
+        from analysis.cost_report import (
+            _write_anomaly_ledger, _maybe_emit_changelog_recovery_entry,
+        )
+
+        stub = MagicMock()
+        _write_anomaly_ledger(
+            {"open_event_id": None, "closed_run_date": "2026-05-16"},
+            bucket=_BUCKET, s3_client=stub,
+        )
+        stub.get_object = MagicMock(return_value={
+            "Body": _StubBody(stub.put_object.call_args.kwargs["Body"])
+        })
+        stub.put_object.reset_mock()
+
+        result = _maybe_emit_changelog_recovery_entry(
+            run_date="2026-05-23", bucket=_BUCKET, s3_client=stub,
+        )
+        assert result is None
+        assert stub.put_object.call_count == 0
 
 
 class TestAnomalyAlertPublish:
@@ -1262,9 +1426,10 @@ class TestAnomalyAlertPublish:
         })
         md = build_cost_section("2026-05-09", s3_client=stub)
         # Section still renders the anomaly block + the changelog auto-emit
-        # still ran (put_object called once for the entry).
+        # still ran: one put_object for the entry, one for the config#867
+        # anomaly ledger (tracks the open event_id for recovery pairing).
         assert "ANOMALY DETECTED" in md
-        assert stub.put_object.call_count == 1
+        assert stub.put_object.call_count == 2
 
     def test_disabled_env_var_suppresses_publish(self, monkeypatch):
         """ALPHA_ENGINE_COST_ANOMALY_ALERT_DISABLED=1 → no publish attempted."""

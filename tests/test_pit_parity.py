@@ -3,10 +3,13 @@
 
 Locks: the basket is Sortino/PSR/CVaR/maxDD + log-domain headline with
 **no Sharpe**; log-domain cumulative return is summed not compounded;
-deltas are pit−current; the 2-split CSCV PBO is honest (None without a
-sweep pair, never a fabricated number); the report is observational and
-flip-gated; run_pit_parity runs both passes with the flag flipped and
-never raises on an S3 upload failure.
+deltas are pit−current; the PBO is a full M-block CSCV distribution on the
+PIT block matrix (config#816) and is honest (None without a PIT block
+matrix, ``insufficient`` — never a fabricated number — on too-small
+inputs); materiality is a block-bootstrap CI that excludes 0 (+ DSR),
+replacing the arbitrary ``abs(ΔSortino)>=0.10`` threshold; the report is
+observational and flip-gated; run_pit_parity runs both passes with the
+flag flipped and never raises on an S3 upload failure.
 """
 
 from __future__ import annotations
@@ -16,7 +19,6 @@ import sys
 import types
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from analysis import pit_parity as pp
@@ -65,28 +67,42 @@ def test_delta_is_pit_minus_current_and_none_safe():
         "sortino_ratio"] is None
 
 
-def test_pbo_none_without_sweep_pair():
-    assert pp._pbo_two_split(None, None) is None
+def test_pbo_none_without_pit_block_matrix():
+    # #816 gap 1+2: single-pass parity (no opt-in sweep) → pbo null, never a
+    # fabricated distribution (A-grade integrity property).
+    assert pp._cscv_pbo(None) is None
+    # Degenerate shapes are also null (not fabricated).
+    assert pp._cscv_pbo([[1.0, 2.0]]) is None          # 1 block
+    assert pp._cscv_pbo([[1.0], [2.0], [3.0], [4.0]]) is None  # 1 combo
 
 
-def test_pbo_two_split_detects_overfit():
-    # In-sample ranks configs c0>c1>c2; out-of-sample reverses → the best
-    # IS config (c0) lands at OOS percentile 0.0 < 0.5 ⇒ overfit=True.
-    cur = pd.DataFrame({"config_id": [0, 1, 2], "sortino_ratio": [3.0, 2.0, 1.0]})
-    pit = pd.DataFrame({"config_id": [0, 1, 2], "sortino_ratio": [1.0, 2.0, 3.0]})
-    r = pp._pbo_two_split(cur, pit)
-    assert r["n_configs"] == 3
-    assert r["overfit"] is True
-    assert r["best_in_sample_config_oos_percentile"] == pytest.approx(0.0)
-    assert r["spearman_rank_corr"] == pytest.approx(-1.0)
+def test_cscv_pbo_full_m_block_distribution():
+    # #816 gap 1: full M-block CSCV on the PIT block matrix produces a real
+    # PBO number via nousergon_lib.quant.stats.pbo.cscv_pbo (not a 2-split
+    # rank-corr). Overfit construction: combo 0 is best in early blocks and
+    # worst in late blocks → the in-sample winner lands low OOS → high PBO.
+    rng = np.random.default_rng(0)
+    n_blocks, n_combos = 8, 6
+    mat = rng.normal(0, 0.1, size=(n_blocks, n_combos))
+    # Make combo 0 the noisy "overfit" pick: great in first half, poor after.
+    mat[: n_blocks // 2, 0] += 3.0
+    mat[n_blocks // 2 :, 0] -= 3.0
+    r = pp._cscv_pbo(mat.tolist())
+    assert r is not None
+    assert r["status"] == "ok"
+    assert r["n_splits"] == n_blocks
+    assert r["n_specs"] == n_combos
+    assert 0.0 <= r["pbo"] <= 1.0          # a real probability, not a rank-corr
+    assert "M-block" in r["method"]
 
 
-def test_pbo_two_split_stable_when_ranks_agree():
-    cur = pd.DataFrame({"config_id": [0, 1, 2], "sortino_ratio": [3.0, 2.0, 1.0]})
-    pit = pd.DataFrame({"config_id": [0, 1, 2], "sortino_ratio": [3.1, 2.2, 0.9]})
-    r = pp._pbo_two_split(cur, pit)
-    assert r["overfit"] is False
-    assert r["best_in_sample_config_oos_percentile"] == pytest.approx(1.0)
+def test_cscv_pbo_insufficient_is_honest_not_fabricated():
+    # <min_splits clean blocks → engine returns status insufficient, NOT a pass.
+    mat = [[1.0, 2.0], [2.0, 1.0]]  # 2 blocks < min_splits(4)
+    r = pp._cscv_pbo(mat, min_splits=4)
+    assert r is not None
+    assert r["status"] != "ok"          # honest-N/A, never a fabricated number
+    assert r.get("pbo") is None or "status" in r
 
 
 def test_build_report_shape_and_materiality():
@@ -98,16 +114,104 @@ def test_build_report_shape_and_materiality():
     )
     assert rep["schema"] == pp.SCHEMA
     assert "Sharpe deliberately absent" in rep["anchor"]
-    # ΔSortino = 0.85 − 1.20 = −0.35 → |Δ| ≥ 0.10 ⇒ material.
     assert rep["delta_pit_minus_current"]["sortino_ratio"] == pytest.approx(-0.35)
-    assert rep["materiality"]["material"] is True
-    assert rep["pbo"] is None  # no sweep pair in single-pass parity
+    # #816 gap 3: materiality is now a bootstrap CI (or legacy fallback) — the
+    # block carries the bootstrap_ci + dsr sub-reports, not a hard threshold.
+    assert "material" in rep["materiality"]
+    assert "basis" in rep["materiality"]
+    assert "bootstrap_ci" in rep["materiality"]
+    assert "dsr" in rep["materiality"]
+    assert "sortino_delta_threshold" not in rep["materiality"]  # arbitrary threshold gone
+    assert rep["pbo"] is None  # no PIT block matrix in single-pass parity
     assert rep["observational"] is True
     assert "Brian-gated" in rep["flip_gate"]
     assert rep["run_quality"]["walk_forward"]["n_cold_start_excluded"] == 6
     assert rep["headline_log_alpha_delta"] == pytest.approx(
         (0.006 + 0.001) - (0.012 + 0.004)
     )
+
+
+def test_block_bootstrap_ci_excludes_zero_fires_material():
+    # A delta stream far from 0 (all strongly negative) → the block-bootstrap
+    # 95% CI excludes 0 → primary materiality trigger fires.
+    rng = np.random.default_rng(1)
+    delta = rng.normal(-0.02, 0.001, size=200)  # tight, clearly < 0
+    ci = pp._block_bootstrap_ci(delta, seed=0)
+    assert ci["status"] == "ok"
+    assert ci["excludes_zero"] is True
+    assert ci["ci_high"] < 0.0
+    assert "block" in ci["method"]
+    assert ci["block_size"] >= 1
+
+
+def test_block_bootstrap_ci_includes_zero_not_material():
+    # A delta stream centered on 0 → CI includes 0 → not material.
+    rng = np.random.default_rng(2)
+    delta = rng.normal(0.0, 0.02, size=200)
+    ci = pp._block_bootstrap_ci(delta, seed=0)
+    assert ci["status"] == "ok"
+    assert ci["excludes_zero"] is False
+    assert ci["ci_low"] < 0.0 < ci["ci_high"]
+
+
+def test_block_bootstrap_ci_insufficient_data():
+    r = pp._block_bootstrap_ci([0.01])          # <2 obs
+    assert r["status"] == "insufficient_data"
+    assert r["excludes_zero"] is False
+    assert pp._block_bootstrap_ci(None) is None
+
+
+def test_materiality_uses_bootstrap_ci_when_streams_present():
+    # PIT strictly below current on every date → per-date delta all negative →
+    # CI excludes 0 → material via the bootstrap CI (not the legacy threshold).
+    n = 120
+    cur = _stats(1.0, 0.9, -0.03, -0.15, list(np.full(n, 0.01)), 0.03)
+    pit = _stats(1.0, 0.9, -0.03, -0.15, list(np.full(n, -0.005)), 0.01)
+    rep = pp.build_contamination_report(cur, pit, run_date="2026-05-17")
+    assert rep["materiality"]["basis"] == "block_bootstrap_ci_excludes_zero"
+    assert rep["materiality"]["material"] is True
+    assert rep["materiality"]["bootstrap_ci"]["excludes_zero"] is True
+
+
+def test_materiality_falls_back_to_legacy_without_streams():
+    # Scalar-only stats (no daily_log_returns) → no per-date delta → legacy
+    # |ΔSortino|>=0.10 fallback keeps a materiality signal for old callers.
+    cur = {"sortino_ratio": 1.20, "psr": 0.9, "cvar_95": -0.03, "max_drawdown": -0.1}
+    pit = {"sortino_ratio": 0.85, "psr": 0.8, "cvar_95": -0.04, "max_drawdown": -0.2}
+    rep = pp.build_contamination_report(cur, pit, run_date="2026-05-17")
+    assert rep["materiality"]["basis"] == "legacy_sortino_delta_threshold_fallback"
+    assert rep["materiality"]["material"] is True  # |ΔSortino|=0.35 >= 0.10
+
+
+def test_dsr_materiality_on_pit_winner():
+    # DSR on the PIT winner's return stream, deflated for n_trials selection bias.
+    rng = np.random.default_rng(3)
+    pit = _stats(1.0, 0.9, -0.03, -0.15, list(rng.normal(0.001, 0.01, size=250)), 0.03)
+    r = pp._dsr_materiality(pit, n_trials=12)
+    assert r is not None
+    assert "dsr" in r
+    assert r["n_trials"] == 12
+    # No n_trials (no opt-in sweep) → honest None, never fabricated.
+    assert pp._dsr_materiality(pit, n_trials=None) is None
+
+
+def test_report_pbo_distribution_when_pit_block_matrix_present():
+    # #816 gap 1+2 end-to-end: a PIT block matrix flows into the report as a
+    # real PBO distribution; n_trials drives DSR.
+    rng = np.random.default_rng(4)
+    n = 120
+    cur = _stats(1.0, 0.9, -0.03, -0.15, list(rng.normal(0.001, 0.01, n)), 0.03)
+    pit = _stats(0.9, 0.9, -0.03, -0.15, list(rng.normal(0.0005, 0.01, n)), 0.02)
+    mat = rng.normal(0, 0.1, size=(8, 6)).tolist()
+    rep = pp.build_contamination_report(
+        cur, pit, run_date="2026-05-17",
+        pit_block_matrix=mat, n_trials=6,
+    )
+    assert rep["pbo"] is not None
+    assert rep["pbo"]["status"] == "ok"
+    assert 0.0 <= rep["pbo"]["pbo"] <= 1.0
+    assert rep["run_quality"]["n_configs_swept"] == 6
+    assert rep["materiality"]["dsr"] is not None  # DSR computed from n_trials
 
 
 def test_run_pit_parity_runs_both_passes_and_survives_upload_failure(monkeypatch):
@@ -331,6 +435,14 @@ def test_backtest_has_pit_parity_pass_child_submode_with_rss_guard():
     assert "ru_maxrss" in src and "PIT_PARITY_PASS_RSS_BUDGET_MB" in src, (
         "per-pass RSS-budget guard (the 'these always degrade' fix) missing"
     )
+    # ru_maxrss is KiB on Linux but BYTES on Darwin/BSD — a platform-blind
+    # /1024 divide reports Darwin peak RSS ~1024x too high, mislabeled as MB,
+    # producing a false "exceeded budget" alert (found live 2026-07-16 from a
+    # local Mac invocation: reported 4,108,352 "MB" for an actual ~3.9 GB run).
+    guard_src = src[src.index("if args.pit_parity_pass:"):src.index("if args.pit_parity_pass:") + 2000]
+    assert "darwin" in guard_src.lower(), (
+        "RSS guard must branch on sys.platform == 'darwin' vs Linux KiB semantics"
+    )
 
 
 def test_isolated_pass_surfaces_child_stderr_on_failure():
@@ -346,3 +458,160 @@ def test_isolated_pass_surfaces_child_stderr_on_failure():
         "non-zero child exit must raise with the captured stderr tail"
     )
     assert "proc.stderr" in src, "the raised error/log must include the child's stderr"
+
+
+# ── config#2449: prior_delta plumbing so step-change alarms aren't inert ─────
+#
+# evaluate_parity_alarms's step-change leg has always existed (analysis/
+# parity_alarms.py), but build_contamination_report never received a
+# prior_delta from its caller, so the leg silently evaluated against None on
+# every run — inert regardless of live drift. This does NOT touch
+# paging_enabled, which stays False (unchanged) per the issue's binding
+# constraint.
+
+
+class _RecordingPutGetS3:
+    """Fake boto3 S3 client: in-memory store, supports both put_object (report
+    upload) and get_object (read_prior_delta's backward probe)."""
+
+    def __init__(self, store: dict | None = None):
+        self.store: dict[str, bytes] = store if store is not None else {}
+        self.put_calls: list[dict] = []
+
+    def put_object(self, Bucket, Key, Body, ContentType=None):
+        self.put_calls.append({"Bucket": Bucket, "Key": Key, "Body": Body})
+        self.store[Key] = Body if isinstance(Body, bytes) else Body.encode()
+
+    def get_object(self, Bucket, Key):
+        from botocore.exceptions import ClientError
+        if Key not in self.store:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        return {"Body": types.SimpleNamespace(read=lambda: self.store[Key])}
+
+
+def test_read_prior_delta_first_run_returns_none_cold_start():
+    """No prior report anywhere in the probe window -> None (documented N/A,
+    not a silent pass): the caller forwards this straight to
+    evaluate_parity_alarms, whose step-change leg is empty ({}) when
+    prior_delta is None -- inert-but-explicit, matching today's behavior."""
+    s3 = _RecordingPutGetS3()
+    result = pp.read_prior_delta("bucket", "2026-07-18", s3_client=s3)
+    assert result is None
+
+
+def test_read_prior_delta_finds_most_recent_prior_report():
+    s3 = _RecordingPutGetS3()
+    prior_report = {
+        "schema": pp.SCHEMA, "run_date": "2026-07-11",
+        "delta_pit_minus_current": {"sortino_ratio": 0.02, "psr": -0.01},
+    }
+    s3.store["backtest/2026-07-11/pit_parity.json"] = __import__("json").dumps(prior_report).encode()
+    result = pp.read_prior_delta("bucket", "2026-07-18", s3_client=s3)
+    assert result == {"sortino_ratio": 0.02, "psr": -0.01}
+
+
+def test_read_prior_delta_skips_incomplete_status_reports_without_a_delta():
+    """A status='incomplete' report has no delta_pit_minus_current -- the probe
+    must keep walking backward rather than returning None/crashing on it."""
+    import json as _json
+    s3 = _RecordingPutGetS3()
+    s3.store["backtest/2026-07-11/pit_parity.json"] = _json.dumps(
+        {"schema": pp.SCHEMA, "run_date": "2026-07-11", "status": "incomplete"}
+    ).encode()
+    s3.store["backtest/2026-07-04/pit_parity.json"] = _json.dumps(
+        {"schema": pp.SCHEMA, "run_date": "2026-07-04",
+         "delta_pit_minus_current": {"sortino_ratio": 0.03}}
+    ).encode()
+    result = pp.read_prior_delta("bucket", "2026-07-18", s3_client=s3)
+    assert result == {"sortino_ratio": 0.03}
+
+
+def test_build_contamination_report_first_run_step_leg_is_empty_not_erroring():
+    """(a) first-ever run has no prior: the report still builds; the alarms
+    block's step_breaches is empty ({}) — inert, and explicitly distinguishable
+    from a "checked and clean" run via band_breaches/step_breaches being
+    separate keys, not a silent pass baked into a single boolean."""
+    cur = _stats(1.20, 0.96, -0.030, -0.12, [0.012, 0.004], 0.05)
+    pit = _stats(1.18, 0.95, -0.031, -0.13, [0.011, 0.004], 0.049)
+    rep = pp.build_contamination_report(
+        cur, pit, run_date="2026-07-18", prior_delta=None,
+    )
+    assert rep["alarms"]["step_breaches"] == {}
+    assert rep["alarms"]["mode"] == "observe"
+
+
+def test_build_contamination_report_synthetic_step_change_fires_alarm_leg():
+    """(b) a synthetic second run whose delta jumps far beyond the prior run's
+    delta DOES fire the step-change alarm leg once prior_delta is wired in --
+    the plumbing this issue exists to add. Without prior_delta wired (the
+    pre-fix state), step_breaches would be {} on every run regardless of how
+    large this jump is."""
+    # Prior run: ~flat parity (small delta).
+    prior_delta = {"sortino_ratio": 0.01}
+
+    # This run: a large synthetic Δsortino step (run-over-run jump of 0.46,
+    # more than double the 0.20 step band).
+    cur = _stats(1.00, 0.90, -0.03, -0.12, [0.01, 0.0], 0.03)
+    pit = _stats(0.55, 0.89, -0.031, -0.13, [0.009, 0.0], 0.029)  # Δsortino = -0.45
+
+    rep = pp.build_contamination_report(
+        cur, pit, run_date="2026-07-18", prior_delta=prior_delta,
+    )
+    step_breaches = rep["alarms"]["step_breaches"]
+    assert "sortino_ratio" in step_breaches
+    assert step_breaches["sortino_ratio"]["breach"] is True
+    assert rep["alarms"]["status"] == "breach"
+    assert rep["alarms"]["mode"] == "observe"  # never pages regardless of breach
+    assert rep["alarms"]["paged"] is False
+
+
+def test_run_pit_parity_wires_read_prior_delta_into_report(monkeypatch):
+    """End-to-end: run_pit_parity reads back the prior run's delta via
+    read_prior_delta and the resulting report's step_breaches reflect it --
+    proving the orchestration-level wiring (not just the pure builder)."""
+    def fake_pass(safe_config, which, run_date):
+        wf = (which == "walkforward")
+        # Large synthetic Δsortino step vs. the seeded prior (0.0).
+        s = _stats(1.0 if not wf else 0.5, 0.9, -0.03, -0.15, [0.01, 0.0], 0.03)
+        if wf:
+            s["predictor_metadata"] = {"walk_forward": {"n_folds": 10}}
+        return s
+
+    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", fake_pass)
+
+    import json as _json
+    s3 = _RecordingPutGetS3()
+    s3.store["backtest/2026-07-11/pit_parity.json"] = _json.dumps(
+        {"schema": pp.SCHEMA, "run_date": "2026-07-11",
+         "delta_pit_minus_current": {"sortino_ratio": 0.0}}
+    ).encode()
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: s3
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    rep = pp.run_pit_parity({"signals_bucket": "b", "_run_date": "2026-07-18"})
+
+    assert rep["delta_pit_minus_current"]["sortino_ratio"] == pytest.approx(-0.5)
+    assert rep["alarms"]["step_breaches"]["sortino_ratio"]["breach"] is True
+    assert rep["alarms"]["status"] == "breach"
+    # Binding constraint: paging_enabled is untouched by this wiring — still
+    # observe-only, never pages, regardless of the breach.
+    assert rep["alarms"]["mode"] == "observe"
+    assert rep["alarms"]["paged"] is False
+
+
+def test_paging_enabled_default_untouched_by_prior_delta_wiring():
+    """Binding constraint (config#2449): this issue's plumbing must not flip
+    paging_enabled. build_contamination_report's evaluate_parity_alarms call
+    does not pass paging_enabled at all (so it always takes the default),
+    and evaluate_parity_alarms's own default stays False."""
+    import inspect
+    src = inspect.getsource(pp.build_contamination_report)
+    call_line = next(l for l in src.splitlines() if "evaluate_parity_alarms(" in l)
+    assert "paging_enabled" not in call_line, (
+        "build_contamination_report's evaluate_parity_alarms call must not "
+        "pass paging_enabled — the paging flip is a separate, Brian-gated decision"
+    )
+    from analysis.parity_alarms import evaluate_parity_alarms as _epa
+    assert inspect.signature(_epa).parameters["paging_enabled"].default is False

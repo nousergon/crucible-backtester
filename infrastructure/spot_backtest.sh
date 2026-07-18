@@ -183,11 +183,11 @@ RUN_DATE="${RUN_DATE:-$(date -u +%Y-%m-%d)}"
 # Saturday firing) but Research + signals.json + the standalone scanner key by
 # trading day (Fri 2026-05-29); keying backtest/{date}/ (incl. pit_parity.json
 # + parity_metrics) by the calendar date is what surfaced the research↔backtester
-# pit-parity drift (L4466). $LIB_PYTHON (line ~125) carries alpha_engine_lib.
+# pit-parity drift (L4466). $LIB_PYTHON (line ~125) carries nousergon_lib.
 # Defensive: keep the calendar value if the lib call fails (a normalization
 # miss must not abort the backtester) — the python entry points re-normalize
 # idempotently as a backstop.
-_RUN_DATE_TD="$("$LIB_PYTHON" -c "import datetime as d; from alpha_engine_lib import trading_calendar as tc; x=d.date.fromisoformat('${RUN_DATE}'[:10]); print(x.isoformat() if tc.is_trading_day(x) else tc.previous_trading_day(x).isoformat())" 2>/dev/null || true)"
+_RUN_DATE_TD="$("$LIB_PYTHON" -c "import datetime as d; from nousergon_lib import trading_calendar as tc; x=d.date.fromisoformat('${RUN_DATE}'[:10]); print(x.isoformat() if tc.is_trading_day(x) else tc.previous_trading_day(x).isoformat())" 2>/dev/null || true)"
 if [ -n "$_RUN_DATE_TD" ]; then
     if [ "$_RUN_DATE_TD" != "$RUN_DATE" ]; then
         echo "==> Normalized RUN_DATE ${RUN_DATE} (calendar) → ${_RUN_DATE_TD} (trading day) per DATE_CONVENTIONS"
@@ -877,7 +877,10 @@ command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m p
 # downgrade note). Alignment fixes the instance; the GUARD below fixes the CLASS.
 cd /home/ec2-user/alpha-engine-predictor
 if [ -f requirements.txt ]; then
-    \$PIP install -q -r requirements.txt 2>/dev/null || true
+    \$PIP install -r requirements.txt || {
+        echo "FATAL: predictor requirements.txt install failed" >&2
+        exit 1
+    }
 fi
 
 # Fail-loud dependency GUARD (L4513 class fix). Assert the nousergon-lib
@@ -898,6 +901,12 @@ PYBIN="\${PIP% -m pip}"
     exit 1
 }
 \$PIP show nousergon-lib | grep -E '^Version:'
+
+# Also verify predictor modules used by backtest.py
+\$PYBIN -c "from synthetic.predictor_backtest import run; from synthetic.production_signal_backtest import build_production_signal_inputs" || {
+    echo "FATAL: predictor modules missing or failed to import" >&2
+    exit 1
+}
 
 # Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)
 \$PIP install -q 'numpy<2'

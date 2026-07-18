@@ -261,3 +261,138 @@ def test_insert_or_replace_on_primary_key_is_idempotent(tmp_path):
     rows = conn.execute(f"SELECT * FROM {TABLE_NAME}").fetchall()
     assert len(rows) == 1, rows  # PK collision replaced, not duplicated
     assert rows[0][2] == 0.05
+
+
+# ── S3 artifact seam: materialize_from_s3 / _export_artifact ────────────────
+#
+# The producer (PredictorBacktest box) and consumer (Evaluator box) each pull
+# their OWN throwaway research.db copy from S3 and nothing pushes it back —
+# the parquet at ARTIFACT_KEY is the only wire between them. These tests
+# exercise both directions of that seam hermetically via a fake s3 client
+# (mirrors tests/test_reporter.py's injected s3_client idiom).
+
+
+class _FakeS3:
+    """download_file/upload_file backed by a local dict of key -> filepath."""
+
+    def __init__(self, tmp_path):
+        self._tmp = tmp_path
+        self._objects: dict[str, str] = {}
+        self.upload_calls: list[tuple[str, str, str]] = []
+
+    def put_local(self, key: str, local_path: str) -> None:
+        self._objects[key] = local_path
+
+    def download_file(self, bucket, key, dest):
+        import shutil
+
+        from botocore.exceptions import ClientError
+
+        if key not in self._objects:
+            raise ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+            )
+        shutil.copyfile(self._objects[key], dest)
+
+    def upload_file(self, src, bucket, key):
+        import shutil
+
+        stored = str(self._tmp / f"stored_{key.replace('/', '_')}")
+        shutil.copyfile(src, stored)
+        self._objects[key] = stored
+        self.upload_calls.append((src, bucket, key))
+
+
+def test_materialize_from_s3_returns_zero_when_artifact_absent(tmp_path):
+    from analysis.scanner_predictor_research_free_backfill import materialize_from_s3
+
+    conn = sqlite3.connect(str(tmp_path / "m.db"))
+    n = materialize_from_s3(conn, "any-bucket", s3_client=_FakeS3(tmp_path))
+    assert n == 0
+    # honest empty state: table exists (or is creatable) with zero rows
+    _ensure_table(conn)
+    assert conn.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}").fetchone()[0] == 0
+
+
+def test_export_then_materialize_roundtrip(tmp_path):
+    """Producer-side export -> consumer-side materialize must reproduce the
+    exact table contents on a second, independent connection (the two-box
+    seam in miniature)."""
+    import pandas as pd
+
+    from analysis.scanner_predictor_research_free_backfill import (
+        ARTIFACT_KEY,
+        _export_artifact,
+        materialize_from_s3,
+    )
+
+    s3 = _FakeS3(tmp_path)
+    producer = sqlite3.connect(str(tmp_path / "producer.db"))
+    _ensure_table(producer)
+    rows = [("T0", "2026-04-12", 0.013, 4), ("T1", "2026-04-20", -0.021, 4)]
+    producer.executemany(f"INSERT INTO {TABLE_NAME} VALUES (?,?,?,?)", rows)
+    producer.commit()
+
+    key = _export_artifact(producer, "any-bucket", s3_client=s3)
+    assert key == ARTIFACT_KEY
+    assert [c[2] for c in s3.upload_calls] == [ARTIFACT_KEY]
+
+    consumer = sqlite3.connect(str(tmp_path / "consumer.db"))
+    n = materialize_from_s3(consumer, "any-bucket", s3_client=s3)
+    assert n == 2
+    got = sorted(consumer.execute(f"SELECT * FROM {TABLE_NAME}").fetchall())
+    assert got == sorted(rows)
+
+    # re-materializing is idempotent (INSERT OR REPLACE on the PK)
+    n2 = materialize_from_s3(consumer, "any-bucket", s3_client=s3)
+    assert n2 == 2
+    assert consumer.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}").fetchone()[0] == 2
+
+
+def test_materialize_seeds_pending_universe_idempotency(tmp_path):
+    """run_backfill's idempotency depends on seeding the fresh local pull from
+    the artifact — after materializing, _pending_universe must exclude the
+    already-computed keys."""
+    from analysis.scanner_predictor_research_free_backfill import (
+        _export_artifact,
+        materialize_from_s3,
+    )
+
+    s3 = _FakeS3(tmp_path)
+    prior = sqlite3.connect(str(tmp_path / "prior.db"))
+    _ensure_table(prior)
+    prior.executemany(
+        f"INSERT INTO {TABLE_NAME} VALUES (?,?,?,?)",
+        [("T0", "2026-04-12", 0.01, 4), ("T1", "2026-04-12", 0.02, 4)],
+    )
+    prior.commit()
+    _export_artifact(prior, "any-bucket", s3_client=s3)
+
+    fresh = _scanner_db(tmp_path)  # a brand-new pull: no backfill table at all
+    materialize_from_s3(fresh, "any-bucket", s3_client=s3)
+    pending = _pending_universe(fresh)
+    pairs = set(zip(pending["ticker"], pending["eval_date"]))
+    assert ("T0", "2026-04-12") not in pairs
+    assert ("T1", "2026-04-12") not in pairs
+    assert len(pending) == 4  # 6 passing - 2 seeded
+
+
+def test_materialize_raises_on_non_404_download_error(tmp_path):
+    """A corrupt/unreachable artifact must raise, never silently demote the
+    counterfactual back to 'skipped' (fail-loud doctrine)."""
+    from botocore.exceptions import ClientError
+
+    from analysis.scanner_predictor_research_free_backfill import materialize_from_s3
+
+    class _Denied(_FakeS3):
+        def download_file(self, bucket, key, dest):
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "no"}}, "GetObject"
+            )
+
+    conn = sqlite3.connect(str(tmp_path / "d.db"))
+    try:
+        materialize_from_s3(conn, "any-bucket", s3_client=_Denied(tmp_path))
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "AccessDenied" in str(e)

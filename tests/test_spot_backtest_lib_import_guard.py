@@ -66,13 +66,20 @@ def test_import_guard_fails_loud():
 
 
 def test_no_silent_predictor_install_masks_the_guard():
-    """The guard exists precisely because the predictor install uses
-    2>/dev/null || true (best-effort). Confirm the guard is the loud backstop —
-    i.e. a fail-loud exit exists somewhere after that best-effort install."""
+    """config#2359: the predictor install used to be best-effort
+    (``2>/dev/null || true``), which hid pip failures until the quant.stats
+    guard tripped 60+ minutes later inside predictor_pipeline. The install
+    itself must now fail loud (no ``2>/dev/null``, no ``|| true``) AND the
+    downstream guard must still exist as a backstop."""
     s = _read()
-    pred_install = s.index("install -q -r requirements.txt 2>/dev/null || true")
-    assert "exit 1" in s[pred_install:], (
-        "no fail-loud backstop after the best-effort predictor install"
+    pred_install = s.index("cd /home/ec2-user/alpha-engine-predictor")
+    guard_idx = s.index("import nousergon_lib.quant.stats.multiple_testing")
+    pred_section = s[pred_install:guard_idx]
+    assert "2>/dev/null || true" not in pred_section, (
+        "predictor deps install must not swallow failures via 2>/dev/null || true"
+    )
+    assert "exit 1" in pred_section, (
+        "no fail-loud backstop after the predictor install"
     )
 
 

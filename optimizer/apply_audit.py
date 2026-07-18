@@ -10,8 +10,9 @@ audit artifact recording, for each auto-apply loop, whether it promoted, was
 blocked (and by exactly which guardrail), was data-starved, was disabled
 (shadow/freeze/flag), or errored — regardless of outcome.
 
-**FROZEN cross-repo schema v1** (``contracts/apply_audit.schema.json``): the
-crucible-evaluator consumer is built in parallel against exactly this shape
+**FROZEN cross-repo schema v1** (``nousergon_lib.contracts`` ``apply_audit``,
+lifted from the repo-local copy on the second-adoption signal, config#1861):
+the crucible-evaluator consumer is built in parallel against exactly this shape
 (RED when a loop has been blocked N consecutive weeks with no human ack).
 Evolution is additive-only; renames/removals require a schema_version bump
 coordinated with the consumer.
@@ -61,8 +62,8 @@ OUTCOMES = ("promoted", "blocked", "insufficient_data", "error", "disabled")
 # ── Stable guardrail slugs ───────────────────────────────────────────────────
 # Derived from the REAL guardrail code (not invented): each slug names the
 # config knob / gate that refused the promotion. Enumerated (and documented)
-# in contracts/apply_audit.schema.json — additions are additive schema
-# evolution; renames are breaking.
+# in the ``apply_audit`` schema in nousergon_lib.contracts — additions are
+# additive schema evolution; renames are breaking.
 BLOCKED_BY_SLUGS = (
     # weight_optimizer.apply_weights
     "oos_degradation",            # _validate_oos failed (degradation >= 20%)
@@ -171,8 +172,11 @@ def classify_loop(
             error-isolated by ``CompletenessTracker.run_module`` — a raising
             loop arrives here as ``{"status": "error", ...}``).
         assembler_summary: compact assembler outcome (executor_params only,
-            under cutover): ``{"status", "writers", "notes"}`` or None when
-            the assembler did not complete.
+            under cutover): ``{"status", "cutover_status", "writers",
+            "notes"}`` or None when the assembler did not complete.
+            ``cutover_status`` (not ``status``) is authoritative for
+            whether the live key was actually written — see
+            ``optimizer.assembler.AssemblerResult.cutover_status``.
         run_error: when the optimizer stage itself aborted before this loop
             produced a result, the exception text (→ outcome "error").
     """
@@ -251,7 +255,11 @@ def classify_loop(
 
     if reason.startswith("cutover_mode"):
         # The assembler is the sole live writer for this config_type; the
-        # loop's true live-key outcome is the assembler's.
+        # loop's true live-key outcome is the assembler's — NOT its merge
+        # status. ``cutover_status`` is keyed on whether the live-key
+        # put_object actually succeeded (see assembler.CutoverApplyError);
+        # ``status`` only says whether the merge produced promotable output
+        # and must never by itself be read as "the live key changed".
         if assembler_summary is None:
             record["detail"] = (
                 "cutover delegated the live write to the assembler, but the "
@@ -259,7 +267,18 @@ def classify_loop(
             )
             return record
         a_status = assembler_summary.get("status")
-        if a_status == "ok":
+        cutover_status = assembler_summary.get("cutover_status")
+        if cutover_status == "failed":
+            # Live-key put_object raised. The live config is UNCHANGED —
+            # this is an error, never "promoted", and must NOT reset
+            # consecutive_blocked_weeks (config#2331).
+            record["outcome"] = "error"
+            record["detail"] = (
+                "cutover assembler FAILED the live-key write — live config "
+                f"unchanged this run: {assembler_summary.get('notes', '')}"
+            )
+            return record
+        if cutover_status == "applied" and a_status == "ok":
             record["outcome"] = "promoted"
             record["detail"] = (
                 "live key written by assembler cutover "
@@ -270,7 +289,8 @@ def classify_loop(
         record["outcome"] = "blocked"
         record["blocked_by"] = ["assembler_skip"]
         record["detail"] = (
-            f"cutover assembler made no live write (status={a_status}): "
+            f"cutover assembler made no live write (status={a_status}, "
+            f"cutover_status={cutover_status}): "
             f"{assembler_summary.get('notes', '')}"
         )
         return record
@@ -337,23 +357,37 @@ def build_audit(
     as_of: str,
     opt_results: dict,
     *,
-    assembler_summary: dict | None = None,
+    assembler_summaries: dict[str, dict | None] | None = None,
     prior: dict | None = None,
     run_error: str | None = None,
 ) -> dict:
-    """Build the audit artifact body (schema v1) from the run's results."""
+    """Build the audit artifact body (schema v1) from the run's results.
+
+    Args:
+        assembler_summaries: ``{config_type: compact_summary}`` — one entry
+            per config_type that ran under cutover this run (config#2054
+            extended cutover from ``executor_params`` alone to all four
+            config types, so this is keyed per-loop rather than a single
+            scalar). A loop absent from this dict gets ``None`` (matches
+            "cutover was off or the assembler did not run for this loop").
+    """
+    assembler_summaries = assembler_summaries or {}
     prior_loops = (prior or {}).get("loops", {}) if isinstance(prior, dict) else {}
+    is_idempotent_rerun = isinstance(prior, dict) and prior.get("as_of") == as_of
     loops: dict[str, dict] = {}
     for loop, results_key in LOOPS.items():
         record = classify_loop(
             loop,
             opt_results.get(results_key),
-            assembler_summary=assembler_summary if loop == "executor_params" else None,
+            assembler_summary=assembler_summaries.get(loop),
             run_error=run_error,
         )
-        record["consecutive_blocked_weeks"] = _carry_forward(
-            record["outcome"], prior_loops.get(loop),
-        )
+        if is_idempotent_rerun:
+            record["consecutive_blocked_weeks"] = prior_loops.get(loop, {}).get("consecutive_blocked_weeks", 0)
+        else:
+            record["consecutive_blocked_weeks"] = _carry_forward(
+                record["outcome"], prior_loops.get(loop),
+            )
         loops[loop] = record
     return {
         "schema_version": SCHEMA_VERSION,
@@ -384,16 +418,26 @@ def summarize_assembler(assemble_result) -> dict | None:
         return None
     try:
         merge_summary = getattr(assemble_result, "merge_summary", {}) or {}
-        writers = sorted({v.get("writer") for v in merge_summary.values() if isinstance(v, dict)})
+        writers = sorted({
+            v.get("writer")
+            for v in merge_summary.values()
+            if isinstance(v, dict) and v.get("writer")
+        })
         return {
             "status": getattr(assemble_result, "status", None),
+            "cutover_status": getattr(assemble_result, "cutover_status", "not_attempted"),
             "writers": writers,
             "notes": getattr(assemble_result, "notes", ""),
         }
     except Exception as e:  # noqa: BLE001 — summarization must not mask the
         # audit emission; an unreadable assembler result is recorded as such.
         logger.warning("Assembler summary extraction failed: %s", e)
-        return {"status": None, "writers": [], "notes": f"summary extraction failed: {e}"}
+        return {
+            "status": None,
+            "cutover_status": "failed",
+            "writers": [],
+            "notes": f"summary extraction failed: {e}",
+        }
 
 
 def emit_apply_audit(
@@ -401,7 +445,7 @@ def emit_apply_audit(
     run_date: str,
     opt_results: dict,
     *,
-    assembler_result=None,
+    assembler_results: dict[str, Any] | None = None,
     upload: bool,
     run_error: BaseException | None = None,
     s3_client=None,
@@ -412,12 +456,22 @@ def emit_apply_audit(
     including when the stage raised (``run_error`` set): the audit records
     ``error`` outcomes for the affected loops, and the caller re-raises so the
     failure still surfaces (except-log-emit-reraise; no swallow).
+
+    Args:
+        assembler_results: ``{config_type: AssemblerResult | None}`` — one
+            entry per config_type the assembler ran for this cycle
+            (config#2054: all four config types run under cutover, not just
+            ``executor_params``).
     """
     prior = load_prior(bucket, s3_client=s3_client) if upload else None
+    assembler_summaries = {
+        config_type: summarize_assembler(result)
+        for config_type, result in (assembler_results or {}).items()
+    }
     audit = build_audit(
         run_date,
         opt_results or {},
-        assembler_summary=summarize_assembler(assembler_result),
+        assembler_summaries=assembler_summaries,
         prior=prior,
         run_error=str(run_error) if run_error else None,
     )

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch, call
 import numpy as np
 import pandas as pd
 import pytest
+from botocore.exceptions import ClientError
 
 from optimizer.predictor_optimizer import (
     _discover_model_variants,
@@ -301,7 +302,9 @@ def test_apply_recommendations_ensemble_only(mock_boto):
     mock_boto.client.return_value = s3
 
     # No existing params
-    s3.get_object.side_effect = Exception("Not found")
+    s3.get_object.side_effect = ClientError(
+        {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+    )
 
     ensemble_result = {
         "recommended_mode": "mse",
@@ -370,7 +373,9 @@ def test_apply_recommendations_none_inputs(mock_boto):
 def test_apply_recommendations_signal_threshold(mock_boto):
     s3 = MagicMock()
     mock_boto.client.return_value = s3
-    s3.get_object.side_effect = Exception("Not found")
+    s3.get_object.side_effect = ClientError(
+        {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+    )
 
     threshold_result = {
         "recommended_signal_threshold": 0.015,
@@ -386,6 +391,29 @@ def test_apply_recommendations_signal_threshold(mock_boto):
     put_calls = [c for c in s3.put_object.call_args_list if "predictor_params.json" in str(c)]
     written = json.loads(put_calls[0].kwargs["Body"])
     assert written["recommended_signal_threshold"] == 0.015
+
+
+@patch("optimizer.predictor_optimizer.boto3")
+def test_apply_recommendations_reraises_transient_s3_error(mock_boto):
+    """Verify transient S3 errors (throttle, AccessDenied) raise, don't silently truncate."""
+    s3 = MagicMock()
+    mock_boto.client.return_value = s3
+
+    # Simulate a transient S3 error (e.g., throttling)
+    error = ClientError(
+        {"Error": {"Code": "ThrottlingException"}},
+        "GetObject"
+    )
+    s3.get_object.side_effect = error
+
+    ensemble_result = {
+        "recommended_mode": "mse",
+        "date": "2026-04-07",
+        "recommendation_reason": "better Sharpe",
+    }
+
+    with pytest.raises(ClientError):
+        apply_recommendations(ensemble_result, None, "bucket")
 
 
 # ── _filter_predictions_by_alpha tests ───────────────────────────────────────

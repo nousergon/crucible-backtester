@@ -154,6 +154,18 @@ param_sweep:
   time_decay_exit_days: [10, 15, 20]
   profit_take_pct: [0.15, 0.20, 0.25, 0.30]
 
+# ── PIT-parity CSCV overfitting measurement (config#816) ─────────────────────
+# When true, the PIT (walk-forward) parity pass runs an opt-in config sweep
+# over the grid above and feeds the (n_blocks, n_combos) Sortino matrix to the
+# combinatorial CSCV PBO engine (Bailey/Borwein/López de Prado/Zhu 2014),
+# populating the real probability-of-backtest-overfitting distribution in
+# backtest/{date}/pit_parity.json. OBSERVE-only — gates nothing.
+# COST: this re-evaluates the sweep's top-K combos across M chronological
+# blocks on EVERY weekly pit_parity pass — the dominant cost of that stage
+# (~most of the pit_parity runtime). Leave false to keep pbo=null (the grid
+# still resolves via select_grid; only this flag turns the CSCV pass on).
+pit_parity_sweep: true
+
 # ── Weight optimizer guardrails ──────────────────────────────────────────────
 weight_optimizer:
   # Keys must EXACTLY match optimizer/weight_optimizer.py::SUB_SCORES —
@@ -312,3 +324,20 @@ veto_analysis:
   min_threshold_change: 0.10
   cost_penalty_weight: 0.30
   enforce_significance: false    # config#1426 Phase 4 — see weight_optimizer comment above
+
+# ── Champion promotion engine — weekly winner-take-all (alpha-engine-config
+# -I2518 / epic I2515, 2026-07-14 ruling; supersedes the config#2364/#2367
+# HAC-significance/hysteresis/cooldown engine) ──────────────────────────────
+# Gates the weekly config/producer_champion.json pointer write — the pointer
+# determines which entry-candidate producer arm (scanner_predictor_direct vs
+# thinktank_coverage) the LIVE alpha-engine executor trades. The engine now
+# compares each arm's realized weekly top-N alpha and flips to whichever
+# scores higher — no configurable thresholds (no significance level, no
+# hysteresis/cooldown weeks): "whichever performs best in a given week is
+# promoted at that time" (Brian's ruling, verbatim). horizon_days/cadence_days
+# remain configurable below only because optimizer/champion_promotion.py's
+# retained (but no-longer-gate-connected) hac_significance() utility still
+# consults them for its Newey-West lag.
+champion_promotion:
+  horizon_days: 21                 # forward-alpha horizon (config#1405 basis) — feeds hac_significance()'s lag only
+  cadence_days: 7                  # weekly evaluation cadence — feeds hac_significance()'s lag only
