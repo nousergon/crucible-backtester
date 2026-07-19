@@ -111,6 +111,18 @@ class TestAnalyzeCioPerformance:
         assert result["n_weeks"] == _MIN_WEEKS - 1
         assert result["min_required"] == _MIN_WEEKS
 
+    def test_retired_cio_lift_is_no_contest_not_a_flip(self):
+        # config-I2993: end_to_end emits a {"status": "retired", ...} cio_lift.
+        # The optimizer must handle it explicitly (no-contest, keep_llm) — never
+        # crash, and never let all-None fields masquerade as a real analysis or
+        # trigger a deterministic flip.
+        result = analyze_cio_performance(
+            _e2e_dict(cio_lift={"status": "retired", "retired_date": "2026-07-12"})
+        )
+        assert result["status"] == "retired"
+        assert result["retired_date"] == "2026-07-12"
+        assert result["recommendation"] == "keep_llm"
+
     def test_rejects_when_n_advance_below_floor(self):
         # n_advance=31 like the 2026-05-09 email — must not flip
         e2e = _e2e_dict(
