@@ -241,6 +241,28 @@ def analyze_cio_performance(e2e_lift: dict) -> dict:
     cio_lift = e2e_lift.get("cio_lift")
     cio_vs_ranking = e2e_lift.get("cio_vs_ranking")
 
+    # config#1580 / config-I2993: the six-team+CIO graph was retired; end_to_end
+    # now emits a {"status": "retired", ...} cio_lift marker instead of live-
+    # weight aggregates. Handle it EXPLICITLY and LOUDLY (a no-contest read) so
+    # its all-None fields can't masquerade as a real "ok/keep_llm" analysis of a
+    # graph that no longer runs. apply_cio_mode is already retired (config#1719),
+    # so nothing actuates on this — the honest status just prevents a misread.
+    if isinstance(cio_lift, dict) and cio_lift.get("status") == "retired":
+        logger.warning(
+            "analyze_cio_performance: cio_lift is RETIRED (%s) — six-team+CIO "
+            "graph removed (config#1580 / config-I2993); returning no-contest.",
+            cio_lift.get("retired_date"),
+        )
+        return {
+            "status": "retired",
+            "retired_date": cio_lift.get("retired_date"),
+            "recommendation": "keep_llm",
+            "reasoning": (
+                "CIO orchestration retired (config#1580 / config-I2993) — "
+                "no live CIO decisions to analyze."
+            ),
+        }
+
     n_dates = e2e_lift.get("n_dates", 0)
     min_weeks = _cfg.get("min_weeks", _MIN_WEEKS)
     if n_dates < min_weeks:

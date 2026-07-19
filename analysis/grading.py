@@ -497,6 +497,15 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
     cio_lift = _safe_get(e2e, "cio_lift")
     cio_vs = _safe_get(e2e, "cio_vs_ranking")
 
+    # config#1580 / config-I2993: the CIO gate was retired; end_to_end emits a
+    # {"status": "retired", ...} marker. Render an explicit retired N/A grade
+    # (not a misleading "fewer than 3 advance decisions" message, and never a
+    # zero/RED that would drag the research grade).
+    if isinstance(cio_lift, dict) and cio_lift.get("status") == "retired":
+        return {"grade": None, "letter": "N/A",
+                "reason": (f"CIO orchestration retired {cio_lift.get('retired_date')} "
+                           f"(config#1580 / config-I2993)")}
+
     if not cio_lift or _safe_get(cio_lift, "n_advance", default=0) < 3:
         return {"grade": None, "letter": "N/A",
                 "reason": ("no CIO decision-lift data this cycle" if not cio_lift
