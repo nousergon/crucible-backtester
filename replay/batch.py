@@ -314,7 +314,8 @@ def compute_and_emit_concordance(
     max_artifacts: int = DEFAULT_MAX_ARTIFACTS,
     s3_client: Optional[Any] = None,
     cloudwatch_client: Optional[Any] = None,
-    chat_anthropic_factory: Optional[Any] = None,
+    client_factory: Optional[Any] = None,
+    api_key: Optional[str] = None,
     emit_metrics: bool = True,
     persist_per_replay: bool = False,
     dry_run: bool = False,
@@ -324,10 +325,12 @@ def compute_and_emit_concordance(
     CloudWatch metrics, and persist a per-target-model batch summary.
 
     Args:
-        target_models: list of model identifiers to replay against.
-            Common shapes: ``["claude-haiku-4-5"]`` for Sonnet→Haiku
-            concordance; ``["claude-haiku-4-5", "claude-sonnet-4-6"]``
-            for both directions in one batch.
+        target_models: list of OpenRouter model ids to replay against
+            (alpha-engine-config-I2997, 2026-07-19 — was an Anthropic
+            model name pre-migration). Common shape:
+            ``["deepseek/deepseek-v4-flash"]`` — the default
+            ReplayConcordance dispatches (see
+            ``lambda_concordance/handler.py``).
         end_time: window ends at this UTC instant (defaults to now).
         window_days: trailing window — default 8 weeks (56 days).
         agent_filter: list of base agent_ids to include. None = all
@@ -424,7 +427,8 @@ def compute_and_emit_concordance(
                     bucket=bucket,
                     replay_prefix=replay_prefix,
                     s3_client=s3,
-                    chat_anthropic_factory=chat_anthropic_factory,
+                    client_factory=client_factory,
+                    api_key=api_key,
                     persist=persist_per_replay,
                 )
             except Exception as exc:  # noqa: BLE001 — never abort a batch

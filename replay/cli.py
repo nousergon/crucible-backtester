@@ -18,22 +18,22 @@ Single examples:
 
     python -m replay.cli single \\
         --artifact-key decision_artifacts/2026/05/03/sector_quant:technology/2026-05-01.json \\
-        --target-model claude-haiku-4-5 \\
+        --target-model deepseek/deepseek-v4-flash \\
         [--bucket alpha-engine-research] \\
         [--max-tokens 8192] \\
         [--no-persist]
 
 Batch examples:
 
-    # 8-week trailing window, Sonnet → Haiku concordance, all canonical agents
+    # 8-week trailing window, production concordance target, all canonical agents
     python -m replay.cli batch \\
-        --target-models claude-haiku-4-5 \\
+        --target-models deepseek/deepseek-v4-flash \\
         [--window-days 56] \\
         [--agents sector_quant,ic_cio]
 
     # Dry-run cost estimation (lists candidate artifacts, no LLM calls)
     python -m replay.cli batch \\
-        --target-models claude-haiku-4-5 \\
+        --target-models deepseek/deepseek-v4-flash \\
         --dry-run
 
 Cost note: every replay invocation costs target-model tokens. Use
@@ -86,7 +86,7 @@ def _build_parser() -> argparse.ArgumentParser:
     single.add_argument(
         "--target-model",
         required=True,
-        help="Model identifier to replay under (e.g. claude-haiku-4-5).",
+        help="OpenRouter model id to replay under (e.g. deepseek/deepseek-v4-flash).",
     )
     single.add_argument(
         "--bucket", default=DEFAULT_BUCKET,
@@ -118,8 +118,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--target-models", required=True,
         help=(
             "Comma-separated list of target model identifiers "
-            "(e.g. 'claude-haiku-4-5' or "
-            "'claude-haiku-4-5,claude-sonnet-4-6')."
+            "(e.g. 'deepseek/deepseek-v4-flash' or "
+            "'deepseek/deepseek-v4-flash,deepseek/deepseek-v4-pro')."
         ),
     )
     batch.add_argument(

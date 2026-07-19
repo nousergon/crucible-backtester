@@ -25,8 +25,15 @@ RUN microdnf install -y git && microdnf clean all
 # validates against). [flow_doctor] extra plumbs flow-doctor's logging
 # integration. No [arcticdb] / [rag] — concordance reads decision
 # artifacts from S3 only.
+#
+# krepis[openai] (alpha-engine-config-I2997, 2026-07-19): replay/runner.py's
+# target-model invocation migrated off langchain_anthropic.ChatAnthropic to
+# krepis.llm.LLMClient's OpenRouter transport (DeepSeek V4 Flash) — the
+# fleet's off-direct-Anthropic migration. Floor bumped past v0.12.2, the
+# earliest tag carrying krepis.llm's OpenRouter unresolved/leaked-tool-call
+# safety fix.
 COPY lambda_concordance/requirements-concordance.txt requirements-concordance.txt
-RUN pip install --no-cache-dir "nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.5" "krepis>=0.3.0" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow_doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.5" "krepis[openai]>=0.12.2" && \
     pip install --no-cache-dir -r requirements-concordance.txt && \
     rm -rf /root/.cache/pip
 

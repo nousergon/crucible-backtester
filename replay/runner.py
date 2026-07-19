@@ -8,36 +8,71 @@ Pipeline:
      ``nousergon_lib.agent_schemas.resolve_schema_for_agent``.
      Skips replay for unknown agent families (no schema to validate
      against → no meaningful concordance signal).
-  3. Invoke target model via
-     ``langchain_anthropic.ChatAnthropic.with_structured_output(SchemaClass,
-     include_raw=True)`` — same invocation pattern as production
-     agents, so any langchain change (model swap, prompt-caching
-     defaults, retry posture) lands in both paths simultaneously.
-  4. Extract the parsed Pydantic instance + ``model_dump`` it for the
-     comparison + persistence layers. Pydantic validation errors
-     surface as ``replay_error`` on the artifact — they're the
-     silent-drift signal we wanted to expose (target model emits a
-     structurally divergent output that the canonical schema rejects).
-  5. Persist side-by-side artifact under the canonical eval_artifacts
+  3. Invoke target model via ``krepis.llm.LLMClient.structured()``
+     against OpenRouter (DeepSeek V4 Flash by default — see
+     alpha-engine-config-I2997 note below). Extracts the parsed
+     Pydantic instance's ``model_dump()`` for the comparison +
+     persistence layers. Schema-validation failures surface as
+     ``replay_error`` on the artifact — they're the silent-drift signal
+     we wanted to expose (target model emits a structurally divergent
+     output that the canonical schema rejects).
+  4. Persist side-by-side artifact under the canonical eval_artifacts
      layout: ``decision_artifacts/_replay/{run_id}_{original_model}_vs_{target_model}.json``
      (flat, YYMMDDHHMM run_id) + a ``decision_artifacts/_replay/latest.json``
      sidecar. Key format owned by ``nousergon_lib.eval_artifacts``.
 
-Why langchain_anthropic.with_structured_output (not bare SDK):
+**alpha-engine-config-I2997 (2026-07-19): migrated off direct Anthropic
+(``langchain_anthropic.ChatAnthropic``) to the fleet-SOTA
+``krepis.llm.LLMClient`` OpenRouter transport** (``target_model`` is now
+an OpenRouter model id, e.g. ``"deepseek/deepseek-v4-flash"`` — the
+default ReplayConcordance dispatches, see ``lambda_concordance/handler.py``
+— not an Anthropic model name). This drops the "invocation isomorphism
+with production agents" rationale the prior ``with_structured_output``
+choice was built on (production agents still call Anthropic directly for
+now; only THIS cheap-model-concordance measurement arm moved), but keeps
+what actually matters for this module's purpose:
 
-  - **Invocation isomorphism with production agents.** Production calls
-    the model the same way; replay measures concordance against that
-    invocation pattern, not against a divergent bare-SDK shim. When
-    Claude 5 ships and langchain updates how it forces tool use, prod
-    agents inherit the change automatically — replay would silently
-    diverge if it stayed on bare SDK.
   - **Pydantic validation against the captured contract.** Catches the
     silent-drift class where a target model emits a slightly different
     structure that would otherwise wash through the comparison stage
-    as an unexplained low concordance score.
+    as an unexplained low concordance score. ``krepis.llm.LLMClient.
+    structured()`` validates the SAME way (``schema.model_validate``),
+    just over a different transport.
   - **Schema portability.** Schemas live in ``nousergon_lib.agent_schemas``
     (lifted 2026-05-05, lib v0.4.0) so backtester can validate against
     the canonical contract without a heavy cross-repo dep on research.
+
+``ModelSpec.structured_outputs=False`` is REQUIRED, not incidental:
+live-verified 2026-07-19 against ``nousergon_lib.agent_schemas.
+QuantAnalystOutput`` (one of the six canonical schemas this module
+resolves) — the JSON-instruction + tolerant-extraction fallback
+(``structured_outputs=False``) round-tripped this schema correctly on
+every live attempt via ``deepseek/deepseek-v4-flash``. Strict
+``response_format=json_schema`` mode (``structured_outputs=True``) is
+NOT used because the sibling alpha-engine-config-I2997 migration
+(crucible-research's ``producers/single_agent.py``, same live-testing
+session) found it UNRELIABLE for DeepSeek-family models on OpenRouter —
+against a structurally similar schema, strict mode intermittently
+renamed/dropped a REQUIRED field (e.g. the equivalent of ``ticker`` came
+back as ``symbol``/``candidate``), failing schema validation on every
+attempt, while the same prompt round-tripped correctly every time under
+``structured_outputs=False``. Since this module measures exactly this
+class of divergence (concordance/silent-drift), routing the measurement
+itself through a transport mode with its OWN independent failure mode
+would confound the signal — ``structured_outputs=False`` is the
+verified-reliable choice, consistent across every DeepSeek+OpenRouter
+call site this migration touched.
+``attempts=1`` (no corrective retry) is DELIBERATE, not a missed
+optimization: this module's whole purpose is measuring how often the
+target model's raw output diverges from the canonical schema — a
+corrective retry would suppress exactly the signal
+(``agent_cheap_model_concordance``) it exists to produce.
+``reasoning={"exclude": True}`` mirrors the fleet's other live DeepSeek
+V4 OpenRouter consumers (morning-signal's ``fallback_llm``,
+crucible-research's ``evals/judge_models.py::OPENROUTER_SHADOW``) —
+without it a reasoning-capable OpenRouter model can burn its entire
+output budget on chain-of-thought and return empty content
+(config#1659 / config#2575).
 
 The captured ``input_data_snapshot`` is intentionally NOT re-presented
 to the model: the original ``user_prompt`` already contained the
@@ -217,7 +252,7 @@ def _persist_replay(
     return key
 
 
-# ── Target-model invocation (langchain_anthropic) ────────────────────────
+# ── Target-model invocation (krepis.llm / OpenRouter) ─────────────────────
 
 
 def _build_messages(system_prompt: str, user_prompt: str) -> list[dict]:
@@ -231,6 +266,31 @@ def _build_messages(system_prompt: str, user_prompt: str) -> list[dict]:
     ]
 
 
+def _resolve_openrouter_api_key(api_key: str | None = None) -> str:
+    """Resolve the OpenRouter API key: explicit ``api_key`` arg wins, else
+    ``nousergon_lib.secrets.get_secret`` (SSM-first —
+    ``/alpha-engine/OPENROUTER_API_KEY``, readable by this Lambda's
+    existing ``alpha-engine-ssm-read`` instance-role policy, no new IAM —
+    env fallback). Same fleet-standard convention every other
+    alpha-engine-config-I2997 call site uses. Raises loudly rather than
+    letting client construction fail with a less diagnosable error.
+    """
+    if api_key:
+        return api_key
+    from nousergon_lib.secrets import get_secret
+
+    key = get_secret("OPENROUTER_API_KEY", required=False, default=None)
+    if not key:
+        raise RuntimeError(
+            "replay target-model invocation requires an OpenRouter API "
+            "key: pass api_key= explicitly, or ensure "
+            "nousergon_lib.secrets.get_secret('OPENROUTER_API_KEY') "
+            "resolves (SSM parameter /alpha-engine/OPENROUTER_API_KEY, or "
+            "the OPENROUTER_API_KEY environment variable as a fallback)."
+        )
+    return key
+
+
 def _invoke_target_with_schema(
     *,
     target_model: str,
@@ -238,104 +298,109 @@ def _invoke_target_with_schema(
     system_prompt: str,
     user_prompt: str,
     max_tokens: int,
-    chat_anthropic_factory: Any | None = None,
+    client_factory: Any | None = None,
+    api_key: str | None = None,
 ) -> tuple[Any, dict[str, Any], int, str | None]:
-    """Invoke target model via langchain_anthropic.with_structured_output().
+    """Invoke target model via ``krepis.llm.LLMClient.structured()``
+    (OpenRouter — DeepSeek V4 Flash by default; see module docstring for
+    the full alpha-engine-config-I2997 migration rationale).
 
-    Returns ``(parsed_output_dict, usage_dict, latency_ms, error_or_none)``.
-    Same shape as the prior bare-SDK helper but with two SOTA upgrades:
+    Returns ``(parsed_output_dict, usage_dict, latency_ms, error_or_none)``
+    — same shape as the pre-migration bare-SDK helper. On exception:
+    ``(None, usage_dict, latency, str(exc))`` — caller persists the error
+    onto the replay artifact rather than raising. Replay is offline
+    analysis; one failed re-invocation should never abort a batch.
+    ``usage_dict`` is populated even on a validation-exhaustion failure
+    when the underlying ``LLMError`` carries partial usage (tokens were
+    still spent on the failed attempt).
 
-    1. **Invocation isomorphism with production agents.** Production
-       agents call the model via ``langchain_anthropic.ChatAnthropic.
-       with_structured_output(SchemaClass)``. Replay uses the same path
-       so any future langchain change (Claude 5 model swap, prompt-
-       caching defaults, retry posture) lands in both prod + replay
-       simultaneously.
-    2. **Pydantic validation on the replay output.** with_structured_
-       output validates the response against the captured schema and
-       raises on drift. Catches the silent-drift class where a target
-       model emits a slightly different structure that would otherwise
-       wash through the comparison stage as a low concordance score.
+    ``client_factory`` is the krepis.llm.LLMClient test seam (mirrors the
+    Think Tank pattern, matches every other alpha-engine-config-I2997 call
+    site): a callable ``(spec, api_key) -> transport_client``. Production
+    leaves it unset — ``LLMClient`` lazily builds the real
+    ``openai.OpenAI`` client pointed at OpenRouter's ``base_url``.
 
-    On exception: ``(None, {}, latency, str(exc))`` — caller persists
-    the error onto the replay artifact rather than raising. Replay is
-    offline analysis; one failed re-invocation should never abort a batch.
-
-    The langchain ``include_raw=True`` mode is used to get both the
-    parsed Pydantic instance AND the raw response (for usage extraction).
-    Pydantic ValidationError surfaces as ``parsing_error`` in the raw
-    output dict — caught + recorded on the replay artifact.
+    Schema-validation failure — the silent-drift signal this module
+    exists to surface — and ordinary transport/SDK errors both funnel
+    through ``krepis.llm.LLMError``/``LLMConfigError``/generic
+    ``Exception`` here; the error string is not pattern-matched by any
+    downstream consumer (verified: ``replay.batch``/``replay.cli`` only
+    truncate + log it), so this function does not need to reproduce the
+    exact pre-migration wording.
     """
+    from krepis.llm import LLMClient, LLMError
+    from krepis.llm_config import ModelSpec
+
     start = time.monotonic()
     try:
-        # Lazy-import langchain to keep the module importable in tests
-        # that don't need real LLM calls.
-        if chat_anthropic_factory is None:
-            from langchain_anthropic import ChatAnthropic
-            chat_anthropic_factory = ChatAnthropic
-
-        llm = chat_anthropic_factory(
+        resolved_key = _resolve_openrouter_api_key(api_key)
+        spec = ModelSpec(
+            provider="openrouter",
             model=target_model,
             max_tokens=max_tokens,
+            # REQUIRED — see module docstring (live-verified 2026-07-19:
+            # strict response_format=json_schema is unreliable for
+            # DeepSeek-family models on OpenRouter; the JSON-instruction +
+            # tolerant-extraction fallback round-tripped correctly).
+            structured_outputs=False,
+            reasoning={"exclude": True},
         )
-        structured_llm = llm.with_structured_output(schema, include_raw=True)
-        response = structured_llm.invoke(_build_messages(system_prompt, user_prompt))
+        client = LLMClient(spec, api_key=resolved_key, client_factory=client_factory)
+        result = client.structured(
+            system=system_prompt,
+            user_content=user_prompt,
+            schema=schema,
+            schema_name=schema.__name__,
+            # Deliberately no corrective retry — see module docstring:
+            # this module MEASURES divergence, a retry would suppress it.
+            attempts=1,
+            max_tokens=max_tokens,
+        )
+    except LLMError as exc:
         latency_ms = int((time.monotonic() - start) * 1000)
-    except Exception as exc:  # noqa: BLE001 — replay never raises
+        usage_dict = _usage_dict_from_llm_usage(exc.usage)
+        return None, usage_dict, latency_ms, (
+            f"structured output validation failed against the canonical "
+            f"schema: {exc}"
+        )
+    except Exception as exc:  # noqa: BLE001 — covers LLMConfigError + transport
+        # errors (bad/missing api key, network, malformed base_url); replay
+        # never raises.
         latency_ms = int((time.monotonic() - start) * 1000)
         return None, {}, latency_ms, str(exc)
 
-    # response shape with include_raw=True:
-    #   {"raw": AIMessage, "parsed": Pydantic | None, "parsing_error": Exception | None}
-    if not isinstance(response, dict):
-        return None, {}, latency_ms, (
-            f"unexpected response shape from with_structured_output: "
-            f"{type(response).__name__}"
-        )
+    latency_ms = int((time.monotonic() - start) * 1000)
+    usage_dict = _usage_dict_from_llm_usage(result.usage)
 
-    parsed_obj = response.get("parsed")
-    parsing_error = response.get("parsing_error")
-    raw = response.get("raw")
-
-    # Token usage from the raw AIMessage (langchain populates
-    # response_metadata['usage'] from the underlying SDK response).
-    usage_dict: dict[str, Any] = {}
-    if raw is not None:
-        meta = getattr(raw, "response_metadata", {}) or {}
-        usage = meta.get("usage") or {}
-        if usage:
-            usage_dict = {
-                "input_tokens": int(usage.get("input_tokens", 0) or 0),
-                "output_tokens": int(usage.get("output_tokens", 0) or 0),
-                "cache_read_input_tokens": int(
-                    usage.get("cache_read_input_tokens", 0) or 0,
-                ),
-                "cache_creation_input_tokens": int(
-                    usage.get("cache_creation_input_tokens", 0) or 0,
-                ),
-            }
-
-    if parsing_error is not None:
-        # Pydantic validation failed against the captured schema. This
-        # IS the silent-drift signal we wanted to surface — not an
-        # error in the replay infrastructure but a real divergence
-        # between the target model's output and the canonical contract.
+    if result.data is None:
         return None, usage_dict, latency_ms, (
-            f"pydantic validation failed: {parsing_error}"
+            "krepis.llm.LLMClient.structured() returned no parsed object"
         )
 
-    if parsed_obj is None:
-        return None, usage_dict, latency_ms, (
-            "with_structured_output returned no parsed object"
-        )
+    return dict(result.data), usage_dict, latency_ms, None
 
-    # Normalize to dict for the comparison + persistence layers.
-    parsed_dict = (
-        parsed_obj.model_dump() if hasattr(parsed_obj, "model_dump")
-        else dict(parsed_obj) if isinstance(parsed_obj, dict)
-        else {"_value": parsed_obj}
-    )
-    return parsed_dict, usage_dict, latency_ms, None
+
+def _usage_dict_from_llm_usage(usage: Any) -> dict[str, Any]:
+    """Normalize a ``krepis.llm.LLMUsage`` into the persisted
+    ``replay_cost`` dict shape. Keeps the two keys ``replay.batch``
+    actually reads (``input_tokens``/``output_tokens``) plus the
+    cache-token fields for parity with the pre-migration shape, and adds
+    ``provider_cost_usd`` — OpenRouter's actually-billed USD cost when the
+    request opts in (``usage.include: true``, set automatically by
+    ``krepis.llm`` for the openrouter provider), a capability the prior
+    Anthropic-SDK path never surfaced. Purely additive — no consumer reads
+    a fixed key set (verified: ``replay.batch`` uses ``.get(k, 0)``)."""
+    if usage is None:
+        return {}
+    return {
+        "input_tokens": int(usage.input_tokens or 0),
+        "output_tokens": int(usage.output_tokens or 0),
+        "cache_read_input_tokens": int(usage.cache_read_tokens or 0),
+        "cache_creation_input_tokens": int(
+            (usage.cache_create_tokens or 0) + (usage.cache_create_1h_tokens or 0)
+        ),
+        "provider_cost_usd": usage.provider_cost_usd,
+    }
 
 
 # ── Top-level entry ──────────────────────────────────────────────────────
@@ -349,23 +414,29 @@ def replay_artifact(
     replay_prefix: str = DEFAULT_REPLAY_PREFIX,
     max_tokens: Optional[int] = None,
     s3_client: Optional[Any] = None,
-    chat_anthropic_factory: Optional[Any] = None,
+    client_factory: Optional[Any] = None,
+    api_key: Optional[str] = None,
     persist: bool = True,
 ) -> ReplayOutput:
     """Replay a single captured artifact under ``target_model``.
 
     Args:
         artifact_key: S3 key of the captured ``DecisionArtifact``.
-        target_model: Model identifier to invoke (e.g. ``"claude-haiku-4-5"``).
+        target_model: OpenRouter model id to invoke (e.g.
+            ``"deepseek/deepseek-v4-flash"`` — alpha-engine-config-I2997;
+            was an Anthropic model name pre-migration).
         bucket: S3 bucket; defaults to ``alpha-engine-research``.
         replay_prefix: S3 prefix for the replay output; defaults to
             ``decision_artifacts/_replay``.
         max_tokens: explicit max_tokens for the target call; defaults
             to ``DEFAULT_MAX_TOKENS``.
-        s3_client / chat_anthropic_factory: injected for tests. The
-            factory takes ``(model, max_tokens)`` and returns an object
-            with ``with_structured_output(schema, include_raw=True)``;
-            production passes ``langchain_anthropic.ChatAnthropic``.
+        s3_client: injected for tests.
+        client_factory: krepis.llm.LLMClient test seam — a callable
+            ``(spec, api_key) -> transport_client`` exposing
+            ``chat.completions.create``. Production leaves it unset.
+        api_key: explicit OpenRouter API key override; defaults to
+            ``nousergon_lib.secrets.get_secret("OPENROUTER_API_KEY")``
+            (see ``_resolve_openrouter_api_key``).
         persist: when False, returns the ``ReplayOutput`` without
             writing it to S3. Used by batch mode + tests.
 
@@ -499,7 +570,8 @@ def replay_artifact(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         max_tokens=max_tokens or DEFAULT_MAX_TOKENS,
-        chat_anthropic_factory=chat_anthropic_factory,
+        client_factory=client_factory,
+        api_key=api_key,
     )
 
     if err is not None:

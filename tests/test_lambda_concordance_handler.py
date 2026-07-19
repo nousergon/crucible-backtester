@@ -129,7 +129,9 @@ class TestEventPayloadThreading:
                    side_effect=fake_compute):
             handler_mod.handler({}, context=None)
 
-        assert captured["target_models"] == ["claude-haiku-4-5"]
+        # alpha-engine-config-I2997 (2026-07-19): default target model
+        # migrated off direct Anthropic to OpenRouter/DeepSeek V4 Flash.
+        assert captured["target_models"] == ["deepseek/deepseek-v4-flash"]
 
     def test_csv_string_target_models_split(self, handler_mod):
         captured = {}
