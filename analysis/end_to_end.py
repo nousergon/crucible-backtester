@@ -21,6 +21,7 @@ Output: lift summary dict + optional e2e_attribution.csv on S3.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -39,6 +40,33 @@ logger = logging.getLogger(__name__)
 # gate's record as "the scanner" unlabeled. Additive-only field (S3 contract
 # discipline) — does not replace/rename any existing key.
 SCANNER_METRIC_ARM = "tech_score_baseline (retired from live feed 2026-06-29)"
+
+# config#1580 / config-I2993: the six-team + macro-economist + CIO research
+# orchestration was RETIRED. The live ``ne-weekly-freshness-pipeline`` has no
+# state that invokes that graph; ``research.db`` ``team_candidates`` /
+# ``cio_evaluations`` stop at 2026-07-10 (last producing cycle Sat 2026-07-11)
+# and will never gain new rows. ``_team_lift`` / ``_cio_lift`` were re-summing
+# that ENTIRE dead history at full weight every weekly cycle (live 2026-07-17
+# artifact: n_dates=153 back to 2025-12), polluting the Report Card + Director.
+# The live path now emits explicit retired markers instead of live-weight
+# aggregates (the functions are RETAINED, uncalled-in-live, for direct/historical
+# readouts + estimator-math tests).
+RESEARCH_GRAPH_RETIRED_DATE = "2026-07-12"
+
+# config-I2994 live-arm labels. The champion feed's ranking score is the scanner
+# universe-board ``attractiveness_score`` (copied verbatim into signals.json
+# ``score`` by crucible-research ``scoring/signals_envelope.py``); its
+# date-clustered IC vs realized 21d alpha is produced canonically by
+# ``attractiveness_eval.py`` (``composite_ic``) — NOT duplicated here. The Think
+# Tank challenger's shadow score is the only research-authored composite left.
+SCANNER_ATTRACTIVENESS_ARM = (
+    "scanner_attractiveness (live champion feed — universe-board "
+    "attractiveness_score; canonical IC in attractiveness_eval.json:composite_ic)"
+)
+THINKTANK_SHADOW_ARM = (
+    "thinktank_coverage (observe-only challenger shadow scores; "
+    "signals_shadow/thinktank_coverage/)"
+)
 
 
 # ── Canonical-horizon research-edge helpers (ROADMAP L4551) ─────────────────
@@ -529,11 +557,80 @@ def compute_lift_metrics(
             logger.warning("trajectory_forward_ic failed (non-fatal): %s", _tfi)
             result["trajectory_forward_ic"] = {"status": "error", "reason": str(_tfi)}
 
-        # 2. Team lift
-        result["team_lift"] = _team_lift(conn, ur, date_filter, params)
+        # 2 + 3. Team lift / CIO lift — RETIRED (config#1580 / config-I2993).
+        # The six-team+CIO orchestration no longer produces; re-aggregating its
+        # frozen history at full weight every cycle was a live-metric defect
+        # (see RESEARCH_GRAPH_RETIRED_DATE). Emit explicit retired markers so the
+        # evaluator's retired/N-A path fires instead of scoring a dead graph.
+        # ``team_lift`` stays a LIST ([]), never a status dict — downstream
+        # consumers (evaluate.py sleeve simulator, analysis/grading, team_skill_
+        # metrics) iterate it and a dict crashes them (regression 2026-04-11).
+        # The retired_date + component list ride on the additive
+        # ``research_graph_retired`` marker below (S3 contract: additive only).
+        result["research_graph_retired"] = {
+            "retired_date": RESEARCH_GRAPH_RETIRED_DATE,
+            "reason": (
+                "six-team + macro-economist + CIO research orchestration retired "
+                "(config#1580); last producing cycle 2026-07-11, research.db "
+                "team_candidates/cio_evaluations rows end 2026-07-10"
+            ),
+            "components": [
+                "team_lift", "cio_lift", "selection_skill_21d", "layer_attribution_21d",
+            ],
+            "superseded_by": (
+                "live_arm_score_ic.thinktank_coverage (challenger) + "
+                "attractiveness_eval.json:composite_ic (scanner_attractiveness, "
+                "config-I2994)"
+            ),
+        }
+        result["team_lift"] = []  # retired — list contract preserved
+        result["cio_lift"] = {
+            "status": "retired",
+            "retired_date": RESEARCH_GRAPH_RETIRED_DATE,
+            "note": (
+                "six-team+CIO graph retired (config#1580 / config-I2993); "
+                "selection_skill_21d + layer_attribution_21d retired with it"
+            ),
+        }
 
-        # 3. CIO lift
-        result["cio_lift"] = _cio_lift(conn, ur, date_filter, params)
+        # 3a. Live-arm score-IC (config-I2994) — the score-IC of the scores the
+        # LIVE architecture actually emits, replacing the retired CIO composite-
+        # IC. Two labeled arms:
+        #   * scanner_attractiveness — the champion feed's ranking score. Its
+        #     universe-board attractiveness_score→21d-alpha date-clustered IC is
+        #     ALREADY produced canonically by attractiveness_eval.py
+        #     (``composite_ic``, config#1389) and graded by the evaluator's
+        #     ``attractiveness_ic`` component. NOT recomputed here — a parallel
+        #     copy is the exact duplicate/divergence defect this issue fixes and
+        #     config-I2994's closes-when forbids ("no duplicate attractiveness-IC
+        #     metric exists"). Emit a self-documenting delegated pointer only.
+        #   * thinktank_coverage — the observe-only challenger shadow scores (the
+        #     only research-authored composite score left in the system). Computed
+        #     here with the SAME date-clustered estimator attractiveness_eval uses
+        #     (_clustered_ic_block), so the two live arms are methodologically
+        #     comparable. Fail-soft so a shadow-read error can never break the
+        #     e2e_lift contract (observability producer; recorded as status=error).
+        try:
+            _tt_arm = _thinktank_shadow_ic(conn, bucket)
+        except Exception as _tt:  # pragma: no cover - defensive
+            logger.warning("thinktank_shadow_ic failed (non-fatal): %s", _tt)
+            _tt_arm = {"status": "error", "reason": str(_tt), "arm": THINKTANK_SHADOW_ARM}
+        result["live_arm_score_ic"] = {
+            "scanner_attractiveness": {
+                "status": "delegated",
+                "arm": SCANNER_ATTRACTIVENESS_ARM,
+                "source_artifact": "backtest/{date}/attractiveness_eval.json",
+                "source_block": "composite_ic",
+                "note": (
+                    "Canonical scanner universe-board attractiveness_score→21d-alpha "
+                    "date-clustered IC is produced by attractiveness_eval.py "
+                    "(config#1389) and graded by the evaluator's attractiveness_ic "
+                    "component. Not recomputed here to avoid a duplicate/divergent "
+                    "metric (config-I2994 dedupe / config-I2993 defect class)."
+                ),
+            },
+            "thinktank_coverage": _tt_arm,
+        }
 
         # 3b. CIO vs score-ranking baseline (2e)
         result["cio_vs_ranking"] = _cio_vs_ranking_lift(conn, ur, date_filter, params)
@@ -728,7 +825,7 @@ def format_lift_report(metrics: dict) -> list[str]:
         )
 
     cl = metrics.get("cio_lift", {})
-    if cl and cl.get("status") != "skipped":
+    if cl and cl.get("status") not in ("skipped", "retired"):
         lines.append(
             f"| CIO promotion | {cl.get('n_advance', '?')} / {cl.get('n_recs', '?')} | "
             f"{_pct(cl.get('advance_avg'))} | {_pct(cl.get('all_recs_avg'))} | "
@@ -2565,6 +2662,12 @@ def _scanner_then_predictor_topN(conn) -> dict:
 def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[dict]:
     """Sector team lift (2b): team picks vs. own sector average from full 900.
 
+    RETIRED from the live ``compute_lift_metrics`` path (config#1580 /
+    config-I2993 — the six-team graph no longer produces). RETAINED, uncalled in
+    the live path, for direct/historical/windowed readouts and estimator-math
+    tests; the live path emits a ``research_graph_retired`` marker instead.
+
+
     The baseline is the average return of ALL stocks in the same sector from
     universe_returns — not just the quant candidates. This measures whether
     each team's picks outperform their sector's random baseline.
@@ -2684,6 +2787,13 @@ def _team_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> list[d
 def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
     """CIO lift (2d): ADVANCE stocks vs. all sector recommendations.
 
+    RETIRED from the live ``compute_lift_metrics`` path (config#1580 /
+    config-I2993 — the CIO gate no longer produces). RETAINED, uncalled in the
+    live path, for direct/historical readouts and estimator-math tests; the live
+    path emits a retired ``cio_lift`` marker instead. Also produces the
+    ``selection_skill_21d`` / ``layer_attribution_21d`` sub-blocks, retired with it.
+
+
     Emits per-bucket stdev so downstream optimizers can compute a
     Welch-style confidence bound on whether ``advance_avg < all_recs_avg``
     is statistically distinguishable from sampling noise. Without this,
@@ -2764,6 +2874,102 @@ def _cio_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
         }
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "cio_evaluations table not found"}
+
+
+def _thinktank_shadow_ic(conn, bucket: str, *, s3_client=None, horizon_days: int | None = None) -> dict:
+    """Observe-only Think Tank challenger-arm score IC (config-I2994).
+
+    The Think Tank challenger writes per-cycle shadow signals to
+    ``s3://{bucket}/signals_shadow/thinktank_coverage/{eval_date}/signals.json``
+    (shape: ``{"date": eval_date, "signals": {ticker: {"score": float, ...}}}``).
+    This is the ONLY research-authored composite score left in the live
+    architecture — the champion path's signals.json ``score`` is the scanner
+    ``attractiveness_score`` verbatim, measured separately by
+    ``attractiveness_eval.composite_ic``.
+
+    Computes the SAME date-clustered Spearman rank-IC estimator the scanner arm
+    uses (``attractiveness_eval._clustered_ic_block``), joining the shadow score
+    to realized 21d market-relative log-alpha from ``universe_returns``
+    (``_load_forward_alpha``) — so the two live arms are methodologically
+    comparable. The 21d realization lag is respected NATURALLY:
+    ``_load_forward_alpha`` returns only rows with a realized ``log_return_21d``,
+    so unevaluable recent cycles are excluded.
+
+    Observe-only: labeled, never gates. Honest small-N — ``status
+    "insufficient_data"`` with explicit counts (``n_shadow_dates`` /
+    ``series_start`` / ``n_eval_dates``) until a shadow cycle has realized 21d
+    alpha and enough weekly cohorts accrue for the clustered t-stat.
+    """
+    # Reuse the scanner arm's estimator + realized-alpha loader (no third copy
+    # of the date-clustered IC math; same package, no import cycle).
+    from analysis.attractiveness_eval import _clustered_ic_block, _load_forward_alpha
+    from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
+    hz = int(horizon_days if horizon_days is not None else DEFAULT_POLICY.primary_horizon)
+    arm = THINKTANK_SHADOW_ARM
+    prefix = "signals_shadow/thinktank_coverage/"
+    try:
+        import boto3
+
+        s3 = s3_client or boto3.client("s3")
+        rows: list[dict] = []
+        shadow_dates: set[str] = set()
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith("/signals.json"):
+                    continue
+                doc = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+                eval_date = doc.get("date")
+                signals = doc.get("signals")
+                if not eval_date or not isinstance(signals, dict):
+                    continue
+                shadow_dates.add(eval_date)
+                for ticker, entry in signals.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    score = entry.get("score")
+                    if score is None:
+                        continue
+                    rows.append({"eval_date": eval_date, "ticker": ticker, "score": float(score)})
+    except Exception as e:  # expected-absence warm-up guard, WARN-logged (no silent swallow)
+        logger.warning("thinktank_shadow_ic: shadow read failed (non-fatal): %s", e)
+        return {"status": "error", "arm": arm, "reason": str(e), "horizon_days": hz}
+
+    if not rows:
+        return {
+            "status": "insufficient_data", "arm": arm, "horizon_days": hz,
+            "reason": "no thinktank_coverage shadow signals found",
+            "n_shadow_dates": 0, "n_eval_dates": 0,
+        }
+
+    scores = pd.DataFrame(rows)
+    series_start = min(shadow_dates)
+    fwd = _load_forward_alpha(conn, hz)
+    if fwd is None or fwd.empty:
+        return {
+            "status": "insufficient_data", "arm": arm, "horizon_days": hz,
+            "reason": "no realized forward alpha in universe_returns",
+            "n_shadow_dates": len(shadow_dates), "series_start": series_start,
+            "n_eval_dates": 0,
+        }
+    merged = scores.merge(
+        fwd[["eval_date", "ticker", "alpha"]], on=["eval_date", "ticker"], how="inner"
+    )
+    if merged.empty:
+        return {
+            "status": "insufficient_data", "arm": arm, "horizon_days": hz,
+            "reason": "no shadow cycle has realized 21d alpha yet (21d realization lag)",
+            "n_shadow_dates": len(shadow_dates), "series_start": series_start,
+            "n_eval_dates": 0,
+        }
+    block = _clustered_ic_block(merged, "score")
+    block.update({
+        "status": "ok", "arm": arm, "horizon_days": hz,
+        "series_start": series_start, "n_shadow_dates": len(shadow_dates),
+    })
+    return block
 
 
 def _cio_vs_ranking_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:

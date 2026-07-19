@@ -7,13 +7,58 @@ outcome cleanly rewards the selected names, and assert the additive
 ``classification_21d`` + ``lift_21d_log`` blocks reflect the 21d edge.
 """
 
+import json
 import sqlite3
 
+import pandas as pd
 import pytest
 
-from analysis.end_to_end import compute_lift_metrics
+from analysis.end_to_end import (
+    _cio_lift,
+    _team_lift,
+    _thinktank_shadow_ic,
+    compute_lift_metrics,
+)
 
 DATE = "2026-05-01"
+
+
+def _lift_direct(db_path):
+    """Call the RETIRED ``_team_lift`` / ``_cio_lift`` estimators directly.
+
+    The live ``compute_lift_metrics`` path retires them (config#1580 /
+    config-I2993 — the six-team+CIO graph no longer produces), emitting retired
+    markers instead. The date-clustered / log-lift MATH the functions implement
+    stays under test via this direct call (they are retained, uncalled-in-live,
+    for exactly this + historical readouts)."""
+    conn = sqlite3.connect(db_path)
+    ur = pd.read_sql_query(
+        "SELECT * FROM universe_returns ORDER BY eval_date, ticker", conn
+    )
+    ur = ur[ur["return_5d"].notna()]
+    out = {"team_lift": _team_lift(conn, ur, "", []),
+           "cio_lift": _cio_lift(conn, ur, "", [])}
+    conn.close()
+    return out
+
+
+class _StubBody:
+    def __init__(self, b): self._b = b
+    def read(self): return self._b
+
+
+class _StubPaginator:
+    def __init__(self, keys): self._keys = keys
+    def paginate(self, **_kw): yield {"Contents": [{"Key": k} for k in self._keys]}
+
+
+class _StubS3:
+    """Minimal S3 stub for _thinktank_shadow_ic (moto-free, like the repo's
+    other S3 tests). ``objects`` maps key -> JSON-serializable doc."""
+    def __init__(self, objects): self._objects = objects
+    def get_paginator(self, _op): return _StubPaginator(list(self._objects))
+    def get_object(self, Bucket, Key):
+        return {"Body": _StubBody(json.dumps(self._objects[Key]).encode())}
 
 
 def _build_research_db(tmp_path):
@@ -80,7 +125,7 @@ def test_scanner_lift_labels_retired_baseline_arm(tmp_path):
 
 
 def test_cio_21d_block_present(tmp_path):
-    out = compute_lift_metrics(_build_research_db(tmp_path))
+    out = _lift_direct(_build_research_db(tmp_path))
     cl = out["cio_lift"]
     assert cl["classification"]["precision"] == 0.5
     assert cl["classification_21d"]["precision"] == 1.0
@@ -89,7 +134,7 @@ def test_cio_21d_block_present(tmp_path):
 def test_cio_selection_skill_block(tmp_path):
     # Fixture: ADVANCE names have +0.05 21d log-alpha, REJECT -0.02 → positive
     # selection gap; conviction (75 vs 45) tracks alpha → positive IC. (L4561)
-    out = compute_lift_metrics(_build_research_db(tmp_path))
+    out = _lift_direct(_build_research_db(tmp_path))
     sel = out["cio_lift"]["selection_skill_21d"]
     assert sel is not None
     assert sel["advance_alpha_21d"] == pytest.approx(0.05)
@@ -103,7 +148,7 @@ def test_cio_layer_attribution_block(tmp_path):
     # Each orchestrated layer (combined_score, macro_shift, final_score,
     # cio_conviction) gets a rank-IC vs realized 21d alpha. In the fixture all
     # track the selected/+alpha split, so each IC is present (and positive). (L4561)
-    out = compute_lift_metrics(_build_research_db(tmp_path))
+    out = _lift_direct(_build_research_db(tmp_path))
     attr = out["cio_lift"]["layer_attribution_21d"]
     assert attr is not None and attr["n"] == 20
     for layer in ("combined_score", "macro_shift", "final_score", "cio_conviction"):
@@ -165,7 +210,7 @@ def test_cio_layer_attribution_date_clustered_block(tmp_path):
             )
     conn.commit()
     conn.close()
-    attr = compute_lift_metrics(str(db))["cio_lift"]["layer_attribution_21d"]
+    attr = _lift_direct(str(db))["cio_lift"]["layer_attribution_21d"]
     assert attr["n_eval_dates"] == 4
     assert attr["combined_score_date_ic_n"] == 4
     # 3 dates IC=1.0 + 1 date slightly below → strongly positive mean, real variance.
@@ -211,7 +256,7 @@ def test_trailing_sector_neutral_leakfree_and_fallback():
 
 
 def test_team_21d_block_present(tmp_path):
-    out = compute_lift_metrics(_build_research_db(tmp_path))
+    out = _lift_direct(_build_research_db(tmp_path))
     team = out["team_lift"][0]
     assert team["classification_21d"]["precision"] == 1.0
     assert "lift_21d_log" in team
@@ -241,3 +286,95 @@ def test_21d_absent_when_columns_missing(tmp_path):
     assert sl["classification"] is not None
     assert sl["classification_21d"] is None
     assert sl["lift_21d_log"] is None
+
+
+# ── Research-graph retirement + live-arm score IC (config-I2993 / config-I2994) ──
+
+
+def test_research_graph_retired_markers(tmp_path):
+    # The six-team+CIO graph is retired: compute_lift_metrics must NOT surface
+    # live-weight team/CIO aggregates. team_lift is [] (list contract preserved),
+    # cio_lift is a retired marker, and the additive research_graph_retired marker
+    # carries the retired_date + superseded_by pointer.
+    out = compute_lift_metrics(_build_research_db(tmp_path), bucket="unused-bucket")
+    assert out["status"] == "ok"
+    assert out["team_lift"] == []
+    assert out["cio_lift"]["status"] == "retired"
+    assert out["cio_lift"]["retired_date"] == "2026-07-12"
+    rg = out["research_graph_retired"]
+    assert rg["retired_date"] == "2026-07-12"
+    assert set(rg["components"]) == {
+        "team_lift", "cio_lift", "selection_skill_21d", "layer_attribution_21d"}
+    # Scanner attractiveness arm is a delegated pointer (canonical IC lives in
+    # attractiveness_eval.json:composite_ic — NOT duplicated here).
+    las = out["live_arm_score_ic"]
+    assert las["scanner_attractiveness"]["status"] == "delegated"
+    assert las["scanner_attractiveness"]["source_block"] == "composite_ic"
+
+
+def _tt_db(tmp_path, *, with_realized_21d):
+    """research.db with universe_returns for one date; realized 21d present/absent."""
+    db = tmp_path / "research.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE universe_returns ("
+        "ticker TEXT, eval_date TEXT, sector TEXT, "
+        "return_5d REAL, spy_return_5d REAL, beat_spy_5d INTEGER, "
+        "return_21d REAL, spy_return_21d REAL, beat_spy_21d INTEGER, "
+        "log_return_21d REAL, log_spy_return_21d REAL)"
+    )
+    for i in range(12):
+        # log alpha ranks with the ticker index so a rank-correlated shadow score
+        # yields a clean positive IC.
+        lr = 0.01 * i if with_realized_21d else None
+        conn.execute(
+            "INSERT INTO universe_returns VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (f"T{i:02d}", DATE, "Tech", 1.0, 0.5, i % 2, 2.0, 1.0, 1, lr, 0.0),
+        )
+    conn.commit()
+    return conn
+
+
+def _tt_shadow_doc(eval_date):
+    return {"date": eval_date, "run_date": eval_date,
+            "signals": {f"T{i:02d}": {"ticker": f"T{i:02d}", "score": float(i)}
+                        for i in range(12)}}
+
+
+def test_thinktank_shadow_ic_ok_with_realized_overlap(tmp_path):
+    conn = _tt_db(tmp_path, with_realized_21d=True)
+    s3 = _StubS3({f"signals_shadow/thinktank_coverage/{DATE}/signals.json":
+                  _tt_shadow_doc(DATE)})
+    block = _thinktank_shadow_ic(conn, "b", s3_client=s3)
+    conn.close()
+    assert block["status"] == "ok"
+    assert block["arm"].startswith("thinktank_coverage")
+    assert block["series_start"] == DATE
+    assert block["n_shadow_dates"] == 1
+    assert block["n_eval_dates"] == 1
+    # score rank-correlates perfectly with realized 21d alpha → IC = +1.0.
+    assert block["date_ic_mean"] == pytest.approx(1.0)
+    # Single date → no Grinold-Kahn t-stat yet (needs >= 3 dates), honest None.
+    assert block["date_ic_p"] is None
+
+
+def test_thinktank_shadow_ic_insufficient_no_realized_overlap(tmp_path):
+    # Shadow scores exist but the universe_returns rows have no realized 21d alpha
+    # yet (21d realization lag) → honest insufficient_data with explicit counts.
+    conn = _tt_db(tmp_path, with_realized_21d=False)
+    s3 = _StubS3({f"signals_shadow/thinktank_coverage/{DATE}/signals.json":
+                  _tt_shadow_doc(DATE)})
+    block = _thinktank_shadow_ic(conn, "b", s3_client=s3)
+    conn.close()
+    assert block["status"] == "insufficient_data"
+    assert block["n_shadow_dates"] == 1
+    assert block["n_eval_dates"] == 0
+
+
+def test_thinktank_shadow_ic_no_shadow_artifacts(tmp_path):
+    conn = _tt_db(tmp_path, with_realized_21d=True)
+    block = _thinktank_shadow_ic(conn, "b", s3_client=_StubS3({}))
+    conn.close()
+    assert block["status"] == "insufficient_data"
+    assert block["n_shadow_dates"] == 0
+    assert block["n_eval_dates"] == 0
