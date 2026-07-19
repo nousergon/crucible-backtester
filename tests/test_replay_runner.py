@@ -4,14 +4,22 @@ Covers:
 
 - Happy path: structured replay extracts the parsed Pydantic instance
   and dumps it for the comparison + persistence layers.
-- Pydantic validation error path: target model emits structurally
+- Schema-validation-failure path: target model emits structurally
   divergent output → captured on the artifact as replay_error.
-- Generic SDK error path: langchain raises → captured, not propagated.
+- Generic transport error path: OpenRouter/SDK raises → captured, not
+  propagated.
 - S3 persistence: replay artifact lands at the documented prefix +
   filename shape.
 - ``persist=False`` skips the S3 write but still returns ReplayOutput.
 - Unknown agent_id family → skipped with marker.
-- ``chat_anthropic_factory`` injection point exercised end-to-end.
+- ``client_factory`` injection point exercised end-to-end.
+
+alpha-engine-config-I2997 (2026-07-19): migrated off direct Anthropic
+(``langchain_anthropic.ChatAnthropic``) to ``krepis.llm.LLMClient``'s
+OpenRouter transport (see ``replay/runner.py``'s module docstring). Mocks
+now build a fake ``openai``-shaped transport client via the
+``client_factory`` seam (``(spec, api_key) -> client`` exposing
+``chat.completions.create``) instead of a fake ``ChatAnthropic``.
 """
 
 from __future__ import annotations
@@ -67,40 +75,45 @@ def _make_s3_stub(artifact: dict) -> MagicMock:
     return s3
 
 
-def _make_chat_anthropic_factory(
+def _make_krepis_factory(
     *,
-    parsed: object | None = None,
-    parsing_error: Exception | None = None,
-    usage: dict | None = None,
-    raise_on_invoke: Exception | None = None,
+    content: str | None = None,
+    model: str = "deepseek/deepseek-v4-flash",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cost: float | None = None,
+    raise_on_create: Exception | None = None,
 ) -> tuple[MagicMock, MagicMock]:
-    """Build a fake ``ChatAnthropic`` factory whose ``with_structured_output``
-    returns a runnable that responds to ``.invoke()`` with the
-    langchain include_raw=True shape:
+    """Build a fake ``krepis.llm.LLMClient`` transport client — the
+    ``client_factory`` test seam every alpha-engine-config-I2997 call site
+    uses: a callable ``(spec, api_key) -> transport_client`` exposing
+    ``chat.completions.create(**kwargs)`` (OpenAI-compatible shape).
 
-        {"raw": AIMessage-like, "parsed": Pydantic | None, "parsing_error": Exception | None}
+    ``content`` is the raw text ``choices[0].message.content`` — under
+    ``structured_outputs=False`` (REQUIRED here, see runner.py's module
+    docstring) ``krepis.llm`` parses this as JSON (tolerating markdown
+    fences) and validates it against the schema.
 
-    Returns ``(factory, structured_runnable)`` so tests can also assert
-    on the call args.
+    Returns ``(factory, fake_client)`` so tests can also assert on the
+    call args recorded by ``fake_client.chat.completions.create``.
     """
-    structured = MagicMock()
-    raw = SimpleNamespace(
-        response_metadata={"usage": usage if usage is not None else {}}
-    )
-    if raise_on_invoke is not None:
-        structured.invoke.side_effect = raise_on_invoke
+    fake_client = MagicMock()
+    if raise_on_create is not None:
+        fake_client.chat.completions.create.side_effect = raise_on_create
     else:
-        structured.invoke.return_value = {
-            "raw": raw,
-            "parsed": parsed,
-            "parsing_error": parsing_error,
-        }
-
-    llm = MagicMock()
-    llm.with_structured_output.return_value = structured
-
-    factory = MagicMock(return_value=llm)
-    return factory, structured
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            prompt_tokens_details=None,
+            cost=cost,
+        )
+        message = SimpleNamespace(content=content)
+        choice = SimpleNamespace(message=message)
+        fake_client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[choice], model=model, usage=usage,
+        )
+    factory = MagicMock(return_value=fake_client)
+    return factory, fake_client
 
 
 # ── Happy path: structured replay ────────────────────────────────────────
@@ -119,23 +132,24 @@ class TestStructuredReplay:
                 {"ticker": "AAPL", "rationale": "FCF strong", "quant_score": 75},
             ],
         )
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=parsed_instance,
-            usage={"input_tokens": 200, "output_tokens": 80},
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(parsed_instance.model_dump()),
+            prompt_tokens=200, completion_tokens=80,
         )
 
         replay = replay_artifact(
             artifact_key="decision_artifacts/2026/05/03/x/run-abc.json",
-            target_model="claude-haiku-4-5",
+            target_model="deepseek/deepseek-v4-flash",
             s3_client=s3,
-            chat_anthropic_factory=factory,
+            client_factory=factory,
+            api_key="sk-or-test",
         )
 
         assert replay.replay_output_kind == "structured"
         assert replay.replay_output["ranked_picks"][0]["ticker"] == "AAPL"
         assert replay.replay_error is None
         assert replay.original_model == "claude-sonnet-4-6"
-        assert replay.replay_model == "claude-haiku-4-5"
+        assert replay.replay_model == "deepseek/deepseek-v4-flash"
 
     def test_factory_called_with_target_model_and_max_tokens(self):
         from nousergon_lib.agent_schemas import QuantAnalystOutput
@@ -143,65 +157,98 @@ class TestStructuredReplay:
 
         artifact = _make_captured_artifact()
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=QuantAnalystOutput(ranked_picks=[]),
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
         )
 
         replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
+            target_model="deepseek/deepseek-v4-flash",
             max_tokens=4096,
-            s3_client=s3, chat_anthropic_factory=factory,
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
         )
 
+        # client_factory receives (spec, api_key) — spec carries the
+        # resolved model/max_tokens/provider, not bare kwargs.
         factory.assert_called_once()
-        call_kwargs = factory.call_args.kwargs
-        assert call_kwargs["model"] == "claude-haiku-4-5"
-        assert call_kwargs["max_tokens"] == 4096
+        spec = factory.call_args.args[0]
+        assert spec.provider == "openrouter"
+        assert spec.model == "deepseek/deepseek-v4-flash"
+        assert spec.max_tokens == 4096
+        assert factory.call_args.args[1] == "sk-or-test"
 
-    def test_with_structured_output_resolves_canonical_schema(self):
-        """Replay must call with_structured_output(SchemaClass, include_raw=True)
-        with the schema RESOLVED FROM THE CAPTURED agent_id — confirming
-        invocation isomorphism with how production agents call the model."""
+    def test_structured_outputs_false_and_reasoning_excluded(self):
+        """REQUIRED, not incidental — see runner.py's module docstring:
+        live-verified 2026-07-19 that strict response_format=json_schema
+        is unreliable for DeepSeek-family models on OpenRouter."""
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
+        from replay.runner import replay_artifact
+
+        artifact = _make_captured_artifact()
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
+        )
+
+        replay_artifact(
+            artifact_key="k.json",
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            persist=False,
+        )
+
+        spec = factory.call_args.args[0]
+        assert spec.structured_outputs is False
+        assert spec.reasoning == {"exclude": True}
+
+    def test_resolves_canonical_schema_and_round_trips_it(self):
+        """Replay must validate against the schema RESOLVED FROM THE
+        CAPTURED agent_id — confirming the canonical contract is enforced
+        per agent family. Indirect check (no with_structured_output call
+        to introspect under the new transport): feed back the SPECIFIC
+        expected schema's own field shape and confirm it round-trips as
+        "structured" (a wrong schema would fail validation against a
+        mismatched field set)."""
         from nousergon_lib.agent_schemas import (
             QuantAnalystOutput, JointFinalizationOutput, CIORawOutput,
-            MacroEconomistRawOutput, HeldThesisUpdateLLMOutput,
+            CIORawDecision, MacroEconomistRawOutput, HeldThesisUpdateLLMOutput,
             QualAnalystOutput,
         )
         from replay.runner import replay_artifact
 
         cases = [
-            ("sector_quant:tech", QuantAnalystOutput),
-            ("sector_qual:healthcare", QualAnalystOutput),
-            ("sector_peer_review:financials", JointFinalizationOutput),
-            ("macro_economist", MacroEconomistRawOutput),
-            ("ic_cio", CIORawOutput),
-            ("thesis_update:AAPL", HeldThesisUpdateLLMOutput),
+            ("sector_quant:tech", QuantAnalystOutput, {"ranked_picks": []}),
+            ("sector_qual:healthcare", QualAnalystOutput, {}),
+            ("sector_peer_review:financials", JointFinalizationOutput, {}),
+            ("macro_economist", MacroEconomistRawOutput, {}),
+            # CIORawOutput.decisions has min_length=1 — model_construct's
+            # default empty list fails real validation on round-trip.
+            ("ic_cio", CIORawOutput, {
+                "decisions": [CIORawDecision(ticker="AAPL", decision="ADVANCE")],
+            }),
+            ("thesis_update:AAPL", HeldThesisUpdateLLMOutput, {}),
         ]
-        for agent_id, expected_schema in cases:
+        for agent_id, expected_schema, minimal_payload in cases:
             artifact = _make_captured_artifact(agent_id=agent_id)
             s3 = _make_s3_stub(artifact)
-            factory, _ = _make_chat_anthropic_factory(
-                # model_construct bypasses validation — fixture only needs
-                # an instance, not a schema-conformant one.
-                parsed=expected_schema.model_construct(),
-            )
+            # model_construct + model_dump bypasses validation on the
+            # BUILD side — fixture only needs a schema-shaped JSON string,
+            # not a fully-conformant instance; extra=allow schemas accept
+            # the minimal payload fine.
+            payload = expected_schema.model_construct(**minimal_payload).model_dump()
+            factory, _ = _make_krepis_factory(content=json.dumps(payload))
 
-            replay_artifact(
+            replay = replay_artifact(
                 artifact_key="k.json",
-                target_model="claude-haiku-4-5",
-                s3_client=s3, chat_anthropic_factory=factory,
+                target_model="deepseek/deepseek-v4-flash",
+                s3_client=s3, client_factory=factory, api_key="sk-or-test",
                 persist=False,
             )
 
-            llm = factory.return_value
-            schema_arg = llm.with_structured_output.call_args.args[0]
-            assert schema_arg is expected_schema, (
-                f"agent_id={agent_id} resolved to {schema_arg}, "
-                f"expected {expected_schema}"
+            assert replay.replay_output_kind == "structured", (
+                f"agent_id={agent_id} expected schema={expected_schema} "
+                f"failed to validate: {replay.replay_error}"
             )
-            # include_raw must be True so the runner can extract token usage.
-            assert llm.with_structured_output.call_args.kwargs["include_raw"] is True
 
     def test_invoke_called_with_system_and_user_messages(self):
         from nousergon_lib.agent_schemas import QuantAnalystOutput
@@ -209,98 +256,122 @@ class TestStructuredReplay:
 
         artifact = _make_captured_artifact(user_prompt="Pick 5 tech names.")
         s3 = _make_s3_stub(artifact)
-        factory, structured = _make_chat_anthropic_factory(
-            parsed=QuantAnalystOutput(ranked_picks=[]),
+        factory, fake_client = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
         )
 
         replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
 
-        messages = structured.invoke.call_args.args[0]
-        assert messages == [
-            {"role": "system", "content": "You are a sector analyst."},
-            {"role": "user", "content": "Pick 5 tech names."},
-        ]
+        call_kwargs = fake_client.chat.completions.create.call_args.kwargs
+        messages = call_kwargs["messages"]
+        assert messages[0] == {"role": "system", "content": "You are a sector analyst."}
+        # structured_outputs=False appends a JSON-schema instruction suffix
+        # to the user turn (krepis's tolerant-extraction fallback) — the
+        # captured user_prompt is unmodified as the PREFIX.
+        assert messages[1]["content"].startswith("Pick 5 tech names.")
+        assert messages[1]["role"] == "user"
 
 
-# ── Pydantic validation error ────────────────────────────────────────────
+# ── Schema-validation failure ────────────────────────────────────────────
 
 
-class TestPydanticValidationError:
-    def test_parsing_error_captured_on_artifact(self):
+class TestSchemaValidationError:
+    def test_validation_failure_captured_on_artifact(self):
         """When the target model emits a structurally divergent output,
-        with_structured_output(include_raw=True) populates parsing_error
-        in the response dict. Replay surfaces that as replay_error
-        rather than silently emitting a 0-agreement comparison — exactly
-        the silent-drift signal we wanted to capture."""
+        krepis.llm.LLMClient.structured() raises LLMError after the
+        (single, attempts=1 — see runner.py docstring) attempt fails
+        schema validation. Replay surfaces that as replay_error rather
+        than silently emitting a 0-agreement comparison — exactly the
+        silent-drift signal we wanted to capture."""
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact()
         s3 = _make_s3_stub(artifact)
-        validation_err = ValueError(
-            "ranked_picks.0.quant_score Input should be ≤ 100"
-        )
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=None, parsing_error=validation_err,
-        )
+        # quant_score must be a number <= 100 (QuantAnalystOutput's
+        # QuantPick) — this string value fails schema validation.
+        bad_payload = json.dumps({
+            "ranked_picks": [
+                {"ticker": "AAPL", "quant_score": "not-a-number"},
+            ],
+        })
+        factory, _ = _make_krepis_factory(content=bad_payload)
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
 
         assert replay.replay_output_kind == "error"
-        assert "pydantic validation failed" in (replay.replay_error or "")
+        assert "validation failed" in (replay.replay_error or "").lower()
         assert "quant_score" in (replay.replay_error or "")
 
+    def test_malformed_json_also_captured_as_validation_failure(self):
+        from replay.runner import replay_artifact
 
-# ── Generic SDK error path ───────────────────────────────────────────────
+        artifact = _make_captured_artifact()
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_krepis_factory(content="not json at all {{{")
+
+        replay = replay_artifact(
+            artifact_key="k.json",
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+            persist=False,
+        )
+
+        assert replay.replay_output_kind == "error"
+        assert replay.replay_error
+
+
+# ── Generic transport error path ─────────────────────────────────────────
 
 
 class TestErrorHandling:
-    def test_sdk_exception_captured_not_raised(self):
+    def test_transport_exception_captured_not_raised(self):
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact()
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(
-            raise_on_invoke=RuntimeError("Anthropic 500"),
+        factory, _ = _make_krepis_factory(
+            raise_on_create=RuntimeError("OpenRouter 500"),
         )
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
         )
 
         assert replay.replay_output_kind == "error"
-        assert "Anthropic 500" in (replay.replay_error or "")
+        assert "OpenRouter 500" in (replay.replay_error or "")
         assert s3.put_object.called
 
-    def test_no_parsed_object_marked_error(self):
+    def test_missing_api_key_captured_not_raised(self):
+        """No api_key arg + no resolvable OPENROUTER_API_KEY (env-isolated
+        by conftest's autouse secrets fixture) → captured as replay_error,
+        never propagated. Replay is offline analysis; one bad config
+        should never abort a batch."""
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact()
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=None, parsing_error=None,
-        )
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, api_key=None,
             persist=False,
         )
 
         assert replay.replay_output_kind == "error"
-        assert "no parsed object" in (replay.replay_error or "")
+        assert "OpenRouter API key" in (replay.replay_error or "")
 
 
 # ── Unknown agent_id family ──────────────────────────────────────────────
@@ -316,12 +387,12 @@ class TestUnknownAgentSkip:
 
         artifact = _make_captured_artifact(agent_id="brand_new_agent")
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(parsed=None)
+        factory, _ = _make_krepis_factory()
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
 
@@ -373,12 +444,12 @@ class TestDeterministicArtifactSkip:
 
         artifact = self._deterministic_artifact()
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(parsed=None)
+        factory, _ = _make_krepis_factory()
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
 
@@ -399,13 +470,13 @@ class TestDeterministicArtifactSkip:
 
         artifact = self._deterministic_artifact()
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(parsed=None)
+        factory, _ = _make_krepis_factory()
 
         # Must not raise.
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
         assert replay is not None
@@ -423,13 +494,13 @@ class TestPersistence:
             run_id="run-xyz", model_name="claude-sonnet-4-6",
         )
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=QuantAnalystOutput(ranked_picks=[]),
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
         )
 
         replay_artifact(
-            artifact_key="src.json", target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            artifact_key="src.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
         )
 
         # Canonical eval_artifacts layout: a flat dated key
@@ -448,8 +519,12 @@ class TestPersistence:
         # Flat — exactly one path segment after the prefix, no run-xyz dir.
         assert key.startswith("decision_artifacts/_replay/")
         assert "run-xyz/" not in key
-        assert key.endswith("_claude-sonnet-4-6_vs_claude-haiku-4-5.json")
+        # target_model's "/" is sanitized to "-" the same as ":" — an
+        # OpenRouter-shaped id (deepseek/deepseek-v4-flash) must not
+        # fracture the S3 key into extra path segments.
+        assert key.endswith("_claude-sonnet-4-6_vs_deepseek-deepseek-v4-flash.json")
         basename = key.rsplit("/", 1)[-1]
+        assert basename.count("/") == 0
         run_id = basename.split("_", 1)[0]
         assert len(run_id) == 10 and run_id.isdigit()  # YYMMDDHHMM
         assert latest == ["decision_artifacts/_replay/latest.json"]
@@ -465,13 +540,13 @@ class TestPersistence:
             run_id="run-xyz", model_name="claude-sonnet-4-6",
         )
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=QuantAnalystOutput(ranked_picks=[]),
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
         )
 
         replay_artifact(
-            artifact_key="src.json", target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            artifact_key="src.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
         )
 
         bodies_by_key = {
@@ -493,15 +568,15 @@ class TestPersistence:
 
         artifact = _make_captured_artifact()
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=QuantAnalystOutput(ranked_picks=[
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[
                 {"ticker": "X", "quant_score": 80, "rationale": "ok"},
-            ]),
+            ]).model_dump()),
         )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
 
@@ -515,13 +590,13 @@ class TestPersistence:
 
         artifact = _make_captured_artifact(model_name="claude-sonnet-4-6:live")
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=QuantAnalystOutput(ranked_picks=[]),
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
         )
 
         replay_artifact(
-            artifact_key="k.json", target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
         )
 
         dated = [
@@ -542,42 +617,39 @@ class TestUsageExtraction:
 
         artifact = _make_captured_artifact()
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=QuantAnalystOutput(ranked_picks=[]),
-            usage={
-                "input_tokens": 1234, "output_tokens": 567,
-                "cache_read_input_tokens": 100,
-                "cache_creation_input_tokens": 50,
-            },
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
+            prompt_tokens=1234, completion_tokens=567, cost=0.00042,
         )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
         )
 
         assert replay.replay_cost["input_tokens"] == 1234
         assert replay.replay_cost["output_tokens"] == 567
-        assert replay.replay_cost["cache_read_input_tokens"] == 100
-        assert replay.replay_cost["cache_creation_input_tokens"] == 50
+        # OpenRouter's actually-billed cost — a capability the pre-migration
+        # Anthropic SDK path never surfaced (purely additive; see runner.py).
+        assert replay.replay_cost["provider_cost_usd"] == 0.00042
 
-    def test_missing_usage_returns_empty_dict(self):
+    def test_missing_usage_returns_zeroed_dict(self):
         from nousergon_lib.agent_schemas import QuantAnalystOutput
         from replay.runner import replay_artifact
 
         artifact = _make_captured_artifact()
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(
-            parsed=QuantAnalystOutput(ranked_picks=[]),
-            usage={},
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
         )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
         )
 
-        assert replay.replay_cost == {}
+        assert replay.replay_cost["input_tokens"] == 0
+        assert replay.replay_cost["output_tokens"] == 0
         assert replay.replay_output_kind == "structured"
 
 
@@ -645,12 +717,12 @@ class TestPlaceholderPromptSkip:
 
         artifact = self._placeholder_artifact()
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(parsed=None)
+        factory, _ = _make_krepis_factory()
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
 
@@ -668,12 +740,12 @@ class TestPlaceholderPromptSkip:
             "system_prompt": "", "user_prompt": "", "tool_definitions": [],
         }
         s3 = _make_s3_stub(artifact)
-        factory, _ = _make_chat_anthropic_factory(parsed=None)
+        factory, _ = _make_krepis_factory()
 
         replay = replay_artifact(
             artifact_key="k.json",
-            target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
 

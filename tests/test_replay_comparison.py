@@ -337,11 +337,16 @@ class TestDispatch:
 class TestRunnerIntegration:
     def test_replay_artifact_populates_comparison_block(self):
         """The runner should call compute_comparison and stamp the
-        ReplayOutput.comparison field on every structured replay."""
-        from types import SimpleNamespace
+        ReplayOutput.comparison field on every structured replay.
+
+        alpha-engine-config-I2997 (2026-07-19): fake transport rebuilt on
+        the krepis.llm.LLMClient OpenRouter client_factory seam (mirrors
+        tests/test_replay_runner.py) — was a fake ChatAnthropic factory.
+        """
         from unittest.mock import MagicMock
         import json
         from replay.runner import replay_artifact
+        from tests.test_replay_runner import _make_krepis_factory
 
         artifact = {
             "schema_version": 1,
@@ -368,28 +373,19 @@ class TestRunnerIntegration:
         s3.get_object.return_value = {"Body": body}
         s3.put_object = MagicMock()
 
-        # Build langchain-style fake: factory → llm → with_structured_output
-        # → runnable whose .invoke() returns the include_raw=True dict shape.
         from nousergon_lib.agent_schemas import QuantAnalystOutput
         parsed = QuantAnalystOutput(ranked_picks=[
             {"ticker": "NVDA", "quant_score": 85, "rationale": "x"},
             {"ticker": "AAPL", "quant_score": 73, "rationale": "y"},
         ])
-        structured = MagicMock()
-        structured.invoke.return_value = {
-            "raw": SimpleNamespace(response_metadata={"usage": {
-                "input_tokens": 100, "output_tokens": 50,
-            }}),
-            "parsed": parsed,
-            "parsing_error": None,
-        }
-        llm = MagicMock()
-        llm.with_structured_output.return_value = structured
-        factory = MagicMock(return_value=llm)
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(parsed.model_dump()),
+            prompt_tokens=100, completion_tokens=50,
+        )
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
 
@@ -402,6 +398,7 @@ class TestRunnerIntegration:
         from unittest.mock import MagicMock
         import json
         from replay.runner import replay_artifact
+        from tests.test_replay_runner import _make_krepis_factory
 
         artifact = {
             "schema_version": 1,
@@ -420,17 +417,13 @@ class TestRunnerIntegration:
         s3.get_object.return_value = {"Body": body}
         s3.put_object = MagicMock()
 
-        # Factory whose runnable raises on invoke — replay must capture
-        # the error rather than propagate.
-        structured = MagicMock()
-        structured.invoke.side_effect = RuntimeError("API down")
-        llm = MagicMock()
-        llm.with_structured_output.return_value = structured
-        factory = MagicMock(return_value=llm)
+        # Transport client raises on create — replay must capture the
+        # error rather than propagate.
+        factory, _ = _make_krepis_factory(raise_on_create=RuntimeError("API down"))
 
         replay = replay_artifact(
-            artifact_key="k.json", target_model="claude-haiku-4-5",
-            s3_client=s3, chat_anthropic_factory=factory,
+            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
             persist=False,
         )
 
