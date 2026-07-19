@@ -19,7 +19,15 @@
 # unrelated to this change — see PR). No API-signature diff found between
 # 0.26.x/0.27.x/0.28.x for the Portfolio methods vectorbt_bridge.py calls.
 vectorbt~=0.28.5
-numpy<3
+# numpy<3 (no explicit upper bound near numba's actual ceiling) let a
+# transitive dep drift: numba (pulled in by vectorbt~=0.28.5 above, not a
+# direct dependency of this repo) hard-caps at numpy<=2.4 and raises
+# ImportError at `_ensure_critical_deps()` otherwise. numpy 2.4.6 was the
+# resolved version when 0.28.5 was validated (see comment block above);
+# capping here reproduces that known-good resolution instead of floating
+# onto whatever numpy 2.5+ PyPI resolves next. alpha-engine-config#2975,
+# #2976.
+numpy>=2.0,<2.5
 plotly<6
 pandas~=2.2
 boto3~=1.34
