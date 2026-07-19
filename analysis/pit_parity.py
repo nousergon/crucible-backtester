@@ -269,61 +269,173 @@ def _delta(pit: dict, cur: dict) -> dict:
     return out
 
 
-def _pbo_two_split(cur_sweep_df, pit_sweep_df) -> dict | None:
-    """Probability-of-Backtest-Overfitting via the degenerate **2-split
-    CSCV** the parity pair naturally forms (Bailey & López de Prado 2014):
-    the current-weights sweep is the in-sample (look-ahead-optimistic)
-    realization, the walk-forward sweep is the out-of-sample one, of the
-    *same config grid*. Metric = Sortino rank (plan invariant 4).
+def _cscv_pbo(pit_block_matrix, spec_ids=None, *, min_splits: int = 4) -> dict | None:
+    """Full **M-block combinatorial CSCV** PBO on the PIT (walk-forward) pass
+    ONLY (#816 gap 1+2; decision B — canonical López de Prado: CSCV runs on
+    the strategy you deploy, not the contaminated look-ahead comparator).
 
-    Reports the Spearman rank correlation of config Sortino-ranks across
-    the two realizations and the OOS percentile of the best-in-sample
-    config. ``overfit`` flags the canonical CSCV condition: the IS-optimal
-    config lands below the OOS median. A full M-block CSCV distribution
-    needs per-block sweep re-evaluation (S× sweep cost) and is documented
-    as a future enhancement, mirroring the plan's CPCV-as-future-option
-    discipline — we do not fabricate a distribution we did not compute.
+    ``pit_block_matrix`` is shape ``(n_blocks, n_combos)`` — one row per
+    chronological CSCV block of the walk-forward sweep, one column per param
+    combo, every cell the SAME metric (Sortino, plan invariant 4) evaluated on
+    that block. This is exactly the aligned-trial matrix
+    :func:`analysis.pbo.cscv_pbo` (Bailey/Borwein/López de Prado/Zhu 2014)
+    consumes — the same calling convention proven at
+    ``optimizer/executor_optimizer.py::_compute_pbo``. The engine's
+    leave-one-split-out symmetric selection test yields a real PBO
+    *distribution* (``lambda`` logits), not the prior degenerate 2-split
+    rank-correlation.
 
-    ``None`` when no sweep pair is supplied (single-pass parity) — the
-    report then carries ``pbo: null`` with an explicit method note rather
-    than a fabricated number.
+    Returns the engine's result dict (``pbo``, ``n_splits``, ``n_specs``,
+    ``status``) verbatim so the honest-N/A posture is preserved:
+    ``status="insufficient"`` when there are <2 combos or <``min_splits``
+    clean blocks — never a fabricated pass.
+
+    ``None`` when no PIT block matrix is supplied (single-pass parity, no
+    opt-in sweep) — the report then carries ``pbo: null`` with a method note
+    rather than a fabricated number (A-grade integrity property).
     """
-    if cur_sweep_df is None or pit_sweep_df is None:
+    if pit_block_matrix is None:
         return None
-    col = "sortino_ratio"
-    if col not in cur_sweep_df.columns or col not in pit_sweep_df.columns:
+    mat = np.asarray(pit_block_matrix, dtype=np.float64)
+    if mat.ndim != 2 or mat.shape[0] < 2 or mat.shape[1] < 2:
         return None
-    join = ("config_id" if "config_id" in cur_sweep_df.columns
-            and "config_id" in pit_sweep_df.columns else None)
-    if join:
-        m = cur_sweep_df[[join, col]].merge(
-            pit_sweep_df[[join, col]], on=join, suffixes=("_is", "_oos"),
-        )
-        is_v = m[f"{col}_is"].to_numpy(float)
-        oos_v = m[f"{col}_oos"].to_numpy(float)
-    else:
-        n = min(len(cur_sweep_df), len(pit_sweep_df))
-        if n < 2:
-            return None
-        is_v = cur_sweep_df[col].to_numpy(float)[:n]
-        oos_v = pit_sweep_df[col].to_numpy(float)[:n]
-    n = is_v.size
-    if n < 2 or not np.isfinite(is_v).any() or not np.isfinite(oos_v).any():
+
+    from analysis.pbo import cscv_pbo
+
+    ids = list(spec_ids) if spec_ids is not None else list(range(mat.shape[1]))
+    res = cscv_pbo(mat.tolist(), spec_ids=ids, min_splits=min_splits)
+    res = dict(res)
+    res.setdefault(
+        "method",
+        "full M-block combinatorial CSCV (Bailey/Borwein/López de Prado/Zhu "
+        "2014) on the PIT walk-forward sweep ONLY (decision B); metric = "
+        "Sortino (plan inv. 4). PBO = P(in-sample winner lands below the OOS "
+        "median).",
+    )
+    return res
+
+
+def _block_bootstrap_ci(
+    delta_series,
+    *,
+    ci_level: float = 0.95,
+    n_resamples: int = 2000,
+    block_size: int | None = None,
+    seed: int = 0,
+) -> dict | None:
+    """Moving-block bootstrap CI on the per-date ΔSortino-contributing return
+    delta stream (#816 gap 3; decision C — materiality = a block-bootstrap CI
+    that **excludes 0** as the primary trigger, replacing the arbitrary
+    ``abs(ΔSortino) >= 0.10`` hard threshold).
+
+    The delta stream is a *time series* (per-date PIT-minus-current portfolio
+    log-return deltas) with serial dependence, so an IID percentile bootstrap
+    understates the CI. We resample overlapping length-``block_size`` blocks
+    (Künsch 1989 moving-block bootstrap; block ≈ ``n**(1/3)`` by default) to
+    preserve short-range autocorrelation. The shared
+    ``nousergon_lib.quant.stats.intervals.bootstrap_ci`` helper is IID-only (not
+    block-aware), so the block resampling is done here and the percentile CI is
+    computed on the block-bootstrap distribution directly — same percentile
+    contract as ``bootstrap_ci`` (``ci_low``/``ci_high``/``estimate``).
+
+    Returns ``{status, n, estimate, ci_low, ci_high, ci_level, method,
+    n_resamples, block_size, excludes_zero}``. ``excludes_zero`` is the
+    primary materiality trigger: True iff the whole CI lies on one side of 0.
+    ``None`` / ``status="insufficient_data"`` when <2 finite observations —
+    never a fabricated interval.
+    """
+    if delta_series is None:
         return None
-    is_rank = np.argsort(np.argsort(is_v))
-    oos_rank = np.argsort(np.argsort(oos_v))
-    spearman = float(np.corrcoef(is_rank, oos_rank)[0, 1]) if n > 1 else None
-    best_is = int(np.nanargmax(is_v))
-    oos_pct = float(oos_rank[best_is] / (n - 1)) if n > 1 else None
+    arr = np.asarray(delta_series, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    n = arr.size
+    if n < 2:
+        return {"status": "insufficient_data", "n": int(n),
+                "method": "moving-block bootstrap", "excludes_zero": False}
+
+    if block_size is None:
+        block_size = max(1, int(round(n ** (1.0 / 3.0))))
+    block_size = min(block_size, n)
+    n_blocks = int(np.ceil(n / block_size))
+
+    rng = np.random.default_rng(seed)
+    # Overlapping start positions for the moving-block bootstrap.
+    max_start = n - block_size + 1
+    means = np.empty(n_resamples, dtype=np.float64)
+    for i in range(n_resamples):
+        starts = rng.integers(0, max_start, size=n_blocks)
+        sample = np.concatenate([arr[s:s + block_size] for s in starts])[:n]
+        means[i] = sample.mean()
+
+    alpha = (1.0 - ci_level) / 2.0
+    ci_low = float(np.quantile(means, alpha))
+    ci_high = float(np.quantile(means, 1.0 - alpha))
+    estimate = float(arr.mean())
+    excludes_zero = bool(ci_low > 0.0 or ci_high < 0.0)
     return {
-        "method": "2-split CSCV (current=in-sample, walk-forward=OOS); "
-                  "Sortino-rank. Full M-block CSCV distribution = future "
-                  "enhancement (not fabricated here).",
-        "n_configs": int(n),
-        "spearman_rank_corr": spearman,
-        "best_in_sample_config_oos_percentile": oos_pct,
-        "overfit": (oos_pct is not None and oos_pct < 0.5),
+        "status": "ok",
+        "n": int(n),
+        "estimate": estimate,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "ci_level": float(ci_level),
+        "method": "moving-block bootstrap (Künsch 1989); percentile CI on the "
+                  "per-date PIT-minus-current return delta.",
+        "n_resamples": int(n_resamples),
+        "block_size": int(block_size),
+        "excludes_zero": excludes_zero,
     }
+
+
+def _dsr_materiality(pit_stats: dict, n_trials: int | None) -> dict | None:
+    """Deflated Sharpe Ratio on the PIT (walk-forward) winner's return stream
+    (#816 gap 3; decision C — DSR on the PSR axis, alongside the block-bootstrap
+    Δ-CI). DSR deflates the winner's Sharpe for the selection bias of picking
+    the best of ``n_trials`` swept combos — a positive DSR means the deployed
+    PIT config's skill survives multiple-testing correction.
+
+    ``None`` when the PIT daily return stream or ``n_trials`` is absent (no
+    opt-in sweep) — the honest-N/A posture. Never fabricates.
+    """
+    if not n_trials or n_trials < 1:
+        return None
+    dlr = pit_stats.get("daily_log_returns")
+    if dlr is None:
+        return None
+    arr = np.asarray(dlr, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 2:
+        return None
+    try:
+        from analysis.dsr import compute_dsr
+    except Exception:  # pragma: no cover - dsr shim always present in prod
+        return None
+    # DSR is defined on simple returns; per plan inv. 5 the PIT stream is
+    # log-domain, so convert back to simple returns for the Sharpe moments.
+    res = compute_dsr(np.expm1(arr), int(n_trials))
+    return dict(res)
+
+
+def _per_date_return_delta(pit_stats: dict, cur_stats: dict):
+    """Aligned per-date PIT-minus-current portfolio log-return delta series,
+    the input to the block-bootstrap materiality CI (decision C).
+
+    Both passes run over the SAME date grid (module docstring), so the two
+    ``daily_log_returns`` streams are index-aligned; we truncate to the shorter
+    (cold-start-excluded PIT folds can shorten the PIT stream). ``None`` when
+    either stream is absent or too short — the CI then reports insufficient.
+    """
+    p, c = pit_stats.get("daily_log_returns"), cur_stats.get("daily_log_returns")
+    if p is None or c is None:
+        return None
+    p = np.asarray(p, dtype=np.float64)
+    c = np.asarray(c, dtype=np.float64)
+    n = min(p.size, c.size)
+    if n < 2:
+        return None
+    d = p[:n] - c[:n]
+    d = d[np.isfinite(d)]
+    return d if d.size >= 2 else None
 
 
 def build_contamination_report(
@@ -332,11 +444,24 @@ def build_contamination_report(
     *,
     run_date: str | None = None,
     wf_meta: dict | None = None,
-    cur_sweep_df=None,
-    pit_sweep_df=None,
+    pit_block_matrix=None,
+    pit_spec_ids=None,
+    n_trials: int | None = None,
     prior_delta: dict | None = None,
 ) -> dict:
     """Assemble the skilled-risk-basket contamination report (pure).
+
+    Statistical rigor (#816):
+
+    - **PBO** — full M-block combinatorial CSCV on the PIT walk-forward sweep
+      ONLY (``pit_block_matrix``; decision B). ``pit_block_matrix is None``
+      (single-pass parity, no opt-in sweep) ⇒ ``pbo: null`` with a method note,
+      never a fabricated distribution.
+    - **Materiality** — block-bootstrap CI on the per-date return delta that
+      **excludes 0** as the primary trigger, plus DSR on the PSR axis
+      (decision C), replacing the arbitrary ``abs(ΔSortino) >= 0.10`` hard
+      threshold. Falls back to the legacy threshold only when the CI cannot be
+      computed (no per-date streams), so single-pass callers still get a signal.
 
     ``prior_delta`` is the previous run's ``delta_pit_minus_current`` basket
     (config#2449) — the caller (``run_pit_parity``) reads it back via
@@ -349,16 +474,53 @@ def build_contamination_report(
     """
     cur_b, pit_b = _basket(cur_stats), _basket(pit_stats)
     delta = _delta(pit_b, cur_b)
-    pbo = _pbo_two_split(cur_sweep_df, pit_sweep_df)
+    pbo = _cscv_pbo(pit_block_matrix, spec_ids=pit_spec_ids)
 
     n_cfg = None
-    if cur_sweep_df is not None:
-        n_cfg = int(len(cur_sweep_df))
+    if pit_block_matrix is not None:
+        try:
+            n_cfg = int(np.asarray(pit_block_matrix).shape[1])
+        except Exception:
+            n_cfg = None
+    elif n_trials:
+        n_cfg = int(n_trials)
 
-    material = bool(
-        delta.get("sortino_ratio") is not None
-        and abs(delta["sortino_ratio"]) >= 0.10
-    )
+    # Decision C — bootstrap CI on the per-date delta (primary trigger:
+    # CI excludes 0) + DSR on the deployed PIT winner.
+    delta_stream = _per_date_return_delta(pit_stats, cur_stats)
+    boot_ci = _block_bootstrap_ci(delta_stream)
+    dsr = _dsr_materiality(pit_stats, n_trials)
+
+    if boot_ci is not None and boot_ci.get("status") == "ok":
+        material = bool(boot_ci.get("excludes_zero"))
+        materiality_basis = "block_bootstrap_ci_excludes_zero"
+        materiality_interp = (
+            "MATERIAL — the block-bootstrap 95% CI on the per-date "
+            "PIT-minus-current return delta EXCLUDES 0: the look-ahead leak "
+            "moved the anchor by a statistically-distinguishable amount. "
+            "Review before the flip."
+            if material else
+            "Not material — the block-bootstrap 95% CI on the per-date return "
+            "delta INCLUDES 0 (delta indistinguishable from noise on this "
+            "grid). Still review run_quality (cold-start coverage can shrink "
+            "the PIT sample and widen the CI)."
+        )
+    else:
+        # No per-date streams (e.g. legacy single-pass callers passing only
+        # scalar stats) — fall back to the legacy ΔSortino threshold so the
+        # report still carries a materiality signal.
+        material = bool(
+            delta.get("sortino_ratio") is not None
+            and abs(delta["sortino_ratio"]) >= 0.10
+        )
+        materiality_basis = "legacy_sortino_delta_threshold_fallback"
+        materiality_interp = (
+            "MATERIAL (legacy |ΔSortino|>=0.10 fallback — no per-date return "
+            "streams available for the bootstrap CI)."
+            if material else
+            "Below the legacy ΔSortino threshold (bootstrap CI unavailable — "
+            "no per-date return streams)."
+        )
     # Leg (g) — tolerance-band + step-change alarms over the full basket delta,
     # OBSERVE mode (computed + recorded in the report; never pages from the
     # pure builder — paging_enabled stays False here regardless of prior_delta;
@@ -389,16 +551,11 @@ def build_contamination_report(
             ),
         },
         "materiality": {
-            "sortino_delta_threshold": 0.10,
             "material": material,
-            "interpretation": (
-                "MATERIAL — the look-ahead leak measurably moved the "
-                "anchor metric; review before the flip."
-                if material else
-                "Below the ΔSortino materiality threshold on this grid — "
-                "still review run_quality (cold-start coverage can mask a "
-                "true delta by shrinking the PIT sample)."
-            ),
+            "basis": materiality_basis,
+            "bootstrap_ci": boot_ci,   # block-bootstrap Δ-CI (primary; decision C)
+            "dsr": dsr,                # Deflated Sharpe on the PIT winner (PSR axis)
+            "interpretation": materiality_interp,
         },
         "alarms": alarms,
         "observational": True,
@@ -468,9 +625,18 @@ def run_pit_parity(config: dict) -> dict:
     # step-change alarm leg has a real baseline instead of always
     # evaluating against None (which made it permanently inert).
     prior_delta = read_prior_delta(bucket, run_date)
+    # #816 decision B: CSCV inputs come from the PIT (walk-forward) pass ONLY.
+    # The walk-forward pass, when the per-block ``pit_parity_sweep`` flag is set
+    # (decision A — opt-in; single-pass callers pass no flag and get pbo=null),
+    # runs run_predictor_param_sweep and returns the (n_blocks, n_combos)
+    # Sortino block matrix under ``_cscv_block_matrix`` in its stats.
+    pit_block_matrix = pit_stats.get("_cscv_block_matrix")
+    pit_spec_ids = pit_stats.get("_cscv_spec_ids")
+    n_trials = pit_stats.get("_cscv_n_trials")
     report = build_contamination_report(
         cur_stats, pit_stats, run_date=run_date, wf_meta=wf_meta,
-        prior_delta=prior_delta,
+        pit_block_matrix=pit_block_matrix, pit_spec_ids=pit_spec_ids,
+        n_trials=n_trials, prior_delta=prior_delta,
     )
 
     key = _write_artifact_to_s3(bucket, run_date, report)

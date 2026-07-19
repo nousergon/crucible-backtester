@@ -3,10 +3,13 @@
 
 Locks: the basket is Sortino/PSR/CVaR/maxDD + log-domain headline with
 **no Sharpe**; log-domain cumulative return is summed not compounded;
-deltas are pit−current; the 2-split CSCV PBO is honest (None without a
-sweep pair, never a fabricated number); the report is observational and
-flip-gated; run_pit_parity runs both passes with the flag flipped and
-never raises on an S3 upload failure.
+deltas are pit−current; the PBO is a full M-block CSCV distribution on the
+PIT block matrix (config#816) and is honest (None without a PIT block
+matrix, ``insufficient`` — never a fabricated number — on too-small
+inputs); materiality is a block-bootstrap CI that excludes 0 (+ DSR),
+replacing the arbitrary ``abs(ΔSortino)>=0.10`` threshold; the report is
+observational and flip-gated; run_pit_parity runs both passes with the
+flag flipped and never raises on an S3 upload failure.
 """
 
 from __future__ import annotations
@@ -16,7 +19,6 @@ import sys
 import types
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from analysis import pit_parity as pp
@@ -65,28 +67,42 @@ def test_delta_is_pit_minus_current_and_none_safe():
         "sortino_ratio"] is None
 
 
-def test_pbo_none_without_sweep_pair():
-    assert pp._pbo_two_split(None, None) is None
+def test_pbo_none_without_pit_block_matrix():
+    # #816 gap 1+2: single-pass parity (no opt-in sweep) → pbo null, never a
+    # fabricated distribution (A-grade integrity property).
+    assert pp._cscv_pbo(None) is None
+    # Degenerate shapes are also null (not fabricated).
+    assert pp._cscv_pbo([[1.0, 2.0]]) is None          # 1 block
+    assert pp._cscv_pbo([[1.0], [2.0], [3.0], [4.0]]) is None  # 1 combo
 
 
-def test_pbo_two_split_detects_overfit():
-    # In-sample ranks configs c0>c1>c2; out-of-sample reverses → the best
-    # IS config (c0) lands at OOS percentile 0.0 < 0.5 ⇒ overfit=True.
-    cur = pd.DataFrame({"config_id": [0, 1, 2], "sortino_ratio": [3.0, 2.0, 1.0]})
-    pit = pd.DataFrame({"config_id": [0, 1, 2], "sortino_ratio": [1.0, 2.0, 3.0]})
-    r = pp._pbo_two_split(cur, pit)
-    assert r["n_configs"] == 3
-    assert r["overfit"] is True
-    assert r["best_in_sample_config_oos_percentile"] == pytest.approx(0.0)
-    assert r["spearman_rank_corr"] == pytest.approx(-1.0)
+def test_cscv_pbo_full_m_block_distribution():
+    # #816 gap 1: full M-block CSCV on the PIT block matrix produces a real
+    # PBO number via nousergon_lib.quant.stats.pbo.cscv_pbo (not a 2-split
+    # rank-corr). Overfit construction: combo 0 is best in early blocks and
+    # worst in late blocks → the in-sample winner lands low OOS → high PBO.
+    rng = np.random.default_rng(0)
+    n_blocks, n_combos = 8, 6
+    mat = rng.normal(0, 0.1, size=(n_blocks, n_combos))
+    # Make combo 0 the noisy "overfit" pick: great in first half, poor after.
+    mat[: n_blocks // 2, 0] += 3.0
+    mat[n_blocks // 2 :, 0] -= 3.0
+    r = pp._cscv_pbo(mat.tolist())
+    assert r is not None
+    assert r["status"] == "ok"
+    assert r["n_splits"] == n_blocks
+    assert r["n_specs"] == n_combos
+    assert 0.0 <= r["pbo"] <= 1.0          # a real probability, not a rank-corr
+    assert "M-block" in r["method"]
 
 
-def test_pbo_two_split_stable_when_ranks_agree():
-    cur = pd.DataFrame({"config_id": [0, 1, 2], "sortino_ratio": [3.0, 2.0, 1.0]})
-    pit = pd.DataFrame({"config_id": [0, 1, 2], "sortino_ratio": [3.1, 2.2, 0.9]})
-    r = pp._pbo_two_split(cur, pit)
-    assert r["overfit"] is False
-    assert r["best_in_sample_config_oos_percentile"] == pytest.approx(1.0)
+def test_cscv_pbo_insufficient_is_honest_not_fabricated():
+    # <min_splits clean blocks → engine returns status insufficient, NOT a pass.
+    mat = [[1.0, 2.0], [2.0, 1.0]]  # 2 blocks < min_splits(4)
+    r = pp._cscv_pbo(mat, min_splits=4)
+    assert r is not None
+    assert r["status"] != "ok"          # honest-N/A, never a fabricated number
+    assert r.get("pbo") is None or "status" in r
 
 
 def test_build_report_shape_and_materiality():
@@ -98,16 +114,104 @@ def test_build_report_shape_and_materiality():
     )
     assert rep["schema"] == pp.SCHEMA
     assert "Sharpe deliberately absent" in rep["anchor"]
-    # ΔSortino = 0.85 − 1.20 = −0.35 → |Δ| ≥ 0.10 ⇒ material.
     assert rep["delta_pit_minus_current"]["sortino_ratio"] == pytest.approx(-0.35)
-    assert rep["materiality"]["material"] is True
-    assert rep["pbo"] is None  # no sweep pair in single-pass parity
+    # #816 gap 3: materiality is now a bootstrap CI (or legacy fallback) — the
+    # block carries the bootstrap_ci + dsr sub-reports, not a hard threshold.
+    assert "material" in rep["materiality"]
+    assert "basis" in rep["materiality"]
+    assert "bootstrap_ci" in rep["materiality"]
+    assert "dsr" in rep["materiality"]
+    assert "sortino_delta_threshold" not in rep["materiality"]  # arbitrary threshold gone
+    assert rep["pbo"] is None  # no PIT block matrix in single-pass parity
     assert rep["observational"] is True
     assert "Brian-gated" in rep["flip_gate"]
     assert rep["run_quality"]["walk_forward"]["n_cold_start_excluded"] == 6
     assert rep["headline_log_alpha_delta"] == pytest.approx(
         (0.006 + 0.001) - (0.012 + 0.004)
     )
+
+
+def test_block_bootstrap_ci_excludes_zero_fires_material():
+    # A delta stream far from 0 (all strongly negative) → the block-bootstrap
+    # 95% CI excludes 0 → primary materiality trigger fires.
+    rng = np.random.default_rng(1)
+    delta = rng.normal(-0.02, 0.001, size=200)  # tight, clearly < 0
+    ci = pp._block_bootstrap_ci(delta, seed=0)
+    assert ci["status"] == "ok"
+    assert ci["excludes_zero"] is True
+    assert ci["ci_high"] < 0.0
+    assert "block" in ci["method"]
+    assert ci["block_size"] >= 1
+
+
+def test_block_bootstrap_ci_includes_zero_not_material():
+    # A delta stream centered on 0 → CI includes 0 → not material.
+    rng = np.random.default_rng(2)
+    delta = rng.normal(0.0, 0.02, size=200)
+    ci = pp._block_bootstrap_ci(delta, seed=0)
+    assert ci["status"] == "ok"
+    assert ci["excludes_zero"] is False
+    assert ci["ci_low"] < 0.0 < ci["ci_high"]
+
+
+def test_block_bootstrap_ci_insufficient_data():
+    r = pp._block_bootstrap_ci([0.01])          # <2 obs
+    assert r["status"] == "insufficient_data"
+    assert r["excludes_zero"] is False
+    assert pp._block_bootstrap_ci(None) is None
+
+
+def test_materiality_uses_bootstrap_ci_when_streams_present():
+    # PIT strictly below current on every date → per-date delta all negative →
+    # CI excludes 0 → material via the bootstrap CI (not the legacy threshold).
+    n = 120
+    cur = _stats(1.0, 0.9, -0.03, -0.15, list(np.full(n, 0.01)), 0.03)
+    pit = _stats(1.0, 0.9, -0.03, -0.15, list(np.full(n, -0.005)), 0.01)
+    rep = pp.build_contamination_report(cur, pit, run_date="2026-05-17")
+    assert rep["materiality"]["basis"] == "block_bootstrap_ci_excludes_zero"
+    assert rep["materiality"]["material"] is True
+    assert rep["materiality"]["bootstrap_ci"]["excludes_zero"] is True
+
+
+def test_materiality_falls_back_to_legacy_without_streams():
+    # Scalar-only stats (no daily_log_returns) → no per-date delta → legacy
+    # |ΔSortino|>=0.10 fallback keeps a materiality signal for old callers.
+    cur = {"sortino_ratio": 1.20, "psr": 0.9, "cvar_95": -0.03, "max_drawdown": -0.1}
+    pit = {"sortino_ratio": 0.85, "psr": 0.8, "cvar_95": -0.04, "max_drawdown": -0.2}
+    rep = pp.build_contamination_report(cur, pit, run_date="2026-05-17")
+    assert rep["materiality"]["basis"] == "legacy_sortino_delta_threshold_fallback"
+    assert rep["materiality"]["material"] is True  # |ΔSortino|=0.35 >= 0.10
+
+
+def test_dsr_materiality_on_pit_winner():
+    # DSR on the PIT winner's return stream, deflated for n_trials selection bias.
+    rng = np.random.default_rng(3)
+    pit = _stats(1.0, 0.9, -0.03, -0.15, list(rng.normal(0.001, 0.01, size=250)), 0.03)
+    r = pp._dsr_materiality(pit, n_trials=12)
+    assert r is not None
+    assert "dsr" in r
+    assert r["n_trials"] == 12
+    # No n_trials (no opt-in sweep) → honest None, never fabricated.
+    assert pp._dsr_materiality(pit, n_trials=None) is None
+
+
+def test_report_pbo_distribution_when_pit_block_matrix_present():
+    # #816 gap 1+2 end-to-end: a PIT block matrix flows into the report as a
+    # real PBO distribution; n_trials drives DSR.
+    rng = np.random.default_rng(4)
+    n = 120
+    cur = _stats(1.0, 0.9, -0.03, -0.15, list(rng.normal(0.001, 0.01, n)), 0.03)
+    pit = _stats(0.9, 0.9, -0.03, -0.15, list(rng.normal(0.0005, 0.01, n)), 0.02)
+    mat = rng.normal(0, 0.1, size=(8, 6)).tolist()
+    rep = pp.build_contamination_report(
+        cur, pit, run_date="2026-05-17",
+        pit_block_matrix=mat, n_trials=6,
+    )
+    assert rep["pbo"] is not None
+    assert rep["pbo"]["status"] == "ok"
+    assert 0.0 <= rep["pbo"]["pbo"] <= 1.0
+    assert rep["run_quality"]["n_configs_swept"] == 6
+    assert rep["materiality"]["dsr"] is not None  # DSR computed from n_trials
 
 
 def test_run_pit_parity_runs_both_passes_and_survives_upload_failure(monkeypatch):

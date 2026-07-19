@@ -534,6 +534,34 @@ pre_launch_preflight() {
         echo "  pre-launch: WARNING — local HEAD ($lhead) is not in origin/$BRANCH; the spot clones origin/$BRANCH and will run WITHOUT your local commits. Push first." >&2
     fi
 
+    # (4) SOFT: config#2871 — config.yaml is commonly a symlink into the
+    # alpha-engine-config repo's tracked backtester/config.yaml (operator
+    # flags like pit_parity_sweep live there). If the symlink resolves
+    # outside a git-tracked path, or the resolved file has uncommitted
+    # drift, an operator hand-edit would silently vanish on the next
+    # symlink/box rebuild with no diff and no audit trail.
+    local cfg_real cfg_git_root cfg_rel cfg_dirty
+    if [ -L "$REPO_ROOT/config.yaml" ]; then
+        cfg_real=$(readlink -f "$REPO_ROOT/config.yaml" 2>/dev/null || true)
+        if [ -n "$cfg_real" ]; then
+            cfg_git_root=$(git -C "$(dirname "$cfg_real")" rev-parse --show-toplevel 2>/dev/null || true)
+            if [ -z "$cfg_git_root" ]; then
+                echo "  pre-launch: WARNING — config.yaml symlinks to $cfg_real, which is NOT inside a git repo; operator flags there have no audit trail and will vanish on rebuild." >&2
+            else
+                cfg_rel="${cfg_real#"$cfg_git_root"/}"
+                if ! git -C "$cfg_git_root" ls-files --error-unmatch "$cfg_rel" >/dev/null 2>&1; then
+                    echo "  pre-launch: WARNING — config.yaml symlinks to $cfg_real, which is NOT git-tracked in $cfg_git_root; operator flags there have no audit trail and will vanish on rebuild." >&2
+                else
+                    cfg_dirty=$(git -C "$cfg_git_root" status --porcelain -- "$cfg_rel" 2>/dev/null || true)
+                    if [ -n "$cfg_dirty" ]; then
+                        echo "  pre-launch: WARNING — config.yaml ($cfg_real) has uncommitted changes not captured in git ($cfg_git_root); these operator flags will NOT survive a rebuild of this symlink. Commit + PR the change:" >&2
+                        echo "$cfg_dirty" | sed 's/^/      /' >&2
+                    fi
+                fi
+            fi
+        fi
+    fi
+
     echo "  pre-launch preflight OK."
 }
 echo "==> Dispatcher pre-launch preflight (fail-fast before provisioning spot)..."
@@ -908,8 +936,26 @@ PYBIN="\${PIP% -m pip}"
     exit 1
 }
 
-# Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)
-\$PIP install -q 'numpy<2'
+# Fail-loud numpy-2 consistency guard (config#2815 migration completion).
+# A stale  \$PIP install 'numpy<2'  used to sit here — added 2026-03-24 (commit
+# 0534004) when pyarrow wheels were still numpy-1 built. The config#2815
+# numpy-2 migration (#536, 2026-07-17) lifted requirements.txt to numpy>=2
+# across backtester + predictor (cvxpy/scipy/vectorbt all now require numpy>=2),
+# but left this caller-side downgrade behind. On the first weekly spot run after
+# the migration it force-downgraded numpy 2.5.1 -> 1.26.4 AFTER the requirements
+# install, leaving the numpy-2-built scipy/cvxpy referencing np.long (removed in
+# numpy 1.24-1.26) -> the backtester runtime_smoke's GBMScorer.load crashed at
+# 'import scipy.sparse' with "module 'numpy' has no attribute 'long'". The
+# downgrade is REMOVED (complete the migration; never re-extend a deprecated
+# shim). This guard asserts the exact import chain that broke (numpy>=2 +
+# scipy.sparse + lightgbm) AFTER all installs, so any future co-installed pin
+# that downgrades numpy breaks LOUD here at deps time (seconds) instead of ~40
+# min into the run. Per feedback_no_silent_fails.
+# (NB: no backticks in this heredoc body -- they would command-substitute.)
+\$PYBIN -c "import numpy, scipy.sparse, lightgbm; assert int(numpy.__version__.split('.')[0]) >= 2, 'numpy '+numpy.__version__+' < 2.0 is inconsistent with the numpy-2-built scipy/cvxpy stack (config#2815)'; print('numpy-2 guard OK: numpy='+numpy.__version__+' scipy='+scipy.__version__+' lightgbm='+lightgbm.__version__)" || {
+    echo "FATAL: numpy-2 environment consistency check failed — a co-installed pin or stale downgrade left numpy below 2.0, breaking the numpy-2-built scipy/lightgbm stack (config#2815). See traceback above." >&2
+    exit 1
+}
 
 echo "Dependencies installed."
 DEPS
