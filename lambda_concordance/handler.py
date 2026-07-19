@@ -3,10 +3,16 @@
 Wraps ``replay.batch.compute_and_emit_concordance`` for the Saturday SF
 weekly run. Iterates the trailing-window decision_artifacts corpus,
 replays each artifact under the configured target model(s) via
-langchain_anthropic + the canonical Pydantic schema, aggregates
-agreement_score per (agent_id_base, target_model), emits the
-``agent_cheap_model_concordance`` CloudWatch metric, persists per-target
-summary JSON to S3.
+``krepis.llm.LLMClient``'s OpenRouter transport + the canonical Pydantic
+schema, aggregates agreement_score per (agent_id_base, target_model),
+emits the ``agent_cheap_model_concordance`` CloudWatch metric, persists
+per-target summary JSON to S3.
+
+**alpha-engine-config-I2997 (2026-07-19):** migrated off direct Anthropic
+(``langchain_anthropic.ChatAnthropic``) to OpenRouter — see
+``replay/runner.py``'s module docstring for the full rationale.
+``target_models`` is now a list of OpenRouter model ids, not Anthropic
+model names.
 
 Per ROADMAP P0 "Replay harness + agent-justification gate" (Model-
 Agnostic Capability Upgrade deliverable #7 — agent-justification gate
@@ -18,7 +24,7 @@ Lambda configuration:
 Event shape (all fields optional):
 
     {
-      "target_models": ["claude-haiku-4-5"],   # default: ["claude-haiku-4-5"]
+      "target_models": ["deepseek/deepseek-v4-flash"],  # default shown
       "end_time_iso":  "2026-05-09T00:00:00Z", # default: now UTC
       "window_days":   56,                      # default: 8 weeks
       "agents":        ["sector_quant", "ic_cio"],  # default: all 6 canonical
@@ -33,14 +39,18 @@ Returns:
       "summary": <compute_and_emit_concordance result>
     }
 
-Cost note: every replay invocation costs target-model tokens. At
-production cadence (1 target × 150 artifacts × Haiku ≈ $0.08 / week).
-The ``max_artifacts`` cap is also a runtime cap — at ~3-5 sec / replay
-call, 150 artifacts fits comfortably under the 900s Lambda timeout.
+Cost note: every replay invocation costs target-model tokens. DeepSeek V4
+Flash via OpenRouter is materially cheaper per-token than the pre-migration
+Haiku baseline. The ``max_artifacts`` cap is also a runtime cap — at
+~3-5 sec / replay call, 150 artifacts fits comfortably under the 900s
+Lambda timeout.
 
 Environment variables:
   S3_BUCKET             — default: alpha-engine-research
-  ANTHROPIC_API_KEY     — pulled from SSM by nousergon_lib.secrets.get_secret()
+  OPENROUTER_API_KEY    — pulled from SSM by nousergon_lib.secrets.get_secret()
+                           (/alpha-engine/OPENROUTER_API_KEY — this Lambda's
+                           existing alpha-engine-ssm-read instance-role
+                           policy already covers it, no new IAM)
   EMAIL_SENDER          — flow-doctor wiring
   EMAIL_RECIPIENTS      — flow-doctor wiring
   GMAIL_APP_PASSWORD    — flow-doctor wiring
@@ -127,8 +137,8 @@ def handler(event: dict, context) -> dict:
     # above have already run for real (the keystone's whole point —
     # exercise bootstrap/import/lib-pin/transport). Return a benign
     # success BEFORE the replay.batch scan (decision_artifacts S3
-    # discovery), BEFORE any langchain_anthropic / target-model call,
-    # and BEFORE any CloudWatch metric emit or S3 summary persist.
+    # discovery), BEFORE any OpenRouter / target-model call, and BEFORE
+    # any CloudWatch metric emit or S3 summary persist.
     if is_shell_run_dry(event):
         logger.info(
             "[lambda_concordance] shell-run dry path: boot+imports OK, "
@@ -138,7 +148,7 @@ def handler(event: dict, context) -> dict:
 
     bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
 
-    target_models = event.get("target_models") or ["claude-haiku-4-5"]
+    target_models = event.get("target_models") or ["deepseek/deepseek-v4-flash"]
     if isinstance(target_models, str):
         # Convenience: accept comma-separated string from SF parameters.
         target_models = [m.strip() for m in target_models.split(",") if m.strip()]
