@@ -908,8 +908,26 @@ PYBIN="\${PIP% -m pip}"
     exit 1
 }
 
-# Force numpy<2 after all deps (pyarrow compiled against numpy 1.x)
-\$PIP install -q 'numpy<2'
+# Fail-loud numpy-2 consistency guard (config#2815 migration completion).
+# A stale  \$PIP install 'numpy<2'  used to sit here — added 2026-03-24 (commit
+# 0534004) when pyarrow wheels were still numpy-1 built. The config#2815
+# numpy-2 migration (#536, 2026-07-17) lifted requirements.txt to numpy>=2
+# across backtester + predictor (cvxpy/scipy/vectorbt all now require numpy>=2),
+# but left this caller-side downgrade behind. On the first weekly spot run after
+# the migration it force-downgraded numpy 2.5.1 -> 1.26.4 AFTER the requirements
+# install, leaving the numpy-2-built scipy/cvxpy referencing np.long (removed in
+# numpy 1.24-1.26) -> the backtester runtime_smoke's GBMScorer.load crashed at
+# 'import scipy.sparse' with "module 'numpy' has no attribute 'long'". The
+# downgrade is REMOVED (complete the migration; never re-extend a deprecated
+# shim). This guard asserts the exact import chain that broke (numpy>=2 +
+# scipy.sparse + lightgbm) AFTER all installs, so any future co-installed pin
+# that downgrades numpy breaks LOUD here at deps time (seconds) instead of ~40
+# min into the run. Per feedback_no_silent_fails.
+# (NB: no backticks in this heredoc body -- they would command-substitute.)
+\$PYBIN -c "import numpy, scipy.sparse, lightgbm; assert int(numpy.__version__.split('.')[0]) >= 2, 'numpy '+numpy.__version__+' < 2.0 is inconsistent with the numpy-2-built scipy/cvxpy stack (config#2815)'; print('numpy-2 guard OK: numpy='+numpy.__version__+' scipy='+scipy.__version__+' lightgbm='+lightgbm.__version__)" || {
+    echo "FATAL: numpy-2 environment consistency check failed — a co-installed pin or stale downgrade left numpy below 2.0, breaking the numpy-2-built scipy/lightgbm stack (config#2815). See traceback above." >&2
+    exit 1
+}
 
 echo "Dependencies installed."
 DEPS
