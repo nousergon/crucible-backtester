@@ -534,6 +534,34 @@ pre_launch_preflight() {
         echo "  pre-launch: WARNING — local HEAD ($lhead) is not in origin/$BRANCH; the spot clones origin/$BRANCH and will run WITHOUT your local commits. Push first." >&2
     fi
 
+    # (4) SOFT: config#2871 — config.yaml is commonly a symlink into the
+    # alpha-engine-config repo's tracked backtester/config.yaml (operator
+    # flags like pit_parity_sweep live there). If the symlink resolves
+    # outside a git-tracked path, or the resolved file has uncommitted
+    # drift, an operator hand-edit would silently vanish on the next
+    # symlink/box rebuild with no diff and no audit trail.
+    local cfg_real cfg_git_root cfg_rel cfg_dirty
+    if [ -L "$REPO_ROOT/config.yaml" ]; then
+        cfg_real=$(readlink -f "$REPO_ROOT/config.yaml" 2>/dev/null || true)
+        if [ -n "$cfg_real" ]; then
+            cfg_git_root=$(git -C "$(dirname "$cfg_real")" rev-parse --show-toplevel 2>/dev/null || true)
+            if [ -z "$cfg_git_root" ]; then
+                echo "  pre-launch: WARNING — config.yaml symlinks to $cfg_real, which is NOT inside a git repo; operator flags there have no audit trail and will vanish on rebuild." >&2
+            else
+                cfg_rel="${cfg_real#"$cfg_git_root"/}"
+                if ! git -C "$cfg_git_root" ls-files --error-unmatch "$cfg_rel" >/dev/null 2>&1; then
+                    echo "  pre-launch: WARNING — config.yaml symlinks to $cfg_real, which is NOT git-tracked in $cfg_git_root; operator flags there have no audit trail and will vanish on rebuild." >&2
+                else
+                    cfg_dirty=$(git -C "$cfg_git_root" status --porcelain -- "$cfg_rel" 2>/dev/null || true)
+                    if [ -n "$cfg_dirty" ]; then
+                        echo "  pre-launch: WARNING — config.yaml ($cfg_real) has uncommitted changes not captured in git ($cfg_git_root); these operator flags will NOT survive a rebuild of this symlink. Commit + PR the change:" >&2
+                        echo "$cfg_dirty" | sed 's/^/      /' >&2
+                    fi
+                fi
+            fi
+        fi
+    fi
+
     echo "  pre-launch preflight OK."
 }
 echo "==> Dispatcher pre-launch preflight (fail-fast before provisioning spot)..."
