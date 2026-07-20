@@ -5872,17 +5872,36 @@ def _main_impl() -> None:
     # crucible-backtester#419) reads to compute the counterfactual. Runs the FULL
     # meta-ensemble (crucible-predictor's MetaModel.predict_single) with the 4
     # research meta-features omitted -> 0.0, over the scanner-passing universe
-    # (scanner_evaluations.quant_filter_pass=1). Idempotent (skip-if-cached on
-    # (ticker, prediction_date)) — a normal weekly run only backfills the delta
-    # since the last pass. OBSERVE-only: gates nothing, feeds e2e_lift once run.
-    # Non-fatal — this is a measurement producer, not a promotion-critical gate;
-    # a failure here must never block the rest of the Saturday pipeline.
+    # (candidates.json's scanner_eval_log, quant_filter_pass=1 — config#3053).
+    # Idempotent (skip-if-cached on (ticker, prediction_date)) — a normal
+    # weekly run only backfills the delta since the last pass.
+    #
+    # config#3053: this phase started OBSERVE-only ("a failure here must never
+    # block the rest of the Saturday pipeline") and that posture was correct
+    # while the arm fed only the e2e counterfactual — but has been stale since
+    # 2026-07-13, when config/producer_champion.json first named
+    # scanner_predictor_direct the LIVE champion. A silently swallowed failure
+    # here now means the weekday order pipeline trades on (or hard-fails on)
+    # a stale champion feed days later, with zero same-day signal. So: still
+    # non-fatal for the OBSERVE-only arm, but FAIL LOUD (re-raise, defeating
+    # the swallow below) whenever the live champion actually depends on this
+    # feed — checked once, up front, so both the swallow decision and the
+    # post-backfill freshness assertion use the same live-champion read.
     if args.mode in ("predictor-backtest", "all") and config.get("research_db"):
+        from analysis.scanner_predictor_research_free_backfill import (
+            assert_champion_feed_fresh,
+            run_backfill,
+        )
+        from optimizer.champion_promotion import read_champion_pointer
+
+        research_free_bucket = config.get("signals_bucket", "alpha-engine-research")
+        champion_pointer = read_champion_pointer(research_free_bucket)
+        live_champion_feed = bool(
+            champion_pointer and champion_pointer.get("champion") == "scanner_predictor_direct"
+        )
         try:
             with registry.phase("scanner_predictor_research_free_backfill", mode=args.mode):
                 import sqlite3
-
-                from analysis.scanner_predictor_research_free_backfill import run_backfill
 
                 predictor_paths = config.get("predictor_paths") or []
                 if isinstance(predictor_paths, str):
@@ -5899,14 +5918,23 @@ def _main_impl() -> None:
                         rf_result = run_backfill(
                             rf_conn,
                             predictor_path=predictor_path,
-                            bucket=config.get("signals_bucket", "alpha-engine-research"),
+                            bucket=research_free_bucket,
                         )
                         logger.info(
                             "scanner_predictor_research_free_backfill: %s", rf_result,
                         )
                     finally:
                         rf_conn.close()
+                if live_champion_feed:
+                    assert_champion_feed_fresh(
+                        research_free_bucket,
+                        run_date=config.get("_run_date") or args.date,
+                        max_days=int(config.get("champion_freshness_max_days", 8)),
+                    )
         except Exception as exc:
+            if live_champion_feed:
+                # LIVE champion trade feed — never swallow (config#3053).
+                raise
             logger.warning(
                 "scanner_predictor_research_free_backfill phase failed (non-fatal, "
                 "OBSERVE-only — config#1405): %s", exc, exc_info=True,

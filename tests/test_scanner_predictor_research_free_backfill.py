@@ -1,12 +1,14 @@
 """Tests for the research-free meta-ensemble backfill producer (config#1405,
-build items 1+2) — ``analysis/scanner_predictor_research_free_backfill.py``.
+build items 1+2; S3-sourced pending-universe + freshness assertion added by
+config#3053) — ``analysis/scanner_predictor_research_free_backfill.py``.
 
-Mirrors ``tests/test_scanner_then_predictor.py``'s approach: a synthetic
-sqlite fixture (no ArcticDB / S3 / real model artifact needed) exercising the
-producer's logic — idempotency (skip-if-cached), the (ticker, eval_date)
-pending-universe query against ``scanner_evaluations``, table creation /
-schema, and the research-free feature-zeroing contract
-(``_assemble_research_free_features``). The ArcticDB-backed feature
+A synthetic sqlite fixture (no ArcticDB needed) plus a fake S3 client
+exercise the producer's logic — idempotency (skip-if-cached), the
+(ticker, eval_date) pending-universe query against S3
+``candidates/{date}/candidates.json::scanner_eval_log`` (config#3053 — NOT
+the retired ``scanner_evaluations`` sqlite table), table creation / schema,
+the champion-feed freshness assertion, and the research-free feature-zeroing
+contract (``_assemble_research_free_features``). The ArcticDB-backed feature
 computation (``run_backfill`` end-to-end) is exercised in the PR description
 against the LIVE production store instead — not reproducible hermetically
 here, per the issue's own testing section ("the meta-ensemble backfill
@@ -15,45 +17,123 @@ validates on the spot run").
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from botocore.exceptions import ClientError
+
 from analysis.scanner_predictor_research_free_backfill import (
+    ARTIFACT_KEY,
     RESEARCH_META_FEATURES,
     TABLE_NAME,
+    NoCandidatesArtifactError,
+    StaleChampionFeedError,
     _assemble_research_free_features,
     _ensure_table,
     _existing_keys,
+    _list_recent_candidate_dates,
     _pending_universe,
+    assert_champion_feed_fresh,
 )
 
 
-def _scanner_db(tmp_path, *, prefill_predictions=None):
-    conn = sqlite3.connect(str(tmp_path / "r.db"))
-    conn.execute(
-        "CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT, quant_filter_pass INTEGER)"
-    )
-    dates = ["2026-04-12", "2026-04-20"]
-    for d in dates:
-        for i in range(5):
-            conn.execute(
-                "INSERT INTO scanner_evaluations VALUES (?,?,?)",
-                (f"T{i}", d, 1 if i < 3 else 0),  # only T0/T1/T2 pass per date
+# ── Fake S3: download_file/upload_file (parquet) + list_objects_v2/get_object
+# (candidates.json) backed by an in-memory dict of key -> bytes/local path.
+# Mirrors tests/test_reporter.py's injected s3_client idiom.
+
+
+class _FakeS3:
+    def __init__(self, tmp_path):
+        self._tmp = tmp_path
+        self._objects: dict[str, str] = {}   # key -> local filepath (parquet)
+        self._bodies: dict[str, bytes] = {}   # key -> raw bytes (candidates.json)
+        self.upload_calls: list[tuple[str, str, str]] = []
+
+    def put_local(self, key: str, local_path: str) -> None:
+        self._objects[key] = local_path
+
+    def put_candidates(self, date: str, artifact: dict) -> None:
+        key = f"candidates/{date}/candidates.json"
+        self._bodies[key] = json.dumps(artifact).encode("utf-8")
+
+    def download_file(self, bucket, key, dest):
+        import shutil
+
+        if key not in self._objects:
+            raise ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
             )
-    if prefill_predictions:
-        conn.execute(
-            f"CREATE TABLE {TABLE_NAME} (ticker TEXT, prediction_date TEXT, "
-            "predicted_alpha REAL, n_research_features_missing INTEGER)"
+        shutil.copyfile(self._objects[key], dest)
+
+    def upload_file(self, src, bucket, key):
+        import shutil
+
+        stored = str(self._tmp / f"stored_{key.replace('/', '_')}")
+        shutil.copyfile(src, stored)
+        self._objects[key] = stored
+        self.upload_calls.append((src, bucket, key))
+
+    def get_object(self, Bucket, Key):
+        if Key in self._bodies:
+            return {"Body": _Body(self._bodies[Key])}
+        if Key in self._objects:
+            with open(self._objects[Key], "rb") as fh:
+                return {"Body": _Body(fh.read())}
+        raise ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not Found"}}, "GetObject"
         )
-        for ticker, d, alpha in prefill_predictions:
-            conn.execute(
-                f"INSERT INTO {TABLE_NAME} VALUES (?,?,?,?)", (ticker, d, alpha, 4)
-            )
+
+    def list_objects_v2(self, Bucket, Prefix, Delimiter=None, ContinuationToken=None):
+        dates = sorted({
+            key[len(Prefix):].split("/")[0]
+            for key in self._bodies
+            if key.startswith(Prefix)
+        })
+        return {
+            "CommonPrefixes": [{"Prefix": f"{Prefix}{d}/"} for d in dates],
+            "IsTruncated": False,
+        }
+
+
+class _Body:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self):
+        return self._data
+
+
+def _candidates_artifact(run_date: str, eval_log: list[dict]) -> dict:
+    return {"run_date": run_date, "scanner_eval_log": eval_log}
+
+
+def _eval_rows(passing: list[str], failing: list[str]) -> list[dict]:
+    return [
+        {"ticker": t, "quant_filter_pass": 1} for t in passing
+    ] + [
+        {"ticker": t, "quant_filter_pass": 0} for t in failing
+    ]
+
+
+def _seeded_s3(tmp_path, *, dates=("2026-04-12", "2026-04-20")) -> _FakeS3:
+    """A fake S3 carrying candidates.json for each of ``dates`` with 3
+    passing (T0/T1/T2) + 2 failing (T3/T4) tickers — the S3 analog of the
+    old ``_scanner_db`` sqlite fixture this module used before config#3053."""
+    s3 = _FakeS3(tmp_path)
+    for d in dates:
+        s3.put_candidates(d, _candidates_artifact(d, _eval_rows(["T0", "T1", "T2"], ["T3", "T4"])))
+    return s3
+
+
+def _prefill(conn, rows):
+    _ensure_table(conn)
+    for ticker, d, alpha in rows:
+        conn.execute(f"INSERT INTO {TABLE_NAME} VALUES (?,?,?,?)", (ticker, d, alpha, 4))
     conn.commit()
-    return conn
 
 
 # ── _ensure_table / schema ───────────────────────────────────────────────────
@@ -89,13 +169,16 @@ def test_table_matches_consumer_contract_from_end_to_end_test():
     assert cols == ["ticker", "prediction_date", "predicted_alpha", "n_research_features_missing"]
 
 
-# ── _pending_universe / idempotency (skip-if-cached) ────────────────────────
+# ── _pending_universe / idempotency (skip-if-cached) — config#3053: sourced
+# from S3 candidates.json::scanner_eval_log, not the retired
+# scanner_evaluations sqlite table. ───────────────────────────────────────
 
 
-def test_pending_universe_returns_all_passing_rows_when_table_empty(tmp_path):
-    conn = _scanner_db(tmp_path)
+def test_pending_universe_returns_all_passing_rows_when_nothing_cached(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
     _ensure_table(conn)
-    pending = _pending_universe(conn)
+    s3 = _seeded_s3(tmp_path)
+    pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
     # 3 passing tickers x 2 dates = 6 rows, none cached yet
     assert len(pending) == 6, pending
     assert set(pending["ticker"]) == {"T0", "T1", "T2"}
@@ -103,11 +186,11 @@ def test_pending_universe_returns_all_passing_rows_when_table_empty(tmp_path):
 
 
 def test_pending_universe_excludes_already_cached_rows(tmp_path):
-    conn = _scanner_db(
-        tmp_path,
-        prefill_predictions=[("T0", "2026-04-12", 0.01), ("T1", "2026-04-12", -0.02)],
-    )
-    pending = _pending_universe(conn)
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    _ensure_table(conn)
+    _prefill(conn, [("T0", "2026-04-12", 0.01), ("T1", "2026-04-12", -0.02)])
+    s3 = _seeded_s3(tmp_path)
+    pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
     # 6 total - 2 cached = 4 remaining
     assert len(pending) == 4, pending
     pairs = set(zip(pending["ticker"], pending["eval_date"]))
@@ -118,31 +201,63 @@ def test_pending_universe_excludes_already_cached_rows(tmp_path):
 
 
 def test_pending_universe_empty_when_fully_cached(tmp_path):
-    prefill = [
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    _ensure_table(conn)
+    _prefill(conn, [
         (f"T{i}", d, 0.0)
         for d in ("2026-04-12", "2026-04-20")
         for i in range(3)
-    ]
-    conn = _scanner_db(tmp_path, prefill_predictions=prefill)
-    pending = _pending_universe(conn)
+    ])
+    s3 = _seeded_s3(tmp_path)
+    pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
     assert pending.empty, pending
 
 
-def test_pending_universe_raises_without_quant_filter_pass_column(tmp_path):
+def test_pending_universe_raises_when_no_candidates_artifact_in_window(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "bad.db"))
-    conn.execute("CREATE TABLE scanner_evaluations (ticker TEXT, eval_date TEXT)")
-    conn.commit()
+    _ensure_table(conn)
+    s3 = _FakeS3(tmp_path)  # no candidates.json written at all
     try:
-        _pending_universe(conn)
-        assert False, "expected sqlite3.OperationalError"
-    except sqlite3.OperationalError as e:
-        assert "quant_filter_pass" in str(e)
+        _pending_universe(conn, bucket="any-bucket", s3_client=s3)
+        assert False, "expected NoCandidatesArtifactError"
+    except NoCandidatesArtifactError as e:
+        assert "candidates.json" in str(e)
+
+
+def test_pending_universe_skips_week_with_empty_eval_log_but_uses_others(tmp_path):
+    """config#3053 item (c): a scan week producing zero eval rows is a
+    Scanner-side contract violation, logged and skipped — not silently
+    treated as identical to 'nothing to backfill' for the WHOLE window when
+    another week in the same window has real data."""
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    _ensure_table(conn)
+    s3 = _FakeS3(tmp_path)
+    s3.put_candidates("2026-04-12", _candidates_artifact("2026-04-12", []))
+    s3.put_candidates("2026-04-20", _candidates_artifact(
+        "2026-04-20", _eval_rows(["T0"], ["T1"]),
+    ))
+    pending = _pending_universe(conn, bucket="any-bucket", s3_client=s3)
+    assert set(zip(pending["ticker"], pending["eval_date"])) == {("T0", "2026-04-20")}
+
+
+def test_pending_universe_respects_lookback_window(tmp_path):
+    """A candidates.json older than lookback_days is not considered."""
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    _ensure_table(conn)
+    s3 = _FakeS3(tmp_path)
+    s3.put_candidates("2020-01-04", _candidates_artifact(
+        "2020-01-04", _eval_rows(["ANCIENT"], []),
+    ))
+    try:
+        _pending_universe(conn, bucket="any-bucket", s3_client=s3, lookback_days=120)
+        assert False, "expected NoCandidatesArtifactError"
+    except NoCandidatesArtifactError:
+        pass
 
 
 def test_existing_keys_reads_ticker_prediction_date_pairs(tmp_path):
-    conn = _scanner_db(
-        tmp_path, prefill_predictions=[("T0", "2026-04-12", 0.01)]
-    )
+    conn = sqlite3.connect(str(tmp_path / "r.db"))
+    _prefill(conn, [("T0", "2026-04-12", 0.01)])
     keys = _existing_keys(conn)
     assert keys == {("T0", "2026-04-12")}
 
@@ -150,6 +265,67 @@ def test_existing_keys_reads_ticker_prediction_date_pairs(tmp_path):
 def test_existing_keys_empty_when_table_absent(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "e.db"))
     assert _existing_keys(conn) == set()
+
+
+# ── _list_recent_candidate_dates ─────────────────────────────────────────────
+
+
+def test_list_recent_candidate_dates_sorted_and_filtered(tmp_path):
+    s3 = _seeded_s3(tmp_path, dates=("2026-04-12", "2026-04-20", "2026-04-06"))
+    dates = _list_recent_candidate_dates("any-bucket", s3_client=s3, lookback_days=365)
+    assert dates == ["2026-04-06", "2026-04-12", "2026-04-20"]
+
+
+def test_list_recent_candidate_dates_empty_when_no_objects(tmp_path):
+    s3 = _FakeS3(tmp_path)
+    assert _list_recent_candidate_dates("any-bucket", s3_client=s3) == []
+
+
+# ── assert_champion_feed_fresh (config#3053) ─────────────────────────────────
+
+
+def _write_parquet_artifact(s3: _FakeS3, tmp_path, rows) -> None:
+    import pandas as pd
+
+    df = pd.DataFrame(rows, columns=["ticker", "prediction_date", "predicted_alpha", "n_research_features_missing"])
+    local = tmp_path / "artifact.parquet"
+    df.to_parquet(local, index=False)
+    s3.put_local(ARTIFACT_KEY, str(local))
+
+
+def test_assert_champion_feed_fresh_passes_within_window(tmp_path):
+    s3 = _FakeS3(tmp_path)
+    _write_parquet_artifact(s3, tmp_path, [("T0", "2026-07-17", 0.01, 4)])
+    assert_champion_feed_fresh("any-bucket", run_date="2026-07-20", max_days=8, s3_client=s3)
+
+
+def test_assert_champion_feed_fresh_raises_when_stale(tmp_path):
+    s3 = _FakeS3(tmp_path)
+    _write_parquet_artifact(s3, tmp_path, [("T0", "2026-07-10", 0.01, 4)])
+    try:
+        assert_champion_feed_fresh("any-bucket", run_date="2026-07-20", max_days=8, s3_client=s3)
+        assert False, "expected StaleChampionFeedError"
+    except StaleChampionFeedError as e:
+        assert "stale" in str(e)
+
+
+def test_assert_champion_feed_fresh_raises_when_artifact_missing(tmp_path):
+    s3 = _FakeS3(tmp_path)  # no parquet uploaded
+    try:
+        assert_champion_feed_fresh("any-bucket", run_date="2026-07-20", max_days=8, s3_client=s3)
+        assert False, "expected StaleChampionFeedError"
+    except StaleChampionFeedError as e:
+        assert "unreadable" in str(e)
+
+
+def test_assert_champion_feed_fresh_raises_when_empty(tmp_path):
+    s3 = _FakeS3(tmp_path)
+    _write_parquet_artifact(s3, tmp_path, [])
+    try:
+        assert_champion_feed_fresh("any-bucket", run_date="2026-07-20", max_days=8, s3_client=s3)
+        assert False, "expected StaleChampionFeedError"
+    except StaleChampionFeedError as e:
+        assert "empty" in str(e)
 
 
 # ── _assemble_research_free_features — the research-free contract ───────────
@@ -268,39 +444,8 @@ def test_insert_or_replace_on_primary_key_is_idempotent(tmp_path):
 # The producer (PredictorBacktest box) and consumer (Evaluator box) each pull
 # their OWN throwaway research.db copy from S3 and nothing pushes it back —
 # the parquet at ARTIFACT_KEY is the only wire between them. These tests
-# exercise both directions of that seam hermetically via a fake s3 client
-# (mirrors tests/test_reporter.py's injected s3_client idiom).
-
-
-class _FakeS3:
-    """download_file/upload_file backed by a local dict of key -> filepath."""
-
-    def __init__(self, tmp_path):
-        self._tmp = tmp_path
-        self._objects: dict[str, str] = {}
-        self.upload_calls: list[tuple[str, str, str]] = []
-
-    def put_local(self, key: str, local_path: str) -> None:
-        self._objects[key] = local_path
-
-    def download_file(self, bucket, key, dest):
-        import shutil
-
-        from botocore.exceptions import ClientError
-
-        if key not in self._objects:
-            raise ClientError(
-                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
-            )
-        shutil.copyfile(self._objects[key], dest)
-
-    def upload_file(self, src, bucket, key):
-        import shutil
-
-        stored = str(self._tmp / f"stored_{key.replace('/', '_')}")
-        shutil.copyfile(src, stored)
-        self._objects[key] = stored
-        self.upload_calls.append((src, bucket, key))
+# exercise both directions of that seam hermetically via the fake s3 client
+# above (mirrors tests/test_reporter.py's injected s3_client idiom).
 
 
 def test_materialize_from_s3_returns_zero_when_artifact_absent(tmp_path):
@@ -318,10 +463,7 @@ def test_export_then_materialize_roundtrip(tmp_path):
     """Producer-side export -> consumer-side materialize must reproduce the
     exact table contents on a second, independent connection (the two-box
     seam in miniature)."""
-    import pandas as pd
-
     from analysis.scanner_predictor_research_free_backfill import (
-        ARTIFACT_KEY,
         _export_artifact,
         materialize_from_s3,
     )
@@ -358,7 +500,7 @@ def test_materialize_seeds_pending_universe_idempotency(tmp_path):
         materialize_from_s3,
     )
 
-    s3 = _FakeS3(tmp_path)
+    s3 = _seeded_s3(tmp_path)
     prior = sqlite3.connect(str(tmp_path / "prior.db"))
     _ensure_table(prior)
     prior.executemany(
@@ -368,9 +510,9 @@ def test_materialize_seeds_pending_universe_idempotency(tmp_path):
     prior.commit()
     _export_artifact(prior, "any-bucket", s3_client=s3)
 
-    fresh = _scanner_db(tmp_path)  # a brand-new pull: no backfill table at all
+    fresh = sqlite3.connect(str(tmp_path / "fresh.db"))  # a brand-new pull: no backfill table at all
     materialize_from_s3(fresh, "any-bucket", s3_client=s3)
-    pending = _pending_universe(fresh)
+    pending = _pending_universe(fresh, bucket="any-bucket", s3_client=s3)
     pairs = set(zip(pending["ticker"], pending["eval_date"]))
     assert ("T0", "2026-04-12") not in pairs
     assert ("T1", "2026-04-12") not in pairs
@@ -380,8 +522,6 @@ def test_materialize_seeds_pending_universe_idempotency(tmp_path):
 def test_materialize_raises_on_non_404_download_error(tmp_path):
     """A corrupt/unreachable artifact must raise, never silently demote the
     counterfactual back to 'skipped' (fail-loud doctrine)."""
-    from botocore.exceptions import ClientError
-
     from analysis.scanner_predictor_research_free_backfill import materialize_from_s3
 
     class _Denied(_FakeS3):

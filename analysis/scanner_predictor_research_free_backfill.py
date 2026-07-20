@@ -60,7 +60,17 @@ Design notes / deliberate scope decisions:
 - **Idempotent / skip-if-cached**: before computing, reads the
   ``(ticker, prediction_date)`` keys already present in
   ``predictor_outcomes_research_free`` and skips them — a re-run (e.g. after
-  a scanner_evaluations refresh) only computes the delta.
+  a new week's Scanner cycle) only computes the delta.
+- **Scanner-passing universe sourced from S3, not sqlite (config#3053).**
+  ``_pending_universe`` reads ``candidates/{run_date}/candidates.json``'s
+  ``scanner_eval_log`` directly rather than the ``scanner_evaluations``
+  sqlite table — that table's only writer (the six-team Research graph) was
+  removed from the weekly SF by the 2026-07-14 config#1580 restructure,
+  which silently orphaned this producer and froze the live champion feed for
+  a week before it surfaced as a weekday trading incident. The standalone
+  Scanner (crucible-research PR#425) writes the equivalent per-ticker gate
+  verdict weekly straight to S3 — a versioned artifact contract, preferred
+  over a removed component's private DB table.
 - **ArcticDB is the sole feature source** (no S3-parquet fallback, matching
   the rest of the post-2026-04-16 pipeline) via ``nousergon_lib.arcticdb``.
   Contrary to the issue's macOS-vs-Saturday-spot-box framing, this store is
@@ -74,10 +84,14 @@ Design notes / deliberate scope decisions:
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 import sqlite3
 import sys
 import tempfile
+from datetime import date as _date
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
@@ -134,6 +148,141 @@ ARTIFACT_KEY = "predictor/research_free_backfill/predictor_outcomes_research_fre
 # synthetic/predictor_backtest.py::download_gbm_model.
 _WEIGHTS_PREFIX = "predictor/weights/meta/"
 
+# config#3053 root-cause: the scanner-passing universe used to come from the
+# ``scanner_evaluations`` sqlite table, whose only writer
+# (``crucible-research graph/research_graph.py::write_scanner_evaluations``,
+# the six-team Research graph) was removed from the weekly SF by the
+# 2026-07-14 config#1580 restructure — orphaning this producer's source and
+# silently freezing the live champion feed for a week before it surfaced as a
+# weekday StaleChampionFeedError trading incident. The standalone Scanner
+# (crucible-research PR#425, ``data/scanner_orchestrator.py``) writes the
+# same per-ticker gate verdict weekly (``saturday_sf`` cadence, ARTIFACT_
+# REGISTRY ``scanner_candidates_json``) directly to S3 as
+# ``candidates/{run_date}/candidates.json::scanner_eval_log`` — a versioned
+# S3 artifact contract, preferred over pulling from a removed component's
+# private DB table (M0 contract preference). ``_pending_universe`` below
+# reads THIS artifact now, not the dead table.
+_CANDIDATES_PREFIX = "candidates"
+
+
+class NoCandidatesArtifactError(RuntimeError):
+    """Raised when no ``candidates.json`` exists anywhere in the lookback
+    window — structurally distinct from a legitimate empty pending set
+    (every known passing row already backfilled). The caller (``run_backfill``)
+    treats this the same as the old "scanner_evaluations table missing" case:
+    a visible ``status: skipped``, not a silent zero-row "ok"."""
+
+
+class StaleChampionFeedError(RuntimeError):
+    """Raised by :func:`assert_champion_feed_fresh` when the research-free
+    parquet's newest ``prediction_date`` is already outside the champion
+    freshness window right after a backfill attempt. Independently defined
+    (not imported) from ``crucible-executor/executor/champion.py``'s
+    same-named exception — same posture as that module's own
+    ``CHALLENGER_SELECTION_LATEST_KEY`` literal: no non-optional cross-repo
+    import, the S3 key + freshness contract is the shared surface. Exists so
+    a producer-side gap is caught same-day (Saturday backfill) instead of
+    only showing up days later as a weekday order-pipeline incident
+    (config#3053)."""
+
+
+def _list_recent_candidate_dates(
+    bucket: str,
+    *,
+    region: str | None = None,
+    s3_client=None,
+    lookback_days: int = 120,
+) -> list[str]:
+    """List ``YYYY-MM-DD`` date strings under ``candidates/{date}/`` in S3
+    that are within ``lookback_days`` of today (UTC). Scanner writes one
+    ``candidates.json`` per week (``saturday_sf`` cadence), so even a
+    multi-year lookback stays well under a single ``list_objects_v2`` page;
+    pagination is still handled defensively.
+    """
+    s3 = s3_client or boto3.client("s3", **({"region_name": region} if region else {}))
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=lookback_days)
+    dates: list[str] = []
+    continuation_token = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": f"{_CANDIDATES_PREFIX}/", "Delimiter": "/"}
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+        resp = s3.list_objects_v2(**kwargs)
+        for cp in resp.get("CommonPrefixes") or []:
+            parts = cp.get("Prefix", "").strip("/").split("/")
+            if len(parts) != 2:
+                continue
+            try:
+                d = _date.fromisoformat(parts[1])
+            except ValueError:
+                continue
+            if d >= cutoff:
+                dates.append(parts[1])
+        if resp.get("IsTruncated"):
+            continuation_token = resp.get("NextContinuationToken")
+        else:
+            break
+    return sorted(dates)
+
+
+def assert_champion_feed_fresh(
+    bucket: str,
+    *,
+    run_date: str,
+    max_days: int = 8,
+    s3_client=None,
+    region: str | None = None,
+) -> None:
+    """Raise :class:`StaleChampionFeedError` if the research-free parquet's
+    newest ``prediction_date`` is more than ``max_days`` calendar days before
+    ``run_date`` — the SAME calendar-day-diff check
+    ``executor/champion.py::_check_freshness`` applies at trade time, run
+    here immediately after the Saturday backfill so a producer-side gap is
+    caught same-day instead of surfacing as a weekday order-pipeline
+    incident days later (config#3053).
+
+    Only meaningful for callers that already know the LIVE champion depends
+    on this feed (``config/producer_champion.json`` champion ==
+    ``scanner_predictor_direct``) — call unconditionally and this would
+    wrongly fail the OBSERVE-only arm while it isn't the live champion.
+    """
+    s3 = s3_client or boto3.client("s3", **({"region_name": region} if region else {}))
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=ARTIFACT_KEY)
+        body = obj["Body"].read()
+    except (ClientError, BotoCoreError) as exc:
+        raise StaleChampionFeedError(
+            f"scanner_predictor_direct is the live champion but the research-free "
+            f"parquet s3://{bucket}/{ARTIFACT_KEY} is unreadable: {exc}. A stale/"
+            "missing champion feed must not trade silently."
+        ) from exc
+
+    try:
+        df = pd.read_parquet(io.BytesIO(body))
+    except Exception as exc:  # noqa: BLE001 — any parse failure must raise
+        raise StaleChampionFeedError(
+            f"scanner_predictor_direct is the live champion but s3://{bucket}/"
+            f"{ARTIFACT_KEY} failed to parse: {exc}"
+        ) from exc
+
+    if df.empty or "prediction_date" not in df.columns:
+        raise StaleChampionFeedError(
+            f"scanner_predictor_direct is the live champion but s3://{bucket}/"
+            f"{ARTIFACT_KEY} is empty or missing the prediction_date column"
+        )
+
+    latest = pd.Timestamp(df["prediction_date"].max()).date()
+    run_d = _date.fromisoformat(run_date)
+    age_days = (run_d - latest).days
+    if age_days > max_days:
+        raise StaleChampionFeedError(
+            f"scanner_predictor_direct champion feed is stale after this week's "
+            f"backfill attempt: freshest prediction_date={latest} is {age_days} "
+            f"calendar day(s) before run_date={run_date} (max allowed {max_days}). "
+            "The weekly producer did not refresh the live champion feed — failing "
+            "loud here instead of at weekday trade time (config#3053)."
+        )
+
 
 def _ensure_table(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -158,29 +307,78 @@ def _existing_keys(conn: sqlite3.Connection) -> set[tuple[str, str]]:
     return {(r[0], r[1]) for r in rows}
 
 
-def _pending_universe(conn: sqlite3.Connection) -> pd.DataFrame:
+def _pending_universe(
+    conn: sqlite3.Connection,
+    *,
+    bucket: str,
+    region: str | None = None,
+    s3_client=None,
+    lookback_days: int = 120,
+) -> pd.DataFrame:
     """The scanner-passing (ticker, eval_date) universe still needing a backfill row.
 
-    Pure read against research.db; raises ``sqlite3.OperationalError`` if
-    ``scanner_evaluations`` (or its ``quant_filter_pass`` column) is absent —
-    the caller decides how to surface that (this module has no fallback
-    universe to fall back to).
+    Reads the S3 ``candidates/{run_date}/candidates.json`` artifact's
+    ``scanner_eval_log`` directly (config#3053) — NOT the ``scanner_evaluations``
+    sqlite table, whose only writer was removed from the weekly SF by the
+    2026-07-14 config#1580 restructure (see ``_CANDIDATES_PREFIX`` comment
+    above for the full root-cause). ``scanner_eval_log`` entries carry the
+    exact same field shape the old table did (``ticker``, ``quant_filter_pass``,
+    ...); the artifact's own ``run_date`` becomes each row's ``eval_date``.
+
+    Raises :class:`NoCandidatesArtifactError` if no ``candidates.json`` exists
+    anywhere in the lookback window — the caller decides how to surface that
+    (this module has no fallback universe to fall back to). A week whose
+    artifact exists but carries an EMPTY ``scanner_eval_log`` is logged and
+    skipped rather than raised (a Scanner-side contract violation, not this
+    producer's job to paper over silently, but also not proof no OTHER week
+    in the window has real data).
     """
-    se_cols = {r[1] for r in conn.execute("PRAGMA table_info(scanner_evaluations)")}
-    if "quant_filter_pass" not in se_cols:
-        raise sqlite3.OperationalError(
-            "scanner_evaluations has no quant_filter_pass column"
-        )
-    df = pd.read_sql_query(
-        "SELECT DISTINCT ticker, eval_date FROM scanner_evaluations "
-        "WHERE quant_filter_pass=1 ORDER BY eval_date, ticker",
-        conn,
+    s3 = s3_client or boto3.client("s3", **({"region_name": region} if region else {}))
+    dates = _list_recent_candidate_dates(
+        bucket, region=region, s3_client=s3, lookback_days=lookback_days,
     )
+    if not dates:
+        raise NoCandidatesArtifactError(
+            f"no candidates.json artifacts found under s3://{bucket}/"
+            f"{_CANDIDATES_PREFIX}/ within the last {lookback_days}d — cannot "
+            "determine the scanner-passing universe (scanner_evaluations table "
+            "retired by config#1580; config#3053 root-cause)"
+        )
+
+    rows: list[dict] = []
+    for d in dates:
+        key = f"{_CANDIDATES_PREFIX}/{d}/candidates.json"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            artifact = json.loads(obj["Body"].read())
+        except (ClientError, BotoCoreError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "failed to read/parse s3://%s/%s (skipping this week's eval "
+                "log): %s", bucket, key, exc,
+            )
+            continue
+        run_date = artifact.get("run_date") or d
+        eval_log = artifact.get("scanner_eval_log") or []
+        if not eval_log:
+            logger.warning(
+                "s3://%s/%s carries an EMPTY scanner_eval_log for run_date=%s "
+                "— a scan week producing zero eval rows is a Scanner-side "
+                "contract violation, not silently papered over here "
+                "(config#3053)", bucket, key, run_date,
+            )
+            continue
+        for rec in eval_log:
+            ticker = rec.get("ticker")
+            if not ticker or not rec.get("quant_filter_pass"):
+                continue
+            rows.append({"ticker": ticker, "eval_date": run_date})
+
+    df = pd.DataFrame(rows, columns=["ticker", "eval_date"]).drop_duplicates()
     existing = _existing_keys(conn)
     if existing and not df.empty:
         mask = ~df.apply(lambda r: (r["ticker"], r["eval_date"]) in existing, axis=1)
         df = df[mask]
-    return df.reset_index(drop=True)
+    return df.sort_values(["eval_date", "ticker"]).reset_index(drop=True)
 
 
 def _download_weights_to_temp(
@@ -577,8 +775,8 @@ def run_backfill(
     # history from scratch.
     n_seeded = materialize_from_s3(conn, bucket=bucket, region=region)
     try:
-        pending = _pending_universe(conn)
-    except sqlite3.OperationalError as exc:
+        pending = _pending_universe(conn, bucket=bucket, region=region)
+    except NoCandidatesArtifactError as exc:
         return {"status": "skipped", "reason": str(exc)}
 
     if pending.empty:
