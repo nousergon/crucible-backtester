@@ -80,7 +80,12 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # risk_aversion × tcost_bps sweep verdict under backtest/{date}/ (sibling of
     # cov_sweep/gamma_sweep), OBSERVE-only, grandfathered like the other per-run
     # diagnostics rather than added to the freshness-SLA registry.
-    "backtest.py": 11,
+    # +1 (11→12) 2026-07-20: config#1993 W3.3 double_sort.json — the 2-horizon
+    # double-sort study verdict under backtest/{date}/ (sibling of
+    # horizon_net_alpha/model_version_net_alpha), OBSERVE-only, registered in
+    # ARTIFACT_REGISTRY.yaml with the same grace_period_cycles:999 treatment as
+    # those two siblings rather than a freshness-SLA row.
+    "backtest.py": 12,
     # config#1405 research-free backfill parquet (predictor/research_free_backfill/
     # predictor_outcomes_research_free.parquet) — the durable producer→consumer wire
     # for the scanner→predictor-direct counterfactual (research.db pulls are
