@@ -53,6 +53,41 @@ _DEFAULT_PBO_BLOCKS = 8  # date-aligned CSCV blocks for the pair-selection PBO
 _PBO_MIN_BLOCKS = 4      # matches nousergon_lib cscv_pbo min_splits
 
 
+def load_predictions_by_horizon_panel(
+    bucket: str, key: str, *, s3_client=None,
+) -> dict[int, dict[str, dict[str, float]]]:
+    """Load + reshape the upstream per-horizon predicted-alpha panel.
+
+    Reads the tidy long-format parquet ``{date, ticker, horizon,
+    predicted_alpha}`` that ``crucible-predictor``
+    ``analysis.horizon_battery.persist_horizon_prediction_panels`` writes to
+    ``s3://{bucket}/predictor/diagnostics/horizon_predictions/{date|latest}.parquet``
+    and pivots it into the ``{horizon: {date_str: {ticker: predicted_alpha}}}``
+    shape ``compute_double_sort`` consumes. Dates are normalized to
+    ``YYYY-MM-DD`` strings regardless of whether the parquet round-trip left
+    the ``date`` column as a ``Timestamp`` or a plain string, matching the
+    convention every other ``predictions_by_date`` panel in this repo uses.
+
+    Passes through whatever horizons are present in the parquet — the caller
+    doesn't need to pre-filter to ``DEFAULT_PAIRS``' members: a pair whose
+    horizon panel is absent degrades gracefully to
+    ``{"status": "missing_horizon_panel"}`` inside ``compute_double_sort``.
+    """
+    from phase_artifacts import load_dataframe
+
+    panel_df = load_dataframe(bucket, key, s3_client=s3_client)
+
+    predictions_by_horizon: dict[int, dict[str, dict[str, float]]] = {}
+    for h, h_df in panel_df.groupby("horizon"):
+        h = int(h)
+        by_date: dict[str, dict[str, float]] = {}
+        for date, date_df in h_df.groupby("date"):
+            date_str = pd.Timestamp(date).strftime("%Y-%m-%d")
+            by_date[date_str] = dict(zip(date_df["ticker"], date_df["predicted_alpha"]))
+        predictions_by_horizon[h] = by_date
+    return predictions_by_horizon
+
+
 def _top_quantile_book(
     predictions: dict, price_row: pd.Series, top_quantile: float
 ) -> list[str]:
