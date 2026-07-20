@@ -957,6 +957,40 @@ PYBIN="\${PIP% -m pip}"
     exit 1
 }
 
+# Fail-loud pip-check dependency-consistency gate (config#2973). The numpy-2
+# guard above only covers the ONE import chain (numpy + scipy.sparse +
+# lightgbm) that has actually broken a run so far. `pip install` reports ANY
+# OTHER co-install/transitive-dependency conflict as a post-hoc "does not
+# take into account all installed packages" warning and still exits 0, so an
+# internally-inconsistent env ships silently and only surfaces as an import
+# crash deep into the run (this is the same silent-inconsistency CLASS the
+# 2026-07-19 numpy/scipy incident belonged to, not a one-off). This gate
+# turns the whole class into a deps-time (seconds) failure instead of a
+# per-import-chain guard that must be hand-extended for every new breakage.
+#
+# Allowlist: newline-separated exact substrings of \`pip check\` conflict
+# lines known to be import-safe on the backtester path -- each entry needs a
+# comment above it justifying why the conflicting package is never imported
+# here. Currently EMPTY: the one conflict instance seen in production so far
+# (numba 0.66.0's numpy<2.5 ceiling, exposed by the config#2815 numpy-2
+# migration) was fixed at the resolution layer above (the numpy<2.5 pin,
+# config#2975/PR541) rather than allowlisted here -- numba backs vectorbt,
+# which IS imported on this path, so silencing that conflict would be unsafe.
+# (NB: no backticks in this heredoc body -- they would command-substitute.)
+PIP_CHECK_ALLOWLIST=""
+PIP_CHECK_OUT=\$(\$PYBIN -m pip check 2>&1) || true
+if [ -z "\$PIP_CHECK_ALLOWLIST" ]; then
+    PIP_CHECK_REMAIN="\$PIP_CHECK_OUT"
+else
+    PIP_CHECK_REMAIN=\$(printf '%s\n' "\$PIP_CHECK_OUT" | grep -vFf <(printf '%s\n' "\$PIP_CHECK_ALLOWLIST") || true)
+fi
+if [ -n "\$PIP_CHECK_REMAIN" ]; then
+    echo "FATAL: pip check reported non-allowlisted dependency conflicts:" >&2
+    printf '%s\n' "\$PIP_CHECK_REMAIN" >&2
+    exit 1
+fi
+echo "pip check: clean (no non-allowlisted conflicts)."
+
 echo "Dependencies installed."
 DEPS
 
