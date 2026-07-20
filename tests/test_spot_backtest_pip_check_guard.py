@@ -79,8 +79,27 @@ def test_allowlist_is_explicit_not_broad_suppression():
     s = _read()
     gate_idx = s.find("PIP_CHECK_ALLOWLIST=")
     assert gate_idx != -1, "no PIP_CHECK_ALLOWLIST allowlist variable found"
-    seg = s[gate_idx: gate_idx + 700]
+    seg = s[gate_idx: gate_idx + 1400]
     assert "grep -vFf" in seg or "grep -vF" in seg, (
         "the allowlist must be applied via a filter (grep -v) against the actual "
         "pip check output, not a bypass"
+    )
+
+
+def test_gate_passes_on_clean_exit_code():
+    """2026-07-20 regression: pip check prints 'No broken requirements found.'
+    (NON-empty) and exits 0 on a clean env. The gate originally failed on any
+    non-empty output, so the FIRST ever clean environment (config#3031's
+    co-install removal) tripped it. The gate must key on pip check's exit
+    code: exit 0 == clean, regardless of output text."""
+    s = _read()
+    gate_idx = s.find("PIP_CHECK_ALLOWLIST=")
+    seg = s[gate_idx: gate_idx + 1400]
+    assert "PIP_CHECK_RC" in seg, (
+        "the gate no longer captures pip check's exit code — a clean env's "
+        "success message ('No broken requirements found.') will be treated "
+        "as a conflict again"
+    )
+    assert 'PIP_CHECK_RC" -eq 0' in seg.replace("\\$", "$") or "PIP_CHECK_RC\" -eq 0" in seg, (
+        "the gate must branch on exit code 0 == clean before any output filtering"
     )
