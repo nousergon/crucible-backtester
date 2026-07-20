@@ -1419,8 +1419,11 @@ else
     # own date.today() on this spot instance, so the backtest stage wrote
     # backtest/2026-05-17/ while the later Evaluator spot looked under
     # backtest/2026-05-18/ — the 2026-05-17 date-split. Parity / pit_parity
-    # / evaluator already thread \${RUN_DATE}; this closes the last gap so
-    # ALL stages key off the single SF-declared date.
+    # thread \${RUN_DATE}; the evaluator invocation did NOT (this comment
+    # previously claimed it did — the drift stayed invisible until the
+    # 2026-07-20 weekday recovery rerun, config#3133) and now threads
+    # --date explicitly in its own stage block below, so ALL stages key
+    # off the single SF-declared date.
     if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --date "\${RUN_DATE}" --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1; then
         echo "ERROR: backtest.py failed. Spot run marked FAILED — check" >&2
         echo "       flow-doctor alerts. Parity + evaluator stages skipped" >&2
@@ -1560,7 +1563,15 @@ else
     if [ "${FREEZE_EVALUATOR}" = "true" ]; then
         _EVAL_FREEZE="--freeze"
     fi
-    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload \$_EVAL_FREEZE --log-level INFO 2>&1; then
+    # --date "\${RUN_DATE}" pins evaluate.py to the SF-stamped run date. The
+    # backtest stage's comment above claimed the evaluator "already threads"
+    # RUN_DATE — it never did; evaluate.py silently defaulted to its own
+    # date.today(). Invisible while the evaluator ran on weekend days (the
+    # trading-day normalization landed on the same Friday by coincidence);
+    # a WEEKDAY recovery rerun (watch-rerun-2026-07-18-12, 2026-07-20)
+    # resolved today() to Monday, looked in backtest/2026-07-20/, and
+    # correctly hard-failed on missing artifacts (config#3133).
+    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE --log-level INFO 2>&1; then
         echo "ERROR: evaluate.py failed. Spot run marked FAILED." >&2
         exit 1
     fi
