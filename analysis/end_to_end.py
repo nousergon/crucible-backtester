@@ -68,6 +68,40 @@ THINKTANK_SHADOW_ARM = (
     "signals_shadow/thinktank_coverage/)"
 )
 
+# alpha-engine-config-I3000 (I2993 pattern extension): three MORE e2e blocks
+# were found still sourcing the RETIRED six-team+CIO graph
+# (``cio_evaluations`` / ``team_candidates``, frozen since RESEARCH_GRAPH_
+# RETIRED_DATE) and re-aggregating that frozen history at full/live weight
+# every weekly cycle: ``cio_vs_ranking``, ``cio_consolidation_counterfactual``,
+# and the neutralization pair ``neutralized_composite_ic`` /
+# ``neutralization_live_forward_ic``. The neutralization pair already carried
+# a ``cutover_date`` label (2026-06-22) but that label alone did not stop it
+# from re-aggregating the dead graph — the underlying query still reads
+# ``team_candidates``/``cio_evaluations``, which stop producing at
+# RESEARCH_GRAPH_RETIRED_DATE, so every post-retirement "live_forward" segment
+# is actually frozen. These four functions are RETAINED (uncalled-in-live) for
+# direct/historical readouts + estimator-math tests, exactly like
+# ``_team_lift``/``_cio_lift`` above; the live path emits retired markers
+# instead of live-weight aggregates.
+CIO_VS_RANKING_RETIRED = {
+    "status": "retired",
+    "retired_date": RESEARCH_GRAPH_RETIRED_DATE,
+    "note": (
+        "six-team+CIO graph retired (config#1580 / config-I2993); cio_vs_ranking "
+        "sourced cio_evaluations, which stops producing at the retired_date "
+        "(alpha-engine-config-I3000)"
+    ),
+}
+CIO_CONSOLIDATION_COUNTERFACTUAL_RETIRED = {
+    "status": "retired",
+    "retired_date": RESEARCH_GRAPH_RETIRED_DATE,
+    "note": (
+        "six-team+CIO graph retired (config#1580 / config-I2993); "
+        "cio_consolidation_counterfactual sourced cio_evaluations, which stops "
+        "producing at the retired_date (alpha-engine-config-I3000)"
+    ),
+}
+
 
 # ── Canonical-horizon research-edge helpers (ROADMAP L4551) ─────────────────
 #
@@ -518,29 +552,45 @@ def compute_lift_metrics(
             logger.warning("momentum_regime_ic failed (non-fatal): %s", _mre)
             result["momentum_regime_ic"] = {"status": "error", "reason": str(_mre)}
 
-        # 1c. Historical Barra-neutralized composite counterfactual (config#1142)
-        # — the raw->neutralized before/after on history, so the gated LIVE
-        # cutover can be decided on robust-metric selection now instead of
-        # waiting for 4 forward OBSERVE cohorts. Fail-soft like 1b.
-        try:
-            result["neutralized_composite_ic"] = _neutralized_composite_ic(
-                conn, factor_loadings or {}
-            )
-        except Exception as _nci:  # pragma: no cover - defensive
-            logger.warning("neutralized_composite_ic failed (non-fatal): %s", _nci)
-            result["neutralized_composite_ic"] = {"status": "error", "reason": str(_nci)}
-
-        # 1d. GRADED LIVE forward efficacy from the PERSISTED neutralized score
-        # (config#1187). Unlike 1c (which re-derives neutralization from history
-        # via _xs_neutralize), this reads the dual field the live cutover now
-        # persists to cio_evaluations and joins THE ACTUAL live ranking score to
-        # realized 21d alpha — the true forward measurement. Honest skip until
-        # the research.db migration + a live cutover cohort land. Fail-soft.
-        try:
-            result["neutralization_live_forward_ic"] = _neutralized_live_forward_ic(conn)
-        except Exception as _nlf:  # pragma: no cover - defensive
-            logger.warning("neutralization_live_forward_ic failed (non-fatal): %s", _nlf)
-            result["neutralization_live_forward_ic"] = {"status": "error", "reason": str(_nlf)}
+        # 1c + 1d. Historical Barra-neutralized composite counterfactual
+        # (config#1142) + GRADED LIVE forward efficacy from the PERSISTED
+        # neutralized score (config#1187) — RETIRED from the live path
+        # (alpha-engine-config-I3000 / I2993 pattern extension). Both blocks
+        # already carried a ``cutover_date: 2026-06-22`` label, but the label
+        # alone never stopped them from re-aggregating the frozen six-team+CIO
+        # graph: ``_neutralized_composite_ic`` sources ``team_candidates``
+        # and ``_neutralized_live_forward_ic`` sources ``cio_evaluations``,
+        # both of which stop producing at RESEARCH_GRAPH_RETIRED_DATE — every
+        # "live_forward" segment computed after that date is actually frozen
+        # history re-presented as live. Emit explicit retired markers instead
+        # (same shape as ``cio_lift`` above) so evaluator's retired/N-A path
+        # fires. The functions are RETAINED, uncalled-in-live, for direct/
+        # historical readouts + estimator-math tests.
+        result["neutralized_composite_ic"] = {
+            "status": "retired",
+            "retired_date": RESEARCH_GRAPH_RETIRED_DATE,
+            "cutover_date": NEUTRALIZATION_LIVE_CUTOVER_DATE,
+            "note": (
+                "six-team+CIO graph retired (config#1580 / config-I2993); "
+                "neutralized_composite_ic re-derived neutralization from "
+                "team_candidates, which stops producing at the retired_date "
+                "(alpha-engine-config-I3000) — the cutover_date label alone did "
+                "not stop it from aggregating frozen history at live weight"
+            ),
+        }
+        result["neutralization_live_forward_ic"] = {
+            "status": "retired",
+            "retired_date": RESEARCH_GRAPH_RETIRED_DATE,
+            "cutover_date": NEUTRALIZATION_LIVE_CUTOVER_DATE,
+            "note": (
+                "six-team+CIO graph retired (config#1580 / config-I2993); "
+                "neutralization_live_forward_ic sourced cio_evaluations."
+                "neutralized_final_score, which stops producing at the "
+                "retired_date (alpha-engine-config-I3000) — the cutover_date "
+                "label alone did not stop it from aggregating frozen history "
+                "at live weight"
+            ),
+        }
 
         # 1e. OBSERVE-mode rolling forward-IC of the attractiveness-trajectory
         # signal (crucible-research #337 / config#1392). Joins the persisted
@@ -632,18 +682,23 @@ def compute_lift_metrics(
             "thinktank_coverage": _tt_arm,
         }
 
-        # 3b. CIO vs score-ranking baseline (2e)
-        result["cio_vs_ranking"] = _cio_vs_ranking_lift(conn, ur, date_filter, params)
+        # 3b. CIO vs score-ranking baseline (2e) — RETIRED (alpha-engine-
+        # config-I3000 / I2993 pattern extension). ``_cio_vs_ranking_lift``
+        # sources ``cio_evaluations``, which stops producing at
+        # RESEARCH_GRAPH_RETIRED_DATE; emit the same retired marker shape
+        # ``cio_lift`` uses instead of re-aggregating that frozen history at
+        # live weight every cycle. Function RETAINED, uncalled-in-live, for
+        # direct/historical readouts + estimator-math tests.
+        result["cio_vs_ranking"] = dict(CIO_VS_RANKING_RETIRED)
 
-        # 3c. CIO consolidation counterfactual (config#967/#968): does a
-        # deterministic top-N selection beat the LLM CIO ADVANCE gate? Fail-soft.
-        try:
-            result["cio_consolidation_counterfactual"] = _cio_consolidation_counterfactual(
-                conn, ur, factor_loadings or None
-            )
-        except Exception as _ccf:  # pragma: no cover - defensive
-            logger.warning("cio_consolidation_counterfactual failed (non-fatal): %s", _ccf)
-            result["cio_consolidation_counterfactual"] = {"status": "error", "reason": str(_ccf)}
+        # 3c. CIO consolidation counterfactual (config#967/#968) — RETIRED
+        # (alpha-engine-config-I3000 / I2993 pattern extension). Same reason:
+        # ``_cio_consolidation_counterfactual`` sources ``cio_evaluations``,
+        # frozen since RESEARCH_GRAPH_RETIRED_DATE. Function RETAINED,
+        # uncalled-in-live, for direct/historical readouts + tests.
+        result["cio_consolidation_counterfactual"] = dict(
+            CIO_CONSOLIDATION_COUNTERFACTUAL_RETIRED
+        )
 
         # 3d. Scanner -> research-free predictor direct (arm 4, config#1405): does
         # ranking the scanner-passing pool by a research-free predicted_alpha beat
@@ -856,9 +911,11 @@ def format_lift_report(metrics: dict) -> list[str]:
             f"**{_pct(pipl.get('lift'))}** | — |"
         )
 
-    # CIO vs score-ranking baseline (2e)
+    # CIO vs score-ranking baseline (2e) — alpha-engine-config-I3000: retired
+    # alongside cio_lift (see the ``status not in (..., "retired")`` guard
+    # above); a retired marker has no cio_avg/ranking_avg/lift to render.
     cvr = metrics.get("cio_vs_ranking", {})
-    if cvr and cvr.get("status") != "skipped":
+    if cvr and cvr.get("status") not in ("skipped", "retired"):
         verdict = "CIO outperforms" if cvr.get("cio_beats_ranking") else "Score ranking outperforms"
         lines.append(
             f"| CIO vs ranking | {cvr.get('n_picks', '?')} picks | "
@@ -1222,6 +1279,13 @@ def _neutralized_composite_ic(
 ) -> dict:
     """Historical Barra-neutralized composite counterfactual (config#1142/#1060).
 
+    RETIRED from the live ``compute_lift_metrics`` path (alpha-engine-config-
+    I3000 / I2993 pattern extension — ``team_candidates`` is part of the
+    retired six-team+CIO graph and stops producing at
+    RESEARCH_GRAPH_RETIRED_DATE). RETAINED, uncalled in the live path, for
+    direct/historical readouts and estimator-math tests; the live path emits a
+    retired ``neutralized_composite_ic`` marker instead.
+
     Answers the cutover-gate question directly on HISTORY instead of waiting for
     4 forward OBSERVE cohorts: does residualizing the research **composite**
     (``team_candidates.quant_score`` — the wide team-stage quant composite)
@@ -1412,6 +1476,14 @@ def _neutralized_composite_ic(
 
 def _neutralized_live_forward_ic(conn) -> dict:
     """Graded LIVE forward efficacy of the #1142 neutralization (config#1187).
+
+    RETIRED from the live ``compute_lift_metrics`` path (alpha-engine-config-
+    I3000 / I2993 pattern extension — ``cio_evaluations`` is part of the
+    retired six-team+CIO graph and stops producing at
+    RESEARCH_GRAPH_RETIRED_DATE, so any post-retirement "live_forward" segment
+    is actually frozen history). RETAINED, uncalled in the live path, for
+    direct/historical readouts and estimator-math tests; the live path emits a
+    retired ``neutralization_live_forward_ic`` marker instead.
 
     The companion ``_neutralized_composite_ic.live_forward`` block measures a
     RE-DERIVED counterfactual: it residualizes ``team_candidates.quant_score``
@@ -1634,6 +1706,13 @@ def load_historical_factor_loadings(
 def _cio_consolidation_counterfactual(conn, ur: pd.DataFrame, loadings: dict | None = None) -> dict:
     """Does a DETERMINISTIC top-N consolidation beat the LLM CIO's ADVANCE gate?
     (config#967/#968 — the "better way to consolidate sector-team picks" test.)
+
+    RETIRED from the live ``compute_lift_metrics`` path (alpha-engine-config-
+    I3000 / I2993 pattern extension — sources ``cio_evaluations``, part of the
+    retired six-team+CIO graph, frozen since RESEARCH_GRAPH_RETIRED_DATE).
+    RETAINED, uncalled in the live path, for direct/historical readouts and
+    estimator-math tests; the live path emits a retired
+    ``cio_consolidation_counterfactual`` marker instead.
 
     The CIO's job is to select the final entrants from the candidate pool it
     scores (``cio_evaluations``). The funnel measurement (config#967) showed the
@@ -2974,6 +3053,13 @@ def _thinktank_shadow_ic(conn, bucket: str, *, s3_client=None, horizon_days: int
 
 def _cio_vs_ranking_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
     """CIO vs score-ranking baseline (2e): does LLM judgment beat mechanical ranking?
+
+    RETIRED from the live ``compute_lift_metrics`` path (alpha-engine-config-
+    I3000 / I2993 pattern extension — sources ``cio_evaluations``, part of the
+    retired six-team+CIO graph, frozen since RESEARCH_GRAPH_RETIRED_DATE).
+    RETAINED, uncalled in the live path, for direct/historical readouts and
+    estimator-math tests; the live path emits a retired ``cio_vs_ranking``
+    marker instead.
 
     Compares CIO's actual ADVANCE picks vs. a counterfactual where we simply
     take the top N candidates by final_score (no LLM judgment). If the score-
