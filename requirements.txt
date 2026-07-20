@@ -100,6 +100,24 @@ cvxpy>=1.9.2,<1.10
 # first validate() (module imports; jsonschema missing) — so the shared-schema
 # gate would never actually run in backtester CI, defeating the cross-repo pin.
 nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.5
+# ── Predictor-replay runtime deps (config#3031) ──────────────────────────────
+# synthetic/predictor_backtest.py and analysis/scanner_predictor_research_free_
+# backfill.py import crucible-predictor CODE in-process (sys.path), so THIS
+# repo declares the libraries that code needs at runtime. The spot deps step
+# previously co-installed crucible-predictor's whole requirements.txt into the
+# same environment, which let predictor's numpy>=2.5.1 floor silently override
+# the numpy<2.5 cap above (numba/vectorbt hard ceiling) — every incompatible
+# pin pair between the two files was a latent deps-step failure. The two
+# requirements files are now NEVER co-resolved: predictor's checkout on the
+# spot box is code-only, and these floors mirror predictor's own (all
+# numpy-2.4-compatible). Guard: tests/test_spot_backtest_no_sibling_requirements.py.
+scipy>=1.18.0
+lightgbm>=4.6.0
+catboost>=1.2.8
+hmmlearn>=0.3.3
+tqdm>=4.68.4
+optuna>=4.9.0
+psutil>=5.9.0
 
 # krepis[openai] (MIT foundation) — direct dep for krepis.dates.resolve_trading_day
 # (pipeline_common re-exports it) and, as of config#1300, krepis.console.console_url

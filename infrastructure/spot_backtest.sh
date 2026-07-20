@@ -923,19 +923,21 @@ command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m p
 \$PIP install --upgrade pip -q
 \$PIP install -q -r requirements.txt
 
-# Also install predictor deps (needed for GBM inference + feature computation).
-# The predictor + backtester alpha-engine-lib pins are now ALIGNED at v0.53.0
-# (fleet lockstep — predictor #238 / L4513), so this co-install no longer
-# downgrades the lib. Background: when the predictor lagged at v0.47.0, installing
-# it here SECOND silently downgraded the lib below quant.stats (first shipped
-# v0.49.0), breaking evaluate.py's import every run (the 2>/dev/null hid pip's
-# downgrade note). Alignment fixes the instance; the GUARD below fixes the CLASS.
+# The predictor checkout is CODE-ONLY (config#3031, 2026-07-20): its
+# requirements.txt is deliberately NOT installed here. Co-installing two
+# repos' requirements files into one resolver namespace let predictor's
+# numpy>=2.5.1 floor (installed second) silently override the backtester's
+# numpy<2.5 cap (numba/vectorbt hard ceiling) — the 2026-07-20 weekly deps
+# failures — and the same class had already bitten via nousergon-lib
+# (L4513) and pyarrow. Every library the in-process predictor replay
+# (synthetic/predictor_backtest.py, research-free backfill) needs at
+# runtime is declared in the backtester's OWN requirements.txt with
+# numpy<2.5-compatible bounds. The import guards below prove the predictor
+# code chain resolves against this single environment.
 cd /home/ec2-user/alpha-engine-predictor
-if [ -f requirements.txt ]; then
-    \$PIP install -r requirements.txt || {
-        echo "FATAL: predictor requirements.txt install failed" >&2
-        exit 1
-    }
+if [ ! -d "/home/ec2-user/alpha-engine-predictor/model" ]; then
+    echo "FATAL: predictor checkout missing (code-only sys.path dependency)" >&2
+    exit 1
 fi
 
 # Fail-loud dependency GUARD (L4513 class fix). Assert the nousergon-lib
