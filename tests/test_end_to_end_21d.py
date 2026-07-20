@@ -312,6 +312,92 @@ def test_research_graph_retired_markers(tmp_path):
     assert las["scanner_attractiveness"]["source_block"] == "composite_ic"
 
 
+def test_three_more_cio_blocks_retired_not_live_weight(tmp_path):
+    # alpha-engine-config-I3000 (I2993 pattern extension): cio_vs_ranking,
+    # cio_consolidation_counterfactual, and the neutralization pair
+    # (neutralized_composite_ic / neutralization_live_forward_ic) all sourced
+    # the retired six-team+CIO graph (team_candidates / cio_evaluations) and
+    # kept re-aggregating that frozen history at full/live weight every
+    # weekly cycle post-PR542. The neutralization pair already carried a
+    # cutover_date label, but the label alone never stopped the underlying
+    # query from reading the frozen tables — this pins that the LIVE
+    # compute_lift_metrics path now emits retired markers for all four,
+    # never a live-weight aggregate.
+    out = compute_lift_metrics(_build_research_db(tmp_path), bucket="unused-bucket")
+    assert out["status"] == "ok"
+
+    cvr = out["cio_vs_ranking"]
+    assert cvr["status"] == "retired"
+    assert cvr["retired_date"] == "2026-07-12"
+
+    ccf = out["cio_consolidation_counterfactual"]
+    assert ccf["status"] == "retired"
+    assert ccf["retired_date"] == "2026-07-12"
+
+    nci = out["neutralized_composite_ic"]
+    assert nci["status"] == "retired"
+    assert nci["retired_date"] == "2026-07-12"
+    # The pre-existing cutover_date label is retained alongside the new
+    # retired marker — the label didn't stop aggregation, so retirement adds
+    # to it rather than replacing it.
+    assert nci["cutover_date"] == "2026-06-22"
+
+    nlf = out["neutralization_live_forward_ic"]
+    assert nlf["status"] == "retired"
+    assert nlf["retired_date"] == "2026-07-12"
+    assert nlf["cutover_date"] == "2026-06-22"
+
+    # None of the four retired blocks carry a live-weight numeric aggregate
+    # (lift / cio_avg / n_weeks-style fields) that a naive consumer could
+    # misread as a live measurement.
+    for block in (cvr, ccf, nci, nlf):
+        assert "lift" not in block
+        assert "cio_avg" not in block
+        assert "n_weeks" not in block
+
+
+def test_cio_vs_ranking_retired_excluded_from_report(tmp_path):
+    # format_lift_report must not render a bogus "CIO vs ranking" row off an
+    # all-None retired marker (mirrors the existing cio_lift "retired" guard).
+    from analysis.end_to_end import format_lift_report
+
+    out = compute_lift_metrics(_build_research_db(tmp_path), bucket="unused-bucket")
+    lines = format_lift_report(out)
+    assert not any("CIO vs ranking" in line for line in lines)
+
+
+def test_retired_neutralization_functions_retained_for_direct_call(tmp_path):
+    # The underlying estimators stay under test via direct call (retained,
+    # uncalled-in-live) — this is the "old artifact / historical readout"
+    # tolerance PR542 established for _team_lift/_cio_lift, mirrored here.
+    # (The full estimator-math tests live in test_neutralized_composite_ic.py
+    # / test_neutralized_live_forward_ic.py / test_cio_consolidation_
+    # counterfactual.py; this just pins that they remain importable/callable
+    # and are NOT invoked by the live compute_lift_metrics path.)
+    from analysis.end_to_end import (
+        _cio_consolidation_counterfactual,
+        _cio_vs_ranking_lift,
+        _neutralized_composite_ic,
+        _neutralized_live_forward_ic,
+    )
+
+    conn = sqlite3.connect(_build_research_db(tmp_path))
+    ur = pd.read_sql_query("SELECT * FROM universe_returns ORDER BY eval_date, ticker", conn)
+    ur = ur[ur["return_5d"].notna()]
+    # Direct calls still run the real estimator (not the retired marker) —
+    # never a KeyError/crash. _cio_vs_ranking_lift returns the computed shape
+    # (cio_avg/ranking_avg/...) with no "status" key on a successful compute;
+    # the others always carry "status".
+    cvr_direct = _cio_vs_ranking_lift(conn, ur, "", [])
+    assert "cio_avg" in cvr_direct or cvr_direct.get("status") in (
+        "skipped", "insufficient_data")
+    assert _cio_consolidation_counterfactual(conn, ur)["status"] in (
+        "skipped", "insufficient_data", "ok")
+    assert _neutralized_composite_ic(conn, {})["status"] == "skipped"
+    assert _neutralized_live_forward_ic(conn)["status"] in ("skipped", "insufficient_data", "ok")
+    conn.close()
+
+
 def _tt_db(tmp_path, *, with_realized_21d):
     """research.db with universe_returns for one date; realized 21d present/absent."""
     db = tmp_path / "research.db"
