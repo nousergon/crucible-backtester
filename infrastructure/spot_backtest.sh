@@ -107,11 +107,38 @@ MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-7200}"
 # break-glass SSH is possible only by temporarily re-opening the SG's
 # port-22 inbound (which it should NOT be in steady state).
 KEY_NAME="alpha-engine-key"
+# alpha-engine-config#3018 (IAM-as-code surface 4, fleet audit config#2340):
+# SECURITY_GROUP / SUBNETS are EC2 *launch* attributes, not an IAM policy
+# surface — ec2:RunInstances on alpha-engine-executor-role is granted with
+# Resource:"*" (see crucible-executor/infrastructure/iam/
+# alpha-engine-executor-role/alpha-engine-ec2-spot.json), i.e. it is not
+# scoped by subnet or SG, so neither value gates access and neither can
+# "drift" against an IAM policy document. SUBNETS is the shared, non-secret
+# 6-subnet capacity-fallback rotation set duplicated verbatim across the
+# data/predictor/backtester spot launchers (same default VPC vpc-566f002e,
+# same SG) — accepted-by-design as plain launch config, intentionally out
+# of IAM-as-code scope. SECURITY_GROUP likewise has no SG-as-code tracking
+# convention anywhere in this fleet (SGs only appear as ARN scoping inside
+# individual IAM policy *statements*, e.g. alpha-engine-dashboard-role's
+# spot-dispatch policy — there is no standalone tracked SG doc to mirror).
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 # All 6 default-VPC subnets across us-east-1{a..f}. The lib CLI rotates
 # across this list on capacity error. Lockstep with data + predictor
 # launchers (same VPC vpc-566f002e, same SG).
 SUBNETS="${SUBNETS:-subnet-a61ec0fb,subnet-1e58307a,subnet-789d3857,subnet-c670118d,subnet-7cff7c43,subnet-e07166ec}"
+# IAM_PROFILE is NOT ungoverned: alpha-engine-executor-profile backs
+# alpha-engine-executor-role, which IS tracked+applied+drift-checked —
+# source of truth is crucible-executor/infrastructure/iam/
+# alpha-engine-executor-role/ (apply.sh + check-drift.py, daily CI +
+# per-PR via .github/workflows/iam-drift-check.yml, OIDC role
+# github-actions-iam-drift-check). That role's ReadWriteBacktestResults
+# S3 statement (backtest/*) exists specifically for this script's spot
+# runs. This repo was already a scanned sibling in crucible-executor's
+# check-no-foreign-writers.py (foreign-writers-check job); this script
+# only ever *references* the profile as a launch attribute (--iam-profile)
+# and never writes IAM, so it was already compliant with the single-writer
+# rule — this comment just makes the cross-repo ownership link legible
+# from the consumer side, which is what config#3018 flagged as missing.
 IAM_PROFILE="alpha-engine-executor-profile"
 # Lib CLI path: ae-dashboard is the SSM target for Backtester / Parity
 # / Evaluator states; the dispatcher's .venv has alpha-engine-lib
