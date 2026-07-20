@@ -1007,18 +1007,30 @@ PYBIN="\${PIP% -m pip}"
 # which IS imported on this path, so silencing that conflict would be unsafe.
 # (NB: no backticks in this heredoc body -- they would command-substitute.)
 PIP_CHECK_ALLOWLIST=""
-PIP_CHECK_OUT=\$(\$PYBIN -m pip check 2>&1) || true
-if [ -z "\$PIP_CHECK_ALLOWLIST" ]; then
-    PIP_CHECK_REMAIN="\$PIP_CHECK_OUT"
+# Gate on pip check's EXIT CODE, not on output emptiness: a clean env prints
+# "No broken requirements found." (non-empty!) and exits 0 -- the original
+# output-emptiness logic here failed the deps step on the FIRST EVER clean
+# environment (2026-07-20, right after config#3031's co-install removal made
+# the env resolvable), because until then every run had a real conflict and
+# the success path had never executed. exit 0 = clean, full stop; only a
+# non-zero exit applies the allowlist filter to the conflict lines.
+PIP_CHECK_RC=0
+PIP_CHECK_OUT=\$(\$PYBIN -m pip check 2>&1) || PIP_CHECK_RC=\$?
+if [ "\$PIP_CHECK_RC" -eq 0 ]; then
+    echo "pip check: clean (exit 0)."
 else
-    PIP_CHECK_REMAIN=\$(printf '%s\n' "\$PIP_CHECK_OUT" | grep -vFf <(printf '%s\n' "\$PIP_CHECK_ALLOWLIST") || true)
+    if [ -z "\$PIP_CHECK_ALLOWLIST" ]; then
+        PIP_CHECK_REMAIN="\$PIP_CHECK_OUT"
+    else
+        PIP_CHECK_REMAIN=\$(printf '%s\n' "\$PIP_CHECK_OUT" | grep -vFf <(printf '%s\n' "\$PIP_CHECK_ALLOWLIST") || true)
+    fi
+    if [ -n "\$PIP_CHECK_REMAIN" ]; then
+        echo "FATAL: pip check reported non-allowlisted dependency conflicts:" >&2
+        printf '%s\n' "\$PIP_CHECK_REMAIN" >&2
+        exit 1
+    fi
+    echo "pip check: all reported conflicts are allowlisted."
 fi
-if [ -n "\$PIP_CHECK_REMAIN" ]; then
-    echo "FATAL: pip check reported non-allowlisted dependency conflicts:" >&2
-    printf '%s\n' "\$PIP_CHECK_REMAIN" >&2
-    exit 1
-fi
-echo "pip check: clean (no non-allowlisted conflicts)."
 
 echo "Dependencies installed."
 DEPS
