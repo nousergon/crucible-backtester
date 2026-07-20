@@ -959,7 +959,7 @@ PYBIN="\${PIP% -m pip}"
 
 # Fail-loud pip-check dependency-consistency gate (config#2973). The numpy-2
 # guard above only covers the ONE import chain (numpy + scipy.sparse +
-# lightgbm) that has actually broken a run so far. `pip install` reports ANY
+# lightgbm) that has actually broken a run so far. \`pip install\` reports ANY
 # OTHER co-install/transitive-dependency conflict as a post-hoc "does not
 # take into account all installed packages" warning and still exits 0, so an
 # internally-inconsistent env ships silently and only surfaces as an import
