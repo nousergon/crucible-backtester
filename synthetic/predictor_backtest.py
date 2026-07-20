@@ -34,6 +34,7 @@ import gc
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -132,6 +133,27 @@ def _available_ram_gb() -> "float | None":
     return None
 
 
+def _top_rss_processes(limit: int = 8) -> str:
+    """Return a `ps`-style dump of the top RSS-consuming processes.
+
+    Pure diagnostics for the headroom-guard failure path (config#2289):
+    the guard's own PASS/FAIL log only ever showed MemAvailable, so a
+    near-floor failure gave no way to attribute what was actually
+    resident. Best-effort — must never raise or mask the real guard
+    outcome.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "rss,pid,comm", "--sort=-rss"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        lines = out.stdout.splitlines()
+        header, rows = lines[0], lines[1 : 1 + limit]
+        return "\n".join([header, *rows])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
+        return f"<unavailable: {exc}>"
+
+
 def _assert_ram_headroom(min_gb: float, label: str = "predictor_pipeline") -> None:
     """Fail loud + legible at phase start if free RAM is below the floor.
 
@@ -154,13 +176,21 @@ def _assert_ram_headroom(min_gb: float, label: str = "predictor_pipeline") -> No
             "non-Linux host or /proc absent)", label,
         )
         return
+    # 2 decimal places (config#2289): a near-floor failure previously
+    # rounded both sides to "6.0 GB available < 6.0 GB required", which
+    # reads as a contradiction and hid the actual boundary value from
+    # whoever had to diagnose the run afterward.
     logger.info(
-        "MEM headroom %s: %.1f GB available, floor %.1f GB", label, avail, min_gb
+        "MEM headroom %s: %.2f GB available, floor %.2f GB", label, avail, min_gb
     )
     if avail < min_gb:
+        logger.error(
+            "MEM headroom %s FAILED — top RSS consumers at check time:\n%s",
+            label, _top_rss_processes(),
+        )
         raise RuntimeError(
             f"Pre-pipeline RAM headroom check FAILED for {label}: "
-            f"{avail:.1f} GB available < {min_gb:.1f} GB required. The full "
+            f"{avail:.2f} GB available < {min_gb:.2f} GB required. The full "
             f"10y × ~900-ticker predictor backtest peaks at ~2.8 GB RSS and "
             f"OOM-kills on a 4 GB instance (L4485, 2026-06-01). Launch this "
             f"phase on an ≥8 GB instance (m5.large / m6i.large / c5.xlarge) — "

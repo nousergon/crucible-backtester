@@ -73,3 +73,26 @@ def test_default_min_ram_floor_is_8gb_class():
     (~7 GB avail) so it rejects the OOM-prone 4 GB c5.large and admits the
     ≥8 GB instances the mode-aware floor in spot_backtest.sh selects."""
     assert 3.5 < pb._DEFAULT_MIN_RAM_GB < 7.0
+
+
+def test_assert_ram_headroom_near_floor_message_shows_true_precision():
+    """config#2289: a near-floor failure (5.97 GB) previously rounded both
+    sides of the comparison to 1 decimal, printing the self-contradictory
+    "6.0 GB available < 6.0 GB required". 2-decimal precision must surface
+    the real boundary value instead of hiding it."""
+    with mock.patch.object(pb, "_available_ram_gb", return_value=5.97):
+        with pytest.raises(RuntimeError, match=r"5\.97 GB available < 6\.00 GB required"):
+            pb._assert_ram_headroom(6.0)
+
+
+def test_assert_ram_headroom_failure_logs_top_rss_processes(caplog):
+    """config#2289: a FAILED check must log what's actually resident at
+    check time, so a near-floor failure is attributable without needing
+    to reproduce it live on a rotated-out log."""
+    with mock.patch.object(pb, "_available_ram_gb", return_value=3.5):
+        with mock.patch.object(pb, "_top_rss_processes", return_value="RSS PID COMMAND\n123456 1 python"):
+            with caplog.at_level("ERROR"):
+                with pytest.raises(RuntimeError):
+                    pb._assert_ram_headroom(6.0)
+    assert "top RSS consumers" in caplog.text
+    assert "123456 1 python" in caplog.text
