@@ -3395,6 +3395,61 @@ def run_predictor_backtest(config: dict) -> dict:
         # run. Fail-soft is intentional (see registry note on the PUT above).
         logger.warning("model_version_net_alpha stage failed (OBSERVE, non-fatal): %s", exc)
 
+    # ── W3.3 (config#1993, OBSERVE): 2-horizon double-sort study ─────────────
+    # Operator GO-ruled 2026-07-10 (config#1993): binding pair set 10×21, 21×63,
+    # 21×126 (config#937 horizon ladder). Loads the per-horizon leak-free OOS
+    # predicted-alpha panel the predictor's horizon battery persists upstream
+    # (crucible-predictor analysis/horizon_battery.py::
+    # persist_horizon_prediction_panels, merged config-predictor#404) and reuses
+    # the price_matrix/spy_prices ALREADY loaded above for this run — no second
+    # inference pass, no new data pull beyond the one small parquet GET. Safe
+    # by construction: analysis.double_sort.compute_double_sort is pure/
+    # read-only, and gates nothing (ARCHITECTURE.md §14(e)).
+    try:
+        from analysis.double_sort import (
+            compute_double_sort,
+            load_predictions_by_horizon_panel,
+        )
+        from analysis.transaction_cost import TransactionCostModel
+
+        ds_cfg = config.get("double_sort", {}) or {}
+        if ds_cfg.get("enabled", True) and result.get("price_matrix") is not None:
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            panel_key = ds_cfg.get(
+                "panel_key", "predictor/diagnostics/horizon_predictions/latest.parquet",
+            )
+            predictions_by_horizon = load_predictions_by_horizon_panel(bucket, panel_key)
+
+            ds = compute_double_sort(
+                predictions_by_horizon,
+                result["price_matrix"],
+                result.get("spy_prices"),
+                cost_model=TransactionCostModel.from_config(config),
+            )
+            stats["double_sort"] = ds
+            _run_date = config.get("_run_date")
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            if _run_date:
+                import boto3
+                s3 = boto3.client("s3")
+                key = f"backtest/{_run_date}/double_sort.json"
+                body = json.dumps({"run_date": _run_date, **ds}, default=str, indent=2).encode("utf-8")
+                try:
+                    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+                    logger.info("double_sort: persisted s3://%s/%s", bucket, key)
+                except Exception as exc:
+                    # config#1234 rationale: double_sort.json is OBSERVE-only /
+                    # non-load-bearing (W3.3, config#1993) and is registered/
+                    # grandfathered in ARTIFACT_REGISTRY.yaml, so the ENFORCE
+                    # freshness-monitor is the recording surface for a missed
+                    # write. Fail-soft is intentional.
+                    logger.warning("double_sort S3 persist failed (non-fatal): %s", exc)
+    except Exception as exc:
+        # config#1234 rationale (outer of dual-layer swallow): the whole W3.3
+        # OBSERVE stage gates nothing; a failure must never abort the backtest
+        # run. Fail-soft is intentional (see registry note on the PUT above).
+        logger.warning("double_sort stage failed (OBSERVE, non-fatal): %s", exc)
+
     return stats
 
 
