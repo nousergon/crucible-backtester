@@ -17,8 +17,10 @@ from analysis.double_sort import (
     _intersection_book,
     _top_quantile_book,
     compute_double_sort,
+    load_predictions_by_horizon_panel,
 )
 from analysis.transaction_cost import TransactionCostModel
+from tests.test_phase_registry import _FakeS3
 
 _ZERO_COST = TransactionCostModel(half_spread_bps=0.0, impact_coef_bps=0.0,
                                   commission_bps=0.0, min_cost_bps=0.0)
@@ -155,3 +157,67 @@ class TestRobustness:
         assert ds["status"] in ("insufficient_rebalances", "insufficient_periods")
         # PBO cannot be formed from a single thin pair
         assert out["selection_pbo"]["status"] == "insufficient"
+
+
+class TestLoadPredictionsByHorizonPanel:
+    """The backtest.py W3.3 stage's S3-parquet-load + reshape step
+    (config#1993): long-format ``{date, ticker, horizon, predicted_alpha}``
+    -> ``{horizon: {date_str: {ticker: alpha}}}``."""
+
+    def _seed(self, s3, bucket, key, rows):
+        df = pd.DataFrame(rows, columns=["date", "ticker", "horizon", "predicted_alpha"])
+        import io
+        buf = io.BytesIO()
+        df.to_parquet(buf, index=False)
+        s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+
+    def test_pivots_long_format_into_horizon_date_ticker_dict(self):
+        s3 = _FakeS3()
+        rows = [
+            ("2026-07-15", "AAPL", 21, 0.01),
+            ("2026-07-15", "MSFT", 21, 0.02),
+            ("2026-07-15", "AAPL", 63, 0.03),
+            ("2026-07-16", "AAPL", 21, 0.015),
+        ]
+        self._seed(s3, "b", "predictor/diagnostics/horizon_predictions/latest.parquet", rows)
+
+        out = load_predictions_by_horizon_panel(
+            "b", "predictor/diagnostics/horizon_predictions/latest.parquet", s3_client=s3,
+        )
+
+        assert set(out.keys()) == {21, 63}
+        assert out[21]["2026-07-15"] == {"AAPL": 0.01, "MSFT": 0.02}
+        assert out[21]["2026-07-16"] == {"AAPL": 0.015}
+        assert out[63]["2026-07-15"] == {"AAPL": 0.03}
+
+    def test_timestamp_dates_normalized_to_ymd_strings(self):
+        """A parquet round-trip can leave `date` as a Timestamp column
+        instead of plain strings — the reshape must normalize either way so
+        downstream `pd.Timestamp(d) in price_index` lookups in
+        compute_double_sort see a consistent key format."""
+        s3 = _FakeS3()
+        rows = [(pd.Timestamp("2026-07-15"), "AAPL", 21, 0.01)]
+        self._seed(s3, "b", "latest.parquet", rows)
+
+        out = load_predictions_by_horizon_panel("b", "latest.parquet", s3_client=s3)
+
+        assert list(out[21].keys()) == ["2026-07-15"]
+
+    def test_output_feeds_compute_double_sort_end_to_end(self):
+        """The loaded/reshaped panel is directly usable by
+        compute_double_sort — the exact call the backtest.py stage makes."""
+        s3 = _FakeS3()
+        pbh, prices, spy = _agreeing_panels(n_dates=200)
+        rows = [
+            (d, t, h, a)
+            for h, panel in pbh.items()
+            for d, tick_alpha in panel.items()
+            for t, a in tick_alpha.items()
+        ]
+        self._seed(s3, "b", "latest.parquet", rows)
+
+        loaded = load_predictions_by_horizon_panel("b", "latest.parquet", s3_client=s3)
+        out = compute_double_sort(loaded, prices, spy, pairs=[(21, 63)],
+                                   cost_model=_ZERO_COST)
+        assert out["status"] == "ok"
+        assert out["pairs"]["21x63"]["double_sort"]["status"] == "ok"
