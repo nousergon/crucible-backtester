@@ -57,6 +57,9 @@ from synthetic.vectorized_entries import (
     REGIME_BULL,
     REGIME_CAUTION,
     REGIME_NEUTRAL,
+    SIZING_ARM_CONVICTION,
+    SIZING_ARM_FRACTIONAL_KELLY,
+    SIZING_ARM_RISK_PARITY,
     SR_MARKET_WEIGHT,
     SR_OVERWEIGHT,
     SR_UNDERWEIGHT,
@@ -64,6 +67,7 @@ from synthetic.vectorized_entries import (
     VectorizedEntryConfig,
     apply_vectorized_entries,
     compute_correlation_matrix,
+    compute_realized_vol_20d,
     compute_vectorized_entries,
 )
 from synthetic.vectorized_exits import (
@@ -446,6 +450,12 @@ def build_combo_configs(
         correlation_lookback_days=np.array([
             int(c.get("correlation_lookback_days", 60)) for c in combo_configs
         ], dtype=np.int32),
+        # Fractional-Kelly sizing arm (config#3081). Ignored unless the
+        # sweep runs with sizing_arm="fractional_kelly"; default 0.25
+        # matches VectorizedEntryConfig.from_uniform's default.
+        kelly_fraction=np.array([
+            c.get("kelly_fraction", 0.25) for c in combo_configs
+        ], dtype=np.float64),
     )
     return exit_cfg, entry_cfg
 
@@ -669,8 +679,28 @@ def run_vectorized_sweep(
     drawdown_tiers: list | None = None,
     market_regime: str = "neutral",
     fee_rate: float = 0.0,
+    sizing_arm: str = SIZING_ARM_CONVICTION,
 ) -> tuple[list, dict]:
     """Run all combos in parallel via VectorizedSimulator.
+
+    ``sizing_arm`` (config#3081 S-slot sizing shootout) selects which
+    raw-weight sizing formula ``compute_vectorized_entries`` uses for
+    every date in this sweep — see
+    ``synthetic.vectorized_entries.compute_vectorized_entries`` module
+    docstring for the "conviction" (default, unchanged incumbent) /
+    "risk_parity" / "fractional_kelly" arms. When the arm is not
+    "conviction", this function computes a ``[n_dates, n_tickers]``
+    trailing-20d realized-vol matrix from ``returns_mat`` (already
+    materialized below for the ATR/momentum features) via
+    ``compute_realized_vol_20d`` and slices it per date/signal; for
+    "fractional_kelly" it also derives a per-signal predicted-alpha
+    proxy from ``signal_upside`` (price-target upside — the most
+    defensible existing per-signal "predicted alpha" already threaded
+    through ``extract_signal_arrays``; see
+    ``synthetic.sizing_shootout`` / ``run_sizing_shootout`` docstring
+    for the full rationale). This does NOT change behavior for the
+    default "conviction" arm — the vol matrix and alpha proxy are only
+    computed and passed through when a caller opts into another arm.
 
     Returns
     -------
@@ -733,6 +763,33 @@ def run_vectorized_sweep(
         "vectorized_sweep: feature matrices built (%.1fs) — %d dates × %d tickers",
         _time.monotonic() - t_setup, n_dates, n_tickers,
     )
+
+    # Trailing-20d realized-vol matrix (config#3081) — only computed when
+    # a non-incumbent sizing arm is selected, since the incumbent
+    # ("conviction") path never reads it. Built once per sweep via a
+    # fully vectorized rolling window (numpy sliding_window_view — no
+    # per-date Python loop): row d's vol uses returns[d-19:d+1] per
+    # ticker (trailing 20 trading days INCLUDING date d, consistent
+    # with atr_mat/momentum_mat being "as of date d" quantities
+    # elsewhere in this loop). The first 19 rows have <20 trading days
+    # of history and are left NaN (matches momentum_mat's own
+    # first-N-rows-NaN convention above) — the sizing-arm helpers in
+    # vectorized_entries.py fall back sensibly (equal-weight /
+    # zero-Kelly) for NaN vol.
+    realized_vol_mat = None
+    if sizing_arm != SIZING_ARM_CONVICTION:
+        realized_vol_mat = np.full((n_dates, n_tickers), np.nan, dtype=np.float64)
+        if n_dates >= 20:
+            windows = np.lib.stride_tricks.sliding_window_view(
+                returns_mat, window_shape=20, axis=0,
+            )  # [n_dates - 19, n_tickers, 20]
+            # compute_realized_vol_20d expects [n_rows, >=20] with rows
+            # as the "signal" axis — reshape to put (date, ticker) pairs
+            # on axis 0, the 20-day window on axis 1.
+            n_windows = windows.shape[0]
+            flat = windows.reshape(n_windows * n_tickers, 20)
+            vol_flat = compute_realized_vol_20d(flat)
+            realized_vol_mat[19:, :] = vol_flat.reshape(n_windows, n_tickers)
 
     # Initialize simulator. fee_rate flows from production config
     # (`simulation_fees`, default 0.001) to mirror scalar single_run's
@@ -909,6 +966,20 @@ def run_vectorized_sweep(
         if n_signals == 0:
             continue
 
+        # Per-signal realized-vol / alpha-proxy slices for the
+        # risk_parity / fractional_kelly sizing arms (config#3081).
+        # None for the incumbent arm (unused by compute_vectorized_entries
+        # in that branch). alpha proxy = signal_upside (price-target
+        # upside) — the most defensible per-signal "predicted alpha"
+        # already threaded through extract_signal_arrays; see
+        # run_sizing_shootout's docstring for the full rationale.
+        sig_realized_vol_20d = None
+        sig_alpha = None
+        if sizing_arm != SIZING_ARM_CONVICTION:
+            sig_realized_vol_20d = realized_vol_mat[date_idx, sig_arrays["signal_ticker_idx"]]
+            if sizing_arm == SIZING_ARM_FRACTIONAL_KELLY:
+                sig_alpha = sig_arrays["signal_upside"]
+
         # Signal age (calendar days between signals_raw['date'] and run_date)
         signal_date_str = signal_lookup.signals_raw_filtered.get("date", date_str)
         try:
@@ -931,6 +1002,9 @@ def run_vectorized_sweep(
             config=entry_cfg,
             correlation_matrix=corr_matrix,
             sector_idx_per_ticker=sector_idx_per_ticker,
+            sizing_arm=sizing_arm,
+            signal_realized_vol_20d=sig_realized_vol_20d,
+            signal_alpha=sig_alpha,
         )
 
         # Record entry orders before applying — columnar accumulator,
@@ -989,3 +1063,95 @@ def run_vectorized_sweep(
         "nav_history": nav_history,  # [n_combos, n_dates], for stats
     }
     return orders_per_combo, diagnostics
+
+
+# ── S-slot sizing shootout (config#3081) ────────────────────────────
+
+
+# Kelly fractions swept by default — at least 2 distinct values so
+# "swept as a parameter" is genuinely honored, not one hardcoded
+# fraction (config#3081 requirement). 0.25 / 0.5 are the conventional
+# "quarter-Kelly" / "half-Kelly" realism anchors.
+DEFAULT_KELLY_FRACTIONS: tuple[float, ...] = (0.25, 0.5)
+
+
+def _arm_label(arm: str, kelly_fraction: float | None = None) -> str:
+    """Canonical per-arm result key.
+
+    "conviction" / "risk_parity" as-is; fractional_kelly expands to
+    ``fractional_kelly_{fraction}`` (e.g. ``fractional_kelly_0.25``)
+    per combo-slot so each swept fraction is independently addressable
+    in the shootout's results dict. Naming convention documented here
+    (config#3081) — the only place arm-name strings are constructed.
+    """
+    if arm == SIZING_ARM_FRACTIONAL_KELLY:
+        if kelly_fraction is None:
+            raise ValueError("fractional_kelly arm requires a kelly_fraction")
+        return f"{SIZING_ARM_FRACTIONAL_KELLY}_{kelly_fraction:g}"
+    return arm
+
+
+def run_sizing_shootout(
+    *,
+    combo_configs: list,
+    arms: tuple[str, ...] = (
+        SIZING_ARM_CONVICTION, SIZING_ARM_RISK_PARITY, SIZING_ARM_FRACTIONAL_KELLY,
+    ),
+    kelly_fractions: tuple[float, ...] = DEFAULT_KELLY_FRACTIONS,
+    **sweep_kwargs,
+) -> dict[str, tuple]:
+    """Run the SAME signal stream through 2-4 sizing arms for comparison.
+
+    config#3081 "S-slot sizing shootout": reuses ``run_vectorized_sweep``
+    unchanged (no new orchestration framework) — this is a thin fan-out
+    wrapper that calls it once per arm with the SAME base combo config
+    (price_matrix / signal_lookups / feature_lookup / sector_map /
+    fee_rate / cash policy / caps — everything except the sizing-arm
+    selector and, for Kelly, the fraction) so the universe/exposure
+    constraints (sector caps, position caps, cash policy) are IDENTICAL
+    across arms and only the raw-weight sizing formula differs — the
+    apples-to-apples comparison the issue asks for.
+
+    Each ``combo_configs`` entry is used as the BASE config for every
+    arm; this function does not fan out over additional param-grid
+    axes itself (a caller wanting a param-grid comparison per arm can
+    still pass a multi-combo ``combo_configs`` list — each combo is
+    carried through unmodified to every arm, so a 3-combo grid produces
+    3-combo results per arm, all directly comparable index-for-index).
+
+    ``fee_rate`` (and every other ``run_vectorized_sweep`` kwarg) is
+    forwarded verbatim via ``**sweep_kwargs`` to EVERY arm's call — so
+    all arms are scored fee-aware (or fee-free) identically; a caller
+    cannot accidentally run one arm with costs and another without,
+    which the issue calls out as an invalid comparison (a cost-free
+    Kelly "win" is not evidence of anything).
+
+    Returns
+    -------
+    dict[str, tuple[VectorizedOrderStore, dict]]
+        Keyed by arm label (``_arm_label``): "conviction", "risk_parity",
+        "fractional_kelly_0.25", "fractional_kelly_0.5", ... — each
+        value is the same ``(orders_per_combo, diagnostics)`` tuple
+        ``run_vectorized_sweep`` returns for that arm.
+    """
+    results: dict[str, tuple] = {}
+    for arm in arms:
+        if arm == SIZING_ARM_FRACTIONAL_KELLY:
+            for frac in kelly_fractions:
+                frac_combos = [
+                    {**c, "kelly_fraction": frac} for c in combo_configs
+                ]
+                label = _arm_label(arm, frac)
+                results[label] = run_vectorized_sweep(
+                    combo_configs=frac_combos,
+                    sizing_arm=SIZING_ARM_FRACTIONAL_KELLY,
+                    **sweep_kwargs,
+                )
+        else:
+            label = _arm_label(arm)
+            results[label] = run_vectorized_sweep(
+                combo_configs=combo_configs,
+                sizing_arm=arm,
+                **sweep_kwargs,
+            )
+    return results
