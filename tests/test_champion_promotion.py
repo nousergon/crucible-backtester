@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
@@ -922,6 +923,55 @@ class TestRunWeeklyEvaluation:
         assert result["leaderboard_date_used"] is None
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
+
+    def test_scoring_exception_publishes_active_alert(self):
+        """config#2884: an outcome='error' week must fire an active alert,
+        not just the passive audit-JSON write -- the only prior liveness
+        signal (ARTIFACT_REGISTRY file-presence SLA) is satisfied by a
+        routine error write, so a persistently-erroring gate could freeze
+        the champion pointer for an unbounded number of weeks with nobody
+        paged. Same malformed-leaderboard trigger as the test above."""
+        s3 = _FakeS3()
+        lb = _tt_leaderboard_ok(run_date="2026-07-18")
+        for spec in lb["specs"]:
+            if spec["name"] == "thinktank_coverage":
+                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
+        with mock.patch("ops_alerts.publish_ops_alert") as mock_publish:
+            result = run_weekly_evaluation(
+                bucket=self.BUCKET, run_date="2026-07-18",
+                e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+                tt_leaderboard=lb,
+                tt_leaderboard_date_used="2026-07-18",
+                freeze=False, upload=True, s3_client=s3,
+            )
+        assert result["outcome"] == "error"
+        mock_publish.assert_called_once()
+        _, kwargs = mock_publish.call_args
+        assert kwargs["severity"] == "error"
+        assert kwargs["dedup_key"] == "champion_promotion_gate_error_2026-07-18"
+        assert "champion_promotion.py::run_weekly_evaluation" in kwargs["source"]
+
+    def test_alert_publish_failure_does_not_propagate(self):
+        """The alert channel itself failing (e.g. SNS unreachable) must not
+        crash the already-erroring evaluate run -- best-effort, swallowed,
+        same posture as the audit-JSON write's own failure handling."""
+        s3 = _FakeS3()
+        lb = _tt_leaderboard_ok(run_date="2026-07-18")
+        for spec in lb["specs"]:
+            if spec["name"] == "thinktank_coverage":
+                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
+        with mock.patch(
+            "ops_alerts.publish_ops_alert", side_effect=RuntimeError("sns down"),
+        ):
+            result = run_weekly_evaluation(
+                bucket=self.BUCKET, run_date="2026-07-18",
+                e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+                tt_leaderboard=lb,
+                tt_leaderboard_date_used="2026-07-18",
+                freeze=False, upload=True, s3_client=s3,
+            )
+        assert result["outcome"] == "error"
+        assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
 
 
 # ── Frozen-schema conformance ────────────────────────────────────────────────

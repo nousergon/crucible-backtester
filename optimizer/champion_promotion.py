@@ -785,6 +785,48 @@ def build_weekly_arm_scores(
     }
 
 
+def _publish_gate_error_alert(run_date: str, error: str) -> None:
+    """Best-effort active alert when ``run_weekly_evaluation`` catches an
+    exception during gate evaluation (config#2884). The weekly winner-take
+    -all gate is correctly fail-STATIC on an internal error -- the pointer
+    is never moved on a bad read -- but until now the ONLY liveness signal
+    was the ARTIFACT_REGISTRY's file-PRESENCE SLA on the audit JSON, which
+    a weekly ``outcome="error"`` write satisfies indefinitely. Without an
+    active alert, a persistent bug could freeze ``config/producer_champion
+    .json`` on a stale/losing arm for an unbounded number of weeks,
+    discoverable only by manually reading each week's audit record.
+    Mirrors the ``_publish_executor_opt_rejection_alert`` pattern in
+    ``evaluate.py``. Never raises -- alerting must not crash the run this
+    gate error already threatened to interrupt.
+    """
+    try:
+        from ops_alerts import publish_ops_alert
+    except ImportError as e:
+        logger.warning(
+            "[champion_promotion] gate-error alert skipped — ops_alerts "
+            "unavailable: %s", e,
+        )
+        return
+    message = (
+        f"champion_promotion gate evaluation raised on {run_date}: {error}. "
+        f"config/producer_champion.json was NOT re-evaluated this week "
+        f"(fail-static — pointer unchanged). See "
+        f"config/apply_audit/producer_champion/{run_date}.json (outcome=error)."
+    )
+    try:
+        publish_ops_alert(
+            message,
+            severity="error",
+            source="crucible-backtester/optimizer/champion_promotion.py::run_weekly_evaluation",
+            dedup_key=f"champion_promotion_gate_error_{run_date}",
+            dedup_window_min=720,  # one alert per Saturday cycle, mirrors pit_parity.py
+        )
+    except Exception:  # noqa: BLE001 — alerting must never crash the run
+        logger.exception(
+            "[champion_promotion] gate-error alert publish failed (best-effort, swallowed)",
+        )
+
+
 def run_weekly_evaluation(
     *,
     bucket: str,
@@ -852,6 +894,7 @@ def run_weekly_evaluation(
         # (still written, per the liveness posture) and move on.
         logger.exception("Champion-promotion gate evaluation raised")
         error = str(e)
+        _publish_gate_error_alert(run_date, error)
 
     audit = build_champion_audit(run_date, gate_result, freeze=freeze, error=error)
 
