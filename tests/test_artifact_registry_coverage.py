@@ -85,7 +85,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # horizon_net_alpha/model_version_net_alpha), OBSERVE-only, registered in
     # ARTIFACT_REGISTRY.yaml with the same grace_period_cycles:999 treatment as
     # those two siblings rather than a freshness-SLA row.
-    "backtest.py": 12,
+    # +1 (12→13) 2026-07-21: config#3081 S-slot sizing shootout —
+    # sizing_shootout.json under backtest/{date}/ (sibling of double_sort/
+    # horizon_net_alpha/model_version_net_alpha), OBSERVE-only demo comparison
+    # of the incumbent conviction sizer vs risk-parity/fractional-Kelly arms;
+    # grandfathered here with the same treatment as those siblings rather than
+    # a freshness-SLA row.
+    "backtest.py": 13,
     # config#1405 research-free backfill parquet (predictor/research_free_backfill/
     # predictor_outcomes_research_free.parquet) — the durable producer→consumer wire
     # for the scanner→predictor-direct counterfactual (research.db pulls are
