@@ -523,6 +523,7 @@ class TestMultiCombo:
                     "coverage_sizing_enabled", "coverage_derate_floor",
                     "min_position_dollar", "correlation_block_enabled",
                     "correlation_block_threshold", "correlation_lookback_days",
+                    "kelly_fraction",
                 ]
             },
         }
