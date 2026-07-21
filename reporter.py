@@ -391,6 +391,33 @@ def _section_pipeline_health(health: dict) -> list[str]:
     if health.get("feature_skip_reasons"):
         lines.append(f"- Predictor feature skips: {health['feature_skip_reasons']}")
 
+    # pit_parity health (config#3120). A persisted status=failed artifact
+    # previously had zero surface on this report — a week's contamination
+    # check could silently vanish with nothing but a Telegram alert (easy
+    # to miss) and no durable weekly-review trail. `pit_parity_status` is
+    # None when pit_parity didn't run this week (disabled / skipped stage —
+    # an expected, non-fatal state, rendered distinctly from a failure);
+    # "failed" is the only other non-"ok" value emitted by
+    # handle_pit_parity_failure / run_pit_parity's incomplete-pass path.
+    pit_status = health.get("pit_parity_status")
+    if pit_status == "failed":
+        error_class = health.get("pit_parity_error_class") or "unknown error"
+        run_date = health.get("pit_parity_run_date") or "unknown date"
+        lines.append(
+            f"- pit_parity: **FAILED** ({error_class}) on {run_date} — "
+            f"contamination report unavailable this week; see the "
+            f"Telegram/SNS alert + backtest/{run_date}/pit_parity.json"
+        )
+    elif pit_status == "incomplete":
+        lines.append(
+            "- pit_parity: **INCOMPLETE** — one or both parity passes did "
+            "not complete; see backtest/{date}/pit_parity.json"
+        )
+    elif pit_status is not None:
+        lines.append("- pit_parity: OK — contamination report emitted")
+    else:
+        lines.append("- pit_parity: not run this week (stage disabled/skipped)")
+
     lines.append("")
     return lines
 

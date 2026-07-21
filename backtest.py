@@ -5740,7 +5740,7 @@ def _main_impl() -> None:
     # the contamination report and returns. Never raises into the SF — the
     # spot stage that invokes it is best-effort and non-blocking.
     if args.pit_parity:
-        from analysis.pit_parity import run_pit_parity, write_failure_artifact
+        from analysis.pit_parity import handle_pit_parity_failure, run_pit_parity
         try:
             report = run_pit_parity(config)
             print(json.dumps(
@@ -5761,37 +5761,13 @@ def _main_impl() -> None:
             # alert via ``nousergon_lib.alerts.publish`` (sev=warning,
             # dedup-keyed on run_date so a swept-cycle retry collapses to
             # one alert). The 2026-05-17→2026-05-24 incident swallowed
-            # 4 silent failures with only an spot-stdout log line —
-            # the operator's gate was unreachable for 11 days.
-            logger.error(
-                "[pit_parity] run failed (observational, non-fatal): %s",
-                e, exc_info=True,
-            )
-            try:
-                write_failure_artifact(config, e)
-            except Exception as artifact_err:
-                logger.error(
-                    "[pit_parity] failure-artifact write also failed: %s",
-                    artifact_err,
-                )
-            try:
-                from nousergon_lib.alerts import publish as _alerts_publish
-                run_date = config.get("_run_date") or "unknown"
-                _alerts_publish(
-                    f"pit_parity failed on {run_date}: "
-                    f"{type(e).__name__}: {str(e)[:200]} — "
-                    f"see s3://{config.get('signals_bucket', 'alpha-engine-research')}/"
-                    f"backtest/{run_date}/pit_parity.json",
-                    severity="warning",
-                    source="alpha-engine-backtester/pit_parity",
-                    dedup_key=f"pit_parity_failed_{run_date}",
-                    dedup_window_min=720,  # 12h — one alert per Saturday cycle
-                )
-            except Exception as alert_err:
-                logger.error(
-                    "[pit_parity] operator alert publish also failed: %s",
-                    alert_err,
-                )
+            # 4 silent failures with only an spot-stdout log line — the
+            # operator's gate was unreachable for 11 days. config#3120:
+            # the artifact-write+alert pairing is extracted into
+            # ``handle_pit_parity_failure`` (analysis/pit_parity.py) so it
+            # is directly unit-testable with a mocked alert sender, not
+            # just reachable via a full spot run.
+            handle_pit_parity_failure(config, e)
         return
 
     _init_pipeline(args, config)

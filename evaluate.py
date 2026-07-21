@@ -229,6 +229,13 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
     config["_predictor_sweep_df"] = predictor_sweep_df
     config["_portfolio_stats"] = portfolio_stats
     config["_predictor_stats"] = predictor_stats
+    # config#3120: read back pit_parity.json (best-effort, NOT part of the
+    # `missing_artifacts`/critical-artifact accounting above) so the Report
+    # Card can surface pit-parity health for the week. pit_parity is
+    # observational-by-design and DEFAULT-OFF-able (PIT_PARITY_ENABLED=0 /
+    # --skip-stages=pit_parity) — a missing key is an expected, non-fatal
+    # state here, never promoted to the evaluator's critical-artifact gate.
+    config["_pit_parity_report"] = _load_pit_parity_report(s3, bucket, prefix)
 
     return {
         "research_db": has_research_db,
@@ -238,6 +245,38 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
         "portfolio_stats": portfolio_stats is not None,
         "predictor_stats": predictor_stats is not None,
     }
+
+
+def _load_pit_parity_report(s3, bucket: str, prefix: str) -> dict | None:
+    """Best-effort read of ``{prefix}/pit_parity.json`` (config#3120).
+
+    Returns the parsed report dict, or ``None`` when the key doesn't exist
+    (pit_parity disabled for this run / hasn't run yet — an expected,
+    non-fatal state) or the read/parse fails for any other reason. Never
+    raises — this is a secondary observability surface for the weekly
+    Report Card, not a critical evaluator input.
+    """
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=f"{prefix}/pit_parity.json")
+        return json.loads(resp["Body"].read())
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "NoSuchKey":
+            logger.info(
+                "pit_parity.json not found at %s/pit_parity.json — pit_parity "
+                "likely disabled or not yet run for this date", prefix,
+            )
+        else:
+            logger.warning(
+                "S3 ClientError loading %s/pit_parity.json: %s — Report Card "
+                "will render pit-parity status as unavailable", prefix, e,
+            )
+        return None
+    except Exception as e:
+        logger.warning(
+            "Failed to parse %s/pit_parity.json: %s — Report Card will "
+            "render pit-parity status as unavailable", prefix, e,
+        )
+        return None
 
 
 # ── Signal quality pipeline ──────────────────────────────────────────────────
@@ -2045,10 +2084,31 @@ def _main_impl() -> None:
         portfolio_stats = config.get("_portfolio_stats")
         predictor_stats = config.get("_predictor_stats")
 
+        # config#3120: surface pit_parity health on the weekly Report Card.
+        # pit_parity_report is None when pit_parity is disabled for this run
+        # / hasn't executed yet for this date — rendered as "not run", not
+        # confused with a failure. A present report's "status" key is
+        # "failed" only on the outer-exception path (handle_pit_parity_
+        # failure); a completed run has no "status" key at all (see
+        # analysis/pit_parity.py::build_contamination_report), which reads
+        # as healthy/ok below.
+        _pit_parity_report = config.get("_pit_parity_report")
         pipeline_health = {
             "db_pull_status": config.get("_db_pull_status"),
             "staleness_warning": portfolio_stats.get("staleness_warning") if portfolio_stats else None,
             "coverage": portfolio_stats.get("coverage") if portfolio_stats else None,
+            "pit_parity_status": (
+                (_pit_parity_report or {}).get("status", "ok")
+                if _pit_parity_report is not None else None
+            ),
+            "pit_parity_error_class": (
+                (_pit_parity_report or {}).get("error_class")
+                if _pit_parity_report is not None else None
+            ),
+            "pit_parity_run_date": (
+                (_pit_parity_report or {}).get("run_date")
+                if _pit_parity_report is not None else None
+            ),
         }
 
         # Compute the evaluator-revamp metric bundles. Each piece
