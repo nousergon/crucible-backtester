@@ -74,7 +74,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest hypothesis
+          pip install pytest hypothesis pytest-cov
 
       # Undefined-name lint (config#1646 follow-on): `sim_all_orders` was
       # referenced in a function that never defined it — a NameError that only
@@ -89,8 +89,11 @@ jobs:
           pip install ruff
           ruff check --select F821 .
 
+      # --cov-fail-under not passed explicitly: pytest-cov reads
+      # [tool.coverage.report] fail_under from pyproject.toml automatically
+      # once --cov is passed (config#2533 coverage ratchet).
       - name: Run tests
-        run: pytest tests/ -v
+        run: pytest tests/ -v --cov=. --cov-report=term-missing
 
       # Advisory-only: pip-audit's newer releases emit a GH Actions error
       # annotation for any finding, which the runner honors as a step failure
