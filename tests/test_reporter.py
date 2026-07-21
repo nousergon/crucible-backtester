@@ -109,6 +109,47 @@ class TestSectionPipelineHealth:
         assert "Research DB: **MISSING** — signal quality analysis skipped" in text
         assert "weird-value" not in text
 
+    # ── pit_parity health (config#3120) ─────────────────────────────────
+
+    def test_pit_parity_failed_status_renders_failed_row(self):
+        """The acceptance bar for config#3120: a fixture failure record
+        (status=failed) must produce a visible tile/row on the Report
+        Card, naming the error class + run date."""
+        health = {
+            "db_pull_status": "ok",
+            "pit_parity_status": "failed",
+            "pit_parity_error_class": "RuntimeError",
+            "pit_parity_run_date": "2026-07-17",
+        }
+        lines = _section_pipeline_health(health)
+        text = "\n".join(lines)
+        assert "pit_parity" in text
+        assert "FAILED" in text
+        assert "RuntimeError" in text
+        assert "2026-07-17" in text
+
+    def test_pit_parity_ok_status_renders_ok_row(self):
+        health = {"db_pull_status": "ok", "pit_parity_status": "ok"}
+        lines = _section_pipeline_health(health)
+        text = "\n".join(lines)
+        assert "pit_parity: OK" in text
+
+    def test_pit_parity_incomplete_status_renders_incomplete_row(self):
+        health = {"db_pull_status": "ok", "pit_parity_status": "incomplete"}
+        lines = _section_pipeline_health(health)
+        text = "\n".join(lines)
+        assert "pit_parity" in text
+        assert "INCOMPLETE" in text
+
+    def test_pit_parity_absent_renders_not_run(self):
+        """pit_parity_status is None when the stage didn't run this week
+        (disabled / skipped) — must render distinctly from a failure,
+        never silently omit the row."""
+        lines = _section_pipeline_health({"db_pull_status": "ok"})
+        text = "\n".join(lines)
+        assert "pit_parity: not run this week" in text
+        assert "FAILED" not in text
+
 
 # ── build_report() ───────────────────────────────────────────────────────────
 

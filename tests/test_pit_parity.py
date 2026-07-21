@@ -399,6 +399,133 @@ def test_write_failure_artifact_swallows_upload_error(monkeypatch):
     assert "_s3_key" not in rep  # upload failed but write_failure_artifact returned
 
 
+# ── handle_pit_parity_failure (config#3120: page on status=failed) ──────────
+
+
+def _stub_s3(monkeypatch):
+    """Install a no-op boto3 stub so write_failure_artifact's S3 upload
+    inside handle_pit_parity_failure doesn't hit the network."""
+    class _RecordingS3:
+        def put_object(self, **kw):
+            pass
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _RecordingS3()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+
+def test_handle_pit_parity_failure_publishes_warning_alert(monkeypatch):
+    """config#3120 acceptance: a pit_parity failure record write must
+    demonstrably produce a Telegram warning. ``nousergon_lib.alerts.publish``
+    is the dual-channel (SNS + Telegram) chokepoint this repo's pit_parity
+    code already documents as its fail-loud surface — this pins that the
+    call actually fires, names run_date + error_class, and is severity
+    'warning' (never blocks/raises — non-blocking posture unchanged)."""
+    _stub_s3(monkeypatch)
+
+    captured: list[dict] = []
+
+    def _fake_publish(message, *, severity, source, dedup_key=None, dedup_window_min=None):
+        captured.append({
+            "message": message, "severity": severity, "source": source,
+            "dedup_key": dedup_key, "dedup_window_min": dedup_window_min,
+        })
+
+    fake_alerts = types.ModuleType("nousergon_lib.alerts")
+    fake_alerts.publish = _fake_publish
+    monkeypatch.setitem(sys.modules, "nousergon_lib.alerts", fake_alerts)
+
+    config = {"signals_bucket": "b", "_run_date": "2026-07-17"}
+    rep = pp.handle_pit_parity_failure(config, RuntimeError("boom in walkforward pass"))
+
+    assert rep["status"] == "failed"
+    assert len(captured) == 1, "exactly one alert must be published"
+    alert = captured[0]
+    assert alert["severity"] == "warning", "must page at WARNING severity, never higher/blocking"
+    assert "2026-07-17" in alert["message"], "must name run_date"
+    assert "RuntimeError" in alert["message"], "must name error_class"
+    assert alert["dedup_key"] == "pit_parity_failed_2026-07-17"
+    assert alert["dedup_window_min"] == 720
+
+
+def test_handle_pit_parity_failure_writes_status_failed_artifact(monkeypatch):
+    """The S3 always-emit-artifact contract must still hold when routed
+    through the new chokepoint (not just the alert)."""
+    captured: list[dict] = []
+
+    class _RecordingS3:
+        def put_object(self, **kw):
+            captured.append(kw)
+
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _RecordingS3()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    fake_alerts = types.ModuleType("nousergon_lib.alerts")
+    fake_alerts.publish = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "nousergon_lib.alerts", fake_alerts)
+
+    config = {"signals_bucket": "b", "_run_date": "2026-07-17"}
+    rep = pp.handle_pit_parity_failure(config, RuntimeError("boom"))
+
+    assert rep["status"] == "failed"
+    assert rep["error_class"] == "RuntimeError"
+    assert rep["_s3_key"] == "backtest/2026-07-17/pit_parity.json"
+    assert len(captured) == 1
+
+
+def test_handle_pit_parity_failure_never_raises_when_alert_publish_fails(monkeypatch):
+    """Non-blocking posture: an alert-publish failure must not propagate —
+    pit_parity stays observational even if the paging channel itself breaks."""
+    _stub_s3(monkeypatch)
+
+    def _boom_publish(*a, **k):
+        raise RuntimeError("SNS/Telegram transport down")
+
+    fake_alerts = types.ModuleType("nousergon_lib.alerts")
+    fake_alerts.publish = _boom_publish
+    monkeypatch.setitem(sys.modules, "nousergon_lib.alerts", fake_alerts)
+
+    config = {"signals_bucket": "b", "_run_date": "2026-07-17"}
+    rep = pp.handle_pit_parity_failure(config, ValueError("synthetic"))
+    assert rep["status"] == "failed"  # returned normally, no exception
+
+
+def test_handle_pit_parity_failure_never_raises_when_artifact_write_also_fails(monkeypatch):
+    """Both surfaces failing (S3 AND alert) must still not raise — the
+    caller (backtest.py::main) treats pit_parity as fully non-blocking."""
+    class _Boom:
+        def put_object(self, **kw):
+            raise RuntimeError("S3 down")
+    fake_boto3 = types.ModuleType("boto3")
+    fake_boto3.client = lambda *a, **k: _Boom()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    fake_alerts = types.ModuleType("nousergon_lib.alerts")
+    fake_alerts.publish = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("also down"))
+    monkeypatch.setitem(sys.modules, "nousergon_lib.alerts", fake_alerts)
+
+    config = {"signals_bucket": "b", "_run_date": "2026-07-17"}
+    rep = pp.handle_pit_parity_failure(config, KeyError("missing"))
+    assert rep["status"] == "failed"
+    assert rep["error_class"] == "KeyError"
+    assert "_s3_key" not in rep
+
+
+def test_backtest_main_pit_parity_branch_uses_handle_pit_parity_failure():
+    """Source pin: backtest.py's ``--pit-parity`` outer-exception handler
+    must route through the new chokepoint (not reintroduce an inline
+    untested copy of the artifact-write + alert-publish pair)."""
+    import inspect
+    import backtest as bt
+
+    src = inspect.getsource(bt)
+    idx = src.index("if args.pit_parity:")
+    branch_src = src[idx:idx + 2500]
+    assert "handle_pit_parity_failure(config, e)" in branch_src
+    assert "from analysis.pit_parity import handle_pit_parity_failure" in branch_src
+
+
 def test_passes_run_via_subprocess_run_not_multiprocessing():
     """L4487: both passes go through _run_predictor_pass_isolated, which uses
     subprocess.run (a fresh `backtest.py --pit-parity-pass`, cwd=backtester) —
