@@ -154,6 +154,72 @@ def write_failure_artifact(
     return report
 
 
+def handle_pit_parity_failure(config: dict, exc: BaseException) -> dict:
+    """Single chokepoint for the ``run_pit_parity`` outer-exception path
+    (``backtest.py::main``'s ``--pit-parity`` branch): (1) always-emit the
+    ``status=failed`` S3 artifact via :func:`write_failure_artifact`, then
+    (2) page a WARNING-severity Telegram + SNS alert via
+    ``nousergon_lib.alerts.publish``, naming ``run_date`` + ``error_class``
+    and deduped on ``run_date`` (720 min — one alert per Saturday cycle even
+    across a swept-cycle retry).
+
+    config#3120: a persisted ``status=failed`` record with zero alerting
+    left the 2026-07-17 week's pit-parity contamination report silently
+    absent for 30+ hours (same silent-warning class as the
+    2026-05-17->2026-05-24 incident this module's always-emit-artifact
+    contract already closed the S3 half of). This closes the alerting half:
+    extracted into its own function (previously inlined in
+    ``backtest.py::main``) so the paging behavior is directly unit-testable
+    with a mocked alert sender, not just reachable via a full spot run.
+
+    Never raises — both the artifact write and the alert publish are
+    best-effort observability steps; pit_parity stays non-blocking
+    (observational posture unchanged — this pages, it never halts the
+    pipeline). Returns the failure report dict (mirrors
+    ``write_failure_artifact``'s return value).
+    """
+    logger.error(
+        "[pit_parity] run failed (observational, non-fatal): %s",
+        exc, exc_info=True,
+    )
+    try:
+        report = write_failure_artifact(config, exc)
+    except Exception as artifact_err:
+        logger.error(
+            "[pit_parity] failure-artifact write also failed: %s",
+            artifact_err,
+        )
+        report = {
+            "schema": SCHEMA,
+            "run_date": config.get("_run_date") or _dt.date.today().isoformat(),
+            "status": "failed",
+            "error_class": type(exc).__name__,
+            "error_msg": str(exc)[:1000],
+            "observational": True,
+        }
+
+    run_date = config.get("_run_date") or "unknown"
+    error_class = type(exc).__name__
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    try:
+        from nousergon_lib.alerts import publish as _alerts_publish
+        _alerts_publish(
+            f"pit_parity failed on {run_date}: "
+            f"{error_class}: {str(exc)[:200]} — "
+            f"see s3://{bucket}/backtest/{run_date}/pit_parity.json",
+            severity="warning",
+            source="alpha-engine-backtester/pit_parity",
+            dedup_key=f"pit_parity_failed_{run_date}",
+            dedup_window_min=720,  # 12h — one alert per Saturday cycle
+        )
+    except Exception as alert_err:
+        logger.error(
+            "[pit_parity] operator alert publish also failed: %s",
+            alert_err,
+        )
+    return report
+
+
 def _write_artifact_to_s3(bucket: str, run_date: str, report: dict) -> str | None:
     """Best-effort upload of the parity report to the canonical S3 key.
 
