@@ -142,7 +142,42 @@ def _parse_args() -> argparse.Namespace:
         "--stop-instance", action="store_true",
         help="Stop this EC2 instance after completion (for scheduled runs)",
     )
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help=(
+            "config#3121: cheap preflight-only smoke — runs "
+            "BacktesterPreflight(mode='evaluate') + a read-only S3 "
+            "reachability probe, then exits 0 BEFORE any diagnostics/"
+            "optimizer work or config writes. Mirrors backtest.py "
+            "--mode=smoke's philosophy (import/config/S3-wiring proof in "
+            "seconds, not a full run) so evaluate.py has its own smoke-"
+            "preflight entry the spot_backtest.sh per-phase smoke loop "
+            "can call (smoke-evaluator) instead of only having the "
+            "input-check-only input_quality_gate as this stage's smoke."
+        ),
+    )
     return parser.parse_args()
+
+
+# ── Smoke preflight (config#3121) ────────────────────────────────────────────
+
+
+def _smoke_probe_s3(config: dict) -> None:
+    """Read-only S3 reachability probe for ``--smoke`` (config#3121).
+
+    ``BacktesterPreflight(mode="evaluate")`` already proves the bucket
+    exists; this adds one cheap, real read call (list the ``backtest/``
+    prefix, max 1 key) so a credentials/permissions problem that a bucket-
+    exists HEAD check wouldn't catch also surfaces in seconds at smoke
+    time, not deep into a real evaluator run. Raises on failure — the
+    whole point of a smoke step is to fail loud and fast; a swallowed
+    exception here would defeat it.
+    """
+    import boto3
+    bucket = config.get("signals_bucket", "alpha-engine-research")
+    s3 = boto3.client("s3")
+    s3.list_objects_v2(Bucket=bucket, Prefix="backtest/", MaxKeys=1)
+    logger.info("[smoke-evaluator] S3 reachability probe OK (bucket=%s)", bucket)
 
 
 # ── Data source initialization ───────────────────────────────────────────────
@@ -1785,6 +1820,21 @@ def _main_impl() -> None:
         bucket=config.get("signals_bucket", "alpha-engine-research"),
         mode="evaluate",
     ).run()
+
+    # config#3121: --smoke exits here, BEFORE _init_data_sources (which
+    # would raise if a real backtest/{date}/ prefix has no critical
+    # artifacts — not a condition a smoke run should depend on) and before
+    # any optimizer/diagnostics work or config writes. Preflight above
+    # already proves imports + S3 bucket reachability; _smoke_probe_s3
+    # adds one more read-only call so a real credentials/permissions
+    # problem (not just a reachable-bucket check) surfaces in seconds.
+    if args.smoke:
+        _smoke_probe_s3(config)
+        logger.info(
+            "[smoke-evaluator] preflight + S3 reachability probe passed — "
+            "exiting 0 without diagnostics/optimizers/config writes",
+        )
+        return
 
     # Initialize optimizer modules
     weight_optimizer.init_config(config)

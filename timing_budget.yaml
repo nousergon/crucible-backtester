@@ -75,6 +75,21 @@ smoke_budgets_seconds:
   # FeatureLookup/ohlcv-precompute setup which runs once per sweep.
   smoke-predictor-param-sweep: 600.0
 
+  # config#3121: pit_parity had NO smoke — its numba/numpy ImportError (or
+  # any subprocess/config-wiring break) surfaced ~2h into a real Saturday
+  # run instead of at smoke time. run_pit_parity ALWAYS runs both passes
+  # (lookahead + walkforward), each in its own OS subprocess
+  # (_run_predictor_pass_isolated, L4487) — so this is roughly 2x
+  # smoke-predictor-backtest's per-pass cost (~120-200s each) plus
+  # subprocess spawn/JSON-round-trip overhead per pass. The tiny-slice
+  # fixture (5 tickers, 30-60 trading days) proves imports + config +
+  # subprocess wiring; an import/config break fails in seconds (long
+  # before this budget matters) — the budget's job is catching a
+  # regression that makes a PASSING smoke slow, not bounding failure time.
+  # Estimated 250-450s typical; 700s headroom matches smoke-phase4 (the
+  # other double-predictor-pass-class smoke).
+  smoke-pit-parity: 700.0
+
 # ── Full-run hard caps (tripwire) ────────────────────────────────────────────
 #
 # Per-phase hard-cap watchdog for non-smoke runs. Exceeding the cap:

@@ -4332,6 +4332,46 @@ _SMOKE_PHASE_MODES: dict[str, dict] = {
         ],
         "skip_phases": None,
     },
+    "smoke-pit-parity": {
+        # config#3121: pit_parity had NO smoke — its numba/numpy ImportError
+        # (or any subprocess/config-wiring break in _run_predictor_pass_
+        # isolated) surfaced ~2h into a real Saturday run instead of in
+        # seconds at smoke time, because none of the 5 existing smoke-<phase>
+        # modes ever set args.pit_parity. This mode does: it routes through
+        # predictor-backtest (matching how the REAL pit_parity stage in
+        # spot_backtest.sh invokes `backtest.py --mode predictor-backtest
+        # --pit-parity`) with the same tiny-slice overrides as the other
+        # predictor smokes, AND sets args.pit_parity=True (see
+        # _apply_smoke_fixture's set_pit_parity handling) so BOTH parity
+        # passes (lookahead + walkforward — run_pit_parity always runs both)
+        # execute for real through the isolated-subprocess path
+        # (_run_predictor_pass_isolated), proving imports + config-JSON
+        # round-trip + subprocess wiring end-to-end in under a minute.
+        # `param_sweep` is overridden to the same tiny 3-combo grid as
+        # smoke-param-sweep — if config.yaml's `pit_parity_sweep` flag is
+        # on, run_predictor_backtest's opt-in CSCV sweep (config#816) reads
+        # THIS grid (select_grid over config["param_sweep"]), so the sweep
+        # path is exercised too, tiny, whenever the tracked flag is set; if
+        # the flag is off, the override is simply unused (pbo stays null).
+        "route_mode": "predictor-backtest",
+        "set_pit_parity": True,
+        "overrides": {
+            "smoke_tickers": _SMOKE_FIXTURE_TICKERS,
+            "predictor_backtest": {
+                "min_trading_days": 30,
+                "max_trading_days": 60,
+                "top_n_signals_per_day": 5,
+            },
+            "param_sweep": {
+                "min_score": [65, 70, 75],
+            },
+            "param_sweep_settings": {
+                "mode": "random", "max_trials": 3, "seed": 0,
+            },
+        },
+        "only_phases": None,
+        "skip_phases": None,
+    },
 }
 
 
@@ -4365,6 +4405,14 @@ def _apply_smoke_fixture(mode: str, args, config: dict) -> None:
     # Route to the underlying full mode for downstream branching
     # (_run_simulation_pipeline, _run_predictor_pipeline).
     args.mode = spec["route_mode"]
+
+    # config#3121: smoke-pit-parity sets this so the `if args.pit_parity:`
+    # branch (which runs BEFORE _init_pipeline / phase-registry, and does
+    # NOT consult only_phases/skip_phases) fires with the tiny-slice
+    # config overrides applied above. Every other smoke mode leaves this
+    # unset (args.pit_parity already defaults False from argparse).
+    if spec.get("set_pit_parity"):
+        args.pit_parity = True
 
     if spec["only_phases"]:
         # Append to whatever the operator already passed — a CLI-passed
@@ -4401,6 +4449,16 @@ def _apply_smoke_fixture(mode: str, args, config: dict) -> None:
     # inherit the prefix too but smoke emails are suppressed and smoke
     # uploads are disabled below so no user-visible artifacts appear.
     args.date = f".smoke/{args.date}"
+
+    # config#3121: re-stamp config["_run_date"] to match — it was already
+    # set (from the PRE-smoke args.date) by the caller before this
+    # function runs. Without this, any S3 key built from _run_date (e.g.
+    # analysis/pit_parity.py's backtest/{_run_date}/pit_parity.json)
+    # would resolve to the REAL production key despite args.date itself
+    # being correctly namespaced — exactly the 2026-04-23 smoke/prod
+    # artifact collision this whole namespacing scheme exists to prevent.
+    if "_run_date" in config:
+        config["_run_date"] = args.date
 
     # Suppress top-level S3 upload. Without this, the export_artifacts
     # phase writes smoke's 5-ticker portfolio_stats.json etc. to
@@ -4692,7 +4750,7 @@ def _parse_args() -> argparse.Namespace:
             "smoke",
             "smoke-simulate", "smoke-param-sweep",
             "smoke-predictor-backtest", "smoke-phase4",
-            "smoke-predictor-param-sweep",
+            "smoke-predictor-param-sweep", "smoke-pit-parity",
         ],
         default="simulate",
         help=(
@@ -5792,6 +5850,22 @@ def _main_impl() -> None:
                     "[pit_parity] operator alert publish also failed: %s",
                     alert_err,
                 )
+        # config#3121: this branch `return`s before the end-of-_main_impl
+        # budget-enforcement call (the smoke-pit-parity mode never reaches
+        # it otherwise, since it routes through this early-return branch,
+        # not the phase-registry / simulation-pipeline path the other
+        # smoke-<phase> modes fall through to). Emitting the elapsed slice
+        # runtime to the phase marker here (rather than only a budget
+        # SystemExit) is the "optional" leg of Brian's scope ruling: a
+        # phase-timing trend is visible even on PASS, not only surfaced as
+        # a hard failure at 2x the budget.
+        if _is_smoke_phase:
+            elapsed = _time.time() - _health_start
+            logger.info(
+                "[smoke-pit-parity] slice runtime %.1fs (phase marker for "
+                "budget-breach extrapolation)", elapsed,
+            )
+            _assert_smoke_within_budget(_original_mode, elapsed, registry=registry)
         return
 
     _init_pipeline(args, config)

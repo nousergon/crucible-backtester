@@ -29,6 +29,7 @@ import backtest
     "smoke-predictor-backtest",
     "smoke-phase4",
     "smoke-predictor-param-sweep",
+    "smoke-pit-parity",
 ])
 def test_smoke_phase_mode_accepted(mode: str):
     with patch.object(sys, "argv", ["backtest.py", "--mode", mode]):
@@ -44,13 +45,14 @@ def test_smoke_phase_mode_registry_exact():
     assert mode_registry_keys == {
         "smoke-simulate", "smoke-param-sweep",
         "smoke-predictor-backtest", "smoke-phase4",
-        "smoke-predictor-param-sweep",
+        "smoke-predictor-param-sweep", "smoke-pit-parity",
     }
 
 
 def test_is_smoke_phase_mode():
     assert backtest._is_smoke_phase_mode("smoke-simulate") is True
     assert backtest._is_smoke_phase_mode("smoke-phase4") is True
+    assert backtest._is_smoke_phase_mode("smoke-pit-parity") is True
     assert backtest._is_smoke_phase_mode("smoke") is False  # the legacy mode
     assert backtest._is_smoke_phase_mode("simulate") is False
     assert backtest._is_smoke_phase_mode("all") is False
@@ -69,6 +71,7 @@ def _blank_args(mode: str) -> argparse.Namespace:
         freeze=False,
         date="2026-04-23",
         upload=True,
+        pit_parity=False,
     )
 
 
@@ -87,7 +90,7 @@ def test_smoke_simulate_routes_to_simulate():
 @pytest.mark.parametrize("mode", [
     "smoke-simulate", "smoke-param-sweep",
     "smoke-predictor-backtest", "smoke-phase4",
-    "smoke-predictor-param-sweep",
+    "smoke-predictor-param-sweep", "smoke-pit-parity",
 ])
 def test_smoke_fixture_namespaces_date_to_isolate_markers(mode: str):
     """Fix for 2026-04-23 SF dry-run failure: smoke markers at
@@ -108,7 +111,7 @@ def test_smoke_fixture_namespaces_date_to_isolate_markers(mode: str):
 @pytest.mark.parametrize("mode", [
     "smoke-simulate", "smoke-param-sweep",
     "smoke-predictor-backtest", "smoke-phase4",
-    "smoke-predictor-param-sweep",
+    "smoke-predictor-param-sweep", "smoke-pit-parity",
 ])
 def test_smoke_fixture_disables_upload(mode: str):
     """Smoke must not write top-level backtest/{date}/ artifacts (report,
@@ -125,7 +128,7 @@ def test_smoke_fixture_disables_upload(mode: str):
 @pytest.mark.parametrize("mode", [
     "smoke-simulate", "smoke-param-sweep",
     "smoke-predictor-backtest", "smoke-phase4",
-    "smoke-predictor-param-sweep",
+    "smoke-predictor-param-sweep", "smoke-pit-parity",
 ])
 def test_every_smoke_mode_sets_smoke_tickers(mode: str):
     """Every smoke fixture must set `smoke_tickers` — it's the dominant
@@ -244,6 +247,52 @@ def test_smoke_predictor_param_sweep_includes_predictor_param_sweep_phase():
     assert "min_score" in config["param_sweep"]
 
 
+def test_smoke_pit_parity_sets_args_pit_parity_true():
+    """config#3121: smoke-pit-parity must set args.pit_parity=True so the
+    `if args.pit_parity:` branch in backtest.py::main actually fires with
+    the tiny-slice overrides applied — without this the mode would just
+    route to predictor-backtest and silently skip pit_parity entirely."""
+    args = _blank_args("smoke-pit-parity")
+    config: dict = {}
+    backtest._apply_smoke_fixture("smoke-pit-parity", args, config)
+
+    assert args.pit_parity is True
+    assert args.mode == "predictor-backtest"
+
+
+def test_smoke_pit_parity_shrinks_predictor_backtest_and_grid():
+    """Tiny-slice fixture: few tickers, short predictor lookback, and a
+    tiny param_sweep grid (exercised by run_predictor_backtest's opt-in
+    CSCV sweep when config.yaml's pit_parity_sweep flag is on — the smoke
+    doesn't force that flag, it just makes sure whatever grid is active
+    stays tiny)."""
+    args = _blank_args("smoke-pit-parity")
+    config: dict = {}
+    backtest._apply_smoke_fixture("smoke-pit-parity", args, config)
+
+    assert config["predictor_backtest"]["min_trading_days"] == 30
+    assert config["predictor_backtest"]["max_trading_days"] == 60
+    assert config["predictor_backtest"]["top_n_signals_per_day"] == 5
+    assert config["param_sweep"] == {"min_score": [65, 70, 75]}
+    settings = config["param_sweep_settings"]
+    assert settings["mode"] == "random"
+    assert settings["max_trials"] == 3
+
+
+def test_smoke_pit_parity_renamespaces_run_date_when_present():
+    """config#3121: if config already carries `_run_date` (set by main()
+    before the fixture runs), the fixture must re-stamp it to match the
+    .smoke/-prefixed args.date — otherwise pit_parity's S3 key
+    (backtest/{_run_date}/pit_parity.json) would resolve to the REAL
+    production key despite args.date itself being correctly namespaced."""
+    args = _blank_args("smoke-pit-parity")
+    config = {"_run_date": "2026-04-23"}
+    backtest._apply_smoke_fixture("smoke-pit-parity", args, config)
+
+    assert config["_run_date"] == ".smoke/2026-04-23"
+    assert config["_run_date"] == args.date
+
+
 def test_fixture_deep_merge_preserves_sibling_keys():
     """A fixture override for predictor_backtest.min_trading_days must
     not wipe out other predictor_backtest keys already in config."""
@@ -311,6 +360,34 @@ def test_all_smoke_modes_route_to_valid_full_modes():
         assert spec["route_mode"] in full_mode_choices, (
             f"Smoke mode {mode} routes to invalid full mode {spec['route_mode']!r}"
         )
+
+
+def test_smoke_pit_parity_budget_check_wired_into_pit_parity_return_branch():
+    """config#3121: smoke-pit-parity routes through the early-return
+    `if args.pit_parity:` branch (NOT the phase-registry/simulation-
+    pipeline path the other smoke-<phase> modes fall through to before
+    reaching the end-of-_main_impl budget check) — so the budget
+    enforcement + phase-marker emission must be wired INSIDE that
+    branch, gated on _is_smoke_phase, or smoke-pit-parity would never
+    get a budget check / timing signal at all.
+    """
+    import inspect
+    src = inspect.getsource(backtest)
+    pit_parity_branch_start = src.index("if args.pit_parity:")
+    # Slice through this branch (bounded — the next top-level statement
+    # after the branch is _init_pipeline).
+    next_marker = src.index("_init_pipeline(args, config)", pit_parity_branch_start)
+    branch_src = src[pit_parity_branch_start:next_marker]
+
+    assert "_is_smoke_phase" in branch_src, (
+        "the pit_parity branch must check _is_smoke_phase before running "
+        "budget enforcement — a non-smoke --pit-parity run has no budget"
+    )
+    assert "_assert_smoke_within_budget(_original_mode, elapsed" in branch_src, (
+        "smoke-pit-parity must call _assert_smoke_within_budget with the "
+        "elapsed slice runtime, same contract as every other smoke-<phase> "
+        "mode"
+    )
 
 
 def test_timing_budget_file_has_entry_for_every_smoke_mode():
