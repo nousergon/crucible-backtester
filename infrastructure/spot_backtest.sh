@@ -1237,6 +1237,27 @@ _smoke_run_mode() {
     [ "\$status" = "ok" ]
 }
 
+_smoke_run_evaluator() {
+    # config#3121: evaluate.py --smoke — the evaluator's own cheap
+    # preflight (BacktesterPreflight(mode="evaluate") + a read-only S3
+    # reachability probe), analogous to _smoke_run_mode's backtest.py
+    # --mode=smoke but for the separate evaluate.py entrypoint (evaluator
+    # previously had only the input-check-only input_quality_gate — no
+    # execution smoke of its own imports/config/S3-wiring at all).
+    local log_file="/tmp/smoke_evaluator.log"
+    local start=\$SECONDS
+    local status="ok"
+
+    echo ""
+    echo "==> Smoke: evaluate.py --smoke"
+    if ! $REMOTE_PYTHON -u evaluate.py --smoke --log-level INFO 2>&1 | tee "\$log_file"; then
+        status="FAIL"
+    fi
+    local dur=\$((SECONDS - start))
+    _smoke_record "smoke-evaluator" "\$status" "\${dur}s" "" ""
+    [ "\$status" = "ok" ]
+}
+
 _smoke_print_summary() {
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
@@ -1288,6 +1309,57 @@ for SMOKE_PHASE_MODE in smoke-simulate smoke-param-sweep smoke-predictor-backtes
         exit 1
     fi
 done
+
+# config#3121: smoke-pit-parity — a tiny-slice (5 tickers, 30-60 trading
+# days) invocation of BOTH pit_parity passes (lookahead + walkforward,
+# including the opt-in CSCV sweep path when config.yaml's pit_parity_sweep
+# flag is on) that proves imports + config + subprocess wiring in well
+# under a minute of real compute (numba/numpy import errors surface
+# immediately, not after the ~250-450s the full tiny-slice pass takes to
+# complete). Gated on PIT_PARITY_ENABLED — same condition the REAL
+# pit_parity stage below uses — so a --no-pit-parity smoke-only run
+# doesn't pay for smoke-testing a stage this run won't execute for real.
+# Runs in the SAME pre-full-run smoke-only position as the loop above
+# (this script IS what runs in the standalone Parity SF state per L4486 —
+# there is no separate "Parity stage" script to wire this into).
+if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ]; then
+    if ! _smoke_run_mode smoke-pit-parity; then
+        echo "ERROR: smoke phase smoke-pit-parity FAILED — aborting smoke-only run"
+        exit 1
+    fi
+else
+    echo ""
+    echo "==> [smoke-pit-parity] SKIPPED (PIT_PARITY_ENABLED!=1 — pit_parity won't run for real either)"
+fi
+
+# config#3121: smoke-parity — import/collection-only proof (see the
+# stage=parity block below for why this stage doesn't get a separate
+# tiny-slice DATA pass: its real pass is already a small 10-day-window
+# integration test).
+echo ""
+echo "==> Smoke: pytest tests/test_parity_replay.py -m parity --collect-only"
+_SMOKE_PARITY_START=\$SECONDS
+_SMOKE_PARITY_STATUS="ok"
+if ! $REMOTE_PYTHON -m pytest tests/test_parity_replay.py -m parity --collect-only -q 2>&1; then
+    _SMOKE_PARITY_STATUS="FAIL"
+fi
+_SMOKE_PARITY_DUR=\$((SECONDS - _SMOKE_PARITY_START))
+_smoke_record "smoke-parity" "\$_SMOKE_PARITY_STATUS" "\${_SMOKE_PARITY_DUR}s" "" ""
+if [ "\$_SMOKE_PARITY_STATUS" = "FAIL" ]; then
+    echo "ERROR: smoke phase smoke-parity FAILED — aborting smoke-only run"
+    exit 1
+fi
+
+# config#3121: smoke-evaluator — every _KNOWN_STAGES entry must declare an
+# execution smoke (tiny-slice preflight run before its full pass); the
+# evaluator previously had only input_quality_gate, which checks SIGNAL
+# INPUTS, not that evaluate.py's own imports/config/S3-wiring actually
+# work. Runs in the same pre-full-run smoke-only position as the other
+# phase smokes above.
+if ! _smoke_run_evaluator; then
+    echo "ERROR: smoke phase smoke-evaluator FAILED — aborting smoke-only run"
+    exit 1
+fi
 
 # ── L280 SUPPRESS contract canary ─────────────────────────────────────────
 # Asserts ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true (exported in
@@ -1459,6 +1531,23 @@ fi
 # backticks or dollar-paren -- they would be command-substituted at heredoc
 # construction (the 2026-06-05 "pit_parity: command not found" noise).
 if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ] && ! _stage_skipped pit_parity; then
+    # config#3121: smoke-pit-parity runs HERE — immediately before the
+    # real pit_parity pass, in the SAME script invocation (the standalone
+    # Parity SF state per L4486) that actually executes it — not just in
+    # the separate --smoke-only preflight path. A tiny-slice (5 tickers,
+    # 30-60 trading days) run of BOTH parity passes proves imports +
+    # config + subprocess wiring in well under a minute; an ImportError /
+    # config break here fails fast instead of ~2h into the real run below.
+    # Non-fatal by the same observational posture as the real stage: a
+    # smoke failure is loud (ERROR + non-zero) but does not exit the spot
+    # run — pit_parity itself is non-blocking, and its smoke inherits that.
+    echo "▶ stage=smoke-pit-parity START at \$(date -u +%H:%M:%S)"
+    if ! $REMOTE_PYTHON -u backtest.py --mode smoke-pit-parity \\
+        --date "\${RUN_DATE}" --log-level INFO 2>&1; then
+        echo "WARNING: smoke-pit-parity FAILED — pit_parity's import/config/subprocess wiring is broken. Continuing (pit_parity is non-blocking) but the real pass below will likely fail the same way." >&2
+    fi
+    echo "▶ stage=smoke-pit-parity END at \$(date -u +%H:%M:%S)"
+
     echo "▶ stage=pit_parity START at \$(date -u +%H:%M:%S) (observational, non-blocking)"
     # Swallow on non-zero exit per feedback_no_silent_fails secondary-
     # observability carve-out: (a) failure mode swallowed = pit_parity
@@ -1498,6 +1587,25 @@ fi
 if _stage_skipped parity; then
     echo "⊘ stage=parity SKIPPED (--skip-stages=\${SKIP_STAGES})"
 else
+    # config#3121: smoke-parity — the parity stage's own "full pass"
+    # (tests/test_parity_replay.py -m parity) already runs in seconds
+    # against a small (default 10-day) window; there is no separate
+    # multi-hour full run to precede with a SEPARATE tiny-slice data pass
+    # the way smoke-pit-parity precedes pit_parity's real run (re-running
+    # the same S3 download + test twice would just double the cost, not
+    # add coverage). The smoke this stage actually needs — and lacked —
+    # is an IMPORT/WIRING proof: pytest --collect-only proves the test
+    # module imports cleanly and the parity marker resolves, in <5s,
+    # before paying for the trades.db download below. Catches a broken
+    # import (numba/numpy-class ImportError, a bad conftest fixture, etc.)
+    # at collection time instead of surfacing as an opaque pytest error
+    # after the S3 download.
+    echo "▶ stage=smoke-parity START at \$(date -u +%H:%M:%S)"
+    if ! $REMOTE_PYTHON -m pytest tests/test_parity_replay.py -m parity --collect-only -q 2>&1; then
+        echo "WARNING: smoke-parity FAILED — test_parity_replay.py failed to import/collect. Continuing (parity is non-blocking) but the real pass below will likely fail the same way." >&2
+    fi
+    echo "▶ stage=smoke-parity END at \$(date -u +%H:%M:%S)"
+
     echo "▶ stage=parity START at \$(date -u +%H:%M:%S)"
     PARITY_TRADES_DB="/tmp/trades_latest.db"
     PARITY_REPORT_DIR="/tmp/parity_report"
@@ -1558,6 +1666,20 @@ fi
 if _stage_skipped evaluator; then
     echo "⊘ stage=evaluator SKIPPED (--skip-stages=\${SKIP_STAGES})"
 else
+    # config#3121: smoke-evaluator runs HERE — immediately before the real
+    # evaluator pass, in the same script invocation that executes it. Cheap
+    # preflight (imports + config load + S3 reachability) via
+    # evaluate.py --smoke; the evaluator previously had only
+    # input_quality_gate (a signal-INPUT check, not an execution smoke of
+    # evaluate.py's own imports/config/S3-wiring). Non-fatal here — same
+    # rationale as smoke-pit-parity above: loud WARNING, spot run continues,
+    # the real pass below will surface the same break if it's real.
+    echo "▶ stage=smoke-evaluator START at \$(date -u +%H:%M:%S)"
+    if ! $REMOTE_PYTHON -u evaluate.py --smoke --log-level INFO 2>&1; then
+        echo "WARNING: smoke-evaluator FAILED — evaluate.py's import/config/S3 wiring is broken. Continuing but the real pass below will likely fail the same way." >&2
+    fi
+    echo "▶ stage=smoke-evaluator END at \$(date -u +%H:%M:%S)"
+
     echo "▶ stage=evaluator START at \$(date -u +%H:%M:%S) freeze=${FREEZE_EVALUATOR}"
     _EVAL_FREEZE=""
     if [ "${FREEZE_EVALUATOR}" = "true" ]; then
