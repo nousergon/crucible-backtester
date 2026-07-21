@@ -75,8 +75,8 @@ with under I2518):**
     ``analysis.end_to_end.compute_lift_metrics()['scanner_then_predictor_counterfactual']
     ['methods']['scanner_then_predictor_topN']['sector_neutral_mean_alpha_21d']``
     — the arm's own realized, sector-neutral 21d alpha, ALREADY benchmark
-    -relative (``alpha21 = log_return_21d - log_spy_return_21d`` at the
-    source, ``analysis/end_to_end.py::_scanner_then_predictor_topN``) —
+    -relative (realized log return minus the log SPY return over the same
+    window, at the source, ``analysis/end_to_end.py::_scanner_then_predictor_topN``) —
     i.e. lift vs the SPY zero-line, not vs any live comparator arm. A
     backtester-internal counterfactual (research.db-derived) already
     computed earlier in the same ``evaluate.py`` run, extracted via
@@ -673,9 +673,9 @@ def _score_scanner_predictor_direct(e2e_lift: dict | None) -> tuple[float | None
     this run's backtester-internal ``scanner_then_predictor_topN``
     counterfactual's OWN realized sector-neutral 21d alpha —
     ``sector_neutral_mean_alpha_21d`` — which is already benchmark-relative
-    at the source (``alpha21 = log_return_21d - log_spy_return_21d``, see
-    ``analysis/end_to_end.py::_scanner_then_predictor_topN``), i.e. a direct
-    lift vs the SPY zero-line, not vs any live comparator arm. See
+    at the source (realized log return minus the log SPY return over the
+    same window, see ``analysis/end_to_end.py::_scanner_then_predictor_topN``),
+    i.e. a direct lift vs the SPY zero-line, not vs any live comparator arm. See
     ``leaderboard_entry_from_e2e_lift``."""
     entry = leaderboard_entry_from_e2e_lift(e2e_lift)
     if entry is None:
