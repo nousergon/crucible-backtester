@@ -106,6 +106,7 @@ from pipeline_common import (
     push_predictor_rolling_metrics,
     resolve_trading_day,
     _load_label_barrier_config,
+    PhaseRegistry,
 )
 
 logger = logging.getLogger(__name__)
@@ -1812,6 +1813,25 @@ def _main_impl() -> None:
 
     tracker = CompletenessTracker()
 
+    # Phase markers (alpha-engine-config-I3112 step 1): the Evaluator SF
+    # state runs this whole file as one ~2h opaque block — a mid-run kill
+    # (e.g. the 2026-07-20 SIGKILL, watch-rerun-2026-07-18-10/-11) left no
+    # record of which internal phase was running or how long each had taken.
+    # Reuses backtest.py's existing PhaseRegistry (pipeline_common.py) —
+    # markers land in the SAME s3://{bucket}/backtest/{date}/.phases/
+    # namespace, "evaluator_"-prefixed to avoid colliding with backtest.py's
+    # own phase names. supports_auto_skip is left at its default False for
+    # every phase below: this is instrumentation-only (START/END markers with
+    # duration_s + status on both success and failure paths), not a resume/
+    # skip mechanism — every phase still runs exactly as before. Flipping a
+    # phase to auto-skippable is future work once its outputs are S3-artifact
+    # validated (see PhaseRegistry's own docstring), and is a precondition for
+    # ever splitting these phases into independent SF states.
+    registry = PhaseRegistry(
+        date=args.date,
+        bucket=config.get("signals_bucket", "alpha-engine-research"),
+    )
+
     # ── Default results ──────────────────────────────────────────────────
     sq_result: dict = {"status": "skipped"}
     regime_rows: list = []
@@ -1826,13 +1846,15 @@ def _main_impl() -> None:
 
     # ── Signal quality pipeline ──────────────────────────────────────────
     if run_diagnostics and (not args.module or args.module == "signal-quality"):
-        sq_result, regime_rows, score_rows, attr_result, df_base = _run_signal_quality(
-            config, tracker, avail,
-        )
+        with registry.phase("evaluator_signal_quality"):
+            sq_result, regime_rows, score_rows, attr_result, df_base = _run_signal_quality(
+                config, tracker, avail,
+            )
 
     # ── Component diagnostics ────────────────────────────────────────────
     if run_diagnostics and not args.module:
-        diagnostics = _run_diagnostics(config, tracker, avail, df_base)
+        with registry.phase("evaluator_diagnostics"):
+            diagnostics = _run_diagnostics(config, tracker, avail, df_base)
 
     # ── Single module mode ───────────────────────────────────────────────
     if args.module and args.module != "signal-quality":
@@ -1854,11 +1876,12 @@ def _main_impl() -> None:
     opt_stage_error: BaseException | None = None
     if run_optimizers:
         try:
-            opt_results = _run_optimizers(
-                config, tracker, avail, df_base,
-                freeze=args.freeze,
-                diagnostics=diagnostics,
-            )
+            with registry.phase("evaluator_optimizers"):
+                opt_results = _run_optimizers(
+                    config, tracker, avail, df_base,
+                    freeze=args.freeze,
+                    diagnostics=diagnostics,
+                )
         except Exception as e:
             opt_stage_error = e
             logger.error(
@@ -1879,37 +1902,38 @@ def _main_impl() -> None:
     # dependency).
     assemble_results: dict = {}
     if run_optimizers and opt_stage_error is None and not args.freeze:
-        from optimizer.assembler import assemble, is_cutover_enabled
-        bucket = config.get("signals_bucket", "alpha-engine-research")
-        for config_type in (
-            "executor_params", "scoring_weights", "predictor_params", "research_params",
-        ):
-            try:
-                result = assemble(
-                    bucket=bucket,
-                    config_type=config_type,
-                    run_date=args.date,
-                    write_assembled=True,
-                )
-                assemble_results[config_type] = result
-                logger.info(
-                    "Assembler run [%s]: status=%s, promoting=%d, frozen_restored=%d, "
-                    "cutover=%s",
-                    config_type,
-                    result.status,
-                    sum(
-                        1 for v in result.artifacts_seen.values()
-                        if v["promotion_intent"] == "promote"
-                    ),
-                    len(result.frozen_keys_restored),
-                    "ON" if is_cutover_enabled() else "OFF (shadow)",
-                )
-            except Exception as e:
-                # Assembler failure must not break the pipeline.
-                logger.warning(
-                    "Assembler run failed for config_type=%s (non-fatal — "
-                    "pipeline continues): %s", config_type, e,
-                )
+        with registry.phase("evaluator_assembler"):
+            from optimizer.assembler import assemble, is_cutover_enabled
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            for config_type in (
+                "executor_params", "scoring_weights", "predictor_params", "research_params",
+            ):
+                try:
+                    result = assemble(
+                        bucket=bucket,
+                        config_type=config_type,
+                        run_date=args.date,
+                        write_assembled=True,
+                    )
+                    assemble_results[config_type] = result
+                    logger.info(
+                        "Assembler run [%s]: status=%s, promoting=%d, frozen_restored=%d, "
+                        "cutover=%s",
+                        config_type,
+                        result.status,
+                        sum(
+                            1 for v in result.artifacts_seen.values()
+                            if v["promotion_intent"] == "promote"
+                        ),
+                        len(result.frozen_keys_restored),
+                        "ON" if is_cutover_enabled() else "OFF (shadow)",
+                    )
+                except Exception as e:
+                    # Assembler failure must not break the pipeline.
+                    logger.warning(
+                        "Assembler run failed for config_type=%s (non-fatal — "
+                        "pipeline continues): %s", config_type, e,
+                    )
 
     # ── Apply-audit artifact (config#1841) ───────────────────────────────
     # Unconditional per-loop outcome record for the four auto-apply loops
@@ -1920,36 +1944,37 @@ def _main_impl() -> None:
     # unconditional so a blocked apply can never again be silent.
     apply_audit_upload = bool(getattr(args, "upload", False)) and not args.freeze
     if run_optimizers:
-        from optimizer.apply_audit import emit_apply_audit
-        apply_audit_result = emit_apply_audit(
-            bucket=config.get("signals_bucket", "alpha-engine-research"),
-            run_date=args.date,
-            opt_results=opt_results,
-            assembler_results=assemble_results,
-            upload=apply_audit_upload,
-            run_error=opt_stage_error,
-        )
-        if opt_stage_error is not None:
-            raise opt_stage_error
-
-        # ── Post-optimizer live-key reconciliation (config#2332) ─────────
-        # Complements config#2331 (assembler fail-loud at the write site):
-        # this catches ANY path that produces the config#2054 orphaned-write
-        # shape — a config type apply_audit grades "promoted" this run
-        # whose live S3 key was not actually refreshed. Only meaningful
-        # against the real bucket, so it rides the same upload gate as the
-        # audit write itself (--freeze / local runs have no live key to
-        # reconcile against). Failure to page must not break the pipeline —
-        # see live_key_reconciliation.run_reconciliation's fail-loud-but-
-        # non-aborting contract.
-        if apply_audit_upload:
-            from optimizer.live_key_reconciliation import run_reconciliation
-            run_reconciliation(
+        with registry.phase("evaluator_apply_audit"):
+            from optimizer.apply_audit import emit_apply_audit
+            apply_audit_result = emit_apply_audit(
                 bucket=config.get("signals_bucket", "alpha-engine-research"),
-                audit=apply_audit_result,
-                run_start=datetime.fromtimestamp(_health_start, tz=timezone.utc),
                 run_date=args.date,
+                opt_results=opt_results,
+                assembler_results=assemble_results,
+                upload=apply_audit_upload,
+                run_error=opt_stage_error,
             )
+            if opt_stage_error is not None:
+                raise opt_stage_error
+
+            # ── Post-optimizer live-key reconciliation (config#2332) ─────────
+            # Complements config#2331 (assembler fail-loud at the write site):
+            # this catches ANY path that produces the config#2054 orphaned-write
+            # shape — a config type apply_audit grades "promoted" this run
+            # whose live S3 key was not actually refreshed. Only meaningful
+            # against the real bucket, so it rides the same upload gate as the
+            # audit write itself (--freeze / local runs have no live key to
+            # reconcile against). Failure to page must not break the pipeline —
+            # see live_key_reconciliation.run_reconciliation's fail-loud-but-
+            # non-aborting contract.
+            if apply_audit_upload:
+                from optimizer.live_key_reconciliation import run_reconciliation
+                run_reconciliation(
+                    bucket=config.get("signals_bucket", "alpha-engine-research"),
+                    audit=apply_audit_result,
+                    run_start=datetime.fromtimestamp(_health_start, tz=timezone.utc),
+                    run_date=args.date,
+                )
 
     # ── Champion promotion engine (weekly winner-take-all, alpha-engine-
     # config-I2518 / epic I2515, 2026-07-14 ruling — supersedes the prior
@@ -1970,36 +1995,37 @@ def _main_impl() -> None:
         champion_bucket = config.get("signals_bucket", "alpha-engine-research")
         champion_upload = bool(getattr(args, "upload", False)) and not args.freeze
         try:
-            e2e_lift_diag = diagnostics.get("e2e_lift") if isinstance(diagnostics, dict) else None
-            # Still maintained for observability / config#2452 continuity —
-            # no longer feeds the gate decision (see champion_promotion.py
-            # module docstring); the gate reads e2e_lift_diag directly.
-            champion_promotion.update_leaderboard_and_get_gate_inputs(
-                champion_bucket, args.date, e2e_lift_diag,
-                upload=champion_upload,
-            )
-            # LATEST-AVAILABLE read (alpha-engine-config-I2544, 2026-07-14
-            # ruling): research/producer_leaderboard/{date}.json is now
-            # written by an async advisory child SF that may not have
-            # finished (or may have failed) by the time this Evaluator
-            # stage runs — read the latest artifact <= args.date rather
-            # than assuming a same-day exact match. tt_leaderboard_date_used
-            # is threaded into the audit record so the trail always shows
-            # which week's evidence decided (or declined to decide) a flip.
-            tt_leaderboard, tt_leaderboard_date_used = (
-                champion_promotion.read_latest_research_producer_leaderboard(
-                    champion_bucket, args.date,
+            with registry.phase("evaluator_champion_promotion"):
+                e2e_lift_diag = diagnostics.get("e2e_lift") if isinstance(diagnostics, dict) else None
+                # Still maintained for observability / config#2452 continuity —
+                # no longer feeds the gate decision (see champion_promotion.py
+                # module docstring); the gate reads e2e_lift_diag directly.
+                champion_promotion.update_leaderboard_and_get_gate_inputs(
+                    champion_bucket, args.date, e2e_lift_diag,
+                    upload=champion_upload,
                 )
-            )
-            champion_promotion.run_weekly_evaluation(
-                bucket=champion_bucket,
-                run_date=args.date,
-                e2e_lift=e2e_lift_diag,
-                tt_leaderboard=tt_leaderboard,
-                tt_leaderboard_date_used=tt_leaderboard_date_used,
-                freeze=args.freeze,
-                upload=champion_upload,
-            )
+                # LATEST-AVAILABLE read (alpha-engine-config-I2544, 2026-07-14
+                # ruling): research/producer_leaderboard/{date}.json is now
+                # written by an async advisory child SF that may not have
+                # finished (or may have failed) by the time this Evaluator
+                # stage runs — read the latest artifact <= args.date rather
+                # than assuming a same-day exact match. tt_leaderboard_date_used
+                # is threaded into the audit record so the trail always shows
+                # which week's evidence decided (or declined to decide) a flip.
+                tt_leaderboard, tt_leaderboard_date_used = (
+                    champion_promotion.read_latest_research_producer_leaderboard(
+                        champion_bucket, args.date,
+                    )
+                )
+                champion_promotion.run_weekly_evaluation(
+                    bucket=champion_bucket,
+                    run_date=args.date,
+                    e2e_lift=e2e_lift_diag,
+                    tt_leaderboard=tt_leaderboard,
+                    tt_leaderboard_date_used=tt_leaderboard_date_used,
+                    freeze=args.freeze,
+                    upload=champion_upload,
+                )
         except Exception:
             # The champion-promotion step must never take down the whole
             # evaluate run (mirrors the assembler's non-fatal posture just
@@ -2025,14 +2051,15 @@ def _main_impl() -> None:
                 )
 
     # ── Regression detection ─────────────────────────────────────────────
-    regression_result = _run_regression(
-        config, tracker, sq_result,
-        config.get("_portfolio_stats"),
-        opt_results.get("weight_result"),
-        opt_results.get("executor_rec"),
-        opt_results.get("veto_result"),
-        args.freeze, args.date,
-    )
+    with registry.phase("evaluator_regression"):
+        regression_result = _run_regression(
+            config, tracker, sq_result,
+            config.get("_portfolio_stats"),
+            opt_results.get("weight_result"),
+            opt_results.get("executor_rec"),
+            opt_results.get("veto_result"),
+            args.freeze, args.date,
+        )
 
     # ── Report ───────────────────────────────────────────────────────────
     # Track whether the report/upload/email block actually completed so the
