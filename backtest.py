@@ -3400,6 +3400,94 @@ def run_predictor_backtest(config: dict) -> dict:
         # run. Fail-soft is intentional (see registry note on the PUT above).
         logger.warning("double_sort stage failed (OBSERVE, non-fatal): %s", exc)
 
+    # ── config#3081 (OBSERVE): S-slot sizing shootout ────────────────────────
+    # Compares the incumbent conviction-weighted sizer against a risk-parity
+    # (inverse-realized-vol) sizer and a fractional-Kelly sizer on the SAME
+    # signal stream already in-memory for THIS run (signals_by_date /
+    # price_matrix / ohlcv_by_ticker / sector_map, all produced above by
+    # synthetic.predictor_backtest.run) — no S3 panel load needed (unlike
+    # double_sort, which pulls a separate predictor horizon panel), since the
+    # vectorized sweep's own inputs are already sitting in `result`. Safe by
+    # construction: synthetic.vectorized_sweep.run_sizing_shootout /
+    # analysis.sizing_shootout.compute_sizing_shootout are pure/read-only over
+    # in-memory data, and gate nothing (ARCHITECTURE.md §14(e)).
+    try:
+        ss_cfg = config.get("sizing_shootout", {}) or {}
+        if ss_cfg.get("enabled", True) and result.get("price_matrix") is not None:
+            from executor.feature_lookup import FeatureLookup
+
+            from analysis.sizing_shootout import compute_sizing_shootout
+            from synthetic.vectorized_sweep import run_sizing_shootout
+
+            ss_signal_lookups = _precompute_signal_lookups(signals_by_date)
+            ss_feature_lookup = FeatureLookup.from_ohlcv_by_ticker(ohlcv_by_ticker)
+            ss_sector_map = result.get("sector_map", {})
+
+            ss_market_regime = "neutral"
+            for sl in (ss_signal_lookups or {}).values():
+                regime_str = (
+                    sl.signals_raw_filtered.get("market_regime")
+                    if hasattr(sl, "signals_raw_filtered") else None
+                )
+                if regime_str:
+                    ss_market_regime = regime_str
+                    break
+
+            ss_init_cash = float(config.get("init_cash", 1_000_000.0))
+            # Same config key + default the vectorized param-sweep path reads
+            # (backtest.py `_run_vectorized_param_sweep`) — every arm gets
+            # this SAME fee_rate (see run_sizing_shootout docstring), so a
+            # cost-free Kelly "win" cannot occur by construction.
+            ss_fee_rate = float(config.get("simulation_fees", 0.001))
+            ss_base_combo = dict(ss_cfg.get("base_combo_config", {}))
+
+            shootout_results = run_sizing_shootout(
+                combo_configs=[ss_base_combo],
+                price_matrix=result["price_matrix"],
+                ohlcv_by_ticker=ohlcv_by_ticker or {},
+                signal_lookups=ss_signal_lookups or {},
+                feature_lookup=ss_feature_lookup,
+                spy_prices=result.get("spy_prices"),
+                sector_map=ss_sector_map,
+                init_cash=ss_init_cash,
+                market_regime=ss_market_regime,
+                fee_rate=ss_fee_rate,
+            )
+
+            ss = compute_sizing_shootout(
+                shootout_results,
+                run_date=config.get("_run_date"),
+                init_cash=ss_init_cash,
+                spy_prices=result.get("spy_prices"),
+                dates=result["price_matrix"].index,
+                combo_configs=[ss_base_combo],
+                fee_rate=ss_fee_rate,
+            )
+            stats["sizing_shootout"] = ss
+            _run_date = config.get("_run_date")
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            if _run_date:
+                import boto3
+                s3 = boto3.client("s3")
+                key = f"backtest/{_run_date}/sizing_shootout.json"
+                body = json.dumps({"run_date": _run_date, **ss}, default=str, indent=2).encode("utf-8")
+                try:
+                    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+                    logger.info("sizing_shootout: persisted s3://%s/%s", bucket, key)
+                except Exception as exc:
+                    # config#1234 rationale: sizing_shootout.json is OBSERVE-only
+                    # / non-load-bearing (config#3081) and is registered/
+                    # grandfathered in ARTIFACT_REGISTRY.yaml, so the ENFORCE
+                    # freshness-monitor is the recording surface for a missed
+                    # write. Fail-soft is intentional.
+                    logger.warning("sizing_shootout S3 persist failed (non-fatal): %s", exc)
+    except Exception as exc:
+        # config#1234 rationale (outer of dual-layer swallow): the whole
+        # config#3081 OBSERVE stage gates nothing; a failure must never abort
+        # the backtest run. Fail-soft is intentional (see registry note on
+        # the PUT above).
+        logger.warning("sizing_shootout stage failed (OBSERVE, non-fatal): %s", exc)
+
     return stats
 
 
