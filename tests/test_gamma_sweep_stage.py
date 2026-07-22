@@ -175,6 +175,8 @@ class TestHappyPath:
         assert payload["status"] == "ok"
         assert payload["n_dates_with_uncertainty"] == 11
         assert payload["n_target_dates"] == 11
+        # config#2454: n_trials = len(cells) persisted alongside the report
+        assert payload["n_trials"] == 1
 
         put_calls = [
             c for c in s3_client.put_object.call_args_list
@@ -183,6 +185,7 @@ class TestHappyPath:
         assert put_calls, "expected put_object on gamma_sweep.json key"
         body_json = json.loads(put_calls[0].kwargs["Body"].decode("utf-8"))
         assert body_json["baseline_name"] == "gamma_0"
+        assert body_json["n_trials"] == 1
 
         mock_sweep.assert_called_once()
         kwargs = mock_sweep.call_args.kwargs
@@ -247,6 +250,59 @@ class TestS3PersistFailure:
             "S3 persist failed" in record.message
             for record in caplog.records
         )
+
+
+# ── Cumulative trial-count accumulator (config#2454) ────────────────────
+
+
+class TestTrialCountAccumulator:
+    def test_increments_on_success(
+        self, stub_config, stub_pred_inputs, stub_sweep_report
+    ):
+        from backtest import run_gamma_sweep_stage
+
+        coverage = list(stub_pred_inputs["predictions_by_date"].keys())
+        s3_client = _make_s3_with_uncertainty(coverage_dates=coverage)
+        with patch(
+            "synthetic.predictor_backtest.run", return_value=stub_pred_inputs
+        ), patch(
+            "analysis.portfolio_optimizer_backtest.run_gamma_sweep",
+            return_value=stub_sweep_report,
+        ), patch(
+            "nousergon_lib.quant.stats.trial_accumulator.increment_trial_count"
+        ) as mock_incr:
+            run_gamma_sweep_stage(
+                config=stub_config, run_date="2026-05-27", s3_client=s3_client,
+            )
+
+        mock_incr.assert_called_once()
+        args, _ = mock_incr.call_args
+        assert args[0] == "gamma_sweep"
+        assert args[1] == 1
+        assert args[2] == "2026-05-27"
+
+    def test_coverage_skip_does_not_increment(
+        self, stub_config, stub_pred_inputs, stub_sweep_report
+    ):
+        """The insufficient-coverage skip path returns before the sweep
+        harness runs — zero new trials this cycle, so no increment."""
+        from backtest import run_gamma_sweep_stage
+
+        s3_client = _make_s3_with_uncertainty(coverage_dates=[])
+        with patch(
+            "synthetic.predictor_backtest.run", return_value=stub_pred_inputs
+        ), patch(
+            "analysis.portfolio_optimizer_backtest.run_gamma_sweep",
+            return_value=stub_sweep_report,
+        ), patch(
+            "nousergon_lib.quant.stats.trial_accumulator.increment_trial_count"
+        ) as mock_incr:
+            payload = run_gamma_sweep_stage(
+                config=stub_config, run_date="2026-05-27", s3_client=s3_client,
+            )
+
+        assert payload["status"] == "skipped"
+        mock_incr.assert_not_called()
 
 
 # ── Uncertainty loader behavior ────────────────────────────────────────
