@@ -817,7 +817,7 @@ def _publish_gate_error_alert(run_date: str, error: str) -> None:
         publish_ops_alert(
             message,
             severity="error",
-            source="crucible-backtester/optimizer/champion_promotion.py::run_weekly_evaluation",
+            source="alpha-engine-backtester/optimizer/champion_promotion.py::run_weekly_evaluation",
             dedup_key=f"champion_promotion_gate_error_{run_date}",
             dedup_window_min=720,  # one alert per Saturday cycle, mirrors pit_parity.py
         )
