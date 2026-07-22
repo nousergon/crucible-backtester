@@ -95,10 +95,16 @@ DEFAULT_SWEEP_GRID = {
 # ── Fallback defaults (override via research_optimizer section in config.yaml) ──
 _MIN_SAMPLES = 200  # min resolved score_performance samples for reliable correlations
 # (satisfied since ~2026-06: 376+ resolved samples). The loop's real block was
-# never sample count — signals.json emitted no boost columns, so
-# compute_boost_correlations returned no_boost_data every run. Fixed by
-# crucible-research scoring/boost_signals.py emitting short_interest_adj /
-# institutional_boost (config#1857).
+# never sample count — signals.json emitted no boost columns. config#1857 fixed
+# the *producer* side (crucible-research scoring/boost_signals.py emitting
+# short_interest_adj / institutional_boost), but boost_signals.emit_boost_signals()
+# was only ever called from the six-team+CIO research graph's archive_writer
+# node — retired 2026-07-12 (config#1580). signals_envelope.py, the live producer
+# since that retirement, is a pure passthrough of the scanner score and does not
+# emit boost columns. No replacement source exists anywhere in the fleet, so the
+# live boost-correlation path below is RETIRED (alpha-engine-config-I3246, spun
+# off from config-I2054) rather than left perpetually data-starved.
+RESEARCH_GRAPH_RETIRED_DATE = "2026-07-12"
 _MIN_IMPROVEMENT = 0.05  # 5% improvement in hit rate to recommend
 _MAX_SINGLE_CHANGE_PCT = 0.50  # max 50% change in any single param value
 _BLEND_FACTOR = 0.30  # conservative: 30% data-driven, 70% current
@@ -162,6 +168,36 @@ def compute_boost_correlations(
     signals_prefix: str = "signals",
 ) -> dict:
     """
+    RETIRED (alpha-engine-config-I3246): boost-correlation signals were only
+    ever emitted into signals.json by the six-team+CIO research graph's
+    archive_writer node, retired 2026-07-12 (config#1580). No replacement
+    boost/correlation source exists — see the module-level comment above
+    ``RESEARCH_GRAPH_RETIRED_DATE``.
+
+    Returns a static retired marker without touching S3. The underlying
+    correlation math is RETAINED, uncalled-in-live, as
+    ``_compute_boost_correlations_historical`` for historical readouts and
+    the existing unit tests that exercise it directly against a synthetic
+    signals.json.
+    """
+    return {
+        "status": "retired",
+        "retired_date": RESEARCH_GRAPH_RETIRED_DATE,
+        "note": (
+            "research_optimizer boost-correlation retired (alpha-engine-config-I3246, "
+            "spun off from config-I2054): upstream six-team+CIO research graph "
+            "retired 2026-07-12 (config#1580); signals_envelope.py, the live producer "
+            "since retirement, emits no boost columns and no replacement source exists"
+        ),
+    }
+
+
+def _compute_boost_correlations_historical(
+    df: pd.DataFrame,
+    bucket: str,
+    signals_prefix: str = "signals",
+) -> dict:
+    """
     Correlate individual signal boosts with beat_spy outcomes.
 
     Loads boost values (short_interest_adj, institutional_boost) from signals.json
@@ -170,6 +206,9 @@ def compute_boost_correlations(
     HorizonPolicy parameter).
 
     Returns dict with per-boost correlation data and sample sizes.
+
+    RETAINED, uncalled-in-live (see ``compute_boost_correlations`` above) —
+    kept for historical/test use only.
     """
     if df is None or df.empty:
         return {"status": "insufficient_data", "note": "No score_performance data"}

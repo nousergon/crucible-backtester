@@ -113,6 +113,11 @@ _RESEARCH_STATUS = {
     "insufficient_data": ("insufficient_data", None),
     "no_boost_data": ("insufficient_data", None),
     "no_improvement": ("blocked", ["min_meaningful_change"]),
+    # boost-correlation signal retired (alpha-engine-config-I3246): a
+    # by-design-off loop, not a data-starved or guardrail-blocked one — maps
+    # to "disabled" like the existing freeze/shadow-mode paths so the
+    # consecutive_blocked_weeks streak neither increments nor resets on it.
+    "retired": ("disabled", None),
 }
 _EXECUTOR_STATUS = {
     "insufficient_data": ("insufficient_data", None),
