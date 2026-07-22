@@ -976,19 +976,30 @@ PYBIN="\${PIP% -m pip}"
 # numpy 1.24-1.26) -> the backtester runtime_smoke's GBMScorer.load crashed at
 # 'import scipy.sparse' with "module 'numpy' has no attribute 'long'". The
 # downgrade is REMOVED (complete the migration; never re-extend a deprecated
-# shim). This guard asserts the exact import chain that broke (numpy>=2 +
-# scipy.sparse + lightgbm) AFTER all installs, so any future co-installed pin
-# that downgrades numpy breaks LOUD here at deps time (seconds) instead of ~40
-# min into the run. Per feedback_no_silent_fails.
+# shim). This guard asserts the exact import chains that broke AFTER all
+# installs, so any future co-installed pin that downgrades numpy breaks LOUD
+# here at deps time (seconds) instead of ~40 min into the run. Two chains:
+#   numpy>=2 + scipy.sparse + lightgbm — the 2026-07-18 runtime_smoke crash
+#     (np.long removed) after the stale downgrade left numpy at 1.26; and
+#   numba + vectorbt — the same weekend's simulate-phase crash (config-I3279):
+#     numpy 2.5.1 resolved above numba 0.66's numpy<2.5 ceiling, so
+#     'import vectorbt' raised "Numba needs NumPy 2.4 or less" ~18h into the
+#     run and portfolio_stats.json/optimizer_gate degraded to an error stub.
+#     The pip-check gate below catches that instance at the METADATA level
+#     (numba declares its ceiling); this import smoke also catches ABI-level
+#     numba/numpy breaks that ship with self-consistent metadata. vectorbt
+#     backs vectorbt_bridge.py -> portfolio_stats + the optimizer-gate arc,
+#     so it is load-bearing for the Saturday SF's promotion artifacts.
+# Per feedback_no_silent_fails.
 # (NB: no backticks in this heredoc body -- they would command-substitute.)
-\$PYBIN -c "import numpy, scipy.sparse, lightgbm; assert int(numpy.__version__.split('.')[0]) >= 2, 'numpy '+numpy.__version__+' < 2.0 is inconsistent with the numpy-2-built scipy/cvxpy stack (config#2815)'; print('numpy-2 guard OK: numpy='+numpy.__version__+' scipy='+scipy.__version__+' lightgbm='+lightgbm.__version__)" || {
-    echo "FATAL: numpy-2 environment consistency check failed — a co-installed pin or stale downgrade left numpy below 2.0, breaking the numpy-2-built scipy/lightgbm stack (config#2815). See traceback above." >&2
+\$PYBIN -c "import numpy, scipy.sparse, lightgbm, numba, vectorbt; assert int(numpy.__version__.split('.')[0]) >= 2, 'numpy '+numpy.__version__+' < 2.0 is inconsistent with the numpy-2-built scipy/cvxpy stack (config#2815)'; print('numpy-2 guard OK: numpy='+numpy.__version__+' scipy='+scipy.__version__+' lightgbm='+lightgbm.__version__+' numba='+numba.__version__+' vectorbt='+vectorbt.__version__)" || {
+    echo "FATAL: import-chain consistency check failed — a co-installed pin, stale downgrade, or numba/numpy ABI mismatch broke the scipy/lightgbm or numba/vectorbt import chain (config#2815, config-I3279). See traceback above." >&2
     exit 1
 }
 
-# Fail-loud pip-check dependency-consistency gate (config#2973). The numpy-2
-# guard above only covers the ONE import chain (numpy + scipy.sparse +
-# lightgbm) that has actually broken a run so far. \`pip install\` reports ANY
+# Fail-loud pip-check dependency-consistency gate (config#2973). The import
+# guard above only covers the TWO chains (numpy + scipy.sparse + lightgbm;
+# numba + vectorbt) that have actually broken runs so far. \`pip install\` reports ANY
 # OTHER co-install/transitive-dependency conflict as a post-hoc "does not
 # take into account all installed packages" warning and still exits 0, so an
 # internally-inconsistent env ships silently and only surfaces as an import

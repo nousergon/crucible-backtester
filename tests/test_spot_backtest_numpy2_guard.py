@@ -76,7 +76,7 @@ def test_numpy2_guard_fails_loud():
     """The guard must exit non-zero on failure (fail-loud) — not swallow it."""
     s = _read()
     guard_idx = s.find("import numpy, scipy.sparse, lightgbm")
-    seg = s[guard_idx: guard_idx + 600]
+    seg = s[guard_idx: guard_idx + 1000]
     assert "exit 1" in seg, (
         "the numpy-2 guard must `exit 1` on failure so a downgrade breaks the "
         "deps step loudly, not silently ~40 min into the run"
