@@ -82,6 +82,7 @@ def _make_krepis_factory(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     cost: float | None = None,
+    served_provider: str | None = None,
     raise_on_create: Exception | None = None,
 ) -> tuple[MagicMock, MagicMock]:
     """Build a fake ``krepis.llm.LLMClient`` transport client — the
@@ -93,6 +94,11 @@ def _make_krepis_factory(
     ``structured_outputs=False`` (REQUIRED here, see runner.py's module
     docstring) ``krepis.llm`` parses this as JSON (tolerating markdown
     fences) and validates it against the schema.
+
+    ``served_provider`` sets a top-level ``.provider`` attribute on the
+    fake response, mirroring OpenRouter's real (non-standard) response
+    shape (config#3006) — ``krepis>=0.18.0`` reads this into
+    ``LLMResult.served_provider``.
 
     Returns ``(factory, fake_client)`` so tests can also assert on the
     call args recorded by ``fake_client.chat.completions.create``.
@@ -109,9 +115,12 @@ def _make_krepis_factory(
         )
         message = SimpleNamespace(content=content)
         choice = SimpleNamespace(message=message)
-        fake_client.chat.completions.create.return_value = SimpleNamespace(
+        resp = SimpleNamespace(
             choices=[choice], model=model, usage=usage,
         )
+        if served_provider is not None:
+            resp.provider = served_provider
+        fake_client.chat.completions.create.return_value = resp
     factory = MagicMock(return_value=fake_client)
     return factory, fake_client
 
@@ -632,6 +641,46 @@ class TestUsageExtraction:
         # OpenRouter's actually-billed cost — a capability the pre-migration
         # Anthropic SDK path never surfaced (purely additive; see runner.py).
         assert replay.replay_cost["provider_cost_usd"] == 0.00042
+
+    def test_served_provider_carries_through(self):
+        # config#3006 — jurisdiction/compliance check reads this off the
+        # persisted artifact instead of re-deriving it from raw_response.
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
+        from replay.runner import replay_artifact
+
+        artifact = _make_captured_artifact()
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
+            served_provider="DeepInfra",
+        )
+
+        replay = replay_artifact(
+            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+        )
+
+        assert replay.replay_cost["served_provider"] == "DeepInfra"
+
+    def test_served_provider_absent_when_not_reported(self):
+        # Also covers the pre-v0.18.0 krepis pin case — the runner reads
+        # this via getattr(result, "served_provider", None), so an older
+        # LLMResult without the attribute degrades to None, not a crash.
+        from nousergon_lib.agent_schemas import QuantAnalystOutput
+        from replay.runner import replay_artifact
+
+        artifact = _make_captured_artifact()
+        s3 = _make_s3_stub(artifact)
+        factory, _ = _make_krepis_factory(
+            content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
+        )
+
+        replay = replay_artifact(
+            artifact_key="k.json", target_model="deepseek/deepseek-v4-flash",
+            s3_client=s3, client_factory=factory, api_key="sk-or-test",
+        )
+
+        assert replay.replay_cost.get("served_provider") is None
 
     def test_missing_usage_returns_zeroed_dict(self):
         from nousergon_lib.agent_schemas import QuantAnalystOutput

@@ -370,7 +370,12 @@ def _invoke_target_with_schema(
         return None, {}, latency_ms, str(exc)
 
     latency_ms = int((time.monotonic() - start) * 1000)
-    usage_dict = _usage_dict_from_llm_usage(result.usage)
+    # getattr, not attribute access — degrades to None gracefully against
+    # a pre-v0.18.0 krepis pin (served_provider is new, config#3006) rather
+    # than raising AttributeError.
+    usage_dict = _usage_dict_from_llm_usage(
+        result.usage, served_provider=getattr(result, "served_provider", None)
+    )
 
     if result.data is None:
         return None, usage_dict, latency_ms, (
@@ -380,7 +385,9 @@ def _invoke_target_with_schema(
     return dict(result.data), usage_dict, latency_ms, None
 
 
-def _usage_dict_from_llm_usage(usage: Any) -> dict[str, Any]:
+def _usage_dict_from_llm_usage(
+    usage: Any, *, served_provider: str | None = None
+) -> dict[str, Any]:
     """Normalize a ``krepis.llm.LLMUsage`` into the persisted
     ``replay_cost`` dict shape. Keeps the two keys ``replay.batch``
     actually reads (``input_tokens``/``output_tokens``) plus the
@@ -389,7 +396,14 @@ def _usage_dict_from_llm_usage(usage: Any) -> dict[str, Any]:
     request opts in (``usage.include: true``, set automatically by
     ``krepis.llm`` for the openrouter provider), a capability the prior
     Anthropic-SDK path never surfaced. Purely additive — no consumer reads
-    a fixed key set (verified: ``replay.batch`` uses ``.get(k, 0)``)."""
+    a fixed key set (verified: ``replay.batch`` uses ``.get(k, 0)``).
+
+    ``served_provider`` (config#3006) — the upstream backend OpenRouter
+    actually routed to (e.g. "DeepInfra"), read off
+    ``LLMResult.served_provider`` at the call site. ``None`` on the
+    exhausted-retry error path (``LLMError`` carries no result object to
+    read it from) — that's an accepted gap, not a bug: a failed call's
+    provider identity isn't load-bearing for the jurisdiction check."""
     if usage is None:
         return {}
     return {
@@ -400,6 +414,7 @@ def _usage_dict_from_llm_usage(usage: Any) -> dict[str, Any]:
             (usage.cache_create_tokens or 0) + (usage.cache_create_1h_tokens or 0)
         ),
         "provider_cost_usd": usage.provider_cost_usd,
+        "served_provider": served_provider,
     }
 
 

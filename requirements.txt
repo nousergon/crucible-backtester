@@ -138,4 +138,11 @@ psutil>=5.9.0
 # v0.12.2 is the earliest krepis tag carrying the OpenRouter unresolved/
 # leaked-tool-call safety fix in krepis.llm; the >=0.12.0 floor here is one
 # patch below that — bumped alongside this change (see the pin below).
-krepis[openai]>=0.12.2
+#
+# Bumped to >=0.18.0 (config#3006, gated on krepis-PR44 merging + publishing):
+# LLMResult gains served_provider (the upstream backend OpenRouter actually
+# routed to, e.g. "DeepInfra") — replay/runner.py reads it via getattr with
+# a None default, so this bump is required for the field to ever be
+# non-None, not for correctness against an older krepis (that path already
+# degrades gracefully).
+krepis[openai]>=0.18.0

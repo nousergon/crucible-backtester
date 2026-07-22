@@ -415,6 +415,12 @@ def compute_and_emit_concordance(
         # Group observations by agent_id_base.
         observations_by_agent: dict[str, list[float]] = defaultdict(list)
         cost_total = {"input_tokens": 0, "output_tokens": 0}
+        # config#3006 — jurisdiction/compliance observation: which
+        # upstream OpenRouter backends actually served this batch's
+        # requests. Empty when every replay pre-dates the krepis
+        # served_provider field (v0.18.0+) or the provider didn't report
+        # one — absence here is informational, not a failure signal.
+        served_providers_seen: set[str] = set()
         replay_failures: list[dict[str, str]] = []
         replay_skips: list[dict[str, str]] = []
         n_replayed = 0
@@ -446,6 +452,10 @@ def compute_and_emit_concordance(
             # Roll up token cost (best-effort).
             for k in ("input_tokens", "output_tokens"):
                 cost_total[k] += int(replay.replay_cost.get(k, 0) or 0)
+
+            served_provider = replay.replay_cost.get("served_provider")
+            if served_provider:
+                served_providers_seen.add(served_provider)
 
             if replay.replay_output_kind == "skipped":
                 # Deliberate non-replay (deterministic artifact or
@@ -530,6 +540,7 @@ def compute_and_emit_concordance(
             "replay_failures": replay_failures,
             "replay_skips": replay_skips,
             "cost": cost_total,
+            "served_providers_seen": sorted(served_providers_seen),
         }
 
         # Persist per-target-model summary.
