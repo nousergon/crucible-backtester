@@ -3450,6 +3450,94 @@ def run_predictor_backtest(config: dict) -> dict:
         # run. Fail-soft is intentional (see registry note on the PUT above).
         logger.warning("double_sort stage failed (OBSERVE, non-fatal): %s", exc)
 
+    # ── config#3081 (OBSERVE): S-slot sizing shootout ────────────────────────
+    # Compares the incumbent conviction-weighted sizer against a risk-parity
+    # (inverse-realized-vol) sizer and a fractional-Kelly sizer on the SAME
+    # signal stream already in-memory for THIS run (signals_by_date /
+    # price_matrix / ohlcv_by_ticker / sector_map, all produced above by
+    # synthetic.predictor_backtest.run) — no S3 panel load needed (unlike
+    # double_sort, which pulls a separate predictor horizon panel), since the
+    # vectorized sweep's own inputs are already sitting in `result`. Safe by
+    # construction: synthetic.vectorized_sweep.run_sizing_shootout /
+    # analysis.sizing_shootout.compute_sizing_shootout are pure/read-only over
+    # in-memory data, and gate nothing (ARCHITECTURE.md §14(e)).
+    try:
+        ss_cfg = config.get("sizing_shootout", {}) or {}
+        if ss_cfg.get("enabled", True) and result.get("price_matrix") is not None:
+            from executor.feature_lookup import FeatureLookup
+
+            from analysis.sizing_shootout import compute_sizing_shootout
+            from synthetic.vectorized_sweep import run_sizing_shootout
+
+            ss_signal_lookups = _precompute_signal_lookups(signals_by_date)
+            ss_feature_lookup = FeatureLookup.from_ohlcv_by_ticker(ohlcv_by_ticker)
+            ss_sector_map = result.get("sector_map", {})
+
+            ss_market_regime = "neutral"
+            for sl in (ss_signal_lookups or {}).values():
+                regime_str = (
+                    sl.signals_raw_filtered.get("market_regime")
+                    if hasattr(sl, "signals_raw_filtered") else None
+                )
+                if regime_str:
+                    ss_market_regime = regime_str
+                    break
+
+            ss_init_cash = float(config.get("init_cash", 1_000_000.0))
+            # Same config key + default the vectorized param-sweep path reads
+            # (backtest.py `_run_vectorized_param_sweep`) — every arm gets
+            # this SAME fee_rate (see run_sizing_shootout docstring), so a
+            # cost-free Kelly "win" cannot occur by construction.
+            ss_fee_rate = float(config.get("simulation_fees", 0.001))
+            ss_base_combo = dict(ss_cfg.get("base_combo_config", {}))
+
+            shootout_results = run_sizing_shootout(
+                combo_configs=[ss_base_combo],
+                price_matrix=result["price_matrix"],
+                ohlcv_by_ticker=ohlcv_by_ticker or {},
+                signal_lookups=ss_signal_lookups or {},
+                feature_lookup=ss_feature_lookup,
+                spy_prices=result.get("spy_prices"),
+                sector_map=ss_sector_map,
+                init_cash=ss_init_cash,
+                market_regime=ss_market_regime,
+                fee_rate=ss_fee_rate,
+            )
+
+            ss = compute_sizing_shootout(
+                shootout_results,
+                run_date=config.get("_run_date"),
+                init_cash=ss_init_cash,
+                spy_prices=result.get("spy_prices"),
+                dates=result["price_matrix"].index,
+                combo_configs=[ss_base_combo],
+                fee_rate=ss_fee_rate,
+            )
+            stats["sizing_shootout"] = ss
+            _run_date = config.get("_run_date")
+            bucket = config.get("signals_bucket", "alpha-engine-research")
+            if _run_date:
+                import boto3
+                s3 = boto3.client("s3")
+                key = f"backtest/{_run_date}/sizing_shootout.json"
+                body = json.dumps({"run_date": _run_date, **ss}, default=str, indent=2).encode("utf-8")
+                try:
+                    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+                    logger.info("sizing_shootout: persisted s3://%s/%s", bucket, key)
+                except Exception as exc:
+                    # config#1234 rationale: sizing_shootout.json is OBSERVE-only
+                    # / non-load-bearing (config#3081) and is registered/
+                    # grandfathered in ARTIFACT_REGISTRY.yaml, so the ENFORCE
+                    # freshness-monitor is the recording surface for a missed
+                    # write. Fail-soft is intentional.
+                    logger.warning("sizing_shootout S3 persist failed (non-fatal): %s", exc)
+    except Exception as exc:
+        # config#1234 rationale (outer of dual-layer swallow): the whole
+        # config#3081 OBSERVE stage gates nothing; a failure must never abort
+        # the backtest run. Fail-soft is intentional (see registry note on
+        # the PUT above).
+        logger.warning("sizing_shootout stage failed (OBSERVE, non-fatal): %s", exc)
+
     return stats
 
 
@@ -5815,7 +5903,7 @@ def _main_impl() -> None:
     # the contamination report and returns. Never raises into the SF — the
     # spot stage that invokes it is best-effort and non-blocking.
     if args.pit_parity:
-        from analysis.pit_parity import run_pit_parity, write_failure_artifact
+        from analysis.pit_parity import handle_pit_parity_failure, run_pit_parity
         try:
             report = run_pit_parity(config)
             print(json.dumps(
@@ -5836,37 +5924,13 @@ def _main_impl() -> None:
             # alert via ``nousergon_lib.alerts.publish`` (sev=warning,
             # dedup-keyed on run_date so a swept-cycle retry collapses to
             # one alert). The 2026-05-17→2026-05-24 incident swallowed
-            # 4 silent failures with only an spot-stdout log line —
-            # the operator's gate was unreachable for 11 days.
-            logger.error(
-                "[pit_parity] run failed (observational, non-fatal): %s",
-                e, exc_info=True,
-            )
-            try:
-                write_failure_artifact(config, e)
-            except Exception as artifact_err:
-                logger.error(
-                    "[pit_parity] failure-artifact write also failed: %s",
-                    artifact_err,
-                )
-            try:
-                from nousergon_lib.alerts import publish as _alerts_publish
-                run_date = config.get("_run_date") or "unknown"
-                _alerts_publish(
-                    f"pit_parity failed on {run_date}: "
-                    f"{type(e).__name__}: {str(e)[:200]} — "
-                    f"see s3://{config.get('signals_bucket', 'alpha-engine-research')}/"
-                    f"backtest/{run_date}/pit_parity.json",
-                    severity="warning",
-                    source="alpha-engine-backtester/pit_parity",
-                    dedup_key=f"pit_parity_failed_{run_date}",
-                    dedup_window_min=720,  # 12h — one alert per Saturday cycle
-                )
-            except Exception as alert_err:
-                logger.error(
-                    "[pit_parity] operator alert publish also failed: %s",
-                    alert_err,
-                )
+            # 4 silent failures with only an spot-stdout log line — the
+            # operator's gate was unreachable for 11 days. config#3120:
+            # the artifact-write+alert pairing is extracted into
+            # ``handle_pit_parity_failure`` (analysis/pit_parity.py) so it
+            # is directly unit-testable with a mocked alert sender, not
+            # just reachable via a full spot run.
+            handle_pit_parity_failure(config, e)
         return
 
     _init_pipeline(args, config)
@@ -5947,17 +6011,36 @@ def _main_impl() -> None:
     # crucible-backtester#419) reads to compute the counterfactual. Runs the FULL
     # meta-ensemble (crucible-predictor's MetaModel.predict_single) with the 4
     # research meta-features omitted -> 0.0, over the scanner-passing universe
-    # (scanner_evaluations.quant_filter_pass=1). Idempotent (skip-if-cached on
-    # (ticker, prediction_date)) — a normal weekly run only backfills the delta
-    # since the last pass. OBSERVE-only: gates nothing, feeds e2e_lift once run.
-    # Non-fatal — this is a measurement producer, not a promotion-critical gate;
-    # a failure here must never block the rest of the Saturday pipeline.
+    # (candidates.json's scanner_eval_log, quant_filter_pass=1 — config#3053).
+    # Idempotent (skip-if-cached on (ticker, prediction_date)) — a normal
+    # weekly run only backfills the delta since the last pass.
+    #
+    # config#3053: this phase started OBSERVE-only ("a failure here must never
+    # block the rest of the Saturday pipeline") and that posture was correct
+    # while the arm fed only the e2e counterfactual — but has been stale since
+    # 2026-07-13, when config/producer_champion.json first named
+    # scanner_predictor_direct the LIVE champion. A silently swallowed failure
+    # here now means the weekday order pipeline trades on (or hard-fails on)
+    # a stale champion feed days later, with zero same-day signal. So: still
+    # non-fatal for the OBSERVE-only arm, but FAIL LOUD (re-raise, defeating
+    # the swallow below) whenever the live champion actually depends on this
+    # feed — checked once, up front, so both the swallow decision and the
+    # post-backfill freshness assertion use the same live-champion read.
     if args.mode in ("predictor-backtest", "all") and config.get("research_db"):
+        from analysis.scanner_predictor_research_free_backfill import (
+            assert_champion_feed_fresh,
+            run_backfill,
+        )
+        from optimizer.champion_promotion import read_champion_pointer
+
+        research_free_bucket = config.get("signals_bucket", "alpha-engine-research")
+        champion_pointer = read_champion_pointer(research_free_bucket)
+        live_champion_feed = bool(
+            champion_pointer and champion_pointer.get("champion") == "scanner_predictor_direct"
+        )
         try:
             with registry.phase("scanner_predictor_research_free_backfill", mode=args.mode):
                 import sqlite3
-
-                from analysis.scanner_predictor_research_free_backfill import run_backfill
 
                 predictor_paths = config.get("predictor_paths") or []
                 if isinstance(predictor_paths, str):
@@ -5974,14 +6057,23 @@ def _main_impl() -> None:
                         rf_result = run_backfill(
                             rf_conn,
                             predictor_path=predictor_path,
-                            bucket=config.get("signals_bucket", "alpha-engine-research"),
+                            bucket=research_free_bucket,
                         )
                         logger.info(
                             "scanner_predictor_research_free_backfill: %s", rf_result,
                         )
                     finally:
                         rf_conn.close()
+                if live_champion_feed:
+                    assert_champion_feed_fresh(
+                        research_free_bucket,
+                        run_date=config.get("_run_date") or args.date,
+                        max_days=int(config.get("champion_freshness_max_days", 8)),
+                    )
         except Exception as exc:
+            if live_champion_feed:
+                # LIVE champion trade feed — never swallow (config#3053).
+                raise
             logger.warning(
                 "scanner_predictor_research_free_backfill phase failed (non-fatal, "
                 "OBSERVE-only — config#1405): %s", exc, exc_info=True,

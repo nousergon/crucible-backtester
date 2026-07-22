@@ -1,0 +1,24 @@
+[tool.coverage.run]
+# No single top-level package here (repo root has analysis/, optimizer/,
+# store/, synthetic/, replay/, loaders/, lambda_*/ plus root-level modules
+# like backtest.py/evaluate.py/reporter.py) — measure the whole tree and
+# omit tests + the venv rather than enumerate every package individually.
+source = ["."]
+omit = [
+    "tests/*",
+    ".venv/*",
+    "venv/*",
+]
+
+[tool.coverage.report]
+# Ratchet floor (config#2533): measured coverage at introduction was
+# 74.65% (`pytest tests/ -v --cov=. --cov-report=term-missing`, CI's own
+# test invocation — no exclusions — with tests/ and the venv omitted from
+# the report per [tool.coverage.run] above; 3180 passed, 22 skipped, 1
+# deselected, 2 pre-existing local-only failures from a RAM-headroom guard
+# tripping on a <6GB sandbox, unrelated to this change and not present on
+# CI's runner). Floor rounded down to the nearest integer so today's suite
+# passes with headroom; raise opportunistically as coverage grows. This
+# gates regression, not a target.
+fail_under = 74
+show_missing = true

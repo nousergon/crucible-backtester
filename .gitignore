@@ -15,6 +15,10 @@ vendor/
 .venv/
 venv/
 
+# Coverage (config#2533)
+.coverage
+coverage.xml
+
 # Config (contains secrets)
 config.yaml
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
@@ -89,6 +90,12 @@ class TestHacSignificance:
 
 
 def _e2e_lift_ok(sn_lift=0.02, n_cycles=6):
+    """alpha-engine-config-I2998: the gate's score source is
+    ``sector_neutral_mean_alpha_21d`` (this arm's own SPY-relative realized
+    alpha, NOT ``sn_lift_vs_agentic_cio``) -- the ``sn_lift`` param sets
+    that field directly (kept as ``sn_lift`` to minimize churn across the
+    many existing call sites); the retired ``sn_lift_vs_agentic_cio``
+    observability field is set to the same value for fixture realism."""
     return {
         "scanner_then_predictor_counterfactual": {
             "status": "ok",
@@ -96,7 +103,7 @@ def _e2e_lift_ok(sn_lift=0.02, n_cycles=6):
             "methods": {
                 "scanner_then_predictor_topN": {
                     "mean_alpha_21d": 0.03,
-                    "sector_neutral_mean_alpha_21d": 0.025,
+                    "sector_neutral_mean_alpha_21d": sn_lift,
                     "n_picks": 40,
                     "sn_lift_vs_agentic_cio": sn_lift,
                 },
@@ -114,11 +121,16 @@ def _tt_leaderboard_ok(run_date="2026-07-18", mean=0.015, n_dates_scored=5):
     """Mimics the REAL crucible-research schema
     (scoring/leaderboard_producers.py::build_producer_leaderboard /
     scoring/leaderboard_scoring.py::score_leaderboard) verified against the
-    crucible-research checkout 2026-07-14."""
+    crucible-research checkout 2026-07-20 (alpha-engine-config-I2998:
+    champion is optional, ``topn_alpha_vs_benchmark`` added -- the gate's
+    actual score source; ``topn_alpha_vs_champion`` kept for schema realism
+    but no longer read by ``_score_thinktank_coverage``). ``mean`` sets
+    ``topn_alpha_vs_benchmark.mean`` for the thinktank_coverage row."""
     return {
         "champion": "agentic_sector_teams",
         "horizon_days": 21,
         "top_n": 50,
+        "benchmark_ticker": "SPY",
         "n_dates": 12,
         "date": run_date,
         "leaderboard_id": "producer",
@@ -126,18 +138,22 @@ def _tt_leaderboard_ok(run_date="2026-07-18", mean=0.015, n_dates_scored=5):
             {
                 "name": "agentic_sector_teams", "kind": "champion",
                 "realized_rank_ic": {"mean": 0.05, "se": 0.02, "t_stat": 2.5, "n_dates": 12},
-                "topn_alpha_vs_champion": None, "n_dates_scored": 12,
+                "topn_alpha_vs_champion": None,
+                "topn_alpha_vs_benchmark": {"mean": 0.01, "se": 0.01, "t_stat": 1.0, "n_dates": 12},
+                "n_dates_scored": 12,
             },
             {
                 "name": "no_agent_quant", "kind": "challenger",
                 "realized_rank_ic": {"mean": 0.03, "se": 0.02, "t_stat": 1.5, "n_dates": 12},
                 "topn_alpha_vs_champion": {"mean": 0.008, "se": 0.01, "t_stat": 0.8, "n_dates": 12},
+                "topn_alpha_vs_benchmark": {"mean": 0.006, "se": 0.01, "t_stat": 0.6, "n_dates": 12},
                 "n_dates_scored": 12,
             },
             {
                 "name": "thinktank_coverage", "kind": "challenger",
                 "realized_rank_ic": {"mean": 0.04, "se": 0.02, "t_stat": 2.0, "n_dates": n_dates_scored},
                 "topn_alpha_vs_champion": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
+                "topn_alpha_vs_benchmark": {"mean": mean, "se": 0.01, "t_stat": 1.5, "n_dates": n_dates_scored},
                 "n_dates_scored": n_dates_scored,
             },
         ],
@@ -247,6 +263,24 @@ class TestBuildWeeklyArmScores:
         )
         assert result["scores"]["thinktank_coverage"] is None
         assert result["unavailable_reasons"]["thinktank_coverage"] == "leaderboard_unavailable"
+
+    def test_thinktank_coverage_scored_when_no_champion_registered(self):
+        """alpha-engine-config-I2998: config-I2993 retired agentic_sector_teams
+        with no successor champion registered -- crucible-research's
+        score_leaderboard now writes champion=None and scores every
+        challenger champion-free. This arm's score must still resolve from
+        topn_alpha_vs_benchmark, independent of the champion field."""
+        lb = _tt_leaderboard_ok(mean=0.021)
+        lb["champion"] = None
+        for spec in lb["specs"]:
+            if spec["name"] == "agentic_sector_teams":
+                spec["kind"] = "retired"
+            spec["topn_alpha_vs_champion"] = None
+        result = build_weekly_arm_scores(
+            _e2e_lift_ok(), lb, run_date="2026-07-18", leaderboard_date_used="2026-07-18",
+        )
+        assert result["scores"]["thinktank_coverage"] == pytest.approx(0.021)
+        assert "thinktank_coverage" not in result["unavailable_reasons"]
 
 
 # ── Gate engine (pure function, weekly winner-take-all) ────────────────────
@@ -476,8 +510,22 @@ class _FakeS3:
 class TestLeaderboardObservability:
     def test_entry_extraction_from_e2e_lift(self):
         entry = leaderboard_entry_from_e2e_lift(_e2e_lift_ok(sn_lift=0.017))
+        assert entry["sector_neutral_mean_alpha_21d"] == 0.017
         assert entry["sn_lift_vs_agentic_cio"] == 0.017
         assert entry["n_cycles"] == 6
+
+    def test_entry_extraction_gates_on_sector_neutral_alpha_not_agentic_lift(self):
+        """alpha-engine-config-I2998: the entry (and hence the gate score)
+        must remain usable even when the retired agentic-comparator field
+        is unavailable -- gating is on sector_neutral_mean_alpha_21d only."""
+        e2e = _e2e_lift_ok(sn_lift=0.019)
+        e2e["scanner_then_predictor_counterfactual"]["methods"][
+            "scanner_then_predictor_topN"
+        ]["sn_lift_vs_agentic_cio"] = None
+        entry = leaderboard_entry_from_e2e_lift(e2e)
+        assert entry is not None
+        assert entry["sector_neutral_mean_alpha_21d"] == 0.019
+        assert entry["sn_lift_vs_agentic_cio"] is None
 
     def test_entry_extraction_handles_missing_or_skipped(self):
         assert leaderboard_entry_from_e2e_lift(None) is None
@@ -852,7 +900,7 @@ class TestRunWeeklyEvaluation:
         assert result["outcome"] == "unchanged_winner_already_champion"
 
     def test_scoring_exception_is_error_outcome_but_still_audited(self):
-        """A malformed thinktank_coverage row (topn_alpha_vs_champion.mean
+        """A malformed thinktank_coverage row (topn_alpha_vs_benchmark.mean
         is non-numeric) raises inside _score_thinktank_coverage's float()
         call -- run_weekly_evaluation's own try/except must catch it,
         record outcome='error', and STILL write the audit record (the
@@ -861,7 +909,7 @@ class TestRunWeeklyEvaluation:
         lb = _tt_leaderboard_ok(run_date="2026-07-18")
         for spec in lb["specs"]:
             if spec["name"] == "thinktank_coverage":
-                spec["topn_alpha_vs_champion"] = {"mean": "not-a-number"}
+                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
         result = run_weekly_evaluation(
             bucket=self.BUCKET, run_date="2026-07-18",
             e2e_lift=_e2e_lift_ok(sn_lift=0.03),
@@ -875,6 +923,55 @@ class TestRunWeeklyEvaluation:
         assert result["leaderboard_date_used"] is None
         assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
         assert f"{self.BUCKET}/config/producer_champion.json" not in s3.store
+
+    def test_scoring_exception_publishes_active_alert(self):
+        """config#2884: an outcome='error' week must fire an active alert,
+        not just the passive audit-JSON write -- the only prior liveness
+        signal (ARTIFACT_REGISTRY file-presence SLA) is satisfied by a
+        routine error write, so a persistently-erroring gate could freeze
+        the champion pointer for an unbounded number of weeks with nobody
+        paged. Same malformed-leaderboard trigger as the test above."""
+        s3 = _FakeS3()
+        lb = _tt_leaderboard_ok(run_date="2026-07-18")
+        for spec in lb["specs"]:
+            if spec["name"] == "thinktank_coverage":
+                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
+        with mock.patch("ops_alerts.publish_ops_alert") as mock_publish:
+            result = run_weekly_evaluation(
+                bucket=self.BUCKET, run_date="2026-07-18",
+                e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+                tt_leaderboard=lb,
+                tt_leaderboard_date_used="2026-07-18",
+                freeze=False, upload=True, s3_client=s3,
+            )
+        assert result["outcome"] == "error"
+        mock_publish.assert_called_once()
+        _, kwargs = mock_publish.call_args
+        assert kwargs["severity"] == "error"
+        assert kwargs["dedup_key"] == "champion_promotion_gate_error_2026-07-18"
+        assert "champion_promotion.py::run_weekly_evaluation" in kwargs["source"]
+
+    def test_alert_publish_failure_does_not_propagate(self):
+        """The alert channel itself failing (e.g. SNS unreachable) must not
+        crash the already-erroring evaluate run -- best-effort, swallowed,
+        same posture as the audit-JSON write's own failure handling."""
+        s3 = _FakeS3()
+        lb = _tt_leaderboard_ok(run_date="2026-07-18")
+        for spec in lb["specs"]:
+            if spec["name"] == "thinktank_coverage":
+                spec["topn_alpha_vs_benchmark"] = {"mean": "not-a-number"}
+        with mock.patch(
+            "ops_alerts.publish_ops_alert", side_effect=RuntimeError("sns down"),
+        ):
+            result = run_weekly_evaluation(
+                bucket=self.BUCKET, run_date="2026-07-18",
+                e2e_lift=_e2e_lift_ok(sn_lift=0.03),
+                tt_leaderboard=lb,
+                tt_leaderboard_date_used="2026-07-18",
+                freeze=False, upload=True, s3_client=s3,
+            )
+        assert result["outcome"] == "error"
+        assert f"{self.BUCKET}/config/apply_audit/producer_champion/2026-07-18.json" in s3.store
 
 
 # ── Frozen-schema conformance ────────────────────────────────────────────────

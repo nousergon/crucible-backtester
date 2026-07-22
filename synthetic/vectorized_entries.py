@@ -47,6 +47,28 @@ Carryover infrastructure:
 
 Future PRs (sweep wiring, PR 4) will assemble per-date inputs from
 SignalLookup + FeatureLookup + research signals JSON.
+
+Sizing arms (config#3081, S-slot sizing shootout)
+--------------------------------------------------
+``compute_vectorized_entries`` takes an optional ``sizing_arm`` kwarg
+(default ``"conviction"``, today's exact incumbent formula above,
+unaffected unless a caller opts in) that swaps ONLY the raw_weight
+formula. Gates 1-3, 5-6, 8-11 above are identical across arms; the
+sizing math (gate 4's dd_multiplier + gate 7's cap) is shared
+machinery all three arms flow through. Two additional arms:
+
+  * ``"risk_parity"`` — inverse-20d-realized-vol weighting, renormalized
+    to the same aggregate sizing budget as the incumbent's equal-weight
+    base. See ``_compute_risk_parity_raw_weight``.
+  * ``"fractional_kelly"`` — ``kelly_fraction[c] * alpha[s] / variance[s]``
+    (continuous-Kelly f* = μ/σ², fractioned + capped for realism). See
+    ``_compute_fractional_kelly_raw_weight``.
+
+Both consume a per-signal ``realized_vol_20d`` array — see
+``compute_realized_vol_20d`` (trailing 20d rolling std of daily
+returns, annualized by default) — built by the caller (typically
+``synthetic.vectorized_sweep.run_sizing_shootout``) from the same
+``returns_mat`` feature matrix already materialized for the sweep.
 """
 
 from __future__ import annotations
@@ -170,6 +192,14 @@ class VectorizedEntryConfig:
     correlation_block_threshold: np.ndarray
     correlation_lookback_days: np.ndarray     # int — caller must build returns_window matrix to this length
 
+    # Fractional-Kelly sizing arm (config#3081 S-slot sizing shootout).
+    # Ignored unless `sizing_arm="fractional_kelly"` is passed to
+    # `compute_vectorized_entries`. Defaults to 0.25 (a conservative
+    # quarter-Kelly) so a combo that never sets this explicitly still
+    # gets a sane, non-explosive fraction if someone flips sizing_arm
+    # without also setting kelly_fraction.
+    kelly_fraction: np.ndarray
+
     @property
     def n_combos(self) -> int:
         return int(self.min_score_to_enter.shape[0])
@@ -219,6 +249,7 @@ class VectorizedEntryConfig:
             "correlation_block_enabled": True,
             "correlation_block_threshold": 0.80,
             "correlation_lookback_days": 60,
+            "kelly_fraction": 0.25,
         }
         defaults.update(overrides)
 
@@ -408,6 +439,185 @@ def _compute_coverage_adj(
 
 
 # ────────────────────────────────────────────────────────────────────
+# Sizing-arm raw-weight helpers (config#3081 S-slot sizing shootout)
+# ────────────────────────────────────────────────────────────────────
+#
+# The incumbent ("conviction") raw_weight formula lives inline in
+# `compute_vectorized_entries` (base_weight × sector_adj × ... ×
+# coverage_adj) and is NOT duplicated here — it stays the single
+# source of truth for production sizing. These two helpers implement
+# ALTERNATE raw-weight formulas selected via the `sizing_arm` param;
+# every other gate (score/momentum/GBM veto/sector cap/equity cap/
+# correlation block/shares-round-to-zero) is completely shared across
+# all three arms, matching the issue's "only the raw weight differs"
+# requirement.
+
+# sizing_arm string constants.
+SIZING_ARM_CONVICTION = "conviction"
+SIZING_ARM_RISK_PARITY = "risk_parity"
+SIZING_ARM_FRACTIONAL_KELLY = "fractional_kelly"
+
+
+def _compute_risk_parity_raw_weight(
+    realized_vol_20d: np.ndarray, config: VectorizedEntryConfig, n_signals: int,
+) -> np.ndarray:
+    """Inverse-volatility ("risk parity") raw weight, pre-cap.
+
+    realized_vol_20d : float64[n_signals] — trailing 20d realized vol
+        (annualized; see ``compute_realized_vol_20d``). NaN, zero, or
+        negative values (unknown/degenerate vol) fall back to the SAME
+        equal weight the incumbent arm's base_weight uses, rather than
+        blowing up a 1/vol division or NaN-propagating the whole row.
+
+    Normalization: weights are inverse-vol, THEN rescaled per-combo so
+    that summing the raw weights across the n_signals candidates on
+    this date equals ``n_signals * base_weight`` (i.e. the SAME total
+    gross exposure the incumbent's equal-weight base_weight would sum
+    to across the same candidate set: n_signals × (1/n_signals) = 1.0
+    "unit" of base sizing budget). Concretely:
+
+        inv_vol[s]       = 1 / vol[s]   (vol replaced by a neutral
+                                          fallback where unknown/<=0)
+        weight[s]        = inv_vol[s] / sum(inv_vol) * n_signals * base_weight
+
+    This keeps risk-parity's AGGREGATE sizing budget for the date's
+    candidate set identical to the incumbent's aggregate budget, while
+    letting individual-signal weights differ (low-vol names get more,
+    high-vol names get less) — the "same universe/exposure constraints"
+    parity the issue calls out. The same per-combo multiplicative
+    adjustments (sector/conviction/upside/dd/atr/confidence/staleness/
+    earnings/coverage) and the same max_pct / sector / equity caps
+    still apply on top of this raw weight in the shared pipeline.
+
+    Returns float64[n_combos, n_signals].
+    """
+    n_combos = config.n_combos
+    if n_signals == 0:
+        return np.zeros((n_combos, 0), dtype=np.float64)
+
+    base_weight = 1.0 / max(n_signals, 1)
+    valid = np.isfinite(realized_vol_20d) & (realized_vol_20d > 0)
+    # Fallback vol for unknown/degenerate signals: the cross-sectional
+    # mean of the known vols (or 1.0 if none known) — this makes the
+    # fallback's inverse-vol weight land near the "average" weight
+    # rather than an arbitrary constant, while never dividing by zero.
+    fallback_vol = float(np.mean(realized_vol_20d[valid])) if np.any(valid) else 1.0
+    if fallback_vol <= 0 or not np.isfinite(fallback_vol):
+        fallback_vol = 1.0
+    safe_vol = np.where(valid, realized_vol_20d, fallback_vol)  # [n_signals]
+
+    inv_vol = 1.0 / safe_vol  # [n_signals]
+    total_inv_vol = float(np.sum(inv_vol))
+    if total_inv_vol <= 0 or not np.isfinite(total_inv_vol):
+        # Degenerate (shouldn't happen given the fallback above, but
+        # guard anyway): equal-weight everyone.
+        per_signal_weight = np.full(n_signals, base_weight, dtype=np.float64)
+    else:
+        per_signal_weight = inv_vol / total_inv_vol * n_signals * base_weight
+
+    # Same weight vector for every combo pre-cap; per-combo caps/adj
+    # apply later in the shared pipeline.
+    return np.broadcast_to(per_signal_weight[None, :], (n_combos, n_signals)).copy()
+
+
+def _compute_fractional_kelly_raw_weight(
+    signal_alpha: np.ndarray,
+    signal_variance: np.ndarray,
+    config: VectorizedEntryConfig,
+    n_signals: int,
+) -> np.ndarray:
+    """Fractional-Kelly raw weight, pre-cap.
+
+    Standard continuous-Kelly closed form for a single asset:
+    ``f* = mu / sigma^2``. Here ``mu = signal_alpha[s]`` (predicted
+    alpha proxy) and ``sigma^2 = signal_variance[s]`` (estimated
+    variance — the square of ``realized_vol_20d``, see
+    ``compute_realized_vol_20d``/caller).
+
+        kelly_weight[s]    = alpha[s] / variance[s]
+        raw_weight[c, s]   = kelly_fraction[c] * kelly_weight[s]
+
+    ``kelly_fraction`` is a PER-COMBO swept parameter (config field
+    ``kelly_fraction``), so sweeping e.g. 0.25 / 0.375 / 0.5 across
+    combos genuinely explores the fraction, not just one hardcoded
+    value.
+
+    Floors:
+      * variance <= 0 or non-finite → that signal's kelly_weight is 0
+        (no division by zero / no NaN propagation).
+      * alpha <= 0 or non-finite → kelly_weight is 0 (no negative
+        sizing; this is a long-only sizer, not a short book).
+      * Negative raw_weight (shouldn't occur given the above, but
+        guarded) is floored to 0.
+
+    A raw full-Kelly bet is typically far larger than any sane position
+    cap; the fractional multiplier here is only the first guardrail —
+    the shared ``max_position_pct`` / ATR / sector / equity caps in the
+    main pipeline are what ultimately bound it to a realistic size.
+
+    Returns float64[n_combos, n_signals].
+    """
+    n_combos = config.n_combos
+    if n_signals == 0:
+        return np.zeros((n_combos, 0), dtype=np.float64)
+
+    valid_alpha = np.isfinite(signal_alpha) & (signal_alpha > 0)
+    valid_var = np.isfinite(signal_variance) & (signal_variance > 0)
+    valid = valid_alpha & valid_var
+    safe_alpha = np.where(valid, signal_alpha, 0.0)
+    safe_var = np.where(valid, signal_variance, 1.0)  # avoid div/0; masked to 0 below anyway
+    kelly_weight = np.where(valid, safe_alpha / safe_var, 0.0)  # [n_signals]
+
+    raw = config.kelly_fraction[:, None] * kelly_weight[None, :]  # [n_combos, n_signals]
+    return np.maximum(raw, 0.0)
+
+
+def compute_realized_vol_20d(returns_window: np.ndarray, *, annualize: bool = True) -> np.ndarray:
+    """Trailing 20-trading-day realized vol per signal/ticker.
+
+    returns_window : float64[n_signals_or_tickers, >=20]
+        Daily returns, most-recent column last. Only the trailing 20
+        columns are used (caller may pass a longer window; this slices
+        the last 20 internally). Rows with fewer than 2 finite values
+        in the trailing window yield NaN (unknown vol — caller's
+        sizing-arm helper falls back sensibly, see
+        ``_compute_risk_parity_raw_weight`` / the Kelly variance input).
+
+    annualize : bool, default True
+        When True, multiplies the raw daily std by ``sqrt(252)`` (the
+        standard trading-days-per-year annualization convention used
+        elsewhere in this repo, e.g. ``_TRADING_DAYS_PER_YEAR`` in
+        ``analysis.horizon_net_alpha``). When False, returns the raw
+        daily std. Documented choice (config#3081): annualized vol is
+        used by both new sizing arms so risk-parity's 1/vol ranking
+        and Kelly's alpha/variance ratio are on a familiar "annual
+        vol" scale a reviewer can sanity-check against, e.g., a stock's
+        known ~20-40% annual vol — the ranking/inverse-proportionality
+        of weights is scale-invariant to this choice (a constant
+        multiplier cancels in the risk-parity normalization and is
+        absorbed into kelly_fraction for the Kelly arm), so this is a
+        readability/documentation choice, not a behavior-changing one
+        for the RELATIVE weights within a single arm.
+
+    Returns float64[n_rows] (one value per row of returns_window).
+    """
+    window = returns_window[:, -20:] if returns_window.shape[1] > 20 else returns_window
+    n_rows = window.shape[0]
+    out = np.full(n_rows, np.nan, dtype=np.float64)
+    finite_counts = np.sum(np.isfinite(window), axis=1)
+    enough = finite_counts >= 2
+    if not np.any(enough):
+        return out
+    # nanstd over rows with enough finite values; ddof=1 (sample std,
+    # matches pandas .std() default used elsewhere in this repo).
+    with np.errstate(invalid="ignore"):
+        daily_std = np.nanstd(window, axis=1, ddof=1)
+    factor = math.sqrt(252.0) if annualize else 1.0
+    out = np.where(enough, daily_std * factor, np.nan)
+    return out
+
+
+# ────────────────────────────────────────────────────────────────────
 # Main entry-decision pipeline
 # ────────────────────────────────────────────────────────────────────
 
@@ -439,6 +649,14 @@ def compute_vectorized_entries(
     # Correlation block inputs (precomputed; pass None to disable).
     correlation_matrix: np.ndarray | None = None,   # float64[n_tickers, n_tickers]
     sector_idx_per_ticker: np.ndarray | None = None,  # int32[n_tickers]
+    # ── Sizing-arm selector (config#3081 S-slot sizing shootout) ────
+    # "conviction" (default) reproduces today's exact incumbent
+    # formula byte-for-byte — existing callers/tests are unaffected
+    # unless they explicitly opt into "risk_parity" or
+    # "fractional_kelly". See SIZING_ARM_* constants above.
+    sizing_arm: str = SIZING_ARM_CONVICTION,
+    signal_realized_vol_20d: np.ndarray | None = None,  # float64[n_signals]; required for risk_parity/fractional_kelly
+    signal_alpha: np.ndarray | None = None,             # float64[n_signals]; required for fractional_kelly
 ) -> EntryDecisions:
     """Compute per-(combo, signal) entry decisions as a matrix.
 
@@ -447,6 +665,13 @@ def compute_vectorized_entries(
 
     The first failing gate sets ``block_reason``; subsequent gates do
     not overwrite (matches scalar ``decide_entries`` cascade order).
+
+    ``sizing_arm`` (config#3081) swaps ONLY the raw_weight formula
+    (base × adjustments); every gate — already-held, score, momentum,
+    drawdown halt, bear/underweight, GBM veto, position/sector/equity
+    caps, correlation block, shares-round-to-zero — is identical across
+    arms. See the "Sizing-arm raw-weight helpers" section above for
+    ``_compute_risk_parity_raw_weight`` / ``_compute_fractional_kelly_raw_weight``.
     """
     n_combos = sim.n_combos
     n_tickers = sim.n_tickers
@@ -549,24 +774,66 @@ def compute_vectorized_entries(
 
     # ── 8. Sizing (compute regardless; gates will mask the eligible set) ──
     base_weight = 1.0 / max(n_signals, 1)
-    sector_adj = _compute_sector_adj(signal_sector_rating, config)
-    conviction_adj = _compute_conviction_adj(signal_conviction, config)
-    upside_adj = _compute_upside_adj(signal_upside, config)
+    # atr_adj is always computed — it also drives the ATR cap check
+    # below (shared across all sizing arms, same as max_pct/sector/
+    # equity caps: the issue's "same caps" requirement).
     atr_adj = _compute_atr_adj(signal_atr_pct, config)
-    confidence_adj = _compute_confidence_adj(
-        signal_pred_confidence, signal_p_up, config,
-    )
-    staleness_adj = _compute_staleness_adj(signal_age_days, config)  # [n_combos, 1]
-    earnings_adj = _compute_earnings_adj(signal_days_to_earnings, config)
-    coverage_adj = _compute_coverage_adj(signal_feature_coverage, config)
 
-    raw_weight = (
-        base_weight
-        * sector_adj * conviction_adj * upside_adj
-        * dd_multiplier_per_combo[:, None]
-        * atr_adj * confidence_adj
-        * staleness_adj * earnings_adj * coverage_adj
-    )
+    if sizing_arm == SIZING_ARM_CONVICTION:
+        # Incumbent formula — UNCHANGED, byte-for-byte (config#3081
+        # backward-compat requirement). Do not edit this branch without
+        # also confirming test_vectorized_entries.py / test_vectorized_sweep.py
+        # parity assertions still hold.
+        sector_adj = _compute_sector_adj(signal_sector_rating, config)
+        conviction_adj = _compute_conviction_adj(signal_conviction, config)
+        upside_adj = _compute_upside_adj(signal_upside, config)
+        confidence_adj = _compute_confidence_adj(
+            signal_pred_confidence, signal_p_up, config,
+        )
+        staleness_adj = _compute_staleness_adj(signal_age_days, config)  # [n_combos, 1]
+        earnings_adj = _compute_earnings_adj(signal_days_to_earnings, config)
+        coverage_adj = _compute_coverage_adj(signal_feature_coverage, config)
+
+        raw_weight = (
+            base_weight
+            * sector_adj * conviction_adj * upside_adj
+            * dd_multiplier_per_combo[:, None]
+            * atr_adj * confidence_adj
+            * staleness_adj * earnings_adj * coverage_adj
+        )
+    elif sizing_arm == SIZING_ARM_RISK_PARITY:
+        if signal_realized_vol_20d is None:
+            raise ValueError(
+                "sizing_arm='risk_parity' requires signal_realized_vol_20d"
+            )
+        # Risk-parity/Kelly arms apply the SAME dd_multiplier (drawdown
+        # halt / graduated de-risking) treatment as the incumbent — the
+        # issue's "ideally the same dd_multiplier ... as the incumbent"
+        # ask — but deliberately do NOT apply the conviction-formula's
+        # other multipliers (sector/conviction/upside/confidence/
+        # staleness/earnings/coverage adjustments): those are specific
+        # to the conviction sizing design, not generic risk controls.
+        # The entry GATES (score/momentum/sector cap/equity cap/etc.)
+        # remain fully shared regardless.
+        raw_weight = _compute_risk_parity_raw_weight(
+            signal_realized_vol_20d, config, n_signals,
+        ) * dd_multiplier_per_combo[:, None]
+    elif sizing_arm == SIZING_ARM_FRACTIONAL_KELLY:
+        if signal_realized_vol_20d is None or signal_alpha is None:
+            raise ValueError(
+                "sizing_arm='fractional_kelly' requires signal_realized_vol_20d "
+                "and signal_alpha"
+            )
+        signal_variance = signal_realized_vol_20d ** 2
+        raw_weight = _compute_fractional_kelly_raw_weight(
+            signal_alpha, signal_variance, config, n_signals,
+        ) * dd_multiplier_per_combo[:, None]
+    else:
+        raise ValueError(
+            f"unknown sizing_arm={sizing_arm!r}; expected one of "
+            f"{SIZING_ARM_CONVICTION!r}, {SIZING_ARM_RISK_PARITY!r}, "
+            f"{SIZING_ARM_FRACTIONAL_KELLY!r}"
+        )
 
     # max_position_pct is regime-conditional.
     if is_bear:

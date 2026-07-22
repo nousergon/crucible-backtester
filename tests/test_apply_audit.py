@@ -182,6 +182,16 @@ class TestClassifyLoop:
         assert rec["outcome"] == "blocked"
         assert rec["blocked_by"] == ["min_meaningful_change"]
 
+    def test_research_retired_maps_to_disabled(self):
+        """alpha-engine-config-I3246: retired reads as by-design-off, not as
+        a data-starved or guardrail-blocked loop."""
+        rec = classify_loop(
+            "research_params",
+            {"status": "retired", "retired_date": "2026-07-12", "note": "boost-correlation retired"},
+        )
+        assert rec["outcome"] == "disabled"
+        assert rec["blocked_by"] is None
+
     def test_executor_status_guardrails(self):
         for status, slug in [
             ("alpha_below_floor", "alpha_floor"),

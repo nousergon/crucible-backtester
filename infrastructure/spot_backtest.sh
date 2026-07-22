@@ -923,19 +923,21 @@ command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m p
 \$PIP install --upgrade pip -q
 \$PIP install -q -r requirements.txt
 
-# Also install predictor deps (needed for GBM inference + feature computation).
-# The predictor + backtester alpha-engine-lib pins are now ALIGNED at v0.53.0
-# (fleet lockstep — predictor #238 / L4513), so this co-install no longer
-# downgrades the lib. Background: when the predictor lagged at v0.47.0, installing
-# it here SECOND silently downgraded the lib below quant.stats (first shipped
-# v0.49.0), breaking evaluate.py's import every run (the 2>/dev/null hid pip's
-# downgrade note). Alignment fixes the instance; the GUARD below fixes the CLASS.
+# The predictor checkout is CODE-ONLY (config#3031, 2026-07-20): its
+# requirements.txt is deliberately NOT installed here. Co-installing two
+# repos' requirements files into one resolver namespace let predictor's
+# numpy>=2.5.1 floor (installed second) silently override the backtester's
+# numpy<2.5 cap (numba/vectorbt hard ceiling) — the 2026-07-20 weekly deps
+# failures — and the same class had already bitten via nousergon-lib
+# (L4513) and pyarrow. Every library the in-process predictor replay
+# (synthetic/predictor_backtest.py, research-free backfill) needs at
+# runtime is declared in the backtester's OWN requirements.txt with
+# numpy<2.5-compatible bounds. The import guards below prove the predictor
+# code chain resolves against this single environment.
 cd /home/ec2-user/alpha-engine-predictor
-if [ -f requirements.txt ]; then
-    \$PIP install -r requirements.txt || {
-        echo "FATAL: predictor requirements.txt install failed" >&2
-        exit 1
-    }
+if [ ! -d "/home/ec2-user/alpha-engine-predictor/model" ]; then
+    echo "FATAL: predictor checkout missing (code-only sys.path dependency)" >&2
+    exit 1
 fi
 
 # Fail-loud dependency GUARD (L4513 class fix). Assert the nousergon-lib
@@ -974,19 +976,30 @@ PYBIN="\${PIP% -m pip}"
 # numpy 1.24-1.26) -> the backtester runtime_smoke's GBMScorer.load crashed at
 # 'import scipy.sparse' with "module 'numpy' has no attribute 'long'". The
 # downgrade is REMOVED (complete the migration; never re-extend a deprecated
-# shim). This guard asserts the exact import chain that broke (numpy>=2 +
-# scipy.sparse + lightgbm) AFTER all installs, so any future co-installed pin
-# that downgrades numpy breaks LOUD here at deps time (seconds) instead of ~40
-# min into the run. Per feedback_no_silent_fails.
+# shim). This guard asserts the exact import chains that broke AFTER all
+# installs, so any future co-installed pin that downgrades numpy breaks LOUD
+# here at deps time (seconds) instead of ~40 min into the run. Two chains:
+#   numpy>=2 + scipy.sparse + lightgbm — the 2026-07-18 runtime_smoke crash
+#     (np.long removed) after the stale downgrade left numpy at 1.26; and
+#   numba + vectorbt — the same weekend's simulate-phase crash (config-I3279):
+#     numpy 2.5.1 resolved above numba 0.66's numpy<2.5 ceiling, so
+#     'import vectorbt' raised "Numba needs NumPy 2.4 or less" ~18h into the
+#     run and portfolio_stats.json/optimizer_gate degraded to an error stub.
+#     The pip-check gate below catches that instance at the METADATA level
+#     (numba declares its ceiling); this import smoke also catches ABI-level
+#     numba/numpy breaks that ship with self-consistent metadata. vectorbt
+#     backs vectorbt_bridge.py -> portfolio_stats + the optimizer-gate arc,
+#     so it is load-bearing for the Saturday SF's promotion artifacts.
+# Per feedback_no_silent_fails.
 # (NB: no backticks in this heredoc body -- they would command-substitute.)
-\$PYBIN -c "import numpy, scipy.sparse, lightgbm; assert int(numpy.__version__.split('.')[0]) >= 2, 'numpy '+numpy.__version__+' < 2.0 is inconsistent with the numpy-2-built scipy/cvxpy stack (config#2815)'; print('numpy-2 guard OK: numpy='+numpy.__version__+' scipy='+scipy.__version__+' lightgbm='+lightgbm.__version__)" || {
-    echo "FATAL: numpy-2 environment consistency check failed — a co-installed pin or stale downgrade left numpy below 2.0, breaking the numpy-2-built scipy/lightgbm stack (config#2815). See traceback above." >&2
+\$PYBIN -c "import numpy, scipy.sparse, lightgbm, numba, vectorbt; assert int(numpy.__version__.split('.')[0]) >= 2, 'numpy '+numpy.__version__+' < 2.0 is inconsistent with the numpy-2-built scipy/cvxpy stack (config#2815)'; print('numpy-2 guard OK: numpy='+numpy.__version__+' scipy='+scipy.__version__+' lightgbm='+lightgbm.__version__+' numba='+numba.__version__+' vectorbt='+vectorbt.__version__)" || {
+    echo "FATAL: import-chain consistency check failed — a co-installed pin, stale downgrade, or numba/numpy ABI mismatch broke the scipy/lightgbm or numba/vectorbt import chain (config#2815, config-I3279). See traceback above." >&2
     exit 1
 }
 
-# Fail-loud pip-check dependency-consistency gate (config#2973). The numpy-2
-# guard above only covers the ONE import chain (numpy + scipy.sparse +
-# lightgbm) that has actually broken a run so far. \`pip install\` reports ANY
+# Fail-loud pip-check dependency-consistency gate (config#2973). The import
+# guard above only covers the TWO chains (numpy + scipy.sparse + lightgbm;
+# numba + vectorbt) that have actually broken runs so far. \`pip install\` reports ANY
 # OTHER co-install/transitive-dependency conflict as a post-hoc "does not
 # take into account all installed packages" warning and still exits 0, so an
 # internally-inconsistent env ships silently and only surfaces as an import
@@ -1005,18 +1018,30 @@ PYBIN="\${PIP% -m pip}"
 # which IS imported on this path, so silencing that conflict would be unsafe.
 # (NB: no backticks in this heredoc body -- they would command-substitute.)
 PIP_CHECK_ALLOWLIST=""
-PIP_CHECK_OUT=\$(\$PYBIN -m pip check 2>&1) || true
-if [ -z "\$PIP_CHECK_ALLOWLIST" ]; then
-    PIP_CHECK_REMAIN="\$PIP_CHECK_OUT"
+# Gate on pip check's EXIT CODE, not on output emptiness: a clean env prints
+# "No broken requirements found." (non-empty!) and exits 0 -- the original
+# output-emptiness logic here failed the deps step on the FIRST EVER clean
+# environment (2026-07-20, right after config#3031's co-install removal made
+# the env resolvable), because until then every run had a real conflict and
+# the success path had never executed. exit 0 = clean, full stop; only a
+# non-zero exit applies the allowlist filter to the conflict lines.
+PIP_CHECK_RC=0
+PIP_CHECK_OUT=\$(\$PYBIN -m pip check 2>&1) || PIP_CHECK_RC=\$?
+if [ "\$PIP_CHECK_RC" -eq 0 ]; then
+    echo "pip check: clean (exit 0)."
 else
-    PIP_CHECK_REMAIN=\$(printf '%s\n' "\$PIP_CHECK_OUT" | grep -vFf <(printf '%s\n' "\$PIP_CHECK_ALLOWLIST") || true)
+    if [ -z "\$PIP_CHECK_ALLOWLIST" ]; then
+        PIP_CHECK_REMAIN="\$PIP_CHECK_OUT"
+    else
+        PIP_CHECK_REMAIN=\$(printf '%s\n' "\$PIP_CHECK_OUT" | grep -vFf <(printf '%s\n' "\$PIP_CHECK_ALLOWLIST") || true)
+    fi
+    if [ -n "\$PIP_CHECK_REMAIN" ]; then
+        echo "FATAL: pip check reported non-allowlisted dependency conflicts:" >&2
+        printf '%s\n' "\$PIP_CHECK_REMAIN" >&2
+        exit 1
+    fi
+    echo "pip check: all reported conflicts are allowlisted."
 fi
-if [ -n "\$PIP_CHECK_REMAIN" ]; then
-    echo "FATAL: pip check reported non-allowlisted dependency conflicts:" >&2
-    printf '%s\n' "\$PIP_CHECK_REMAIN" >&2
-    exit 1
-fi
-echo "pip check: clean (no non-allowlisted conflicts)."
 
 echo "Dependencies installed."
 DEPS
@@ -1405,8 +1430,11 @@ else
     # own date.today() on this spot instance, so the backtest stage wrote
     # backtest/2026-05-17/ while the later Evaluator spot looked under
     # backtest/2026-05-18/ — the 2026-05-17 date-split. Parity / pit_parity
-    # / evaluator already thread \${RUN_DATE}; this closes the last gap so
-    # ALL stages key off the single SF-declared date.
+    # thread \${RUN_DATE}; the evaluator invocation did NOT (this comment
+    # previously claimed it did — the drift stayed invisible until the
+    # 2026-07-20 weekday recovery rerun, config#3133) and now threads
+    # --date explicitly in its own stage block below, so ALL stages key
+    # off the single SF-declared date.
     if ! $REMOTE_PYTHON -u backtest.py --mode $BACKTEST_MODE --date "\${RUN_DATE}" --upload --log-level INFO $BACKTEST_SKIP_PHASE4_FLAG $BACKTEST_PHASE_FLAGS 2>&1; then
         echo "ERROR: backtest.py failed. Spot run marked FAILED — check" >&2
         echo "       flow-doctor alerts. Parity + evaluator stages skipped" >&2
@@ -1546,7 +1574,15 @@ else
     if [ "${FREEZE_EVALUATOR}" = "true" ]; then
         _EVAL_FREEZE="--freeze"
     fi
-    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload \$_EVAL_FREEZE --log-level INFO 2>&1; then
+    # --date "\${RUN_DATE}" pins evaluate.py to the SF-stamped run date. The
+    # backtest stage's comment above claimed the evaluator "already threads"
+    # RUN_DATE — it never did; evaluate.py silently defaulted to its own
+    # date.today(). Invisible while the evaluator ran on weekend days (the
+    # trading-day normalization landed on the same Friday by coincidence);
+    # a WEEKDAY recovery rerun (watch-rerun-2026-07-18-12, 2026-07-20)
+    # resolved today() to Monday, looked in backtest/2026-07-20/, and
+    # correctly hard-failed on missing artifacts (config#3133).
+    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE --log-level INFO 2>&1; then
         echo "ERROR: evaluate.py failed. Spot run marked FAILED." >&2
         exit 1
     fi
