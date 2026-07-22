@@ -12,7 +12,13 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from optimizer.assembler import set_cutover_enabled
-from optimizer.research_optimizer import S3_PARAMS_KEY, apply, produce_artifact
+from optimizer.research_optimizer import (
+    RESEARCH_GRAPH_RETIRED_DATE,
+    S3_PARAMS_KEY,
+    apply,
+    compute_boost_correlations,
+    produce_artifact,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -167,3 +173,29 @@ class TestApplyCutoverGate:
         artifact_s3 = _mock_recommendation_artifact_s3.client.return_value
         body = json.loads(artifact_s3.put_object.call_args.kwargs["Body"])
         assert body["promotion_intent"] == "skip"
+
+
+class TestBoostCorrelationRetired:
+    """alpha-engine-config-I3246: the live boost-correlation path is retired —
+    it must never touch S3 and must always report status=retired, regardless
+    of input, so the loop reads as by-design-off rather than data-starved."""
+
+    @patch("optimizer.research_optimizer.boto3")
+    def test_compute_boost_correlations_is_retired_and_never_touches_s3(self, mock_boto3):
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+
+        import pandas as pd
+
+        df = pd.DataFrame({"score_date": ["2026-07-01"], "symbol": ["AAA"]})
+        result = compute_boost_correlations(df, bucket="test-bucket")
+
+        assert result["status"] == "retired"
+        assert result["retired_date"] == RESEARCH_GRAPH_RETIRED_DATE
+        assert s3.get_object.call_args_list == []
+
+    def test_retired_status_propagates_through_recommend_as_no_op(self):
+        from optimizer.research_optimizer import recommend
+
+        result = recommend(compute_boost_correlations(None, bucket="test-bucket"), current_params={})
+        assert result["status"] == "retired"
