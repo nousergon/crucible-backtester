@@ -70,10 +70,16 @@ def _build_s3_stub_with_artifacts(artifacts_by_key: dict[str, dict]) -> MagicMoc
     return s3
 
 
-def _stub_replay(*, agreement_score: float, agent_id_base: str = "sector_quant"):
+def _stub_replay(
+    *, agreement_score: float, agent_id_base: str = "sector_quant",
+    served_provider: str | None = None,
+):
     """Build a stand-in for replay_artifact's ReplayOutput."""
     from replay.runner import ReplayOutput
 
+    replay_cost = {"input_tokens": 100, "output_tokens": 50}
+    if served_provider is not None:
+        replay_cost["served_provider"] = served_provider
     return ReplayOutput(
         original_run_id="r1",
         original_agent_id=f"{agent_id_base}:tech",
@@ -81,7 +87,7 @@ def _stub_replay(*, agreement_score: float, agent_id_base: str = "sector_quant")
         replay_model="claude-haiku-4-5",
         replay_output={"ranked_picks": []},
         replay_output_kind="structured",
-        replay_cost={"input_tokens": 100, "output_tokens": 50},
+        replay_cost=replay_cost,
         replay_latency_ms=200,
         comparison={
             "agreement_score": agreement_score,
@@ -262,6 +268,62 @@ class TestComputeAndEmitConcordance:
         assert target["agents_skipped_thin_sample"][0]["agent_id_base"] == "sector_quant"
         # No CW emission for skipped group.
         cw.put_metric_data.assert_not_called()
+
+    def test_served_providers_seen_deduped_and_sorted(self):
+        # config#3006 — batch-level jurisdiction observation: which
+        # upstream backends actually served this run, deduped across
+        # every replayed artifact.
+        from replay.batch import compute_and_emit_concordance
+
+        end = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        artifacts = {
+            f"decision_artifacts/2026/05/09/sector_quant:tech/r{i}.json":
+                _make_artifact("sector_quant:tech", f"r{i}")
+            for i in range(3)
+        }
+        s3 = _build_s3_stub_with_artifacts(artifacts)
+        providers = ["DeepInfra", "AtlasCloud", "DeepInfra"]
+
+        def fake_replay(*, artifact_key, target_model, **kwargs):
+            return _stub_replay(
+                agreement_score=0.9, served_provider=providers.pop(0),
+            )
+
+        with patch("replay.batch.replay_artifact", side_effect=fake_replay):
+            summary = compute_and_emit_concordance(
+                target_models=["claude-haiku-4-5"],
+                end_time=end, window_days=1,
+                s3_client=s3,
+                emit_metrics=False,
+            )
+
+        target = summary["per_target_model"][0]
+        assert target["served_providers_seen"] == ["AtlasCloud", "DeepInfra"]
+
+    def test_served_providers_seen_empty_when_none_reported(self):
+        # Pre-v0.18.0 krepis pin, or a provider that doesn't report the
+        # field — informational absence, not a failure.
+        from replay.batch import compute_and_emit_concordance
+
+        end = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        artifacts = {
+            f"decision_artifacts/2026/05/09/sector_quant:tech/r{i}.json":
+                _make_artifact("sector_quant:tech", f"r{i}")
+            for i in range(3)
+        }
+        s3 = _build_s3_stub_with_artifacts(artifacts)
+
+        with patch("replay.batch.replay_artifact",
+                   return_value=_stub_replay(agreement_score=0.9)):
+            summary = compute_and_emit_concordance(
+                target_models=["claude-haiku-4-5"],
+                end_time=end, window_days=1,
+                s3_client=s3,
+                emit_metrics=False,
+            )
+
+        target = summary["per_target_model"][0]
+        assert target["served_providers_seen"] == []
 
     def test_aggregates_per_agent_and_emits(self):
         from replay.batch import compute_and_emit_concordance
