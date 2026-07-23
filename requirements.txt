@@ -138,4 +138,4 @@ psutil>=5.9.0
 # v0.12.2 is the earliest krepis tag carrying the OpenRouter unresolved/
 # leaked-tool-call safety fix in krepis.llm; the >=0.12.0 floor here is one
 # patch below that — bumped alongside this change (see the pin below).
-krepis[openai]>=0.12.2
+krepis[openai]>=0.18.0
