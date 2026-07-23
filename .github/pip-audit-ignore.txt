@@ -21,3 +21,20 @@
 # from 18.x, or when the pyarrow major bump is scheduled as its own tracked
 # upgrade.
 PYSEC-2026-113
+
+# langchain-anthropic 0.3.22: fix requires bumping to 1.4.6 — a major
+# 0.x->1.x version jump with real breaking-change risk (LangChain's own
+# migration notes call out message/schema shape changes across this
+# boundary). Deliberately not bundled into the PR that flips pip-audit to
+# blocking (config#2530) — scoped as its own tracked upgrade instead.
+# Accepted — accepted 2026-07-23, revisit when
+# nousergon/alpha-engine-config#3681 lands.
+PYSEC-2026-2556
+
+# langchain-core 0.3.86: two advisories, both fixed only by the same
+# major 0.x->1.x bump as PYSEC-2026-2556 above (langchain-core is a
+# shared transitive dep of langchain-anthropic, same upgrade covers all
+# three). Accepted — accepted 2026-07-23, revisit when
+# nousergon/alpha-engine-config#3681 lands.
+PYSEC-2026-2193
+PYSEC-2026-2562
