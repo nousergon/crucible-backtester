@@ -82,6 +82,11 @@ import boto3
 import pandas as pd
 import yaml
 
+# krepis.heartbeat — §116 rule 5 heartbeat cadence convention.
+# TIME_BASED_HEARTBEAT tracks monotonic time for emit_heartbeat_if_elapsed
+# alongside the legacy iteration-based _HEARTBEAT_EVERY (line 1449).
+from krepis.heartbeat import HEARTBEAT_INTERVAL_S, emit_heartbeat_if_elapsed
+
 from analysis import param_sweep
 from optimizer import executor_optimizer
 from optimizer.config_archive import read_params_pit_or_current
@@ -1477,6 +1482,7 @@ def _run_simulation_loop(
 
     t0 = _time.monotonic()
     _budget_warned = False
+    _last_heartbeat_ts = 0.0  # §116 rule 5 time-based heartbeat tracker
 
     for idx in range(start_idx, n_dates):
         signal_date = sim_dates[idx]
@@ -1566,6 +1572,14 @@ def _run_simulation_loop(
                 "Simulation loop: %d/%d dates processed (%.1fs elapsed, last=%s)",
                 idx + 1, n_dates, elapsed, signal_date,
             )
+
+        # S116 rule 5: time-based heartbeat at fleet cadence alongside the
+        # legacy iteration-based one above, via the krepis.heartbeat chokepoint.
+        _last_heartbeat_ts = emit_heartbeat_if_elapsed(
+            "simulate",
+            interval_s=HEARTBEAT_INTERVAL_S,
+            last_heartbeat_at=_last_heartbeat_ts,
+        )
 
     # L2: the sim completed all dates — clear the checkpoint so a fresh run for
     # this date recomputes (within-run resume is for FAILED runs only; cross-run
