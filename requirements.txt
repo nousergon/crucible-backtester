@@ -115,7 +115,7 @@ scipy>=1.18.0
 lightgbm>=4.6.0
 catboost>=1.2.8
 hmmlearn>=0.3.3
-tqdm>=4.68.4
+tqdm>=4.69.0
 optuna>=4.9.0
 psutil>=5.9.0
 
