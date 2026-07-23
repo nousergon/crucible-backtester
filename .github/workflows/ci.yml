@@ -89,6 +89,14 @@ jobs:
           pip install ruff
           ruff check --select F821 .
 
+      # config#3219 §121 hermetic-vs-live test split lint: every test file that
+      # imports a live-service module (boto3, requests, arcticdb, …) at module
+      # level must carry @pytest.mark.live (or @pytest.mark.skipif /
+      # @pytest.mark.parity / test_live_* naming) so it is excluded from the
+      # default hermetic suite via addopts = -m "not parity and not live".
+      - name: Hermetic-vs-live marker lint
+        run: python3 scripts/lint_hermetic_test_marker.py
+
       # --cov-fail-under not passed explicitly: pytest-cov reads
       # [tool.coverage.report] fail_under from pyproject.toml automatically
       # once --cov is passed (config#2533 coverage ratchet).
