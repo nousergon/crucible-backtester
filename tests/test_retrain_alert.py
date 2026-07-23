@@ -211,10 +211,10 @@ def test_send_alert_suppressed(mock_suppress, mock_write):
     assert result["reason"] == "suppressed"
 
 
-@patch("analysis.retrain_alert._send_smtp")
+@patch("analysis.retrain_alert.send_email")
 @patch("analysis.retrain_alert._write_alert_to_s3")
 @patch("analysis.retrain_alert._should_suppress", return_value=False)
-def test_send_alert_email(mock_suppress, mock_write, mock_smtp):
+def test_send_alert_email(mock_suppress, mock_write, mock_send_email):
     alert = {
         "triggered": True,
         "date": "2026-04-07",
@@ -224,11 +224,10 @@ def test_send_alert_email(mock_suppress, mock_write, mock_smtp):
     }
     config = {"email_sender": "test@test.com", "email_recipients": ["user@test.com"]}
 
-    with patch.dict("os.environ", {"GMAIL_APP_PASSWORD": "fake_pw"}):
-        result = send_retrain_alert(alert, config, "bucket")
+    result = send_retrain_alert(alert, config, "bucket")
 
     assert result["sent"] is True
-    mock_smtp.assert_called_once()
+    mock_send_email.assert_called_once()
     mock_write.assert_called_once()
 
 

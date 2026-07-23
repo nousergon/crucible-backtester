@@ -27,13 +27,11 @@ from __future__ import annotations
 
 import json
 import logging
-import smtplib
 from datetime import date, datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import boto3
 
+from nousergon_lib.email_sender import send_email
 from nousergon_lib.secrets import get_secret
 
 log = logging.getLogger(__name__)
@@ -220,13 +218,16 @@ def send_retrain_alert(
     plain_body = _build_plain_body(alert)
 
     region = config.get("aws_region", "us-east-1")
-    gmail_pw = get_secret("GMAIL_APP_PASSWORD", required=False, default="")
 
     try:
-        if gmail_pw:
-            _send_smtp(subject, plain_body, html_body, sender, recipients, gmail_pw)
-        else:
-            _send_ses(subject, plain_body, html_body, sender, recipients, region)
+        send_email(
+            subject,
+            plain_body,
+            recipients=recipients,
+            html=html_body,
+            sender=sender,
+            region=region,
+        )
         log.info("Retrain alert sent: %s", subject)
         return {"sent": True, "subject": subject, "n_triggers": alert["n_triggers"]}
     except Exception as exc:
@@ -349,32 +350,3 @@ def _build_plain_body(alert: dict) -> str:
     lines.append("The weekly training cadence will retrain the model on the")
     lines.append("next Saturday pipeline run.")
     return "\n".join(lines)
-
-
-# ── Email transport (same pattern as emailer.py) ─────────────────────────────
-
-def _send_smtp(subject, plain, html, sender, recipients, gmail_pw):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(plain, "plain"))
-    msg.attach(MIMEText(html, "html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(sender, gmail_pw)
-        server.sendmail(sender, recipients, msg.as_string())
-
-
-def _send_ses(subject, plain, html, sender, recipients, region):
-    ses = boto3.client("ses", region_name=region)
-    ses.send_email(
-        Source=sender,
-        Destination={"ToAddresses": recipients},
-        Message={
-            "Subject": {"Data": subject, "Charset": "UTF-8"},
-            "Body": {
-                "Text": {"Data": plain, "Charset": "UTF-8"},
-                "Html": {"Data": html, "Charset": "UTF-8"},
-            },
-        },
-    )
