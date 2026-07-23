@@ -74,7 +74,7 @@ jobs:
       # same matrixed GHA job. Pin matches requirements.txt's `krepis>=0.4.0`
       # floor.
       - name: Set up Python for canary-rollback alert publish
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install krepis for deploy_*.sh alerts call
