@@ -384,7 +384,7 @@ echo "════════════════════════�
 
 # ── Phase-aware instance-type floor (L4485) ──────────────────────────────────
 # Modes that run predictor_pipeline (10y GBM inference over ~900 tickers;
-# peak RSS ~2.8 GB measured 2026-06-01) need ≥8 GB RAM. The 4 GB c5.large —
+# peak RSS ~2.8 GB measured 2026-06-01) need ≥16 GB RAM. The 4 GB c5.large —
 # FIRST in the default rotation — OOM-killed predictor_pipeline on the
 # 2026-06-01 off-cycle run. CRITICAL: the Saturday SF's PredictorBacktest +
 # PortfolioOptimizerBacktest states invoke this script with NO --instance-type,
@@ -395,18 +395,17 @@ echo "════════════════════════�
 # param-sweep / simulate / signal-quality don't load the predictor tensor and
 # stay on the cheap 4 GB-first rotation. Skipped when the operator passes an
 # explicit --instance-type (their choice wins, incl. deliberate small debug).
-_PREDICTOR_RAM_FLOOR_TYPES="m5.large,m6i.large,m5a.large,c5.xlarge,c6i.xlarge"
-# L4487 (2026-06-05): the ≥16 GB pit_parity floor (L4486d) is REVERTED to ≥8 GB.
-# pit_parity now runs its two passes in separate subprocesses
-# (analysis/pit_parity.py::_run_predictor_pass_isolated → backtest.py
-# --pit-parity-pass), so the OS reclaims each pass's RSS between passes — the
-# Parity spot's footprint is bounded to ONE pass (~2.8 GB), which fits the 8 GB
-# floor with margin. No PIT_PARITY_ENABLED special-case: all predictor-bearing
-# modes (incl. the Parity state's --mode=all) share the cheap 8 GB floor again.
+_PREDICTOR_RAM_FLOOR_TYPES="m5.xlarge,m6i.xlarge,m5a.xlarge,c5.2xlarge,c6i.2xlarge"
+# I3280 (2026-07-23): the universal predictor floor was bumped from 8 GB to 16 GB
+# instances — the RAM headroom guard requires ≥6.0 GB available MemAvailable, but
+# 8 GB instances can dip to ~6 GB under OS overhead + ArcticDB caches, leaving
+# zero margin against the requirement. 16 GB instances (~13-14 GB available)
+# provide comfortable margin. pit_parity shares this same universal floor
+# (subprocess isolation already bounded its per-pass footprint to ~2.8 GB).
 case "$BACKTEST_MODE" in
     all|predictor-backtest|portfolio-optimizer-backtest)
         if [ -z "$INSTANCE_TYPE" ]; then
-            echo "  Mode '$BACKTEST_MODE' runs predictor_pipeline → applying ≥8 GB instance floor"
+            echo "  Mode '$BACKTEST_MODE' runs predictor_pipeline → applying ≥16 GB instance floor"
             INSTANCE_TYPES="$_PREDICTOR_RAM_FLOOR_TYPES"
         fi
         ;;
