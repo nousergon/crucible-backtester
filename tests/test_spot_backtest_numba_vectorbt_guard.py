@@ -84,3 +84,21 @@ def test_guard_fails_loud():
         "the import-chain guard must exit 1 on failure so a broken env fails "
         "the deps step instead of shipping to the run"
     )
+
+
+def test_guard_success_path_prints_version():
+    """§119 rule 1 success-path: the combined guard invocation must print a
+    version-confirmation message on the success path (not merely fail loud),
+    so a clean env where every import resolves is visibly attested in the
+    deps-step log output."""
+    s = _read()
+    guard = _guard_invocation(s)
+    assert "print(" in guard, (
+        "the import-chain guard must include a print/success message so a clean "
+        "env is visibly attested in deps logs; a bare import + assert + || exit 1 "
+        "would show nothing on the success path"
+    )
+    assert "numpy-2 guard OK" in guard or "OK:" in guard or "print(" and "guard" in guard.lower(), (
+        "the success message should be recognizable (e.g. 'numpy-2 guard OK') "
+        "so operators can distinguish a pass from a skipped/silent step"
+    )

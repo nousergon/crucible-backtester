@@ -65,3 +65,37 @@ def test_config_drift_guard_is_soft_never_blocks_launch():
         "call exit 1 and block a launch, since config.yaml is not always a "
         "symlink (e.g. local/non-EC2 runs)"
     )
+
+
+def test_plain_file_produces_no_drift_warning():
+    """§119 rule 1 success-path: when config.yaml is a plain file (NOT a
+    symlink), the config#2871 drift-guard warnings must be unreachable — the
+    entire drift check body lives inside `if [ -L ... ]`, so a plain file
+    silently reaches the final OK without any drift-related output."""
+    text = _text()
+    start = text.index("pre_launch_preflight() {")
+    end = text.index("echo \"  pre-launch preflight OK.\"", start)
+    preflight = text[start:end]
+    # The drift check is gated on `if [ -L ... ]` — a plain file skips it.
+    assert 'if [ -L "$REPO_ROOT/config.yaml" ]; then' in preflight, (
+        "the drift guard must be wrapped in a symlink check so a plain file "
+        "produces no warnings"
+    )
+    # The config#2871 guard's WARNING lines must sit INSIDE the `if` block.
+    # Find the symlink check position and verify the drift-specific warnings
+    # appear only after it, not before (where they'd fire unconditionally).
+    symlink_idx = preflight.index('if [ -L "$REPO_ROOT/config.yaml"')
+    # The drift-specific warning messages (the guard's actual warning lines):
+    drift_warnings = [
+        "operator flags there have no audit trail",
+        "will NOT survive a rebuild",
+        "not captured in git",
+    ]
+    for warning in drift_warnings:
+        warning_idx = preflight.find(warning)
+        if warning_idx != -1:
+            assert warning_idx > symlink_idx, (
+                f"config drift warning {warning!r} appears BEFORE the `if [ -L ]` "
+                f"symlink check (pos {warning_idx} < symlink pos {symlink_idx}); "
+                "it would fire unconditionally even for a plain file"
+            )

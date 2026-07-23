@@ -85,6 +85,37 @@ def test_numpy2_guard_fails_loud():
     assert "2>/dev/null" not in line, "the guard import must be loud (no 2>/dev/null)"
 
 
+def test_numpy2_guard_success_path_asserts_version_and_prints():
+    """§119 rule 1 success-path: the guard must assert numpy>=2 AND print a
+    version confirmation on the success path, not merely exit non-zero on
+    failure — a clean env where all imports resolve should produce attestable
+    output in the deps-step log."""
+    s = _read()
+    guard_idx = s.find("import numpy, scipy.sparse, lightgbm")
+    assert guard_idx != -1, "no numpy-2 import guard found"
+    seg = s[guard_idx: guard_idx + 500]
+    # The guard uses `|| { ... exit 1; }` — on success the || block is skipped.
+    line = next((ln for ln in seg.splitlines() if "import numpy, scipy.sparse" in ln), "")
+    assert "||" in line, (
+        "the numpy-2 guard must use `|| {` so a successful import + assert "
+        "passes through without exiting 1; a standalone invocation would exit "
+        "non-zero on assert failure but provide no structural success-path signal"
+    )
+    assert "2>/dev/null" not in line, (
+        "the guard import must be loud (no 2>/dev/null) so a failure message "
+        "reaches stderr before the exit"
+    )
+    # The print() call on the success path is load-bearing: it confirms the
+    # resolved version so operators can distinguish "all modules passed" from
+    # "the guard was never reached."
+    assert "print('numpy-2 guard OK" in seg.replace("\\'", "'") or "print(\"numpy-2 guard OK" in seg, (
+        "the guard must print a version-confirmation message on the success "
+        "path so a clean résolution is visibly attested in deps logs; the "
+        "success message must include version details so an operator can "
+        "verify the resolved versions without re-running the step"
+    )
+
+
 def test_requirements_still_pin_numpy2():
     """The guard is only correct while requirements.txt actually targets numpy 2.
     If a future edit re-caps numpy below 2, the guard (and this incident's fix)

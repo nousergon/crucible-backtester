@@ -115,3 +115,39 @@ def test_guard_verifies_the_renamed_nousergon_lib_distribution():
         "the guard import must use the real `nousergon_lib` module, not the "
         "deprecated `alpha_engine_lib` alias"
     )
+
+
+def test_guard_passes_on_successful_import():
+    """§119 rule 1 success-path: the guard must use the ``|| { ... exit 1; }``
+    pattern so a successful import passes silently (no exit), and the post-guard
+    ``$PIP show nousergon-lib`` version line follows to confirm the resolved
+    distribution on the success path."""
+    s = _read()
+    guard_idx = s.find("import nousergon_lib.quant.stats.multiple_testing")
+    assert guard_idx != -1, "no quant.stats import guard found"
+    seg = s[guard_idx: guard_idx + 800]
+    # The guard must be `$PYBIN -c "import ..." || {` — the || ensures a
+    # successful import continues past the guard without triggering exit 1.
+    lines = seg.splitlines()
+    guard_line = next((ln for ln in lines if "multiple_testing" in ln), "")
+    assert "||" in guard_line, (
+        "the import guard must use `|| {` so a successful import does NOT "
+        "trigger exit 1 — a standalone import without the failover would be "
+        "silent on failure but also provides no structural success-path signal"
+    )
+    assert "|| {" in guard_line or "||" + guard_line.split("||")[1].lstrip().startswith("{"), (
+        "the import guard's `||` must be followed by a block containing "
+        "exit 1 so the guard only fires on actual import failure"
+    )
+    # The guard line itself must not redirect stderr (would silence the error).
+    assert "2>/dev/null" not in guard_line, (
+        "the guard import must be loud (no 2>/dev/null) so a failure message "
+        "reaches stderr before the exit"
+    )
+    # A $PIP show nousergon-lib version line should follow the guard on the
+    # success path so the resolved version is visible in logs.
+    post_guard = s[guard_idx + 300: guard_idx + 600]
+    assert "show nousergon-lib" in post_guard, (
+        "a `$PIP show nousergon-lib` version line should follow the import "
+        "guard on the success path, confirming the resolved distribution"
+    )
