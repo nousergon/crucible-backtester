@@ -1,5 +1,5 @@
 numpy>=2.5.1,<3
-pandas>=2.0
+pandas>=3.0.5
 # Ceiling exists ONLY because scipy 1.18.0 was, at the time of Deploy #525
 # (2026-07-16), the first scipy release requiring numpy>=2.0.0 wheels, which
 # conflicted with the numpy<2 cap that was on the line above back then — pip
