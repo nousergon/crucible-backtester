@@ -4934,6 +4934,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--force-phases", default="",
                         help="Comma-separated list of phase names to force-rerun (overrides markers "
                              "for those phases only). More surgical than --force.")
+    parser.add_argument("--force-skip-errored", action="store_true",
+                        help="Allow --skip-phases to skip phases whose prior marker has "
+                             "status=error. The end-of-run critical-deliverable check "
+                             "(check_critical_deliverables) still fires regardless of this "
+                             "flag — a phase producing critical artifacts with status=error "
+                             "always fails the stage.")
     # Tier 4 vectorized predictor_param_sweep — default ON since
     # 2026-04-28 v18 validated stats parity (post fee-rate alignment)
     # + cap retighten 5400→1800. Two flags retained for explicit control:
@@ -5755,6 +5761,7 @@ def _main_impl() -> None:
         force=args.force,
         force_phases=force_phases,
         hard_caps=hard_caps,
+        force_skip_errored=getattr(args, "force_skip_errored", False),
     )
     config["_phase_registry"] = registry
 
@@ -6197,6 +6204,13 @@ def _main_impl() -> None:
                 _export_simulation_artifacts(config, args.date, sweep_df=sweep_df, predictor_sweep_df=predictor_sweep_df, portfolio_stats=portfolio_stats, predictor_stats=predictor_stats)
         except Exception as e:
             logger.warning("Simulation artifact export failed (non-fatal): %s", e)
+
+        # I3281: end-of-run critical-deliverable check. Fails the stage if any
+        # critical phase has a status=error marker — even if the phase was
+        # explicitly skipped via --skip-phases or --force-skip-errored. This is
+        # the hard backstop against the silent-green-run pattern where an errored
+        # phase's degraded artifact is invisible to the stage driver.
+        registry.check_critical_deliverables()
 
         # Outcome taxonomy guard (L4523 — encodes ARCHITECTURE.md §22). The
         # Evaluator treats portfolio_stats.json + sweep_df.parquet as CRITICAL.
