@@ -378,6 +378,11 @@ def phase(name: str, **context):
 
 _MARKER_SCHEMA_VERSION = 1
 
+# Phases whose deliverables are critical to downstream consumers (Evaluator / SF).
+# An errored marker for a critical phase always fails the stage at end-of-run,
+# even if the phase was explicitly skipped via --skip-phases or --force-skip-errored.
+_CRITICAL_PHASES = frozenset({"simulation_pipeline", "predictor_pipeline"})
+
 
 def _marker_key(date: str, phase_name: str) -> str:
     return f"backtest/{date}/.phases/{phase_name}.json"
@@ -526,6 +531,8 @@ class PhaseRegistry:
         force_phases: Iterable[str] | None = None,
         hard_caps: dict[str, float] | None = None,
         s3_client=None,
+        critical_phases: set[str] | None = None,
+        force_skip_errored: bool = False,
     ):
         self.date = date
         self.bucket = bucket
@@ -559,6 +566,18 @@ class PhaseRegistry:
         # count. A "firing" = the phase hit its hard cap (the silent-burn
         # tripwire), which the watchdog converts to a PhaseTimeoutError abort.
         self._watchdog_records: list[dict] = []
+        # Phases whose deliverables are critical — errored markers for these
+        # always fail the stage at end-of-run via check_critical_deliverables().
+        # Defaults to the fleet-wide _CRITICAL_PHASES set; override for tests.
+        self._critical_phases = set(critical_phases) if critical_phases is not None else set(_CRITICAL_PHASES)
+        # When True, --skip-phases may skip a phase whose prior marker has
+        # status=error (with a loud warning). The end-of-run critical-deliverable
+        # check still fires regardless of this flag.
+        self._force_skip_errored = force_skip_errored
+        # Phases explicitly skipped whose prior marker had status=error.
+        # Tracked for audit / degradation reporting even when force_skip_errored
+        # is True.
+        self._errored_skipped_phases: set[str] = set()
 
     # ── S3 helpers ───────────────────────────────────────────────────────
 
@@ -717,13 +736,36 @@ class PhaseRegistry:
           5. Default: run.
 
         Reason strings are structured so downstream INFO logs are grep-able:
-          "only_phases_filter" | "explicit_skip" | "auto_skip_marker_ok"
+          "only_phases_filter" | "explicit_skip" | "explicit_skip_errored_forced"
+          | "force_run_over_errored_marker" | "auto_skip_marker_ok"
           | "force_rerun" | "force_phase_rerun" | "default_run"
           | "not_auto_skippable" | "marker_artifact_missing"
         """
         if self._only is not None and phase_name not in self._only:
             return False, "only_phases_filter"
         if phase_name in self._explicit_skip:
+            # I3281: check if the skipped-over phase has a prior error marker.
+            # Without --force-skip-errored, refuse to skip an errored phase —
+            # force the operator to acknowledge with the flag.
+            marker = self._read_marker(phase_name)
+            if marker is not None and marker.get("status") == "error":
+                if self._force_skip_errored:
+                    logger.warning(
+                        "phase_registry: explicit skip of phase %s whose prior marker "
+                        "has status=error (--force-skip-errored). Its deliverables may "
+                        "be stale or absent — the end-of-run critical check will still "
+                        "fire if this is a critical phase.",
+                        phase_name,
+                    )
+                    self._errored_skipped_phases.add(phase_name)
+                    return False, "explicit_skip_errored_forced"
+                logger.warning(
+                    "phase_registry: refusing to explicitly skip phase %s whose prior "
+                    "marker has status=error. Use --force-skip-errored to acknowledge "
+                    "and proceed, or re-run the phase to get a fresh result.",
+                    phase_name,
+                )
+                return True, "force_run_over_errored_marker"
             return False, "explicit_skip"
         if self._force_all:
             return True, "force_rerun"
@@ -752,6 +794,35 @@ class PhaseRegistry:
     def load_marker(self, phase_name: str) -> dict | None:
         """Public accessor for a phase's marker — used by loaders in later PRs."""
         return self._read_marker(phase_name)
+
+    def check_critical_deliverables(self) -> None:
+        """End-of-run gate: fail if any critical phase has a status=error marker.
+
+        This is the hard backstop (I3281): even when --force-skip-errored allows
+        skipping an errored phase, the end-of-run check examines ALL critical
+        phases' markers. Any critical phase whose marker says status=error —
+        whether from this invocation or a prior run that was skipped over — fails
+        the stage. This prevents the silent-green-run pattern where --skip-phases
+        over errored phases produces a status=ok stage.
+
+        Non-critical phases' error markers are intentionally NOT checked here:
+        stages like cov_estimator_sweep and gamma_sweep are declared non-fatal
+        by design (observability, not pipeline blockers).
+
+        Raises RuntimeError if any critical phase has a current error marker.
+        """
+        errors: list[str] = []
+        for phase in sorted(self._critical_phases):
+            marker = self._read_marker(phase)
+            if marker is not None and marker.get("status") == "error":
+                errors.append(phase)
+        if errors:
+            raise RuntimeError(
+                f"Critical phase(s) with status=error marker: "
+                f"{', '.join(errors)}. The stage must fail because these phases' "
+                f"deliverables are required by downstream consumers (Evaluator / "
+                f"SF). Check the PHASE_END logs. Use --force to re-run."
+            )
 
     # ── Phase context manager ────────────────────────────────────────────
 
