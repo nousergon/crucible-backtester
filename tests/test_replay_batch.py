@@ -294,6 +294,7 @@ class TestComputeAndEmitConcordance:
                 target_models=["claude-haiku-4-5"],
                 end_time=end, window_days=1,
                 s3_client=s3,
+                emit_metrics=False,
             )
 
         target = summary["per_target_model"][0]
@@ -318,6 +319,7 @@ class TestComputeAndEmitConcordance:
                 target_models=["claude-haiku-4-5"],
                 end_time=end, window_days=1,
                 s3_client=s3,
+                emit_metrics=False,
             )
 
         target = summary["per_target_model"][0]
