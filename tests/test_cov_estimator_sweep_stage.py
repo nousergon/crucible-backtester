@@ -96,6 +96,8 @@ class TestHappyPath:
         # baseline + ranking carried through
         assert payload["baseline_name"] == "LW_H1"
         assert payload["ranking"] == [("LW_H1", 0.5)]
+        # config#2454: n_trials = len(cells) persisted alongside the report
+        assert payload["n_trials"] == 1
 
         # S3 put_object called with the expected key
         s3_client.put_object.assert_called_once()
@@ -106,6 +108,7 @@ class TestHappyPath:
         # Body decodes as JSON containing the report fields
         body_json = json.loads(kwargs["Body"].decode("utf-8"))
         assert body_json["baseline_name"] == "LW_H1"
+        assert body_json["n_trials"] == 1
 
     def test_harness_invoked_with_predictor_outputs(
         self, stub_config, stub_pred_inputs, stub_sweep_report
@@ -204,6 +207,89 @@ class TestS3PersistFailure:
             "S3 persist failed" in record.message
             for record in caplog.records
         )
+
+
+# ── Cumulative trial-count accumulator (config#2454) ────────────────────
+
+
+class TestTrialCountAccumulator:
+    def test_increments_cumulative_trial_count_on_success(
+        self, stub_config, stub_pred_inputs, stub_sweep_report
+    ):
+        """A successful sweep increments the shared nousergon-lib
+        accumulator with this cycle's n_trials (len(cells))."""
+        from backtest import run_cov_estimator_sweep_stage
+
+        with patch(
+            "synthetic.predictor_backtest.run", return_value=stub_pred_inputs
+        ), patch(
+            "analysis.portfolio_optimizer_backtest.run_cov_estimator_sweep",
+            return_value=stub_sweep_report,
+        ), patch(
+            "nousergon_lib.quant.stats.trial_accumulator.increment_trial_count"
+        ) as mock_incr:
+            run_cov_estimator_sweep_stage(
+                config=stub_config,
+                run_date="2026-05-27",
+                s3_client=MagicMock(),
+            )
+
+        mock_incr.assert_called_once()
+        args, kwargs = mock_incr.call_args
+        assert args[0] == "cov_estimator_sweep"
+        assert args[1] == 1  # len(stub_sweep_report["cells"])
+        assert args[2] == "2026-05-27"
+
+    def test_accumulator_failure_does_not_raise(
+        self, stub_config, stub_pred_inputs, stub_sweep_report, caplog
+    ):
+        """The accumulator increment is best-effort — a failure (e.g.
+        nousergon-lib not yet on the pin that ships the module, or a
+        transient S3 error) must not break the sweep artifact write."""
+        from backtest import run_cov_estimator_sweep_stage
+
+        with patch(
+            "synthetic.predictor_backtest.run", return_value=stub_pred_inputs
+        ), patch(
+            "analysis.portfolio_optimizer_backtest.run_cov_estimator_sweep",
+            return_value=stub_sweep_report,
+        ), patch(
+            "nousergon_lib.quant.stats.trial_accumulator.increment_trial_count",
+            side_effect=RuntimeError("contention"),
+        ):
+            payload = run_cov_estimator_sweep_stage(
+                config=stub_config,
+                run_date="2026-05-27",
+                s3_client=MagicMock(),
+            )
+
+        assert payload["status"] == "ok"
+        assert any(
+            "trial-count increment failed" in record.message
+            for record in caplog.records
+        )
+
+    def test_skipped_cycle_does_not_increment(
+        self, stub_config, stub_sweep_report
+    ):
+        """The predictor-backtest-failure skip path returns before the
+        sweep harness (and therefore the accumulator call) ever runs."""
+        from backtest import run_cov_estimator_sweep_stage
+
+        with patch(
+            "synthetic.predictor_backtest.run",
+            return_value={"status": "error", "error": "boom"},
+        ), patch(
+            "nousergon_lib.quant.stats.trial_accumulator.increment_trial_count"
+        ) as mock_incr:
+            payload = run_cov_estimator_sweep_stage(
+                config=stub_config,
+                run_date="2026-05-27",
+                s3_client=MagicMock(),
+            )
+
+        assert payload["status"] == "skipped"
+        mock_incr.assert_not_called()
 
 
 # ── Config validation ───────────────────────────────────────────────────

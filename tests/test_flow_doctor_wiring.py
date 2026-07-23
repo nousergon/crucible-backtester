@@ -400,7 +400,7 @@ class TestLibVersionPin:
         assert "@main" not in text, "nousergon-lib must be pinned to a tag, not @main"
         assert "@v0.124.5" in text, (
             "nousergon-lib should pin to v0.124.5 (nousergon_lib.health enrichment "
-            "writer for config#1727 Phase C; lockstep with fleet at v0.124.5). "
+            "writer for config#1727 Phase C; lockstep with fleet at v0.124.5; bumped for nousergon_lib.quant.stats.trial_accumulator (config#2454)). "
             "Prior: v0.86.0 — flow-doctor>=0.8.0 notify_on_category for config#1695. "
             "(nousergon_lib.quant.horizons + the outcome_record contract, "
             "config#1483 Phase 1 / nousergon-lib#147) consumed by the "
