@@ -100,15 +100,14 @@ def test_no_raw_backticks_in_unquoted_heredocs():
     )
 
 
-def test_pit_parity_floor_reverted_to_8gb_after_subprocess_isolation():
-    """L4487: the L4486d ≥16 GB pit_parity floor is REVERTED — pit_parity now runs
-    each pass in its own subprocess (footprint bounded to one pass ~2.8 GB), so the
-    Parity stage shares the cheap ≥8 GB floor again. No 16 GB special-case remains."""
+def test_pit_parity_floor_upgraded_to_16gb_shared_universal():
+    """L4487 + I3280: the universal predictor floor was bumped from 8 GB to 16 GB
+    instances to guarantee margin above the 6.0 GB RAM headroom requirement.
+    pit_parity shares this same universal floor; no dedicated pit_parity special-case
+    exists."""
     s = _read_script()
     assert "_PIT_PARITY_RAM_FLOOR_TYPES" not in s, (
         "the dedicated ≥16 GB pit_parity floor should be gone (L4487 subprocess isolation)"
     )
-    # predictor-bearing modes all share the single ≥8 GB floor list
-    assert '_PREDICTOR_RAM_FLOOR_TYPES="m5.large' in s
-    # and there is no longer a PIT_PARITY_ENABLED-gated 16 GB branch
-    assert "≥16 GB instance floor" not in s
+    # All predictor-bearing modes share the single universal floor (now 16 GB)
+    assert '_PREDICTOR_RAM_FLOOR_TYPES="m5.xlarge' in s

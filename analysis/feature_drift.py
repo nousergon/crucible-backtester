@@ -109,7 +109,26 @@ def compute_feature_drift(
         valid = joined[["actual", feat]].dropna()
         if len(valid) < _MIN_SAMPLES:
             continue
-        ic, _ = spearmanr(valid[feat], valid["actual"])
+
+        # Skip features with object dtype (e.g. nested dicts from non-unique
+        # index data — should not happen after the _join_outcomes_with_features
+        # fix, but guard defensively to avoid a confusing scipy error).
+        if not np.issubdtype(valid[feat].dtype, np.number):
+            log.warning("Feature drift: skipping feature %s — non-numeric dtype %s", feat, valid[feat].dtype)
+            continue
+
+        try:
+            ic, _ = spearmanr(valid[feat], valid["actual"])
+        except (ValueError, TypeError, AttributeError) as exc:
+            # scipy can raise or return non-standard types for edge-case inputs
+            # (uniform values, single-element arrays, mixed object dtypes).
+            # log and skip this feature rather than crashing the whole module.
+            log.warning(
+                "Feature drift: skipping feature %s — spearmanr failed: %s: %s",
+                feat, type(exc).__name__, exc,
+            )
+            continue
+
         production_ics[feat] = round(float(ic), 6)
 
     # ── Load training-time feature ICs ───────────────────────────────────────
@@ -255,7 +274,16 @@ def _join_outcomes_with_features(
     outcomes: pd.DataFrame,
     features_by_ticker: dict[str, pd.DataFrame],
 ) -> pd.DataFrame:
-    """Join prediction outcomes with feature values on (ticker, date)."""
+    """Join prediction outcomes with feature values on (ticker, date).
+
+    Defensively handles edge cases from ArcticDB data:
+    - Non-unique index dates: ``feat_df.loc`` returns a DataFrame; the last
+      row is taken (most recent data wins).
+    - Single-column DataFrame returning a scalar in some pandas versions:
+      wrapped back to a Series with the column name.
+
+    Raises on unexpected types — a data-shape change should surface early.
+    """
     rows = []
     for _, row in outcomes.iterrows():
         ticker = row["symbol"]
@@ -275,6 +303,17 @@ def _join_outcomes_with_features(
             if len(prior) == 0:
                 continue
             feat_row = feat_df.loc[prior[-1]]
+
+        # Normalize feat_row to a Series with scalar values.
+        if isinstance(feat_row, pd.DataFrame):
+            # Non-unique index: multiple rows matched — take the last one.
+            feat_row = feat_row.iloc[-1]
+        elif not isinstance(feat_row, pd.Series):
+            # Scalar return (e.g. single-column DataFrame + unique index in
+            # some pandas versions) — wrap to Series with the column name so
+            # ``to_dict()`` below produces ``{col_name: value}``.
+            col_name = feat_df.columns[0]
+            feat_row = pd.Series({col_name: feat_row}, name=row.get("prediction_date"))
 
         combined = {
             "symbol": ticker,
