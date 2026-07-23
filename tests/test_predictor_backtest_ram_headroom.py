@@ -68,10 +68,10 @@ def test_assert_ram_headroom_skips_when_unreadable():
         pb._assert_ram_headroom(6.0)  # must not raise
 
 
-def test_default_min_ram_floor_is_8gb_class():
-    """Floor sits between a 4 GB instance (~3.5 GB avail) and an 8 GB one
-    (~7 GB avail) so it rejects the OOM-prone 4 GB c5.large and admits the
-    ≥8 GB instances the mode-aware floor in spot_backtest.sh selects."""
+def test_default_min_ram_floor_sits_above_4gb_below_16gb():
+    """Floor sits between a 4 GB instance (~3.5 GB avail) and a 16 GB one
+    (~13-14 GB avail) so it rejects the OOM-prone 4 GB c5.large and admits the
+    ≥16 GB instances the mode-aware floor in spot_backtest.sh now selects."""
     assert 3.5 < pb._DEFAULT_MIN_RAM_GB < 7.0
 
 
