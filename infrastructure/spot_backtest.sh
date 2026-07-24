@@ -1412,6 +1412,11 @@ _stage_skipped() {
     esac
 }
 
+# Track whether backtest was skipped so the evaluator invocation below knows
+# to pass --skip-backtester and distinguish intentional absence from unexpected
+# failure (config#2887).
+_BACKTEST_WAS_SKIPPED=false
+
 # ── Stage: backtest ─────────────────────────────────────────────────────────
 # If backtest.py fails we exit non-zero so parity + evaluator never run
 # against stale or missing artifacts — the evaluator would otherwise
@@ -1421,6 +1426,7 @@ _stage_skipped() {
 # evaluator run against invalid sweep results and was the root cause of
 # multiple undetected param oscillations.
 if _stage_skipped backtest; then
+    _BACKTEST_WAS_SKIPPED=true
     echo "⊘ stage=backtest SKIPPED (--skip-stages=\${SKIP_STAGES})"
 else
     echo "▶ stage=backtest START at \$(date -u +%H:%M:%S)"
@@ -1573,6 +1579,10 @@ else
     if [ "${FREEZE_EVALUATOR}" = "true" ]; then
         _EVAL_FREEZE="--freeze"
     fi
+    _EVAL_SKIP_BT=""
+    if [ "$_BACKTEST_WAS_SKIPPED" = "true" ]; then
+        _EVAL_SKIP_BT="--skip-backtester"
+    fi
     # --date "\${RUN_DATE}" pins evaluate.py to the SF-stamped run date. The
     # backtest stage's comment above claimed the evaluator "already threads"
     # RUN_DATE — it never did; evaluate.py silently defaulted to its own
@@ -1581,7 +1591,7 @@ else
     # a WEEKDAY recovery rerun (watch-rerun-2026-07-18-12, 2026-07-20)
     # resolved today() to Monday, looked in backtest/2026-07-20/, and
     # correctly hard-failed on missing artifacts (config#3133).
-    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE --log-level INFO 2>&1; then
+    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE \$_EVAL_SKIP_BT --log-level INFO 2>&1; then
         echo "ERROR: evaluate.py failed. Spot run marked FAILED." >&2
         exit 1
     fi

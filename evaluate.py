@@ -142,6 +142,11 @@ def _parse_args() -> argparse.Namespace:
         "--stop-instance", action="store_true",
         help="Stop this EC2 instance after completion (for scheduled runs)",
     )
+    parser.add_argument(
+        "--skip-backtester", action="store_true",
+        help="Backtester was intentionally skipped — tolerate missing simulation "
+             "artifacts as expected rather than marking the evaluator run degraded",
+    )
     return parser.parse_args()
 
 
@@ -149,7 +154,15 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
-    """Initialize all data sources. Returns availability map."""
+    """Initialize all data sources. Returns availability map.
+
+    When ``--skip-backtester`` is set, all missing simulation artifacts are
+    tolerated as expected (operator intentionally skipped the backtester run).
+    When ``--skip-backtester`` is NOT set, a missing artifact is an unexpected
+    condition — the evaluator still proceeds but marks itself degraded so the
+    report card distinguishes "intentional skip" from "unplanned absence on a
+    normal run" (config#2887).
+    """
     # Research DB
     init_research_db(args.db, config)
     db_path = config.get("research_db")
@@ -169,7 +182,10 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
     prefix = f"backtest/{args.date}"
     s3 = boto3.client("s3")
 
+    skip_bt = getattr(args, "skip_backtester", False)
     missing_artifacts: list[str] = []
+    unexpected_missing: list[str] = []  # only populated on non-skip runs
+
     for artifact, loader in [
         ("sweep_df.parquet", lambda body: pd.read_parquet(io.BytesIO(body))),
         ("predictor_sweep_df.parquet", lambda body: pd.read_parquet(io.BytesIO(body))),
@@ -189,15 +205,22 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
                 predictor_stats = data
             logger.info("Loaded simulation artifact: %s", artifact)
         except ClientError as e:
-            # NoSuchKey is an expected state when backtest.py hasn't run
-            # for this date (e.g., first run after --mode param-sweep was
-            # skipped). Other ClientErrors are real S3 problems.
             if e.response.get("Error", {}).get("Code") == "NoSuchKey":
-                logger.warning(
-                    "Simulation artifact not found in S3: %s/%s — evaluator "
-                    "will run without it (backtest.py may not have run)",
-                    prefix, artifact,
-                )
+                if skip_bt:
+                    logger.warning(
+                        "Simulation artifact not found in S3: %s/%s — "
+                        "backtester was intentionally skipped, evaluator "
+                        "will run without it",
+                        prefix, artifact,
+                    )
+                else:
+                    logger.error(
+                        "UNEXPECTED — simulation artifact not found in S3: "
+                        "%s/%s. Backtester was NOT skipped. Evaluator will "
+                        "proceed in degraded mode.",
+                        prefix, artifact,
+                    )
+                    unexpected_missing.append(artifact)
                 missing_artifacts.append(artifact)
             else:
                 logger.error(
@@ -212,23 +235,53 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
             )
             raise
 
-    # If ALL critical optimizer artifacts are missing, downstream optimizers
-    # will run against zero data and produce garbage config recommendations.
-    # Block the run by raising — operators must see the failure loudly so
-    # the Saturday pipeline does not auto-promote bad configs.
-    critical = {"sweep_df.parquet", "portfolio_stats.json"}
-    if critical.issubset(set(missing_artifacts)):
+    # Backtester-critical: both ``sweep_df.parquet`` AND
+    # ``portfolio_stats.json`` missing means no simulation output at all —
+    # optimizers would run against zero data and produce garbage config
+    # recommendations. Hard-fail regardless of skip flag.
+    backtester_critical = {"sweep_df.parquet", "portfolio_stats.json"}
+    if backtester_critical.issubset(set(missing_artifacts)):
         raise RuntimeError(
-            f"All critical simulation artifacts missing from "
-            f"s3://{bucket}/{prefix}/: {sorted(critical)}. "
+            f"All critical backtester artifacts missing from "
+            f"s3://{bucket}/{prefix}/: {sorted(backtester_critical)}. "
             f"backtest.py must run before evaluate.py in the Saturday "
             f"pipeline. Check the upstream step status."
+        )
+
+    # Predictor-critical: both PredictorBacktest outputs missing means
+    # the predictor pipeline did not produce its simulation outputs
+    # (config#2887: hardening — an unplanned PredictorBacktest partial-write
+    # failure should surface as loudly as a Backtester one).
+    predictor_critical = {"predictor_sweep_df.parquet", "predictor_stats.json"}
+    if predictor_critical.issubset(set(missing_artifacts)):
+        raise RuntimeError(
+            f"All critical predictor artifacts missing from "
+            f"s3://{bucket}/{prefix}/: {sorted(predictor_critical)}. "
+            f"The PredictorBacktest pipeline likely did not run or failed. "
+            f"Check the upstream step status."
         )
 
     config["_sweep_df"] = sweep_df
     config["_predictor_sweep_df"] = predictor_sweep_df
     config["_portfolio_stats"] = portfolio_stats
     config["_predictor_stats"] = predictor_stats
+
+    # On a normal (non-skip) run, any single missing artifact is an
+    # unexpected condition — set a degraded marker so the report card /
+    # completeness manifest surfaces it distinctly from an intentional skip
+    # (config#2887, config#3120).
+    if not skip_bt and unexpected_missing:
+        config["_artifact_degraded"] = True
+        config["_artifact_degraded_reason"] = (
+            f"Critical simulation artifact(s) unexpectedly missing on "
+            f"normal (non-skip-flagged) run: "
+            f"{', '.join(sorted(unexpected_missing))}"
+        )
+        logger.error(
+            "Evaluator degraded: %s",
+            config["_artifact_degraded_reason"],
+        )
+
     # config#3120: read back pit_parity.json (best-effort, NOT part of the
     # `missing_artifacts`/critical-artifact accounting above) so the Report
     # Card can surface pit-parity health for the week. pit_parity is
@@ -244,6 +297,8 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
         "predictor_sweep_df": predictor_sweep_df is not None,
         "portfolio_stats": portfolio_stats is not None,
         "predictor_stats": predictor_stats is not None,
+        "_skip_backtester": skip_bt,
+        "_degraded": not skip_bt and len(unexpected_missing) > 0,
     }
 
 
