@@ -1055,6 +1055,7 @@ class TestEmitDegradedParityResult:
 # ── Integration test (opt-in) ───────────────────────────────────────────────
 
 @pytest.mark.parity
+@pytest.mark.live
 def test_parity_replay_end_to_end():
     """Full parity test — replays backtester over last N live trade dates.
 
