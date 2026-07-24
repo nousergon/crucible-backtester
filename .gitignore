@@ -41,6 +41,7 @@ results/
 .idea/
 .vscode/
 CLAUDE.md
+AGENTS.md
 
 # Gitleaks config (symlink to shared config)
 .gitleaks.toml
