@@ -45,13 +45,13 @@ jobs:
 
     steps:
       - name: Checkout backtester repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6
@@ -60,7 +60,7 @@ jobs:
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64  # v2
 
       # Each deploy_*.sh's canary-rollback path publishes a dedup-keyed alert
       # via `python3 -m krepis.alerts publish` (config#1339/config#1545) so a
@@ -74,7 +74,7 @@ jobs:
       # same matrixed GHA job. Pin matches requirements.txt's `krepis>=0.4.0`
       # floor.
       - name: Set up Python for canary-rollback alert publish
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: '3.12'
       - name: Install krepis for deploy_*.sh alerts call
@@ -98,7 +98,7 @@ jobs:
 
       - name: Append to system-wide deploy changelog
         if: always()
-        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@765aa682f6c5b7e1e5fc241c7bac1e9e0d6ca326  # @main (resolved 2026-07-24)
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
           deploy_workflow: deploy.yml
@@ -109,5 +109,5 @@ jobs:
   notify-main-failure:
     needs: [deploy]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@6c4bdb834f0869efc5de3166b285a812053ea709  # @main (resolved 2026-07-24)
     secrets: inherit
