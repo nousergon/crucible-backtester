@@ -23,7 +23,7 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
-from nousergon_lib.quant.horizons import DEFAULT_POLICY
+from nousergon_lib.quant.horizons import DEFAULT_POLICY, HorizonPolicy
 
 from analysis.outcome_store import attach_outcomes
 from analysis.stats_utils import benjamini_hochberg
@@ -53,7 +53,10 @@ _SPY_5D = _SHORT_COLS.spy_return
 _SPY_21D = _LONG_COLS.spy_return
 
 
-def load_score_performance(db_path: str) -> pd.DataFrame:
+def load_score_performance(
+    db_path: str,
+    policy: HorizonPolicy = _POLICY,
+) -> pd.DataFrame:
     """
     Load score_performance from research.db, with the outcome columns
     re-sourced from the long-format ``score_performance_outcomes`` store.
@@ -67,6 +70,13 @@ def load_score_performance(db_path: str) -> pd.DataFrame:
     legacy 2dp-percent convention on returns at that single boundary). If the
     store table is absent (pre-cutover DB), the raw wide columns pass through
     unchanged — a graceful no-op.
+
+    Args:
+        db_path: path to research.db.
+        policy:  HorizonPolicy resolving which outcome columns to attach.
+                 Defaults to the fleet-wide DEFAULT_POLICY (primary 21d +
+                 diagnostic 5d). Callers building the alpha-decay-curve
+                 ladder pass a policy spanning (1, 3, 5, 10, 15, 21)d.
 
     Returns a DataFrame carrying the score_performance non-outcome columns
     (symbol, score_date, score, price_on_date, …) plus the per-horizon outcome
@@ -104,7 +114,7 @@ def load_score_performance(db_path: str) -> pd.DataFrame:
 
     # Re-source outcome columns from the long-format store (config#1529). The
     # wide columns are dropped and rebuilt from score_performance_outcomes.
-    df = attach_outcomes(df, str(path), policy=_POLICY)
+    df = attach_outcomes(df, str(path), policy=policy)
 
     logger.info("Loaded %d rows from score_performance", len(df))
     return df

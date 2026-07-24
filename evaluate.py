@@ -82,7 +82,10 @@ from analysis import end_to_end
 from analysis import attractiveness_eval as attractiveness_eval_analysis
 from analysis import trigger_scorecard, alpha_distribution, veto_value
 from analysis import shadow_book as shadow_book_analysis
-from analysis import behavioral_anomaly as behavioral_anomaly_analysis
+from analysis import (
+    behavioral_anomaly as behavioral_anomaly_analysis,
+    alpha_decay,
+)
 from analysis import exit_timing, macro_eval
 from analysis import regime_stratified_sortino_runner
 from optimizer import weight_optimizer, executor_optimizer, research_optimizer
@@ -824,6 +827,19 @@ def _run_diagnostics(
     results["feature_drift"] = tracker.run_module(
         "feature_drift",
         lambda: _run_feature_drift(config),
+        required_inputs={"research_db": avail["research_db"]},
+        skip_if_missing=["research_db"],
+    )
+
+    # Alpha decay curve (config#1981) — measures how quickly signal alpha
+    # fades after entry across the ladder horizons (1d/3d/5d/10d/15d/21d).
+    # Reads score_performance_outcomes via the decay-curve HorizonPolicy.
+    # Gracefully degrades to insufficient_data until the decay-curve producer
+    # (nousergon-data#963) backfills the intermediate horizons. Observe-only —
+    # no gate, no config promotion.
+    results["alpha_decay"] = tracker.run_module(
+        "alpha_decay",
+        lambda: alpha_decay.run_decay_curve(config.get("research_db")),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
     )
@@ -2470,6 +2486,16 @@ def _main_impl() -> None:
         completeness_path = out_dir / "completeness.json"
         completeness_path.write_text(tracker.to_json())
         logger.info("Wrote %s", completeness_path)
+
+        # Save alpha-decay-curve artifact (config#1981).  The decay curve is a
+        # dashboard-renderable JSON that lives alongside the other evaluator
+        # artifacts.  Written even when insufficient_data (the dashboard needs to
+        # distinguish "producer hasn't run" from the evaluator not having tried).
+        alpha_decay_result = diagnostics.get("alpha_decay")
+        if alpha_decay_result is not None:
+            alpha_decay_path = out_dir / "alpha_decay_curve.json"
+            alpha_decay_path.write_text(json.dumps(alpha_decay_result, indent=2, default=str))
+            logger.info("Wrote %s", alpha_decay_path)
 
         print(f"\nEvaluation report saved to {out_dir}/")
         print(f"\n{'='*60}")
