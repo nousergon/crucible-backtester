@@ -7,14 +7,22 @@ name: Gate Label Guard
 # (incident precedent: nousergon-data-PR643, 2026-07-05, config#1446/#1464).
 # Logic lives in the fleet chokepoint: nousergon-lib gate-label-guard.yml.
 # Rollout: config-I3491.
+#
+# Pinned to 6c4bdb8 (GITHUB_EVENT_PATH fix, nousergon-lib#248, 2026-07-23):
+# replaces toJson(github.event) which caused startup_failure for large PR
+# payloads. merge_group trigger added for merge-queue compatibility
+# (config-I3682).
 
 on:
   pull_request:
     types: [opened, reopened, labeled, unlabeled, ready_for_review, synchronize]
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   gate-label-guard:
-    uses: nousergon/nousergon-lib/.github/workflows/gate-label-guard.yml@main
+    uses: nousergon/nousergon-lib/.github/workflows/gate-label-guard.yml@6c4bdb834f0869efc5de3166b285a812053ea709
