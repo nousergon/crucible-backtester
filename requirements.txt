@@ -40,14 +40,10 @@ ib_insync~=0.9.86
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
 # pin exists solely to satisfy the security-audit gate.
 setuptools>=83.0.0
-# Replay harness (replay/runner.py) re-invokes captured agents under a
-# different model. Uses langchain_anthropic.with_structured_output() —
-# matches the production-agent invocation pattern exactly so replay
-# concordance measures "would Haiku produce the same output as Sonnet
-# given the same input" rather than "do we get the same answer when we
-# call the model two different ways." Schema classes resolve via
-# alpha_engine_lib.agent_schemas.resolve_schema_for_agent.
-langchain-anthropic~=0.3
+# Replay harness migrated from langchain_anthropic.ChatAnthropic to
+# krepis.llm.LLMClient's OpenRouter transport (alpha-engine-config-I2997,
+# 2026-07-19). The pinned langchain-anthropic~=0.3 was removed in this
+# change since no code imports it.
 # Counterfactual rule fit (replay/counterfactual.py) trains a shallow
 # decision tree (max_depth=3) on (agent_input → agent_decision) pairs
 # extracted from the captured DecisionArtifact corpus. >85% match rate
