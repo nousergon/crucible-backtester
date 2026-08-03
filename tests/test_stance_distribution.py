@@ -12,6 +12,10 @@ ROADMAP L1614. Mechanizes the "stance distribution within ±2σ of prior
 - _select_baseline_dates picks the most recent in each prior ISO week.
 - _load_stance_counts skips missing/corrupted files with a WARN, not raises.
 - Alert publish is opt-out via env var.
+- stance × stance_source contingency: the report names the pillar-vs-
+  heuristic source mix (config#6068), and the alert carries it.
+- n + share observability: an n-decline with flat shares stays
+  interpretable as volume variation, not a mix shift (config#6068).
 """
 
 from __future__ import annotations
@@ -27,12 +31,20 @@ from botocore.exceptions import ClientError
 from analysis import stance_distribution as sd
 
 
-def _make_pred_response(stance_counts: dict[str, int]) -> dict:
-    """Build a fake predictions/{date}.json body matching the prod shape."""
+def _make_pred_response(stance_counts: dict[str, int], source: str | None = None) -> dict:
+    """Build a fake predictions/{date}.json body matching the prod shape.
+
+    ``source`` attaches ``stance_source`` to every entry (prod predictor
+    #183 emits it on each prediction); ``None`` leaves the field absent
+    (older-file / defensive-path case, bucketed under "unknown").
+    """
     predictions = []
     for stance, n in stance_counts.items():
         for i in range(n):
-            predictions.append({"ticker": f"{stance.upper()}_{i}", "stance": stance})
+            entry = {"ticker": f"{stance.upper()}_{i}", "stance": stance}
+            if source is not None:
+                entry["stance_source"] = source
+            predictions.append(entry)
     return {"predictions": predictions}
 
 
@@ -213,23 +225,138 @@ def test_load_stance_counts_skips_missing_and_corrupt():
     """A missing or corrupt file should WARN but not raise; remaining dates load."""
     file_map = {
         "2026-04-17": _make_pred_response({"momentum": 5, "value": 5,
-                                            "quality": 5, "catalyst": 5}),
+                                            "quality": 5, "catalyst": 5},
+                                           source="heuristic"),
         "2026-04-24": None,  # treated as NoSuchKey by stub
         "2026-05-01": "__corrupt__",
         "2026-05-08": _make_pred_response({"momentum": 6, "value": 6,
-                                            "quality": 6, "catalyst": 6}),
+                                            "quality": 6, "catalyst": 6},
+                                           source="pillar"),
     }
     s3 = _make_s3_client(file_map)
-    counts = sd._load_stance_counts(
+    stats = sd._load_stance_counts(
         bucket="test-bucket",
         dates=[date(2026, 4, 17), date(2026, 4, 24),
                date(2026, 5, 1), date(2026, 5, 8)],
         s3_client=s3,
     )
-    assert date(2026, 4, 17) in counts
-    assert date(2026, 5, 8) in counts
-    assert date(2026, 4, 24) not in counts
-    assert date(2026, 5, 1) not in counts
+    assert date(2026, 4, 17) in stats
+    assert date(2026, 5, 8) in stats
+    assert date(2026, 4, 24) not in stats
+    assert date(2026, 5, 1) not in stats
+    # Enriched shape (config#6068): counts unchanged, plus n + source split
+    first = stats[date(2026, 4, 17)]
+    assert first["counts"] == {"momentum": 5, "value": 5, "quality": 5, "catalyst": 5}
+    assert first["n"] == 20
+    assert first["source_totals"] == {"heuristic": 20}
+    assert first["by_source"]["heuristic"]["momentum"] == 5
+    assert stats[date(2026, 5, 8)]["source_totals"] == {"pillar": 24}
+
+
+def test_source_contingency_split():
+    """A pillar-vs-heuristic split is named in the report (config#6068)."""
+    baseline = _healthy_distribution()
+    file_map = {d: _make_pred_response(baseline, source="heuristic")
+                for d in _FRIDAYS[:-1]}
+    # Current week: quality runs hot through the pillar path (16 pillar
+    # picks vs baseline mean 12 → z=+4 breach), the rest heuristic — a
+    # breach whose source mix must be answerable from the report.
+    pillar_part = _make_pred_response({"quality": 16}, source="pillar")
+    heuristic_part = _make_pred_response(
+        {"momentum": 6, "value": 8, "catalyst": 2}, source="heuristic")
+    file_map["2026-05-15"] = {
+        "predictions": pillar_part["predictions"] + heuristic_part["predictions"],
+    }
+    s3 = _make_s3_client(file_map)
+    report = sd.compute_stance_distribution_drift(
+        bucket="test-bucket", current_date="2026-05-15", s3_client=s3,
+    )
+    assert report["status"] == "fail"
+    assert "quality" in report["failures"]
+    contingency = report["current_source_contingency"]
+    assert contingency["pillar"] == {"momentum": 0, "value": 0,
+                                     "quality": 16, "catalyst": 0}
+    assert contingency["heuristic"]["quality"] == 0
+    assert report["source_totals"] == {"pillar": 16, "heuristic": 16}
+    assert report["current_n"] == 32
+    # Invariant: sum(source_totals) == sum(counts) <= n
+    assert sum(report["source_totals"].values()) == sum(
+        report["current_distribution"].values()) == 32
+
+
+def test_n_decline_flat_shares_interpretable():
+    """n-decline with flat shares reads as volume, not a mix shift (#6048)."""
+    # 4-week baseline at 28 picks each, quality 21/28 = 75% share.
+    baseline = {"momentum": 3, "value": 2, "quality": 21, "catalyst": 2}
+    # Current week: 24 picks, quality 18/24 = 75% — count breaches the
+    # band (21 vs mean, σ_floor=1.0 → z=-3) but share is identical.
+    current = {"momentum": 2, "value": 2, "quality": 18, "catalyst": 2}
+    file_map = {d: _make_pred_response(baseline, source="heuristic")
+                for d in _FRIDAYS[:-1]}
+    file_map["2026-05-15"] = _make_pred_response(current, source="heuristic")
+    s3 = _make_s3_client(file_map)
+    report = sd.compute_stance_distribution_drift(
+        bucket="test-bucket", current_date="2026-05-15", s3_client=s3,
+    )
+    assert report["status"] == "fail"
+    assert "quality" in report["failures"]
+    # The count band says breach; n + share say the mix is unchanged.
+    assert report["current_n"] == 24
+    assert report["current_shares"]["quality"] == 0.75
+    baseline_share = report["file_volume"]["2026-05-08"]["shares"]["quality"]
+    assert baseline_share == 0.75
+    assert report["file_volume"]["2026-05-15"]["n"] == 24
+    assert report["file_volume"]["2026-04-17"]["n"] == 28
+
+
+def test_missing_stance_source_buckets_unknown():
+    """Entries without stance_source bucket under 'unknown' (defensive)."""
+    file_map = {d: _make_pred_response(_healthy_distribution())
+                for d in _FRIDAYS}
+    s3 = _make_s3_client(file_map)
+    report = sd.compute_stance_distribution_drift(
+        bucket="test-bucket", current_date="2026-05-15", s3_client=s3,
+    )
+    assert report["status"] == "ok"
+    assert report["source_totals"] == {"unknown": 32}
+    assert report["current_source_contingency"]["unknown"]["quality"] == 12
+    # Empty file → n=0, all-zero shares, no division-by-zero.
+    empty_file = {d: _make_pred_response(_healthy_distribution())
+                  for d in _FRIDAYS[:-1]}
+    empty_file["2026-05-15"] = {"predictions": []}
+    s3 = _make_s3_client(empty_file)
+    report = sd.compute_stance_distribution_drift(
+        bucket="test-bucket", current_date="2026-05-15", s3_client=s3,
+    )
+    assert report["current_n"] == 0
+    assert report["current_shares"] == {s: 0.0 for s in sd.KNOWN_STANCES}
+
+
+def test_alert_carries_source_mix_and_n(monkeypatch):
+    """The FAIL alert names n, per-stance share, and the source mix."""
+    monkeypatch.setenv("ALPHA_ENGINE_STANCE_DRIFT_ALERT_DISABLED", "0")
+    baseline = _healthy_distribution()
+    collapsed = {**baseline, "quality": 0, "value": baseline["value"] + 12}
+    file_map = {d: _make_pred_response(baseline, source="heuristic")
+                for d in _FRIDAYS[:-1]}
+    file_map["2026-05-15"] = _make_pred_response(collapsed, source="heuristic")
+    s3 = _make_s3_client(file_map)
+
+    fake_result = MagicMock()
+    fake_result.sns.ok = True
+    fake_result.telegram.ok = True
+    fake_result.any_ok = True
+
+    with patch("ops_alerts.publish_ops_alert", return_value=fake_result) as mock_publish:
+        report = sd.compute_stance_distribution_drift(
+            bucket="test-bucket", current_date="2026-05-15", s3_client=s3,
+        )
+
+    assert report["status"] == "fail"
+    call_msg = mock_publish.call_args.args[0]
+    # Share + n are in the breach line: 0 of 32 picks, 0.0%.
+    assert "(0.0% of 32 picks)" in call_msg
+    assert "Source mix: heuristic 32 (100.0%) (32/32 classified)" in call_msg
 
 
 def test_alert_publish_called_on_fail(monkeypatch):

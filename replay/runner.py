@@ -345,14 +345,14 @@ def _invoke_target_with_schema(
             structured_outputs=False,
             reasoning={"exclude": True},
         )
+        # krepis >=0.23.0 requires callsite_id as a keyword-only argument
+        # (added as a breaking change — the param has no default). This id
+        # is the row this call site already owns in alpha-engine-config's
+        # LLM_CALLSITE_REGISTRY.yaml (`replay-concordance`), so spend lands
+        # under the callsite the registry says produces it — inventing a
+        # new string here would attribute it to nothing.
         client = LLMClient(
             spec,
-            # REQUIRED since the 2026-07-28 cost-telemetry change made
-            # callsite_id mandatory on LLMClient. This id is the row this
-            # call site already owns in alpha-engine-config's
-            # LLM_CALLSITE_REGISTRY.yaml (`replay-concordance`), so spend
-            # lands under the callsite the registry says produces it —
-            # inventing a new string here would attribute it to nothing.
             callsite_id="replay-concordance",
             api_key=resolved_key,
             client_factory=client_factory,

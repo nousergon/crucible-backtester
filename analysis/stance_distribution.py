@@ -125,21 +125,45 @@ def _select_baseline_dates(
     return sorted([d for _, d in sorted_weeks])
 
 
+# ``stance_source`` vocabulary (predictor #183 contract — see
+# crucible-predictor/model/stance_classifier.py). Bucketing is literal
+# (any observed string becomes its own bucket) so an unexpected producer
+# value like a stale "pillar_based" is visible in the contingency rather
+# than silently merged; entries without a source bucket under UNKNOWN_SOURCE
+# so ``sum(source_totals) == sum(counts)`` always holds (the classified
+# count, which is ≤ n when junk-stance entries exist).
+UNKNOWN_SOURCE: str = "unknown"
+
+
 def _load_stance_counts(
     bucket: str, dates: list[_dt.date], s3_client=None,
-) -> dict[_dt.date, dict[str, int]]:
-    """Load ``predictor/predictions/{date}.json`` for each date and count stances.
+) -> dict[_dt.date, dict]:
+    """Load ``predictor/predictions/{date}.json`` for each date; return per-file stats.
 
-    Returns ``{date: {stance: count, ...}}``. Stances missing from a
-    prediction are not counted; an entirely-empty file or absent
-    ``stance`` field yields a dict of zeros for KNOWN_STANCES.
+    Returns ``{date: {"counts": {stance: count},
+                      "n": total picks in the file,
+                      "by_source": {source: {stance: count}},
+                      "source_totals": {source: count}}}``.
+
+    ``counts`` counts only entries whose ``stance`` is in KNOWN_STANCES
+    (unchanged semantics); ``n`` counts every entry in the file's
+    ``predictions`` list, so a file that shrinks (28→24 picks) or gains
+    junk-stance entries is distinguishable from a stance-class mix shift.
+    ``by_source`` / ``source_totals`` split the classified entries by the
+    entry's ``stance_source`` (``"pillar"`` | ``"heuristic"`` per the
+    predictor contract; any other literal value is kept as its own
+    bucket; missing field → UNKNOWN_SOURCE). Invariant:
+    ``sum(source_totals.values()) == sum(counts.values()) <= n``.
+
+    An entirely-empty file or absent ``stance`` field yields a dict of
+    zeros for KNOWN_STANCES with ``n`` = the raw entry count.
 
     Defensive: dates whose S3 object is missing or unparseable are
     skipped with a WARN, not raised — a one-off corrupted file should
     not block the whole weekly check.
     """
     s3 = s3_client or boto3.client("s3")
-    out: dict[_dt.date, dict[str, int]] = {}
+    out: dict[_dt.date, dict] = {}
     for d in dates:
         key = f"predictor/predictions/{d.isoformat()}.json"
         try:
@@ -154,13 +178,40 @@ def _load_stance_counts(
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning("Could not parse %s: %s", key, e)
             continue
+        entries = data.get("predictions", []) or []
         counts = {s: 0 for s in KNOWN_STANCES}
-        for pred in data.get("predictions", []) or []:
+        by_source: dict[str, dict[str, int]] = {}
+        source_totals: dict[str, int] = {}
+        for pred in entries:
             stance = pred.get("stance")
             if stance in counts:
                 counts[stance] += 1
-        out[d] = counts
+                source = pred.get("stance_source") or UNKNOWN_SOURCE
+                bucket_by_source = by_source.setdefault(
+                    source, {s: 0 for s in KNOWN_STANCES})
+                bucket_by_source[stance] += 1
+                source_totals[source] = source_totals.get(source, 0) + 1
+        out[d] = {
+            "counts": counts,
+            "n": len(entries),
+            "by_source": by_source,
+            "source_totals": source_totals,
+        }
     return out
+
+
+def _stance_shares(counts: dict[str, int], n: int) -> dict[str, float]:
+    """Per-stance share ``count/n`` rounded to 3dp.
+
+    Share is the volume-independent view of the distribution: an
+    n-decline (28→24 picks) that keeps shares flat is interpretable as
+    natural volume variation rather than a stance mix shift. ``n <= 0``
+    (no picks) yields all-zero shares — the count band is
+    ``_check_within_band``'s job, shares are only context.
+    """
+    if n <= 0:
+        return {s: 0.0 for s in KNOWN_STANCES}
+    return {s: round(counts.get(s, 0) / n, 3) for s in KNOWN_STANCES}
 
 
 def _check_within_band(
@@ -231,22 +282,49 @@ def _publish_drift_alert(report: dict) -> None:
     current_date = report.get("current_date", "?")
     baseline_dates = report.get("baseline_dates", []) or []
     per_stance = report.get("per_stance", {}) or {}
+    # Volume context (config#6068): n + per-stance share make a count-band
+    # breach interpretable against file size — an n-decline with flat
+    # shares (the 2026-07-31 drift) is visible as such instead of a mix
+    # shift. Source mix makes the pillar-vs-heuristic question answerable
+    # from the alert itself rather than requiring a manual read of five
+    # prediction files.
+    n_picks = (report.get("file_volume") or {}).get(current_date, {}).get("n", 0)
+    source_totals = report.get("source_totals") or {}
+    total_classified = sum(source_totals.values())
+
+    def _pct(part: int) -> float:
+        return 100.0 * part / n_picks if n_picks else 0.0
+
     failure_lines = []
     for stance in failures:
         s = per_stance.get(stance, {})
+        current = s.get("current") or 0
         failure_lines.append(
-            f"{stance} current={s.get('current')} "
+            f"{stance} current={current} "
+            f"({_pct(current):.1f}% of {n_picks} picks) "
             f"baseline_mean={s.get('baseline_mean')} "
             f"σ={s.get('baseline_std')} "
             f"band=[{s.get('lower_bound')},{s.get('upper_bound')}] "
             f"z={s.get('deviation')}"
         )
+    if source_totals:
+        source_mix = ", ".join(
+            f"{src} {tot} ({_pct(tot):.1f}%)"
+            for src, tot in sorted(source_totals.items())
+        )
+        source_sentence = (
+            f" Source mix: {source_mix}"
+            f" ({total_classified}/{n_picks} classified)."
+        )
+    else:
+        source_sentence = ""
     message = (
         f"Stance-distribution drift on {current_date}: "
         f"{len(failures)} of {len(KNOWN_STANCES)} stances breached "
         f"±{SIGMA_BAND}σ vs {len(baseline_dates)}-week baseline "
         f"({', '.join(d for d in baseline_dates)}). "
         + " | ".join(failure_lines)
+        + source_sentence
         + ". Phase 5 acceptance check; investigate "
         "classify_stance pillar-vs-heuristic path."
     )
@@ -290,6 +368,13 @@ def compute_stance_distribution_drift(
     "insufficient_data", "error"}``. On ``"fail"`` and unless
     ``publish_alert=False``, fires a Telegram + SNS alert via
     ``nousergon_lib.alerts.publish``.
+
+    The report carries volume + source observability (config#6068) as
+    additive fields: ``current_n``, ``current_shares`` (count/n per
+    stance), ``current_source_contingency`` (stance × stance_source),
+    ``source_totals``, and ``file_volume`` (per loaded date: ``n`` +
+    ``shares``) — the ``status``/``current_distribution``/``per_stance``
+    contract is unchanged.
     """
     try:
         current = _dt.date.fromisoformat(current_date)
@@ -308,20 +393,23 @@ def compute_stance_distribution_drift(
         }
 
     baseline_dates = _select_baseline_dates(all_dates, current, n_baseline_weeks)
-    counts = _load_stance_counts(
+    stats = _load_stance_counts(
         bucket, baseline_dates + [current], s3_client=s3_client,
     )
 
-    current_counts = counts.get(current)
-    baseline_counts = [counts[d] for d in baseline_dates if d in counts]
+    current_stats = stats.get(current)
+    baseline_stats = [stats[d] for d in baseline_dates if d in stats]
 
-    if current_counts is None:
+    if current_stats is None:
         return {
             "status": "insufficient_data",
             "note": f"predictions/{current_date}.json absent or unparseable",
             "current_date": current_date,
-            "baseline_dates_found": [d.isoformat() for d in baseline_dates if d in counts],
+            "baseline_dates_found": [d.isoformat() for d in baseline_dates if d in stats],
         }
+
+    current_counts = current_stats["counts"]
+    baseline_counts = [s["counts"] for s in baseline_stats]
 
     if len(baseline_counts) < MIN_BASELINE_WEEKS:
         return {
@@ -331,7 +419,7 @@ def compute_stance_distribution_drift(
                 f"(need ≥{MIN_BASELINE_WEEKS}); cannot compute meaningful σ"
             ),
             "current_date": current_date,
-            "baseline_dates_found": [d.isoformat() for d in baseline_dates if d in counts],
+            "baseline_dates_found": [d.isoformat() for d in baseline_dates if d in stats],
             "current_distribution": current_counts,
         }
 
@@ -344,8 +432,22 @@ def compute_stance_distribution_drift(
         "status": "fail" if failures else "ok",
         "current_date": current_date,
         "n_baseline_weeks": len(baseline_counts),
-        "baseline_dates": [d.isoformat() for d in baseline_dates if d in counts],
+        "baseline_dates": [d.isoformat() for d in baseline_dates if d in stats],
         "current_distribution": current_counts,
+        # Volume + source observability (config#6068): additive fields so a
+        # count-band breach is interpretable against pick-count n and the
+        # pillar-vs-heuristic source mix without reading prediction files.
+        "current_n": current_stats["n"],
+        "current_shares": _stance_shares(current_counts, current_stats["n"]),
+        "current_source_contingency": current_stats["by_source"],
+        "source_totals": current_stats["source_totals"],
+        "file_volume": {
+            d.isoformat(): {
+                "n": s["n"],
+                "shares": _stance_shares(s["counts"], s["n"]),
+            }
+            for d, s in stats.items()
+        },
         "sigma_band": sigma_band,
         "sigma_floor": sigma_floor,
         "per_stance": per_stance,
