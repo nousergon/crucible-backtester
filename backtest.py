@@ -3462,6 +3462,18 @@ def run_predictor_backtest(config: dict) -> dict:
                     # ARTIFACT_REGISTRY.yaml, so the ENFORCE freshness-monitor is the
                     # recording surface for a missed write. Fail-soft is intentional.
                     logger.warning("model_version_net_alpha S3 persist failed (non-fatal): %s", exc)
+        else:
+            # config-I3069: this branch is why the artifact went missing for
+            # months with zero signal — the compute+S3-write above simply
+            # never ran and nothing logged it. Name the skip reason so a
+            # future regression (e.g. research_db pull failing again) is
+            # visible in the spot-run log instead of silent.
+            logger.warning(
+                "model_version_net_alpha: skipped (enabled=%s, version_preds=%d, "
+                "price_matrix=%s) — no S3 write this run",
+                mvna_cfg.get("enabled", True), len(version_preds),
+                result.get("price_matrix") is not None,
+            )
     except Exception as exc:
         # config#1234 rationale (outer of dual-layer swallow): the whole L4488b
         # OBSERVE stage gates nothing; a failure must never abort the backtest
@@ -6110,8 +6122,22 @@ def _main_impl() -> None:
     # _init_pipeline / the optimizer so it can never write a config; emits
     # the contamination report and returns. Never raises into the SF — the
     # spot stage that invokes it is best-effort and non-blocking.
+    #
+    # config-I3069: init_research_db (NOT the rest of _init_pipeline — that
+    # stays skipped, preserving the "never write a config" guarantee above)
+    # runs here so config["research_db"] is populated before run_pit_parity ->
+    # _run_predictor_pass_isolated -> the isolated `--pit-parity-pass`
+    # subprocess -> run_predictor_backtest. That subprocess is the ONLY
+    # production call site of model_version_net_alpha (L4488b); without a
+    # local research.db path, load_version_predictions() always returned {}
+    # and the compute+S3-write silently never ran — model_version_net_alpha.json
+    # never existed in backtest/{date}/ despite the adjacent horizon_net_alpha
+    # stage (which doesn't need research_db) writing every week. Read-only
+    # pull; degrades to research_db=None on failure exactly as the main path
+    # does (init_research_db never raises).
     if args.pit_parity:
         from analysis.pit_parity import handle_pit_parity_failure, run_pit_parity
+        init_research_db(args.db, config)
         # config#6032: the PredictorBacktest phase ran the SAME walk-forward
         # (PIT) inference over the same config earlier in this SF and wrote
         # predictor_stats.json — reuse it for the walk-forward pass instead of

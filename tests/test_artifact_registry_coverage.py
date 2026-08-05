@@ -103,6 +103,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # config#1726: optimizer_run/{trading_day}.json liveness proxy for event_driven
     # config_* rows — registered as optimizer_run_manifest in ARTIFACT_REGISTRY.yaml.
     "evaluate.py": 1,
+    # config#3112 evaluator SF split: S3 diagnostics→optimizer snapshot handoff
+    # — 3 PUTs (diagnostics dict + signal-quality outputs + df_base.parquet into
+    # evaluator/diagnostics/{date}/). A load-bearing producer→consumer wire
+    # between the EvaluatorDiagnostics and EvaluatorOptimize SF halves; absence
+    # silently degrades the optimize half. Grandfathered here pending
+    # ARTIFACT_REGISTRY registration for freshness monitoring (a distinct
+    # follow-up on alpha-engine-config from the same groom session I3112 arc).
+    "evaluate_handoff.py": 3,
     # config#1841 apply-audit — 2 PUTs (config/apply_audit/{date}.json + the
     # latest.json mirror): the per-run outcome record for the four auto-apply
     # loops (promoted / blocked-by-guardrail / insufficient_data / disabled /

@@ -18,8 +18,15 @@ SCRIPT = Path(__file__).resolve().parent.parent / "infrastructure" / "spot_backt
 
 def test_evaluator_invocation_threads_run_date():
     s = SCRIPT.read_text()
-    m = re.search(r"evaluate\.py --mode all[^\n]*", s)
-    assert m, "evaluator stage invocation (evaluate.py --mode all) not found"
+    # config-I3112: the evaluator stage now passes evaluate.py's mode through
+    # from the baked EVAL_HALF value ("all" by default, "diagnostics"/
+    # "optimize" for the split SF states) — the date-threading contract
+    # pinned here is unchanged.
+    m = re.search(
+        r'evaluate\.py --mode "\\\$\{EVAL_HALF\}" --upload --date "\\\$\{RUN_DATE\}"',
+        s,
+    )
+    assert m, "evaluator stage invocation (evaluate.py --mode ...) not found"
     line = m.group(0)
     assert '--date "\\${RUN_DATE}"' in line, (
         f"the evaluator invocation must pass --date \"${{RUN_DATE}}\" — without "

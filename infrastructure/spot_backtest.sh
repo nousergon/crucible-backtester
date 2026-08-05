@@ -182,6 +182,18 @@ DRY_RUN="${DRY_RUN:-false}"               # true → --dry-run
 # iteration against a single stage (e.g. parity-only when debugging a cred
 # divergence).
 SKIP_STAGES="${SKIP_STAGES:-}"
+# config-I3112 (2026-07-20 Brian ruling): the weekly SF's single bundled
+# Evaluator state is decomposed into two sequential states —
+# EvaluatorDiagnostics (--eval-half=diagnostics) then EvaluatorOptimize
+# (--eval-half=optimize) — each with its own executionTimeout + Catch path,
+# reusing this same spot box. This flag selects which HALF of evaluate.py's
+# internal pipeline this spot invocation runs: "all" (default, the bundled
+# behavior) maps to evaluate.py --mode all; the two halves map to
+# --mode diagnostics / --mode optimize. The optimize half reads the
+# diagnostics snapshot the diagnostics half wrote (evaluate_handoff.py) —
+# see evaluate.py's S3-mediated handoff. Unknown values hard-fail below
+# (no-silent-fails), mirroring the --skip-stages typo guard.
+EVAL_HALF="${EVAL_HALF:-all}"
 # pit_parity observational stage (ROADMAP L2371 / plan §D4). DEFAULT ON
 # 2026-05-17 (Brian): every Saturday SF spot run now emits
 # backtest/{date}/pit_parity.json (the skilled-risk-basket contamination
@@ -305,6 +317,8 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN="true"; shift ;;
         --skip-stages) SKIP_STAGES="$2"; shift 2 ;;
         --skip-stages=*) SKIP_STAGES="${1#*=}"; shift ;;
+        --eval-half) EVAL_HALF="$2"; shift 2 ;;
+        --eval-half=*) EVAL_HALF="${1#*=}"; shift ;;
         --no-pit-parity) PIT_PARITY_ENABLED="0"; shift ;;
         --pit-parity-enabled) PIT_PARITY_ENABLED="$2"; shift 2 ;;
         --pit-parity-enabled=*) PIT_PARITY_ENABLED="${1#*=}"; shift ;;
@@ -315,6 +329,20 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# ── Validate --eval-half against the known vocabulary ───────────────────────
+# config-I3112: {all, diagnostics, optimize} map 1:1 to evaluate.py's
+# --mode values. Hard-fail on anything else per no-silent-fails — a typo
+# like --eval-half=diagnostic would otherwise silently run the FULL
+# evaluator (mode "all"-ish default path) and mislead the operator.
+case "$EVAL_HALF" in
+    all|diagnostics|optimize) ;;
+    *)
+        echo "ERROR: unknown --eval-half='$EVAL_HALF'" >&2
+        echo "       Valid values: all diagnostics optimize" >&2
+        exit 1
+        ;;
+esac
 
 # ── Validate --skip-stages against the known stage vocabulary ────────────────
 # Hard-fail on unknown names per no-silent-fails: a typo like
@@ -1487,6 +1515,11 @@ PIT_PARITY_ENABLED="${PIT_PARITY_ENABLED}"
 # interpolation as SKIP_STAGES / PIT_PARITY_ENABLED above; the prior
 # per-spot \$(date -u) recompute was the 2026-05-17 Evaluator date-split.
 RUN_DATE="${RUN_DATE}"
+# EVAL_HALF baked in from the dispatcher's --eval-half flag (config-I3112).
+# Same mechanism as RUN_DATE — the dispatcher-side value is interpolated at
+# heredoc-generation time so the runtime evaluator-stage gate below resolves
+# it on the spot instance.
+EVAL_HALF="${EVAL_HALF}"
 
 _stage_skipped() {
     case ",\${SKIP_STAGES}," in
@@ -1733,7 +1766,12 @@ else
     # a WEEKDAY recovery rerun (watch-rerun-2026-07-18-12, 2026-07-20)
     # resolved today() to Monday, looked in backtest/2026-07-20/, and
     # correctly hard-failed on missing artifacts (config#3133).
-    if ! $REMOTE_PYTHON -u evaluate.py --mode all --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE \$_EVAL_SKIP_BT --log-level INFO 2>&1; then
+    # --mode "\${EVAL_HALF}" (config-I3112): "all" keeps the bundled behavior
+    # byte-identical for manual runs; the SF's split states pass
+    # --eval-half=diagnostics / --eval-half=optimize, which map 1:1 to
+    # evaluate.py's modes (the optimize half reads the S3 diagnostics
+    # snapshot the diagnostics half wrote).
+    if ! $REMOTE_PYTHON -u evaluate.py --mode "\${EVAL_HALF}" --upload --date "\${RUN_DATE}" \$_EVAL_FREEZE \$_EVAL_SKIP_BT --log-level INFO 2>&1; then
         echo "ERROR: evaluate.py failed. Spot run marked FAILED." >&2
         exit 1
     fi

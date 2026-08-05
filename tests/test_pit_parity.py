@@ -545,6 +545,55 @@ def test_backtest_main_pit_parity_branch_uses_handle_pit_parity_failure():
     assert "from analysis.pit_parity import handle_pit_parity_failure" in branch_src
 
 
+def test_backtest_pit_parity_branch_inits_research_db_before_run_pit_parity():
+    """config-I3069 regression: the --pit-parity branch must populate
+    config["research_db"] (via init_research_db) BEFORE calling run_pit_parity,
+    so the isolated `--pit-parity-pass` subprocess it spawns — the ONLY
+    production call site of model_version_net_alpha (L4488b) — can actually
+    read predictor_outcomes[_shadow] via load_version_predictions(). Before
+    this fix, research_db was never set on the --pit-parity path (only
+    _init_pipeline sets it, and _init_pipeline deliberately does not run here
+    — see the branch's own "never write a config" comment), so
+    model_version_net_alpha.json silently never got written despite the
+    adjacent horizon_net_alpha.json (no research_db dependency) writing every
+    week. Source pin, bounded by INDENTATION (not a fixed char window — see
+    the sibling test above for why that broke once already): still must NOT
+    call the full _init_pipeline (that guarantee is deliberate and must
+    survive this fix)."""
+    import inspect
+    import backtest as bt
+
+    src = inspect.getsource(bt)
+    lines = src.splitlines(keepends=True)
+    start = next(
+        i for i, ln in enumerate(lines) if ln.strip() == "if args.pit_parity:"
+    )
+    base_indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(lines[i]) - len(lines[i].lstrip()) <= base_indent:
+            end = i
+            break
+    branch_src = "".join(lines[start:end])
+
+    init_db_idx = branch_src.index("init_research_db(args.db, config)")
+    # config#6032 anchored the call on the signature prefix (no closing
+    # paren): run_pit_parity gained a `predictor_stats=` kwarg in the
+    # artifact-reuse change, and the ordering guarantee under test is
+    # about the call site, not its argument list.
+    run_pp_idx = branch_src.index("run_pit_parity(config")
+    assert init_db_idx < run_pp_idx, (
+        "init_research_db must run before run_pit_parity in the --pit-parity branch"
+    )
+    assert "_init_pipeline(args, config)" not in branch_src, (
+        "the --pit-parity branch must still never run the full _init_pipeline "
+        "(it must never write a config — only the narrow research_db pull is safe here)"
+    )
+
+
 def test_smoke_pit_parity_forced_import_error_fails_named_and_non_fatal(monkeypatch):
     """config#3121 acceptance: a deliberately broken pit-parity import (or
     any other _run_predictor_pass_isolated failure) must fail with a

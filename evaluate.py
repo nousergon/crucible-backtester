@@ -97,6 +97,7 @@ from optimizer import pillar_weight_optimizer
 from optimizer.config_archive import read_params_pit_or_current
 from emailer import send_digest_email
 from reporter import build_digest, build_report, save, upload_to_s3
+from evaluate_handoff import load_snapshot, write_snapshot
 from completeness import CompletenessTracker
 from pipeline_common import (
     load_config,
@@ -2004,6 +2005,38 @@ def _main_impl() -> None:
     if run_diagnostics and not args.module:
         with registry.phase("evaluator_diagnostics"):
             diagnostics = _run_diagnostics(config, tracker, avail, df_base)
+            # config-I3112 deliverable 2: single-producer S3 snapshot
+            # handoff. The weekly SF now runs this mode as its own
+            # EvaluatorDiagnostics state; the follow-on EvaluatorOptimize
+            # state (--mode optimize) has no in-process diagnostics, so
+            # EVERYTHING the optimize half consumes that this half produced
+            # must cross the state boundary — the diagnostics dict
+            # (trigger_scorecard / e2e_lift / factor_blend_sensitivity) plus
+            # the signal-quality outputs (sq_result / regime_rows /
+            # score_rows / attr_result) and df_base, without which the
+            # weight/veto/research/pillar optimizers would silently skip.
+            # Write is fail-loud (load-bearing) and rides the same
+            # args.upload gate as sibling artifacts (--freeze / local runs
+            # build + log without persisting). Lives inside the phase block
+            # so the phase marker records the write's duration + status.
+            # See evaluate_handoff.py.
+            if args.upload:
+                handoff_bucket = config.get("signals_bucket", "alpha-engine-research")
+                handoff_keys = write_snapshot(
+                    bucket=handoff_bucket,
+                    date=args.date,
+                    diagnostics=diagnostics,
+                    sq_result=sq_result,
+                    regime_rows=regime_rows,
+                    score_rows=score_rows,
+                    attr_result=attr_result,
+                    df_base=df_base,
+                )
+                logger.info(
+                    "Diagnostics snapshot written for %s: %s",
+                    args.date,
+                    ", ".join(f"s3://{handoff_bucket}/{key}" for key in handoff_keys.values()),
+                )
 
     # ── Single module mode ───────────────────────────────────────────────
     if args.module and args.module != "signal-quality":
@@ -2014,6 +2047,32 @@ def _main_impl() -> None:
             run_optimizers = True
         # For diagnostic modules, they'd need to be run individually
         # This is handled by the diagnostics dict being empty
+
+    # ── S3-mediated diagnostics snapshot read (config-I3112 deliverable 2) ─
+    # --mode optimize standalone (the SF's EvaluatorOptimize state) has no
+    # in-process diagnostics: read back the snapshot the EvaluatorDiagnostics
+    # state wrote. A missing snapshot (manual --mode optimize against a date
+    # with no prior diagnostics run) degrades to today's empty-dict behavior
+    # with a loud warning; a genuine S3 transport failure propagates so the
+    # SF sees it rather than silently skipping the diagnostics-dependent
+    # optimizers. See evaluate_handoff.py.
+    if args.mode == "optimize" and not args.module:
+        handoff_bucket = config.get("signals_bucket", "alpha-engine-research")
+        snapshot = load_snapshot(handoff_bucket, args.date)
+        if snapshot is not None:
+            diagnostics = snapshot["diagnostics"]
+            sq_result = snapshot["sq_result"]
+            regime_rows = snapshot["regime_rows"]
+            score_rows = snapshot["score_rows"]
+            attr_result = snapshot["attr_result"]
+            df_base = snapshot["df_base"]
+            logger.info(
+                "Loaded diagnostics snapshot for %s: %d diagnostics, "
+                "df_base=%s",
+                args.date,
+                len(diagnostics) if isinstance(diagnostics, dict) else 0,
+                "present" if df_base is not None else "absent",
+            )
 
     # ── Optimizers ───────────────────────────────────────────────────────
     # config#1841: the optimizer stage is wrapped so the apply-audit artifact
@@ -2614,7 +2673,16 @@ def _main_impl() -> None:
         if len(report_md) > 2000:
             print(f"\n... (truncated — see {out_dir}/report.md for full report)")
 
-        if args.upload:
+        # config-I3112: the report/upload/email tail is the OPTIMIZE half's
+        # deliverable. Under --mode diagnostics (the SF's EvaluatorDiagnostics
+        # state) opt_results is empty by construction — uploading a report or
+        # appending a grade rendered from empty optimizer results would land
+        # a partial artifact, and the digest email would be misleading AND win
+        # the run_date dedup race against the optimize half's real one. The
+        # report.md is still built + printed locally in both modes (the
+        # diagnostics half's local build is what the Friday smoke harness
+        # exercises); only the outward artifacts are gated.
+        if args.upload and run_optimizers:
             upload_to_s3(
                 local_dir=out_dir,
                 bucket=config.get("output_bucket", "alpha-engine-research"),
@@ -2639,7 +2707,7 @@ def _main_impl() -> None:
         # backtest.py — the two are intentionally NOT bundled.
         sender = config.get("email_sender")
         recipients = config.get("email_recipients", [])
-        if sender and recipients:
+        if sender and recipients and run_optimizers:
             digest_md = build_digest(
                 run_date=args.date,
                 title="Evaluation Digest",
