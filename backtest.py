@@ -4288,6 +4288,41 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                         "increment failed (non-fatal): %s", exc,
                     )
 
+        # config#6032: also build the pit_parity CSCV block matrix here when
+        # pit_parity_sweep is set. The phase runs walk-forward (PIT) inference
+        # (config#833 default), i.e. the SAME computation the Parity stage's
+        # walk-forward pass repeats in its own subprocess — so attaching the
+        # matrix to single_stats lets pit_parity reuse this whole artifact
+        # (predictor_stats.json) for that pass and skip a full predictor-
+        # pipeline subprocess (~25 min). Mirrors the branch in
+        # run_predictor_backtest (backtest.py:3265): same grid (config
+        # param_sweep — this phase's seeded grid is a superset of the parity
+        # raw grid), same top-K, same per-block re-sims, decision B (PIT pass
+        # only). Observational: any failure leaves pbo=null on the parity side
+        # (honest-N/A), never fabricated — and the Parity stage falls back to
+        # its own sweep.
+        if config.get("pit_parity_sweep") and sweep_df is not None \
+                and not sweep_df.empty and trading_dates:
+            try:
+                single_stats.update(
+                    _build_pit_parity_cscv_matrix(
+                        sweep_df, sim_fn, trading_dates, config,
+                    )
+                )
+                logger.info(
+                    "[pit_parity] CSCV block matrix built in the PredictorBacktest "
+                    "phase for pit_parity reuse (top_k=%s, n_blocks=%s)",
+                    config.get("pit_parity_cscv_top_k", 12),
+                    config.get("pit_parity_cscv_n_blocks", 8),
+                )
+            except Exception as exc:
+                logger.error(
+                    "[pit_parity] CSCV block matrix build failed in the phase "
+                    "(%s) — the Parity stage will fall back to its own "
+                    "subprocess sweep; pbo stays honest (null, never "
+                    "fabricated).", exc, exc_info=True,
+                )
+
     return single_stats, sweep_df
 
 
@@ -5134,6 +5169,18 @@ def _parse_args() -> argparse.Namespace:
         help="INTERNAL (L4487): path the --pit-parity-pass child pickles its "
              "predictor-backtest stats dict to.",
     )
+    parser.add_argument(
+        "--predictor-stats-key", default=None,
+        help="INTERNAL (config#6032): S3 key of the PredictorBacktest phase's "
+             "predictor_stats.json artifact (backtest/{date}/predictor_stats.json). "
+             "With --pit-parity, the walk-forward (PIT) pass reuses the phase's "
+             "already-computed stats instead of re-running the full predictor "
+             "pipeline in a subprocess (~25 min saved per Saturday). Only used "
+             "when the artifact validates as walk-forward-mode with the CSCV "
+             "block matrix present (the phase runs the same walk-forward "
+             "inference over the same config earlier in the SF); any mismatch "
+             "falls back to the subprocess. Not for manual use.",
+    )
     # --walk-forward / --no-walk-forward : mirrors the --use-vectorized-sweep
     # / --use-scalar-sweep opt-out pattern above. DEFAULT ON since
     # 2026-07-08 per Brian's pit_parity.json review (config#833, console
@@ -5599,6 +5646,24 @@ def _run_predictor_pipeline(
     return predictor_stats, predictor_sweep_df, executor_rec
 
 
+def _json_stats_default(o):
+    """JSON fallback encoder for predictor_stats.json (config#6032).
+
+    numpy/pandas arrays must round-trip as real JSON arrays so the Parity
+    stage's pit_parity reuse path can rebuild ``daily_log_returns`` /
+    ``_cscv_block_matrix`` from the artifact. The legacy ``default=str``
+    stringified them (e.g. ``str(np.ndarray)``), which the reporter's
+    scalar-only reads tolerated but which is unusable for reuse. Everything
+    else keeps the legacy str() fallback.
+    """
+    import numpy as np
+    if isinstance(o, (np.ndarray, pd.Series)):
+        return o.tolist()
+    if isinstance(o, pd.DataFrame):
+        return o.to_dict(orient="list")
+    return str(o)
+
+
 def _export_simulation_artifacts(
     config: dict,
     run_date: str,
@@ -5640,7 +5705,12 @@ def _export_simulation_artifacts(
         exported.append("portfolio_stats.json")
 
     if predictor_stats:
-        s3.put_object(Bucket=bucket, Key=f"{prefix}/predictor_stats.json", Body=json.dumps(predictor_stats, indent=2, default=str).encode())
+        s3.put_object(
+            Bucket=bucket, Key=f"{prefix}/predictor_stats.json",
+            Body=json.dumps(
+                predictor_stats, indent=2, default=_json_stats_default,
+            ).encode(),
+        )
         exported.append("predictor_stats.json")
 
     if exported:
@@ -6068,12 +6138,41 @@ def _main_impl() -> None:
     if args.pit_parity:
         from analysis.pit_parity import handle_pit_parity_failure, run_pit_parity
         init_research_db(args.db, config)
+        # config#6032: the PredictorBacktest phase ran the SAME walk-forward
+        # (PIT) inference over the same config earlier in this SF and wrote
+        # predictor_stats.json — reuse it for the walk-forward pass instead of
+        # re-running the full predictor pipeline in a subprocess. Best-effort:
+        # a missing/unreadable artifact must NOT fail the observational stage —
+        # run_pit_parity falls back to the walkforward subprocess. Logged LOUD
+        # so the fallback is never silent.
+        predictor_stats = None
+        if args.predictor_stats_key:
+            try:
+                import boto3
+                _pb_bucket = config.get("signals_bucket", "alpha-engine-research")
+                _pb_obj = boto3.client("s3").get_object(
+                    Bucket=_pb_bucket, Key=args.predictor_stats_key,
+                )
+                predictor_stats = json.loads(_pb_obj["Body"].read())
+                logger.info(
+                    "[pit_parity] loaded PredictorBacktest artifact "
+                    "s3://%s/%s for walk-forward pass reuse",
+                    _pb_bucket, args.predictor_stats_key,
+                )
+            except Exception as e:
+                logger.error(
+                    "[pit_parity] predictor_stats artifact s3://%s/%s could not "
+                    "be loaded (%s) — falling back to the walkforward subprocess",
+                    config.get("signals_bucket", "alpha-engine-research"),
+                    args.predictor_stats_key, e,
+                )
         try:
-            report = run_pit_parity(config)
+            report = run_pit_parity(config, predictor_stats=predictor_stats)
             print(json.dumps(
                 {k: report[k] for k in (
                     "schema", "run_date", "delta_pit_minus_current",
-                    "headline_log_alpha_delta", "materiality", "pbo", "_s3_key",
+                    "headline_log_alpha_delta", "materiality", "pbo",
+                    "reuse", "_s3_key",
                 ) if k in report},
                 indent=2, default=str,
             ))

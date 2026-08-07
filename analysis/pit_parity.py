@@ -658,7 +658,49 @@ def build_contamination_report(
     }
 
 
-def run_pit_parity(config: dict) -> dict:
+def _validate_reusable_predictor_stats(stats: dict) -> str | None:
+    """Validate a PredictorBacktest-phase ``predictor_stats.json`` artifact
+    as a substitute for pit_parity's walk-forward (PIT) pass (config#6032).
+
+    Returns ``None`` when the artifact is a valid substitute; a
+    human-readable rejection reason otherwise.
+
+    Why validation gates reuse at all: the phase's artifact is only
+    interchangeable with the walk-forward pass when (1) it was produced
+    under the SAME inference mode — walk-forward ON, the config#833 default
+    (`synthetic/predictor_backtest.py` resolves ``config.get("walk_forward",
+    True)``); a legacy-mode artifact (walk_forward OFF) is the *look-ahead*
+    comparator's computation and reusing it for the PIT side would compare
+    legacy-vs-legacy, silently zeroing the contamination signal the stage
+    exists to produce — and (2) it carries the CSCV block matrix
+    (config#816 decision B) the PBO measurement needs; reusing a
+    matrix-less artifact would silently degrade pbo to null. Every other
+    failure shape falls back to the walk-forward subprocess instead —
+    the artifact saves ~25 min of runtime; the signal is the point of the
+    stage, and a degraded measurement is never an acceptable price for a
+    runtime saving.
+    """
+    if not isinstance(stats, dict):
+        return f"artifact is not a dict (got {type(stats).__name__})"
+    if stats.get("status") not in (None, "ok"):
+        return f"artifact status={stats.get('status')!r} (not ok)"
+    wf_meta = (stats.get("predictor_metadata") or {}).get("walk_forward")
+    if wf_meta is None:
+        return ("artifact is not walk-forward (PIT) mode — "
+                "predictor_metadata.walk_forward missing; only a walk-forward "
+                "artifact can substitute for the walk-forward pass")
+    dlr = stats.get("daily_log_returns")
+    arr = np.asarray(dlr, dtype=np.float64) if dlr is not None else None
+    if arr is None or arr.size < 2 or not np.all(np.isfinite(arr)):
+        return ("artifact daily_log_returns missing/unparseable — the "
+                "block-bootstrap materiality CI needs the per-date stream")
+    if "_cscv_block_matrix" not in stats:
+        return ("artifact lacks _cscv_block_matrix — PBO (config#816 "
+                "decision B) would degrade to null")
+    return None
+
+
+def run_pit_parity(config: dict, predictor_stats: dict | None = None) -> dict:
     """Run the predictor backtest both ways over the same grid + build the
     report. Returns the report dict; the caller persists it.
 
@@ -667,6 +709,21 @@ def run_pit_parity(config: dict) -> dict:
     two of those — no param-sweep / phase-registry plumbing. PBO needs a
     sweep pair; in this single-pass mode it is reported ``null`` with a
     method note (no fabricated distribution).
+
+    config#6032: ``predictor_stats`` is the PredictorBacktest phase's
+    ``predictor_stats.json`` artifact (downloaded by ``backtest.py``'s
+    ``--pit-parity --predictor-stats-key`` path). When it validates as a
+    substitute for the walk-forward (PIT) pass (see
+    :func:`_validate_reusable_predictor_stats`), that pass REUSES the
+    phase's already-computed stats instead of re-running the full
+    predictor pipeline in a subprocess — the phase runs the same
+    walk-forward inference over the same config on the same Saturday, so
+    the artifact is numerically identical to what the subprocess would
+    compute (deterministic pipeline, no S3-dependent inputs), while the
+    parity stage drops one ~25-min full-pipeline run. Any validation
+    failure logs LOUD and falls back to the walkforward subprocess. The
+    look-ahead pass is NEVER reused — it runs the legacy single-pass path
+    (walk_forward=False), which no phase artifact reproduces.
     """
     # NB: each pass runs run_predictor_backtest in its own subprocess
     # (_run_predictor_pass_isolated) — not imported/called in this process.
@@ -676,6 +733,30 @@ def run_pit_parity(config: dict) -> dict:
     # Strip non-copyable runtime handles before deepcopy. See module-level
     # ``_RUNTIME_HANDLE_KEYS`` comment for the failure-mode history.
     safe_config = _config_without_runtime_handles(config)
+
+    # config#6032: decide the walk-forward pass source BEFORE running the
+    # look-ahead pass, so the decision (and any rejection reason) is visible
+    # in the report even when a pass fails.
+    reuse_reason = None
+    pit_stats = None
+    if predictor_stats is not None:
+        reuse_reason = _validate_reusable_predictor_stats(predictor_stats)
+        if reuse_reason is None:
+            logger.info(
+                "[pit_parity] pass 2/2 — walk-forward PIT stats REUSED from the "
+                "PredictorBacktest phase's predictor_stats.json (no subprocess; "
+                "~25 min saved). The phase ran the same walk-forward inference "
+                "over the same config earlier in this SF."
+            )
+            pit_stats = predictor_stats
+        else:
+            logger.error(
+                "[pit_parity] predictor_stats.json NOT reusable for the "
+                "walk-forward pass (%s) — falling back to the walkforward "
+                "subprocess. Reuse requires a walk-forward-mode artifact that "
+                "carries the CSCV block matrix; a degraded measurement is never "
+                "an acceptable price for a runtime saving.", reuse_reason,
+            )
 
     # L4487: each pass runs in its OWN subprocess (a fresh `python backtest.py
     # --pit-parity-pass …`), so the OS reclaims pass-1's full RSS before pass-2
@@ -687,8 +768,9 @@ def run_pit_parity(config: dict) -> dict:
     logger.info("[pit_parity] pass 1/2 — legacy single-pass (look-ahead) [isolated subprocess]")
     cur_stats = _run_predictor_pass_isolated(safe_config, "lookahead", run_date)
 
-    logger.info("[pit_parity] pass 2/2 — walk-forward PIT [isolated subprocess]")
-    pit_stats = _run_predictor_pass_isolated(safe_config, "walkforward", run_date)
+    if pit_stats is None:
+        logger.info("[pit_parity] pass 2/2 — walk-forward PIT [isolated subprocess]")
+        pit_stats = _run_predictor_pass_isolated(safe_config, "walkforward", run_date)
 
     if cur_stats.get("status") not in (None, "ok") or \
             pit_stats.get("status") not in (None, "ok"):
@@ -701,6 +783,11 @@ def run_pit_parity(config: dict) -> dict:
             "schema": SCHEMA, "run_date": run_date, "status": "incomplete",
             "current_status": cur_stats.get("status"),
             "pit_status": pit_stats.get("status"),
+            "reuse": {
+                "artifact_present": predictor_stats is not None,
+                "walk_forward_from_predictor_stats": pit_stats is predictor_stats,
+                "rejection_reason": reuse_reason,
+            },
             "observational": True,
         }
         # Always-emit-artifact contract: the operator's manual-flip gate
@@ -730,6 +817,14 @@ def run_pit_parity(config: dict) -> dict:
         pit_block_matrix=pit_block_matrix, pit_spec_ids=pit_spec_ids,
         n_trials=n_trials, prior_delta=prior_delta,
     )
+    # config#6032: record the walk-forward pass source so the operator can
+    # verify a fast parity stage actually reused the phase artifact (vs.
+    # silently falling back to the subprocess).
+    report["reuse"] = {
+        "artifact_present": predictor_stats is not None,
+        "walk_forward_from_predictor_stats": pit_stats is predictor_stats,
+        "rejection_reason": reuse_reason,
+    }
 
     key = _write_artifact_to_s3(bucket, run_date, report)
     if key is not None:

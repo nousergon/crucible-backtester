@@ -1620,7 +1620,16 @@ if [ "\${PIT_PARITY_ENABLED:-0}" = "1" ] && ! _stage_skipped pit_parity; then
     # (sev=warning, dedup-keyed on run_date). 2026-05-17→2026-05-24
     # incident: this swallow ate 4 RecursionError silently before the
     # contract was added.
+    # config#6032: the PredictorBacktest phase (earlier in this SF, same
+    # RUN_DATE) already ran the SAME walk-forward (PIT) inference over the
+    # same config and wrote backtest/{RUN_DATE}/predictor_stats.json — bake
+    # that key in so backtest.py --pit-parity can reuse it for the walk-
+    # forward pass instead of re-running the full predictor pipeline in a
+    # subprocess (~25 min saved). Best-effort: a missing/unreadable artifact
+    # falls back to the subprocess inside backtest.py (never fails the
+    # observational stage).
     $REMOTE_PYTHON -u backtest.py --mode predictor-backtest --pit-parity \\
+        --predictor-stats-key "backtest/\${RUN_DATE}/predictor_stats.json" \\
         --date "\${RUN_DATE}" --log-level INFO 2>&1 \\
         || echo "WARNING: pit_parity stage failed (observational — spot run continues; failure-artifact + Telegram alert published by the inner Python)"
     echo "▶ stage=pit_parity END at \$(date -u +%H:%M:%S)"

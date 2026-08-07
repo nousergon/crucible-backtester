@@ -580,7 +580,11 @@ def test_backtest_pit_parity_branch_inits_research_db_before_run_pit_parity():
     branch_src = "".join(lines[start:end])
 
     init_db_idx = branch_src.index("init_research_db(args.db, config)")
-    run_pp_idx = branch_src.index("run_pit_parity(config)")
+    # config#6032 anchored the call on the signature prefix (no closing
+    # paren): run_pit_parity gained a `predictor_stats=` kwarg in the
+    # artifact-reuse change, and the ordering guarantee under test is
+    # about the call site, not its argument list.
+    run_pp_idx = branch_src.index("run_pit_parity(config")
     assert init_db_idx < run_pp_idx, (
         "init_research_db must run before run_pit_parity in the --pit-parity branch"
     )
@@ -851,3 +855,148 @@ def test_paging_enabled_default_untouched_by_prior_delta_wiring():
     )
     from analysis.parity_alarms import evaluate_parity_alarms as _epa
     assert inspect.signature(_epa).parameters["paging_enabled"].default is False
+
+
+# ── config#6032: reuse of the PredictorBacktest phase's predictor_stats.json
+# ──────────────────────────────────────────────────────────────────────────────
+# The phase runs the SAME walk-forward (PIT) inference over the same config
+# earlier in the SF, so a valid artifact substitutes for the walk-forward
+# subprocess (saving ~25 min). Reuse is gated on the artifact being
+# walk-forward-mode AND carrying the CSCV block matrix — anything else falls
+# back to the subprocess rather than silently degrading the measurement.
+
+def _phase_artifact(sortino=0.6, status="ok", *, with_matrix=True,
+                    with_wf_meta=True):
+    s = _stats(sortino, 0.8, -0.05, -0.25, [0.005, 0.0, -0.001], 0.01)
+    s["status"] = status
+    if with_wf_meta:
+        s["predictor_metadata"] = {"walk_forward": {"n_folds": 12}}
+    if with_matrix:
+        s["_cscv_block_matrix"] = [
+            [0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8],
+        ]
+        s["_cscv_spec_ids"] = [0, 1]
+        s["_cscv_n_trials"] = 2
+    return s
+
+
+def _count_passes(monkeypatch):
+    seen: list[str] = []
+
+    def fake_pass(safe_config, which, run_date):
+        seen.append(which)
+        s = _stats(1.0 if which == "lookahead" else 0.6,
+                   0.9, -0.03, -0.15, [0.01, 0.0], 0.03)
+        if which == "walkforward":
+            s["predictor_metadata"] = {"walk_forward": {"n_folds": 12}}
+        return s
+
+    monkeypatch.setattr(pp, "_run_predictor_pass_isolated", fake_pass)
+    return seen
+
+
+def test_run_pit_parity_reuses_valid_predictor_stats_artifact(monkeypatch):
+    """A valid phase artifact (walk-forward mode + CSCV block matrix)
+    substitutes for the walk-forward subprocess — ONLY the look-ahead pass
+    runs, and the PBO matrix comes from the artifact (never degraded)."""
+    seen = _count_passes(monkeypatch)
+
+    rep = pp.run_pit_parity(
+        {"signals_bucket": "b", "_run_date": "2026-05-17"},
+        predictor_stats=_phase_artifact(),
+    )
+
+    assert seen == ["lookahead"]  # walkforward subprocess skipped
+    assert rep["reuse"]["walk_forward_from_predictor_stats"] is True
+    assert rep["reuse"]["artifact_present"] is True
+    assert rep["reuse"]["rejection_reason"] is None
+    # delta = pit − current: 0.6 − 1.0
+    assert rep["delta_pit_minus_current"]["sortino_ratio"] == pytest.approx(-0.4)
+    assert rep["run_quality"]["walk_forward"]["n_folds"] == 12  # wf_meta read
+    assert rep["pbo"]["status"] == "ok"  # artifact matrix fed full M-block CSCV
+
+
+def test_run_pit_parity_falls_back_without_cscv_matrix(monkeypatch):
+    """A matrix-less artifact must NOT be reused — PBO (config#816 decision B)
+    would silently degrade to null. Full subprocess fallback, reason recorded."""
+    seen = _count_passes(monkeypatch)
+
+    rep = pp.run_pit_parity(
+        {"signals_bucket": "b", "_run_date": "2026-05-17"},
+        predictor_stats=_phase_artifact(with_matrix=False),
+    )
+
+    assert seen == ["lookahead", "walkforward"]  # full fallback
+    assert rep["reuse"]["walk_forward_from_predictor_stats"] is False
+    assert "_cscv_block_matrix" in rep["reuse"]["rejection_reason"]
+
+
+def test_run_pit_parity_falls_back_on_legacy_mode_artifact(monkeypatch):
+    """A legacy-mode artifact (no walk_forward metadata) is the LOOK-AHEAD
+    comparator's computation — reusing it for the PIT side would compare
+    legacy-vs-legacy and zero the contamination signal. Fallback."""
+    seen = _count_passes(monkeypatch)
+
+    rep = pp.run_pit_parity(
+        {"signals_bucket": "b", "_run_date": "2026-05-17"},
+        predictor_stats=_phase_artifact(with_wf_meta=False),
+    )
+
+    assert seen == ["lookahead", "walkforward"]
+    assert rep["reuse"]["walk_forward_from_predictor_stats"] is False
+    assert "walk-forward" in rep["reuse"]["rejection_reason"]
+
+
+def test_run_pit_parity_falls_back_on_bad_status_artifact(monkeypatch):
+    """An artifact with a non-ok status is a failure record, not a
+    substitute — fallback."""
+    seen = _count_passes(monkeypatch)
+
+    rep = pp.run_pit_parity(
+        {"signals_bucket": "b", "_run_date": "2026-05-17"},
+        predictor_stats=_phase_artifact(status="insufficient_data"),
+    )
+
+    assert seen == ["lookahead", "walkforward"]
+    assert rep["reuse"]["walk_forward_from_predictor_stats"] is False
+
+
+def test_run_pit_parity_no_artifact_runs_both_passes(monkeypatch):
+    """No artifact (standalone/off-cycle parity run, or --predictor-stats-key
+    absent) — both subprocesses, exactly the pre-config#6032 behavior."""
+    seen = _count_passes(monkeypatch)
+
+    rep = pp.run_pit_parity({"signals_bucket": "b", "_run_date": "2026-05-17"})
+
+    assert seen == ["lookahead", "walkforward"]
+    assert rep["reuse"]["artifact_present"] is False
+    assert rep["reuse"]["walk_forward_from_predictor_stats"] is False
+
+
+def test_predictor_stats_json_roundtrip_preserves_arrays():
+    """config#6032 artifact contract: predictor_stats.json must round-trip
+    numpy/pandas arrays as real JSON arrays (not str()-ified), so the parity
+    reuse path can rebuild daily_log_returns / _cscv_block_matrix from the
+    phase artifact. The reporter's scalar-only reads are unaffected."""
+    import json
+
+    import pandas as pd
+
+    from backtest import _json_stats_default
+
+    stats = {
+        "status": "ok",
+        "sortino_ratio": 0.9,
+        "daily_log_returns": pd.Series([0.001, -0.002, 0.003]),
+        "_cscv_block_matrix": np.array([[0.1, 0.2], [0.3, 0.4]]),
+        "total_alpha": 0.03,
+    }
+    blob = json.dumps(stats, default=_json_stats_default)
+    loaded = json.loads(blob)
+
+    assert loaded["daily_log_returns"] == [0.001, -0.002, 0.003]
+    assert loaded["_cscv_block_matrix"] == [[0.1, 0.2], [0.3, 0.4]]
+    assert loaded["sortino_ratio"] == 0.9
+    # The reused artifact must feed _per_date_return_delta's np.asarray path.
+    arr = np.asarray(loaded["daily_log_returns"], dtype=np.float64)
+    assert arr.shape == (3,)
