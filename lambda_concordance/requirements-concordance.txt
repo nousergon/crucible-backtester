@@ -1,6 +1,6 @@
 # Concordance Lambda — minimal deps. Mirrors lambda_health/requirements-health.txt
 # in spirit (lightweight, no LightGBM / vectorbt / ArcticDB).
-boto3>=1.43.59
+boto3>=1.43.65
 pyyaml>=6.0.3
 # replay.runner invokes target models via krepis.llm.LLMClient's OpenRouter
 # transport (alpha-engine-config-I2997, 2026-07-19 — migrated off

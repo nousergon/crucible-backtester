@@ -14,7 +14,7 @@ pandas>=2.0
 # silent backtrack — is what picks up 1.19 and any releases after it.
 # Re-check wheel availability for cp312/manylinux before raising further.
 scipy>=1.10,<1.19
-boto3>=1.43.59
+boto3>=1.43.65
 # pipeline_common.py does `import yaml` at module import time (reads
 # labeling.forward_days to derive ACTIVE_HORIZON_DAYS). Pin explicitly
 # rather than rely on alpha-engine-lib pulling PyYAML transitively.

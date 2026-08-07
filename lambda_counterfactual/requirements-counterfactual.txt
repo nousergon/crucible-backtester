@@ -1,7 +1,7 @@
 # Counterfactual rule fit Lambda — minimal deps. No langchain, no
 # Anthropic — pure offline analysis (sklearn fits trees on captured
 # (input → decision) pairs).
-boto3>=1.43.59
+boto3>=1.43.65
 pyyaml>=6.0.3
 # replay.counterfactual fits DecisionTreeClassifier(max_depth=3) on
 # rows extracted from decision_artifacts/ via DictVectorizer + emits
