@@ -241,18 +241,70 @@ def _run(event: dict, context) -> dict:
     }
 
     # Per-stage output assertion (config-I7214, sf-pipeline-policy.md §2.1).
-    # OBSERVE MODE — never changes this handler's own outcome. run_date is
-    # this Lambda's end_time (the SF's $$.Execution.StartTime), falling
-    # back to "now" for a bare invocation with no end_time_iso.
-    _coverage_run_date = (end_time or _started).date().isoformat()
+    # OBSERVE MODE — never changes this handler's own outcome.
+    # alpha-engine-config-I10171 — CORRECTION. This keyed the verdict on
+    # `end_time_iso` ($$.Execution.StartTime), the CALENDAR date, while
+    # $.run_date is the cycle's TRADING day. On the 2026-09-05 Saturday
+    # cycle for trading day 2026-09-04 the verdict landed in
+    # `_stage_coverage/2026-09-05/`, a partition the reader stopped
+    # consulting that same day (the dual-partition fallback expired, by
+    # design) — after which this stage read `absent`, indistinguishable
+    # from a stage that never ran.
+    #
+    # It also FABRICATED: `or _started` substituted this Lambda's own
+    # wall-clock for a genuinely-absent execution identity, which is the
+    # alpha-engine-config-I8155 forbidden class. Removed — an absent
+    # identity now records UNMEASURED with a reason.
+    from stage_coverage_run_date import resolve_stage_run_date
+
+    _coverage_run_date, _run_date_provenance = resolve_stage_run_date(
+        event,
+        stage="Counterfactual",
+        fallback=end_time.date().isoformat() if end_time else None,
+        fallback_source="event.end_time_iso",
+        logger=logger,
+    )
+    if not _coverage_run_date:
+        logger.error(
+            "stage-coverage assertion SKIPPED for Counterfactual: neither run_date "
+            "nor end_time_iso on this event (execution identity absent) — "
+            "never substituting wall-clock (alpha-engine-config-I8155)",
+        )
+        result["stage_coverage"] = {
+            "stage": "Counterfactual",
+            "status": "UNMEASURED",
+            "reason": "execution run_date absent from event (no run_date, no end_time_iso)",
+            **_run_date_provenance,
+        }
+        return result
     try:
         from krepis.stage_coverage import assert_stage_coverage
-        result["stage_coverage"] = assert_stage_coverage(
-            "Counterfactual", run_date=_coverage_run_date, window_start=_started,
-        )
+        result["stage_coverage"] = {
+            **assert_stage_coverage(
+                "Counterfactual", run_date=_coverage_run_date, window_start=_started,
+            ),
+            # alpha-engine-config-I10171: which field the partition key came
+            # from travels WITH the verdict, into the SF execution history.
+            # A fallback nobody can see afterwards reproduces the defect.
+            **_run_date_provenance,
+        }
     except ImportError as exc:
         # Loud, not silent: the lib pin predates the module. Observe mode —
         # the handler's own outcome is unchanged (config-I7214).
         logger.error("stage-coverage assertion unavailable: %s", exc)
+
+    # alpha-engine-config-I10198 / sf-pipeline-policy §2.3b, clause
+    # `SFP-2.3b-stage-status-is-the-worst-substatus` (nous-ergon-ops-PR1119).
+    # A stage that fans out into named sub-results and returns ONE
+    # enclosing status can lose arbitrary work while every §2.3
+    # mechanism — this state's `Catch`, `MarkCounterfactualDegraded`,
+    # the completion marker — reports health, because all of them key
+    # off the STAGE's status. Structural, not a list of sub-result
+    # names: the hand-kept list is how `EvalRollingMean` reported OK
+    # over an errored `agent_quality` for two weeks. A no-op on a
+    # payload whose sub-results all passed.
+    from stage_substatus import enforce_worst_substatus
+
+    enforce_worst_substatus(result, stage="Counterfactual", logger=logger)
 
     return result

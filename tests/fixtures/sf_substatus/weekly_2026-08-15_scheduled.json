@@ -1,0 +1,1018 @@
+[
+ {
+  "state": "WeeklyRunDayGate",
+  "result": {
+   "weekly_run_day_gate": {
+    "Payload": {
+     "is_weekly_run_day": true,
+     "stage_coverage": {
+      "status": "COVERED_NO_OUTPUT",
+      "reason": "pure NYSE-calendar arithmetic; `inference/trading_day_gate.py` constructs no boto3 client and contains no S3/Arctic/DynamoDB reference."
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "LibPinDriftCheck",
+  "result": {
+   "libpin_drift_result": {
+    "Payload": {
+     "status": "MEASURED",
+     "has_drift": false,
+     "parity_ok": true,
+     "floor_ok": true,
+     "reason": "in_sync",
+     "stage_coverage": {
+      "status": "COVERED_NO_OUTPUT",
+      "reason": "fetches pins over GitHub raw and compares them; no S3/boto3 write call on this path."
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "PipelineContractCheck",
+  "result": {
+   "pipeline_contract_result": {
+    "Payload": {
+     "status": "MEASURED",
+     "has_violation": false,
+     "boundary_count": 5,
+     "reason": "in_sync",
+     "stage_coverage": {
+      "status": "COVERED_NO_OUTPUT",
+      "reason": "GitHub-raw fetch plus local YAML validation; no S3/boto3 write call."
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "EvaluatorDeployDriftCheck",
+  "result": {
+   "evaluator_deploy_drift_result": {
+    "Payload": {
+     "stamp_present": true,
+     "reason": "in_sync",
+     "has_drift": false,
+     "stage_coverage": {
+      "status": "UNMEASURED",
+      "reason": "registry unreadable: AccessDenied: An error occurred (AccessDenied) when calling the GetObject operation: User: arn:aws:sts::REDACTED-ACCOUNT-ID:assumed-role/REDACTED-ROLE is not authorized to perform: s3:GetObject on resource: \"arn:aws:s3:::alpha-engine-research/_freshness_monitor/ARTIFACT_REGISTRY.yaml\" because no identity-based policy allows the s3:GetObject action"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "EvaluatorDirectorDeployDriftCheck",
+  "result": {
+   "evaluator_director_deploy_drift_result": {
+    "Payload": {
+     "stamp_present": true,
+     "reason": "in_sync",
+     "has_drift": false,
+     "stage_coverage": {
+      "status": "UNMEASURED",
+      "reason": "registry unreadable: AccessDenied: An error occurred (AccessDenied) when calling the GetObject operation: User: arn:aws:sts::REDACTED-ACCOUNT-ID:assumed-role/REDACTED-ROLE is not authorized to perform: s3:GetObject on resource: \"arn:aws:s3:::alpha-engine-research/_freshness_monitor/ARTIFACT_REGISTRY.yaml\" because no identity-based policy allows the s3:GetObject action"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "WeeklyPreflight",
+  "result": {
+   "weekly_preflight_result": {
+    "Payload": {
+     "status": "OK",
+     "has_violation": false,
+     "warn_count": 0,
+     "skip_count": 10,
+     "ran_count": 4,
+     "stage_coverage": {
+      "status": "COVERED_NO_OUTPUT",
+      "reason": "read-only AWS control-plane calls (iam:SimulatePrincipalPolicy, lambda:GetFunctionConfiguration, cloudwatch:GetMetricStatistics, states:DescribeStateMachine) plus zero-cost static analysis; `sf_preflight.py` has no put_object call, and the Lambda's own IAM policy grants no s3:PutObject."
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "AcquireMutex",
+  "result": {}
+ },
+ {
+  "state": "DispatchWeeklyFreshnessSpot",
+  "result": {}
+ },
+ {
+  "state": "WaitForWeeklyFreshnessSpotBootstrap",
+  "result": {
+   "weekly_freshness_spot_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitForWeeklyFreshnessSpotBootstrap",
+  "result": {
+   "weekly_freshness_spot_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "SubstrateHealthGate",
+  "result": {
+   "substrate_gate_result": {
+    "gate": {
+     "status": "Success",
+     "disk_used_percent": 8
+    }
+   }
+  }
+ },
+ {
+  "state": "MorningEnrich",
+  "result": {
+   "morning_enrich_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitForMorningEnrich",
+  "result": {
+   "morning_enrich_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitForMorningEnrich",
+  "result": {
+   "morning_enrich_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "DataPhase1",
+  "result": {
+   "data_phase1_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitForDataPhase1",
+  "result": {
+   "data_phase1_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitForDataPhase1",
+  "result": {
+   "data_phase1_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "PredictorTraining",
+  "result": {
+   "predictor_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitForPredictorTraining",
+  "result": {
+   "predictor_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "Scanner",
+  "result": {
+   "scanner_result": {
+    "Payload": {
+     "status": "OK",
+     "summary": {
+      "leaderboard": {
+       "status": "ok"
+      },
+      "universe_board": {
+       "status": "OK"
+      }
+     },
+     "stage_coverage": {
+      "status": "COVERED",
+      "reason": "all 8 declared artifact(s) written in-window"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "RegimeSubstrate",
+  "result": {
+   "regime_substrate_result": {
+    "Payload": {
+     "statusCode": 200,
+     "regime_change_signal": false,
+     "stage_coverage": {
+      "status": "MISSING",
+      "reason": "1 declared artifact(s) absent: regime_state_dated"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "SignalsEnvelope",
+  "result": {
+   "signals_envelope_result": {
+    "Payload": {
+     "status": "OK",
+     "universe_count": 903,
+     "stage_coverage": {
+      "status": "STALE",
+      "reason": "1 declared artifact(s) predate this run's window: research_db_backup"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "ChallengerShadow",
+  "result": {}
+ },
+ {
+  "state": "RAGIngestion",
+  "result": {
+   "rag_ingestion_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 3600
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitForRAGIngestion",
+  "result": {
+   "rag_ingestion_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitForPredictorTraining",
+  "result": {
+   "predictor_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "ResolveZooSpecs",
+  "result": {
+   "resolve_zoo_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 600
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitResolveZoo",
+  "result": {
+   "resolve_zoo_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitResolveZoo",
+  "result": {
+   "resolve_zoo_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "TrainSpecDispatch",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   },
+   "train_spec_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitForRAGIngestion",
+  "result": {
+   "rag_ingestion_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "RegimeRetrospectiveEval",
+  "result": {
+   "regime_retrospective_eval_result": {
+    "Payload": {
+     "statusCode": 200,
+     "n_pairings": 16,
+     "asymmetric_weighted_agreement_rate": 0.6875,
+     "rolling_window_score": 0.6875,
+     "stage_coverage": {
+      "status": "COVERED",
+      "reason": "all 1 declared artifact(s) written in-window"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "DataPhase2",
+  "result": {
+   "data_phase2_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitForDataPhase2",
+  "result": {
+   "data_phase2_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitTrainSpec",
+  "result": {
+   "train_spec_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "ModelZooSelect",
+  "result": {
+   "model_zoo_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 5400
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitForModelZoo",
+  "result": {
+   "model_zoo_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitForModelZoo",
+  "result": {
+   "model_zoo_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "WaitForDataPhase2",
+  "result": {
+   "data_phase2_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "EvalJudgeSubmitWeekly",
+  "result": {
+   "eval_judge_submit": {
+    "Payload": {
+     "status": "EMPTY",
+     "request_count": 0,
+     "stage_coverage": {
+      "status": "COVERED_NO_OUTPUT",
+      "reason": "writes `decision_artifacts/_eval_batch_plans/{date}/{batch_id}.json`, where {batch_id} is the Anthropic batch id minted at submit time (or a synthetic `empty-{date}` when the plan has zero requests). The registry's probe resolves fixed {date}/{trading_day} templates only, so this needs the `list_prefix_recent` check mode the substrate does not yet carry \u2014 the same grandfathered class the header names. Covered downstream by `eval_artifact_latest`, which cannot be written unless a plan was submitted and polled."
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "EvalJudgeProcess",
+  "result": {
+   "eval_judge_result": {
+    "Payload": {
+     "status": "OK",
+     "complete": true,
+     "budget_stopped": false,
+     "summary": {
+      "complete": true
+     },
+     "stage_coverage": {
+      "status": "STALE",
+      "reason": "1 declared artifact(s) predate this run's window: eval_artifact_latest"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "EvalRollingMean",
+  "result": {
+   "eval_rolling_mean_result": {
+    "Payload": {
+     "status": "OK",
+     "calibration": {
+      "status": "insufficient"
+     },
+     "control_bands": {
+      "status": "OK"
+     },
+     "agent_quality": {
+      "status": "ERROR",
+      "error": "'str' object has no attribute 'isoformat'"
+     },
+     "producer_leaderboard": {
+      "status": "ok"
+     },
+     "stage_coverage": {
+      "status": "COVERED",
+      "reason": "all 1 declared artifact(s) written in-window"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "RationaleClustering",
+  "result": {
+   "rationale_clustering_result": {
+    "Payload": {
+     "status": "OK",
+     "stage_coverage": {
+      "status": "COVERED_NO_OUTPUT",
+      "reason": "writes `decision_artifacts/_analysis/{agent_id}/{YYYY-WW}.json` \u2014 per agent, keyed by ISO year-week rather than by date, and skipped per agent under MIN_RATIONALES_FOR_CLUSTERING. There is no fixed key and no latest pointer, so nothing here can be probed by template; needs `list_prefix_recent`."
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "ReplayConcordance",
+  "result": {
+   "replay_concordance_result": {
+    "Payload": {
+     "status": "PARTIAL",
+     "duration_seconds": 732.5,
+     "stage_coverage": {
+      "status": "COVERED",
+      "reason": "all 1 declared artifact(s) written in-window"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "Counterfactual",
+  "result": {
+   "counterfactual_result": {
+    "Payload": {
+     "status": "OK",
+     "duration_seconds": 71.5,
+     "stage_coverage": {
+      "status": "COVERED_NO_OUTPUT",
+      "reason": "writes `decision_artifacts/_counterfactual/{agent_id_base}/{run_id}.json` plus a per-agent `latest.json`. The latest pointer is per AGENT, and the supported-agent set is derived at runtime, so there is no single fixed key whose absence means the stage did nothing; needs `list_prefix_recent`."
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "AggregateCosts",
+  "result": {
+   "aggregate_costs_result": {
+    "Payload": {
+     "status": "SKIPPED",
+     "reason": "no_cost_raw_for_date",
+     "stage_coverage": {
+      "status": "MISSING",
+      "reason": "1 declared artifact(s) absent: llm_cost_parquet"
+     }
+    },
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    },
+    "StatusCode": 200
+   }
+  }
+ },
+ {
+  "state": "Backtester",
+  "result": {
+   "backtester_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 7200
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitForBacktester",
+  "result": {
+   "backtester_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitForBacktester",
+  "result": {
+   "backtester_poll": {
+    "ResponseCode": 0
+   }
+  }
+ },
+ {
+  "state": "PredictorBacktest",
+  "result": {
+   "predictor_backtest_result": {
+    "Command": {
+     "CompletedCount": 0,
+     "DeliveryTimedOutCount": 0,
+     "ErrorCount": 0,
+     "TargetCount": 1,
+     "TimeoutSeconds": 7200
+    }
+   }
+  }
+ },
+ {
+  "state": "WaitForPredictorBacktest",
+  "result": {
+   "predictor_backtest_poll": {
+    "ResponseCode": -1
+   }
+  }
+ },
+ {
+  "state": "WaitForPredictorBacktest",
+  "result": {
+   "predictor_backtest_poll": {
+    "ResponseCode": 1
+   }
+  }
+ },
+ {
+  "state": "HandleFailure",
+  "result": {
+   "failure_notify": {
+    "SdkHttpMetadata": {
+     "HttpStatusCode": 200
+    }
+   }
+  }
+ }
+]

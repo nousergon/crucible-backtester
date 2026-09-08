@@ -134,3 +134,128 @@ def test_no_stage_coverage_invocation_passes_run_date_variable():
         "it the wrong value for stage-coverage grouping, which must match "
         "the SF execution's own (unnormalized) run_date: $EXECUTION_RUN_DATE."
     )
+
+
+# ── The Lambda side of the same contract (alpha-engine-config-I10171) ───────
+#
+# The tests above cover the SHELL launchers, which pass an explicit
+# `--run-date "$EXECUTION_RUN_DATE"`. The two Lambda handlers in this repo
+# had the same defect one layer down: they derived the key from
+# `event["end_time_iso"]` ($$.Execution.StartTime — the CALENDAR date) and,
+# when that was absent, from their own wall clock. Both `Counterfactual` and
+# `ReplayConcordance` verdicts for the 2026-09-04 cycle therefore landed
+# under `_stage_coverage/2026-09-05/`, which the reader stopped consulting
+# on that very day when the dual-partition fallback expired.
+#
+# Population is DERIVED, not listed: every `.py` under a `lambda_*/`
+# directory whose source calls `assert_stage_coverage(`. A THIRD replay
+# Lambda added tomorrow is held to the rule without a test edit — the same
+# reason the shell block above enumerates `infrastructure/*.sh`.
+
+_RESOLVER = "resolve_stage_run_date"
+
+
+def _coverage_asserting_lambda_files() -> list[str]:
+    found: list[str] = []
+    for directory in sorted(REPO_ROOT.glob("lambda_*")):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            if "assert_stage_coverage(" in path.read_text():
+                found.append(str(path.relative_to(REPO_ROOT)))
+    return found
+
+
+def test_the_lambda_scan_is_not_vacuous():
+    """A scan that silently matched nothing makes every test below green
+    while the class re-opens next to it."""
+    files = _coverage_asserting_lambda_files()
+    assert len(files) >= 2, files
+
+
+def test_every_lambda_handler_resolves_its_run_date_through_the_resolver():
+    for filename in _coverage_asserting_lambda_files():
+        source = (REPO_ROOT / filename).read_text()
+        assert _RESOLVER in source, (
+            f"{filename} asserts stage coverage but never calls {_RESOLVER} "
+            "— its partition key is derived locally and can silently be the "
+            "CALENDAR date (alpha-engine-config-I10171)"
+        )
+
+
+def test_no_lambda_handler_keys_a_verdict_on_a_wall_clock_or_start_time():
+    """`end_time_iso` may still exist — as the resolver's NAMED `fallback=`,
+    never as the value handed straight to `assert_stage_coverage`, and never
+    with a `_started`/`now()` substitute behind an `or`
+    (alpha-engine-config-I8155's forbidden fabrication class)."""
+    for filename in _coverage_asserting_lambda_files():
+        source = (REPO_ROOT / filename).read_text()
+        for args in _assert_call_args(source):
+            # Only the run_date= argument. `window_start=_started` is the
+            # CORRECT use of this handler's entry time and must not trip the
+            # check — a guard that reports a finding on a legitimately-named
+            # neighbour teaches readers to suppress it.
+            run_date_arg = _kwarg(args, "run_date")
+            assert run_date_arg is not None, (
+                f"{filename} calls assert_stage_coverage without run_date= : {args!r}"
+            )
+            assert "end_time" not in run_date_arg, (
+                f"{filename} passes an end_time-derived value as the "
+                f"assert_stage_coverage run_date: {run_date_arg!r}"
+            )
+            assert "_started" not in run_date_arg, (
+                f"{filename} passes its own wall clock as the "
+                f"assert_stage_coverage run_date: {run_date_arg!r}"
+            )
+        assert "(end_time or _started)" not in source, (
+            f"{filename} still fabricates a run_date from its own wall clock "
+            "when the execution identity is absent (config-I8155)"
+        )
+
+
+def _assert_call_args(source: str) -> list[str]:
+    """Paren-matched argument text of every `assert_stage_coverage(...)`."""
+    calls: list[str] = []
+    needle = "assert_stage_coverage("
+    idx = source.find(needle)
+    while idx != -1:
+        i = idx + len(needle)
+        depth = 1
+        while i < len(source) and depth:
+            if source[i] == "(":
+                depth += 1
+            elif source[i] == ")":
+                depth -= 1
+            i += 1
+        calls.append(source[idx + len(needle):i - 1])
+        idx = source.find(needle, i)
+    return calls
+
+
+def _kwarg(args: str, name: str) -> str | None:
+    """The text of `name=<value>` inside a call's argument span, or None.
+
+    Splits on top-level commas only, so a value containing its own call or
+    dict does not truncate the span.
+    """
+    depth = 0
+    parts: list[str] = []
+    current = ""
+    for ch in args:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += ch
+    parts.append(current)
+    for part in parts:
+        stripped = part.strip()
+        if stripped.startswith(f"{name}="):
+            return stripped[len(name) + 1:]
+    return None

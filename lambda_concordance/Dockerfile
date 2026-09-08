@@ -79,6 +79,15 @@ RUN microdnf install -y tar gzip && microdnf clean all && \
 # /var/task/handler.py (handler resolves LAMBDA_TASK_ROOT). replay/
 # imports stay nested.
 COPY preflight.py .
+# stage_coverage_run_date.py — repo-ROOT single-file module resolving the
+# partition key the stage-coverage verdict is written under
+# (alpha-engine-config-I10171). handler.py imports it; omitting the COPY
+# makes the whole coverage block ModuleNotFoundError in the deployed
+# image — on the observer that exists to notice absences.
+COPY stage_coverage_run_date.py .
+# stage_substatus.py — repo-ROOT single-file module deriving the stage's
+# status from its own sub-results (alpha-engine-config-I10198).
+COPY stage_substatus.py .
 COPY replay/ replay/
 
 # flow-doctor.yaml ships alongside the handler; handler.py resolves
