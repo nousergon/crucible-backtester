@@ -32,6 +32,9 @@ from __future__ import annotations
 try:  # noqa: SIM105
     import arcticdb  # noqa: F401
 except Exception:  # pragma: no cover - arcticdb optional in some envs
+    # (a) arcticdb not installed in this env. (c) no recording surface --
+    # carve-out: expected-absence-with-fallback, same class as
+    # backtest.py's identical import-order guard (alpha-engine-config-I10226).
     pass
 
 import argparse
@@ -1163,6 +1166,13 @@ def _read_current_weights(config: dict) -> dict:
         if len(weights) == len(weight_optimizer.SUB_SCORES):
             return weights
     except Exception:
+        # (a) config/scoring_weights.json S3 read/parse failed (object
+        # absent, malformed). (c) no recording surface -- carve-out:
+        # expected-absence-with-fallback, this is the first of three
+        # preference-ordered weight sources tried in turn; the final source
+        # (configured_default_weights() below) is a validated chokepoint
+        # that raises ConfigKeyDriftError rather than silently zero-filling
+        # (alpha-engine-config-I10226).
         pass
 
     research_paths = config.get("research_paths", [])

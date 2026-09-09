@@ -500,8 +500,11 @@ def save_dict_of_dataframes(
     try:
         pa.default_memory_pool().release_unused()
     except Exception:
-        # Best effort — older pyarrow versions may not expose this
-        # API. Don't fail the save if the cleanup hint is rejected.
+        # (a) release_unused() unsupported/rejected on this pyarrow
+        # version. (c) no recording surface -- carve-out: best effort
+        # memory-pool cleanup hint, older pyarrow versions may not expose
+        # this API; the save must not fail on a rejected cleanup hint
+        # (alpha-engine-config-I10226).
         pass
 
     key = artifact_key(date, phase, name, "parquet")
@@ -665,6 +668,9 @@ def save_signals_by_date_flat(
     try:
         pa.default_memory_pool().release_unused()
     except Exception:
+        # (a) release_unused() unsupported/rejected on this pyarrow
+        # version. (c) no recording surface -- carve-out, same class as
+        # the identical guard above (alpha-engine-config-I10226).
         pass
 
     s3 = _client(s3_client)

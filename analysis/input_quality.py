@@ -321,6 +321,12 @@ def gate_signal_inputs(
                     source="alpha-engine-backtester/analysis/input_quality.py",
                 )
             except Exception:  # noqa: BLE001 — alert is best-effort observability
+                # (a) alert_publisher transport failure (network, webhook
+                # down). (c) no recording surface -- Telegram/notification-
+                # transport carve-out (a failed notification must never
+                # abort the input-quality gate); `raise InputQualityError`
+                # below still fires when enforce=True regardless of this
+                # branch (alpha-engine-config-I10226).
                 pass
         if enforce:
             raise InputQualityError(verdict.reason)

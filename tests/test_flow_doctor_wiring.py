@@ -392,7 +392,13 @@ class TestColdStartDeferral:
 # The tag every deploy artifact must pin. `tests/test_lib_pin_lockstep.py`
 # asserts requirements.txt and the three Lambda Dockerfiles all carry the SAME
 # tag; this constant is what that tag must be.
-_EXPECTED_LIB_TAG = "v0.124.99"
+#
+# Bumped v0.124.99 -> v0.124.115 (alpha-engine-config-I10226): the first
+# published nousergon-lib carrying nousergon_lib.testing.debug_swallow_guard
+# (nousergon-lib-PR398), which tests/test_no_debug_only_swallows.py now
+# imports. See requirements.txt's own comment on this pin for the full
+# MERGE ORDER note (nousergon-lib-PR398 merges and publishes first).
+_EXPECTED_LIB_TAG = "v0.124.115"
 
 
 class TestLibVersionPin:

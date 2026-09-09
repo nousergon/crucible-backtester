@@ -183,6 +183,12 @@ def compute_score_calibration(
                     sectors, left_on="symbol", right_on="ticker", how="left",
                 )
         except Exception as _e:
+            # (a) universe_returns sector-enrichment join failed (table
+            # absent, connection error) -- df keeps its pre-join columns and
+            # sector-grouped diagnosis is unavailable for this run.
+            # (c) no recording surface beyond this DEBUG line -- carve-out:
+            # expected-absence-with-fallback, the join is a diagnostic
+            # enrichment, not a required input (alpha-engine-config-I10226).
             logger.debug("universe_returns sector join skipped: %s", _e)
 
         try:
@@ -196,6 +202,12 @@ def compute_score_calibration(
                     regimes, left_on="score_date", right_on="date", how="left",
                 )
         except Exception as _e:
+            # (a) macro_snapshots regime-enrichment join failed -- df keeps
+            # its pre-join columns and regime-grouped diagnosis is
+            # unavailable for this run.
+            # (c) no recording surface beyond this DEBUG line -- carve-out:
+            # expected-absence-with-fallback, same class as the sector join
+            # above (alpha-engine-config-I10226).
             logger.debug("macro_snapshots regime join skipped: %s", _e)
 
         conn.close()
