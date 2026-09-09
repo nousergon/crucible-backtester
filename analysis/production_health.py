@@ -260,7 +260,40 @@ def compute_production_health(
 
     hit_rate = float(df["correct"].mean())
 
-    valid = df.dropna(subset=["net_signal", "actual"])
+    # ── Champion scoping for the IC ratio (measured 2026-09-09) ──────────────
+    # rolling_30d_ic below fed the ic_ratio/degradation_flag by dividing over
+    # ALL resolved outcomes in the lookback window, with no scoping to which
+    # model served them — while `_load_training_ic` resolves the CURRENTLY-
+    # deployed champion's OOS reference. At a ~21d horizon a champion rotation
+    # mid-window means most (here: essentially all 498/498) resolved outcomes
+    # were served by an already-retired champion, so the ratio compared one
+    # model's live behaviour against a different model's training reference —
+    # the same defect class as alpha-engine-config-I10290 (a veto compared
+    # against itself). Scope the numerator to the SAME champion identified in
+    # each date's predictor/predictions/{date}.json (`champion_version_id`);
+    # "current" = whichever champion served the most recent resolvable date.
+    champion_by_date = _load_champion_by_date(bucket, df["prediction_date"].dropna().astype(str).unique().tolist())
+    df["champion_version_id"] = df["prediction_date"].astype(str).map(champion_by_date)
+    resolved_dates = [d for d, cid in champion_by_date.items() if cid]
+    current_champion_id = champion_by_date[max(resolved_dates)] if resolved_dates else None
+
+    if current_champion_id is not None:
+        champion_df = df[df["champion_version_id"] == current_champion_id]
+        n_champion_scoped = int(len(champion_df))
+        champion_scoping_status = (
+            "ok" if n_champion_scoped >= _MIN_SAMPLES else "insufficient_champion_samples"
+        )
+    else:
+        # Diagnostic feed (predictions/{date}.json) unreadable for every date
+        # in the window — fail OPEN to the whole-window IC so a transient S3
+        # hiccup on a secondary feed doesn't blackout the primary detector,
+        # but the status is recorded so this is auditable, never silent.
+        champion_df = df
+        n_champion_scoped = None
+        champion_scoping_status = "unresolved"
+
+    ic_scope_df = champion_df if champion_scoping_status in ("ok", "unresolved") else champion_df.iloc[0:0]
+    valid = ic_scope_df.dropna(subset=["net_signal", "actual"])
     ic_30d = None
     if len(valid) >= _MIN_SAMPLES:
         from scipy.stats import pearsonr
@@ -286,8 +319,16 @@ def compute_production_health(
     # `meta_model_ic = 0.4634` (Ridge in-sample Pearson) instead of the
     # honest 21d OOS Spearman of 0.166.
     training_ic, training_ic_source = _load_training_ic(bucket)
-    ic_ratio = round(ic_30d / training_ic, 2) if ic_30d is not None and training_ic and training_ic > 0 else None
-    degradation_flag = ic_ratio is not None and ic_ratio < _DEGRADATION_RATIO
+    if champion_scoping_status == "insufficient_champion_samples":
+        # Honest "uncomputable" posture — do NOT silently compute a ratio
+        # whose numerator would still be dominated by a different champion's
+        # rows. This is exactly today's live case: the current champion has
+        # served too few dates for the 21d-horizon outcomes to have resolved.
+        ic_ratio = None
+        degradation_flag = False
+    else:
+        ic_ratio = round(ic_30d / training_ic, 2) if ic_30d is not None and training_ic and training_ic > 0 else None
+        degradation_flag = ic_ratio is not None and ic_ratio < _DEGRADATION_RATIO
 
     # ── Prediction distribution (mode collapse check) ────────────────────────
     direction_counts = df["predicted_direction"].value_counts(normalize=True).to_dict()
@@ -304,6 +345,17 @@ def compute_production_health(
         "regime_ic": regime_ic,
         "training_ic": training_ic,
         "training_ic_source": training_ic_source,
+        # Basis for rolling_30d_ic/ic_ratio/degradation_flag — see the
+        # champion-scoping block above. "ok" = ic_30d is scoped to
+        # champion_version_id's own served rows (n_champion_scoped of them);
+        # "insufficient_champion_samples" = champion resolved but too few
+        # resolved outcomes to trust a ratio (ic_ratio/degradation_flag both
+        # forced to the uncomputable posture, never silently mixed);
+        # "unresolved" = predictions/{date}.json unreadable for every date in
+        # the window, fell back to the unscoped (pre-fix) whole-window IC.
+        "champion_version_id": current_champion_id,
+        "champion_scoping_status": champion_scoping_status,
+        "n_champion_scoped": n_champion_scoped,
         "ic_ratio": ic_ratio,
         "degradation_flag": degradation_flag,
         "prediction_distribution": prediction_distribution,
@@ -335,6 +387,38 @@ _L1_COMPONENT_FIELDS = {
     "volatility": "expected_move",
     "research_calibrator": "research_calibrator_prob",
 }
+
+
+def _load_champion_by_date(
+    bucket: str, dates: list[str], s3_client=None
+) -> dict[str, str | None]:
+    """Return ``{prediction_date: champion_version_id}`` from
+    ``predictor/predictions/{date}.json``'s top-level ``champion_version_id``
+    field, for the champion-scoping join in ``compute_production_health``.
+
+    A separate small per-date S3 GET from ``_load_l1_predictions_for_dates``'s
+    (both read the same artifact) — accepted minor duplication over
+    restructuring the shared fetch, since the two consumers run at different
+    points in ``compute_production_health`` and each already degrades
+    gracefully on a missing/unreadable artifact. A date with a missing or
+    unreadable artifact, or one whose payload lacks the field, maps to
+    ``None`` and is excluded from the champion-scoped subset — never silently
+    treated as belonging to any particular champion.
+    """
+    out: dict[str, str | None] = {}
+    if not dates:
+        return out
+    s3 = s3_client or boto3.client("s3")
+    for d in sorted({str(d) for d in dates if d}):
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=f"predictor/predictions/{d}.json")
+            payload = json.loads(obj["Body"].read())
+        except Exception as e:  # noqa: BLE001 — secondary observability; falls back honestly, see caller
+            log.debug("Champion scoping: predictions/%s.json fetch failed: %s", d, e)
+            out[d] = None
+            continue
+        out[d] = payload.get("champion_version_id")
+    return out
 
 
 def _load_l1_predictions_for_dates(

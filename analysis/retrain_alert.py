@@ -2,9 +2,21 @@
 analysis/retrain_alert.py — Phase 5: Predictor retraining alerts.
 
 Evaluates trigger conditions from Phase 2 (production health, calibration)
-and Phase 3 (feature drift) outputs. When any condition fires, sends an
-alert email explaining why retraining is recommended. Does NOT trigger
-retraining automatically — the weekly cadence continues as-is.
+and Phase 3 (feature drift) outputs. Does NOT trigger retraining
+automatically — the weekly cadence continues as-is regardless of whether any
+condition fires.
+
+Because of that, no trigger below is "actionable now" in the
+policy-observability §7.2 sense (a page is for something that can't wait for
+the next console look) — the already-scheduled Saturday run handles all five
+regardless. So a fired trigger is always recorded as a dashboard fact
+(``retrain_alert_latest.json`` / ``history.jsonl``, written unconditionally);
+it only ALSO emails/pages when it names a condition in
+``_ACTIONABLE_TRIGGERS`` — empty today, since no trigger currently carries a
+decision only Brian can make before Saturday. See ``_ACTIONABLE_TRIGGERS``
+and ``send_retrain_alert`` (measured 2026-09-09: an ic_degradation HIGH page
+fired for a ratio that, per the champion-scoping fix in
+``production_health.py``, wasn't even a valid comparison).
 
 Trigger conditions (any one sufficient):
   1. Production IC degradation: rolling 30d IC < 50% of training IC
@@ -44,6 +56,32 @@ _ECE_THRESHOLD = 0.10
 _MODE_COLLAPSE_THRESHOLD = 0.75
 _MIN_DAYS_BETWEEN_ALERTS = 2  # suppress duplicate alerts from reruns/retries
 _CALIBRATOR_GRACE_DAYS = 30  # skip calibration_breakdown in the N days after a new calibrator deploys
+
+# policy-observability §7.2: "A page is for something actionable now and
+# cannot wait for the next time Brian looks at the console. Everything else
+# goes to the surface." §7.4: an alert class that only informs declares its
+# automated remediation path.
+#
+# NONE of the five trigger conditions evaluated below currently carry an
+# action beyond the ALREADY-SCHEDULED weekly retrain — this module's own
+# docstring says so ("does NOT trigger retraining automatically — the weekly
+# cadence continues as-is"), and the email body it used to always send told
+# Brian exactly that: "the weekly training cadence will retrain the model on
+# the next Saturday pipeline run." An email demanding attention for a fact
+# the schedule was already going to act on is a page with no decision behind
+# it (measured 2026-09-09: an ic_degradation HIGH page fired for exactly
+# this — the current champion had too few resolved outcomes to even compute
+# a real ratio, see the champion-scoping fix above, and even a genuine
+# degradation still just waits for Saturday).
+#
+# `_ACTIONABLE_TRIGGERS` names trigger conditions that DO carry a decision
+# only a human can make right now — e.g. a future "waiting for Saturday has a
+# real, measured cost" case that would justify an early manual retrain.
+# Empty until such a condition exists: `send_retrain_alert` emails only when
+# at least one fired reason's trigger is in this set; every other case is
+# still recorded to S3 (the dashboard fact — always, never gated on this)
+# but does not page.
+_ACTIONABLE_TRIGGERS: set[str] = set()
 
 
 def _calibrator_within_grace(calibration: dict, run_date: str | None = None) -> bool:
@@ -165,6 +203,10 @@ def evaluate_retrain_triggers(
         })
 
     triggered = len(reasons) > 0
+    # See _ACTIONABLE_TRIGGERS docstring: True only when a fired reason names
+    # a condition carrying a decision beyond the already-scheduled weekly
+    # retrain. Gates send_retrain_alert's email/page — never the S3 record.
+    actionable_now = any(r["trigger"] in _ACTIONABLE_TRIGGERS for r in reasons)
 
     if triggered:
         high_count = sum(1 for r in reasons if r["severity"] == "high")
@@ -182,6 +224,7 @@ def evaluate_retrain_triggers(
         "n_triggers": len(reasons),
         "reasons": reasons,
         "summary": summary,
+        "actionable_now": actionable_now,
     }
 
 
@@ -191,7 +234,13 @@ def send_retrain_alert(
     bucket: str,
 ) -> dict:
     """
-    Send alert email and write alert to S3 if triggers fired.
+    Write the alert to S3 (always, when triggered) and email/page ONLY when
+    it is actionable now (policy-observability §7.2/§7.4 — see
+    ``_ACTIONABLE_TRIGGERS``). A triggered-but-not-actionable alert is a
+    recorded dashboard fact, not a page: it still lands in
+    ``retrain_alert_latest.json``/``history.jsonl`` for the console and any
+    downstream consumer, it just doesn't demand attention for a fact the
+    already-scheduled weekly retrain was going to act on regardless.
 
     Suppresses duplicate alerts within _MIN_DAYS_BETWEEN_ALERTS.
     """
@@ -204,10 +253,19 @@ def send_retrain_alert(
         log.info("Retrain alert: suppressed (alerted within %d days)", _MIN_DAYS_BETWEEN_ALERTS)
         return {"sent": False, "reason": "suppressed"}
 
-    # Write alert to S3
+    # Write alert to S3 — the dashboard fact, unconditional on actionability.
     _write_alert_to_s3(alert, bucket)
 
-    # Send email
+    if not alert.get("actionable_now"):
+        log.info(
+            "Retrain alert: informational only (no actionable_now trigger) — "
+            "recorded to S3, not paged: %s",
+            alert.get("summary"),
+        )
+        return {"sent": False, "reason": "informational_dashboard_only", "s3_written": True}
+
+    # Send email — reached only when a trigger carries a decision beyond the
+    # already-scheduled weekly retrain.
     sender = config.get("email_sender")
     recipients = config.get("email_recipients", [])
     if not sender or not recipients:
