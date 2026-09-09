@@ -105,8 +105,17 @@ def compute_veto_value(
             for _, row in shadow.iterrows():
                 if row["intended_dollars"]:
                     shadow_sizes[(row["ticker"], row["date"])] = float(row["intended_dollars"])
-        except Exception:
-            pass
+        except Exception as exc:
+            # (a) executor_shadow_book query failed (bad schema, locked/corrupt
+            # sqlite file, connection error) -- shadow_sizes stays empty and
+            # EVERY row below silently falls back to the uniform
+            # default_position_size, materially changing the dollar_impact
+            # metric with no other signal that it happened.
+            # (c) recorded at WARNING here (alpha-engine-config-I10226).
+            logger.warning(
+                "veto_value: shadow book query failed at %s, falling back to "
+                "default_position_size for all rows: %s", trades_db_path, exc,
+            )
 
     # `actual_alpha` is decimal alpha (decimal log-units for new rows post
     # canonical-21d cutover; arithmetic-decimal for old rows where the

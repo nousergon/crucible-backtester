@@ -8,4 +8,4 @@ pyyaml>=6.0.3
 # Pydantic contract (lib v0.4.0 — pulled in above via the nousergon-lib
 # install). krepis[openai] (which provides the `openai` package this needs)
 # is installed in the Dockerfile alongside nousergon-lib, not here.
-pydantic>=2.13.4
+pydantic>=2.13.5

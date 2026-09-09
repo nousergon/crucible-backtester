@@ -514,6 +514,12 @@ def _load_regime_by_date(bucket: str) -> dict[str, str]:
                 regime = signals.get("market_regime", "neutral")
                 regime_map[date_str] = regime
             except Exception:
+                # (a) a single date's signals.json failed to read/parse
+                # (missing key, malformed JSON) -- that date is simply
+                # skipped, the loop continues over the remaining 60 dates.
+                # (c) no recording surface -- expected-absence-with-fallback,
+                # same class as executor's eod_reconcile.py:751
+                # (alpha-engine-config-I10226).
                 pass
     except Exception as exc:
         log.debug("Failed to load regime data from signals: %s", exc)

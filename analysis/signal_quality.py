@@ -98,7 +98,12 @@ def load_score_performance(db_path: str) -> pd.DataFrame:
                     df.drop(columns=["ticker"], inplace=True, errors="ignore")
                     logger.info("Enriched score_performance with sector from universe_returns (%d mapped)", df["sector"].notna().sum())
             except Exception:
-                pass  # universe_returns may not exist yet
+                # (a) universe_returns sector-enrichment join failed (table
+                # absent, connection error) -- df keeps its pre-join columns.
+                # (c) no recording surface -- carve-out:
+                # expected-absence-with-fallback, universe_returns may not
+                # exist yet (alpha-engine-config-I10226).
+                pass
     finally:
         conn.close()
 
