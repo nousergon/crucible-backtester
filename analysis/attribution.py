@@ -485,6 +485,12 @@ def _resolve_sub_score_columns(df: pd.DataFrame) -> dict[str, str]:
             if explicit:
                 return explicit
         except Exception as e:
+            # (a) sub_scores column expansion failed (unexpected shape,
+            # not actually a dict-like column) -- explicit attribution
+            # columns are unavailable for this run and the caller falls
+            # back to its own default attribution.
+            # (c) no recording surface beyond this DEBUG line -- carve-out:
+            # expected-absence-with-fallback (alpha-engine-config-I10226).
             logger.debug("Could not expand sub_scores column: %s", e)
 
     return {}

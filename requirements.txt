@@ -118,7 +118,20 @@ cvxpy>=1.9.2,<1.10
 # test). Without it the test's `pytest.importorskip` would not skip but ERROR at
 # first validate() (module imports; jsonschema missing) — so the shared-schema
 # gate would never actually run in backtester CI, defeating the cross-repo pin.
-nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.99
+# Bumped 0.124.99 -> 0.124.115 (alpha-engine-config-I10226): the first
+# published nousergon-lib carrying nousergon_lib.testing.debug_swallow_guard
+# (nousergon-lib-PR398, branch nel-i10226-swallows) — the shared AST scanner
+# tests/test_no_debug_only_swallows.py in this repo calls, lifted out of
+# crucible-executor's original detector (alpha-engine-config-I10031,
+# crucible-executor-PR547) on second adoption per policy-shared-code.
+# 0.124.115 is the expected next auto-bumped patch tag (auto-version-bump.yml
+# bumps on every merge to main that touches src/; 0.124.114 was the last
+# published tag when this pin was written). MERGE ORDER: nousergon-lib-PR398
+# merges and publishes FIRST — this repo's CI cannot resolve this pin, and
+# tests/test_no_debug_only_swallows.py cannot import, until it does. If a
+# different nousergon-lib PR merges first and the actual publish lands on a
+# later patch, raise this pin to match.
+nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.115
 # ── Predictor-replay runtime deps (config#3031) ──────────────────────────────
 # synthetic/predictor_backtest.py and analysis/scanner_predictor_research_free_
 # backfill.py import crucible-predictor CODE in-process (sys.path), so THIS

@@ -1,0 +1,166 @@
+# .debug-swallow-allowlist.yaml -- baseline for
+# tests/test_no_debug_only_swallows.py (alpha-engine-config-I10226).
+#
+# The class this guards: an `except Exception` (or a narrower except clause
+# immediately following one, per-site) whose body only records the failure
+# at logger.debug(...) or discards it as a bare `pass` -- invisible on any
+# entrypoint whose root logger runs at INFO (~/Development/CLAUDE.md "Fail
+# loud and fast"). Lifted detector: nousergon_lib.testing.debug_swallow_guard
+# (alpha-engine-config-I10226, mirroring crucible-executor's original
+# .debug-swallow-allowlist.yaml, alpha-engine-config-I10031,
+# crucible-executor-PR547). A new site with no entry fails the build. An
+# entry whose `expires` has passed fails loudly -- re-justify or remove,
+# never silently re-grandfather. An entry that no longer matches anything
+# ALSO fails, so the allowance cannot quietly widen after the site it
+# covered is gone or fixed.
+#
+# `path` + `line` identify the `except` line itself (the line the guard's
+# AST walk reports). Every entry requires a `reason` naming (a) the failure
+# mode swallowed and (c) the concrete recording surface (or the explicit
+# "no recording surface -- carve-out" for a transport/teardown/
+# expected-absence-with-fallback swallow the fleet rule's own carve-out
+# clause covers), per ~/Development/CLAUDE.md "Fail loud and fast."
+#
+# Sweep for alpha-engine-config-I10226: the AST detector found 15 live
+# sites (not the issue's crude 29). Of those 15, 2 were fixed to
+# logger.warning with a named recording surface (analysis/veto_value.py and
+# reporter.py) and no longer appear in the live scan -- see the PR body for
+# both. The remaining 13, listed below, are all genuine
+# transport/teardown/expected-absence-with-fallback carve-outs: none write
+# or gate a durable backtest artifact, result, or manifest, and every
+# multi-source fallback chain here (evaluate.py scoring weights,
+# pipeline_common.py sector_map.json) already terminates in either a
+# validated raise-on-drift chokepoint or a WARNING on full exhaustion.
+
+schema_version: 1
+entries:
+  # ── Diagnostic-enrichment joins (best-effort, columns are optional) ──────
+  - path: analysis/alpha_distribution.py
+    line: 185
+    reason: >-
+      universe_returns sector-enrichment join failed. No recording surface
+      -- carve-out: expected-absence-with-fallback, the join is a
+      diagnostic enrichment (sector-grouped calibration diagnosis), not a
+      required input.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  - path: analysis/alpha_distribution.py
+    line: 204
+    reason: >-
+      macro_snapshots regime-enrichment join failed. No recording surface
+      -- carve-out: expected-absence-with-fallback, same class as the
+      sector join above.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  - path: analysis/attribution.py
+    line: 487
+    reason: >-
+      sub_scores column expansion failed (unexpected shape). No recording
+      surface -- carve-out: expected-absence-with-fallback, caller falls
+      back to its own default attribution.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  - path: analysis/signal_quality.py
+    line: 100
+    reason: >-
+      universe_returns sector-enrichment join failed. No recording surface
+      -- carve-out: expected-absence-with-fallback, universe_returns may
+      not exist yet.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  - path: analysis/production_health.py
+    line: 516
+    reason: >-
+      A single date's signals.json failed to read/parse while building the
+      60-date regime map. No recording surface -- carve-out:
+      expected-absence-with-fallback, that date is skipped and the loop
+      continues, same class as crucible-executor's eod_reconcile.py:751.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  # ── Notification transport (best-effort, never gates the real signal) ────
+  - path: analysis/input_quality.py
+    line: 323
+    reason: >-
+      alert_publisher transport failure. No recording surface --
+      Telegram/notification-transport carve-out (a failed notification
+      must never abort the input-quality gate); raise InputQualityError
+      still fires when enforce=True regardless of this branch.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  - path: backtest.py
+    line: 7326
+    reason: >-
+      publish_ops_alert transport failure on the empty-param-sweep path.
+      No recording surface -- notification-transport carve-out; the
+      condition itself is still visible via the smoke-phase assertion
+      immediately below.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  # ── Optional-dependency import order (arcticdb symbol-resolution guard) ──
+  - path: backtest.py
+    line: 45
+    reason: >-
+      arcticdb not installed in this env. No recording surface --
+      carve-out: expected-absence-with-fallback, arcticdb is optional and
+      every downstream use degrades independently.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  - path: evaluate.py
+    line: 34
+    reason: >-
+      arcticdb not installed in this env. No recording surface --
+      carve-out: expected-absence-with-fallback, same class as
+      backtest.py's identical import-order guard.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  # ── Preference-ordered fallback chains (final source validated/raises) ───
+  - path: evaluate.py
+    line: 1168
+    reason: >-
+      config/scoring_weights.json S3 read/parse failed -- first of three
+      preference-ordered scoring-weight sources. No recording surface --
+      carve-out: expected-absence-with-fallback; the final source
+      (weight_optimizer.configured_default_weights()) is a validated
+      chokepoint that raises ConfigKeyDriftError rather than silently
+      zero-filling.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  - path: pipeline_common.py
+    line: 1391
+    reason: >-
+      sector_map.json miss/read failure at one of two preference-ordered
+      S3 prefixes. No recording surface at this per-attempt DEBUG --
+      carve-out: expected-absence-with-fallback, full exhaustion of both
+      prefixes is already recorded loud at WARNING immediately below.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  # ── Best-effort memory-pool cleanup hint (pyarrow API availability) ──────
+  - path: phase_artifacts.py
+    line: 502
+    reason: >-
+      pa.default_memory_pool().release_unused() unsupported/rejected on
+      this pyarrow version. No recording surface -- carve-out: best-effort
+      memory-pool cleanup hint, older pyarrow versions may not expose this
+      API; the save must not fail on a rejected cleanup hint.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  - path: phase_artifacts.py
+    line: 670
+    reason: >-
+      pa.default_memory_pool().release_unused() unsupported/rejected on
+      this pyarrow version. No recording surface -- carve-out, same class
+      as the identical guard above.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
