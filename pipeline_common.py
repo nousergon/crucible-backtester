@@ -1389,6 +1389,11 @@ def load_sector_map(config: dict) -> dict[str, str] | None:
             resp = s3.get_object(Bucket=bucket, Key=key)
             return json.load(resp["Body"])
         except Exception as e:
+            # (a) sector_map.json miss/read failure at one of two
+            # preference-ordered prefixes. (c) no recording surface at this
+            # per-attempt DEBUG -- carve-out: expected-absence-with-fallback,
+            # full exhaustion of both prefixes IS already recorded loud at
+            # WARNING immediately below (alpha-engine-config-I10226).
             logger.debug(
                 "[pipeline_common] sector_map.json miss at s3://%s/%s: %s",
                 bucket, key, type(e).__name__,
