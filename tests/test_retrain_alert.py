@@ -136,6 +136,35 @@ def test_none_inputs():
     assert result["n_triggers"] == 0
 
 
+# ── actionable_now (policy-observability §7.2/§7.4 severity/routing fix) ────
+
+
+def test_actionable_now_false_when_triggered_by_current_trigger_types():
+    """None of today's five trigger conditions carry a decision beyond the
+    already-scheduled weekly retrain — _ACTIONABLE_TRIGGERS is empty, so a
+    triggered alert must still be non-actionable (dashboard fact, not a
+    page). Regression for the 2026-09-09 ic_degradation HIGH page that
+    demanded attention for a fact the Saturday cadence was already going to
+    act on."""
+    health = {
+        "degradation_flag": True,
+        "ic_ratio": 0.20,
+        "rolling_30d_ic": 0.015,
+        "training_ic": 0.08,
+        "mode_collapse_flag": True,
+        "regime_ic": {"bear": -0.02},
+        "prediction_distribution": {"UP": 0.02, "FLAT": 0.95, "DOWN": 0.03},
+    }
+    result = evaluate_retrain_triggers(health, None, None)
+    assert result["triggered"] is True
+    assert result["actionable_now"] is False
+
+
+def test_actionable_now_false_when_no_triggers():
+    result = evaluate_retrain_triggers(None, None, None)
+    assert result["actionable_now"] is False
+
+
 # ── calibrator grace window ──────────────────────────────────────────────────
 
 def test_calibration_breakdown_suppressed_during_grace():
@@ -223,6 +252,9 @@ def test_send_alert_email(mock_suppress, mock_write, mock_send_email):
         "n_triggers": 1,
         "summary": "RETRAIN RECOMMENDED",
         "reasons": [{"trigger": "ic_degradation", "detail": "IC dropped", "severity": "high"}],
+        # Exercises the email SEND mechanism itself, decoupled from which
+        # trigger types are actionable — see test_actionable_now_gates_email.
+        "actionable_now": True,
     }
     config = {"email_sender": "test@test.com", "email_recipients": ["user@test.com"]}
 
@@ -231,6 +263,33 @@ def test_send_alert_email(mock_suppress, mock_write, mock_send_email):
     assert result["sent"] is True
     mock_send_email.assert_called_once()
     mock_write.assert_called_once()
+
+
+@patch("analysis.retrain_alert.send_email")
+@patch("analysis.retrain_alert._write_alert_to_s3")
+@patch("analysis.retrain_alert._should_suppress", return_value=False)
+def test_send_alert_not_actionable_records_but_does_not_page(mock_suppress, mock_write, mock_send_email):
+    """A triggered alert with actionable_now False (today's normal case —
+    see test_actionable_now_false_when_triggered_by_current_trigger_types)
+    must still write the S3 dashboard fact but must NOT email/page, even
+    with full email config present."""
+    alert = {
+        "triggered": True,
+        "date": "2026-04-07",
+        "n_triggers": 1,
+        "summary": "RETRAIN RECOMMENDED",
+        "reasons": [{"trigger": "ic_degradation", "detail": "IC dropped", "severity": "high"}],
+        "actionable_now": False,
+    }
+    config = {"email_sender": "test@test.com", "email_recipients": ["user@test.com"]}
+
+    result = send_retrain_alert(alert, config, "bucket")
+
+    assert result["sent"] is False
+    assert result["reason"] == "informational_dashboard_only"
+    assert result["s3_written"] is True
+    mock_write.assert_called_once()
+    mock_send_email.assert_not_called()
 
 
 @patch("analysis.retrain_alert._write_alert_to_s3")
@@ -242,6 +301,7 @@ def test_send_alert_no_email_config(mock_suppress, mock_write):
         "n_triggers": 1,
         "summary": "test",
         "reasons": [{"trigger": "test", "detail": "test", "severity": "high"}],
+        "actionable_now": True,
     }
     result = send_retrain_alert(alert, {}, "bucket")
     assert result["sent"] is False

@@ -73,7 +73,7 @@ entries:
     tracking: alpha-engine-config-I10226
 
   - path: analysis/production_health.py
-    line: 516
+    line: 600
     reason: >-
       A single date's signals.json failed to read/parse while building the
       60-date regime map. No recording surface -- carve-out:
