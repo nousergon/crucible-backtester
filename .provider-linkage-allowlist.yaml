@@ -42,3 +42,17 @@ entries:
       appears only inside the test's own denylist, never as a live read.
     expires: "2026-11-27"
     tracking: alpha-engine-config-I9295
+
+  # -- `dist` class, enforcement flip (alpha-engine-config-I10225) --
+
+  - path: requirements.txt
+    pattern: "openai:dist"
+    reason: >-
+      `krepis[openai]>=0.59.53` -- the `openai` extra is krepis's own declared
+      transport dependency for `krepis.dates.resolve_trading_day` and the
+      router edge's OpenAI-compatible wire, pulled in through the router
+      package (per the comment above this line: "krepis[openai] (MIT
+      foundation) -- direct dep for krepis.dates.resolve_trading_day"). No
+      module in this repo imports `openai` directly.
+    expires: "2026-12-07"
+    tracking: alpha-engine-config-I10225
