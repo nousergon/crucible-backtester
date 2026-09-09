@@ -78,7 +78,13 @@ def _section_data_accumulation(signal_quality: dict, config: dict) -> list[str]:
 
         conn.close()
     except Exception as e:
-        logger.debug("Data accumulation section failed: %s", e)
+        # (a) the entire "Data Accumulation" section query failed (missing
+        # table, locked/corrupt sqlite file, schema drift) -- the section is
+        # silently omitted from the generated report with the only trace at
+        # DEBUG, indistinguishable from a report that legitimately has
+        # nothing to say here.
+        # (c) recorded at WARNING here (alpha-engine-config-I10226).
+        logger.warning("Data accumulation section failed: %s", e)
         return []
 
     def _bar(current: int, target: int) -> str:

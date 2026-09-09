@@ -43,6 +43,9 @@ Options:
 try:  # noqa: SIM105
     import arcticdb  # noqa: F401
 except Exception:  # pragma: no cover - arcticdb optional in some envs
+    # (a) arcticdb not installed in this env. (c) no recording surface --
+    # carve-out: expected-absence-with-fallback, arcticdb is optional and
+    # every downstream use degrades independently (alpha-engine-config-I10226).
     pass
 
 import argparse
@@ -7321,6 +7324,12 @@ def _main_impl() -> None:
                         source="alpha-engine-backtester/backtest.py",
                     )
                 except Exception:  # noqa: BLE001 — alert is best-effort observability
+                    # (a) publish_ops_alert transport failure. (c) no
+                    # recording surface -- notification-transport carve-out,
+                    # same class as executor's Telegram swallows; the
+                    # empty-param-sweep condition itself is still visible
+                    # via the smoke-phase assertion immediately below
+                    # (alpha-engine-config-I10226).
                     pass
                 # I6043 sibling sweep: smoke-side only — tighten the
                 # production WARN-and-continue into a hard fail.
