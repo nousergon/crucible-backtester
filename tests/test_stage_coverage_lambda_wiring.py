@@ -120,7 +120,7 @@ class TestModuleAbsentDegradesLoudlyNotSilently:
         name, mod, cfg = handler_case
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)):
-            result = mod.handler({}, context=None)
+            result = mod.handler({"run_date": "2026-09-04"}, context=None)
         # Handler's own status/summary contract is unaffected by the
         # absent module — this IS the observe-mode degrade contract.
         assert result["status"] == "OK"
@@ -131,7 +131,7 @@ class TestModuleAbsentDegradesLoudlyNotSilently:
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)), \
              patch.object(mod.logger, "error") as mock_error:
-            mod.handler({}, context=None)
+            mod.handler({"run_date": "2026-09-04"}, context=None)
         assert mock_error.called, (
             f"{name}: ImportError for krepis.stage_coverage must be "
             f"logged (logger.error), not silently passed"
@@ -143,7 +143,7 @@ class TestModuleAbsentDegradesLoudlyNotSilently:
         name, mod, cfg = handler_case
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)):
-            result = mod.handler({}, context=None)
+            result = mod.handler({"run_date": "2026-09-04"}, context=None)
         assert "stage_coverage" not in result
 
 
@@ -191,7 +191,7 @@ class TestModulePresentVerdictLandsInPayload:
         name, mod, cfg = handler_case
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)):
-            result = mod.handler({}, context=None)
+            result = mod.handler({"run_date": "2026-09-04"}, context=None)
         assert "stage_coverage" in result, f"{name}: verdict did not land in the returned payload"
         assert result["stage_coverage"]["stage"] == cfg["sf_stage"]
         assert result["stage_coverage"]["status"] == "COVERED"
@@ -200,7 +200,7 @@ class TestModulePresentVerdictLandsInPayload:
         name, mod, cfg = handler_case
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)):
-            mod.handler({}, context=None)
+            mod.handler({"run_date": "2026-09-04"}, context=None)
         assert len(fake_stage_coverage_module) == 1
         assert fake_stage_coverage_module[0]["stage"] == cfg["sf_stage"]
 
@@ -209,26 +209,71 @@ class TestModulePresentVerdictLandsInPayload:
         before = datetime.now(timezone.utc)
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)):
-            mod.handler({}, context=None)
+            mod.handler({"run_date": "2026-09-04"}, context=None)
         after = datetime.now(timezone.utc)
         window_start = fake_stage_coverage_module[0]["window_start"]
         assert window_start.tzinfo is not None
         assert before <= window_start <= after
 
-    def test_run_date_derived_from_end_time_iso_when_present(self, handler_case, fake_stage_coverage_module):
-        name, mod, cfg = handler_case
-        with patch.object(mod, "_ensure_init"), \
-             patch(cfg["compute_target"], return_value=_ok_summary(name)):
-            mod.handler({"end_time_iso": "2026-05-09T00:00:00Z"}, context=None)
-        assert fake_stage_coverage_module[0]["run_date"] == "2026-05-09"
+    def test_the_sf_threaded_run_date_beats_the_execution_start_time(
+        self, handler_case, fake_stage_coverage_module,
+    ):
+        """alpha-engine-config-I10171, the defect in one test.
 
-    def test_run_date_falls_back_to_now_when_end_time_absent(self, handler_case, fake_stage_coverage_module):
+        `end_time_iso` is `$$.Execution.StartTime` — the CALENDAR date —
+        while `$.run_date` is the cycle's TRADING day. On the Saturday
+        2026-09-05 cycle for trading day 2026-09-04, keying on the calendar
+        date wrote the verdict to `_stage_coverage/2026-09-05/`, which no
+        reader consults once the dual-partition fallback expired that same
+        day. `run_date` must win whenever the SF threads it.
+        """
         name, mod, cfg = handler_case
-        today = datetime.now(timezone.utc).date().isoformat()
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)):
-            mod.handler({}, context=None)
-        assert fake_stage_coverage_module[0]["run_date"] == today
+            result = mod.handler(
+                {"end_time_iso": "2026-09-05T06:00:00Z", "run_date": "2026-09-04"},
+                context=None,
+            )
+        assert fake_stage_coverage_module[0]["run_date"] == "2026-09-04"
+        assert result["stage_coverage"]["run_date_source"] == "event.run_date"
+        assert "run_date_fallback_reason" not in result["stage_coverage"]
+
+    def test_end_time_iso_is_a_recorded_fallback_not_a_silent_one(
+        self, handler_case, fake_stage_coverage_module, caplog,
+    ):
+        """The pre-step-(1) live Payload shape: no `run_date` on the event.
+        The handler still records a verdict — an off-cycle operator
+        invocation is legitimate — but it says WHICH field it used, and
+        warns. A fallback nobody can see afterwards is the defect itself."""
+        import logging
+
+        name, mod, cfg = handler_case
+        with caplog.at_level(logging.WARNING), \
+             patch.object(mod, "_ensure_init"), \
+             patch(cfg["compute_target"], return_value=_ok_summary(name)):
+            result = mod.handler({"end_time_iso": "2026-05-09T00:00:00Z"}, context=None)
+        assert fake_stage_coverage_module[0]["run_date"] == "2026-05-09"
+        assert result["stage_coverage"]["run_date_source"] == "fallback:event.end_time_iso"
+        assert result["stage_coverage"]["run_date_fallback_reason"]
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_no_fabricated_date_when_no_identity_is_on_the_event(
+        self, handler_case, fake_stage_coverage_module,
+    ):
+        """alpha-engine-config-I8155's forbidden class, live in this repo
+        until now: `(end_time or _started)` substituted the Lambda's OWN
+        wall-clock for a genuinely-absent execution identity, filing a
+        verdict against a date no execution ever named. A missing identity
+        must record UNMEASURED, never a substitute."""
+        name, mod, cfg = handler_case
+        with patch.object(mod, "_ensure_init"), \
+             patch(cfg["compute_target"], return_value=_ok_summary(name)):
+            result = mod.handler({}, context=None)
+        assert result["stage_coverage"]["status"] == "UNMEASURED"
+        assert result["stage_coverage"]["reason"]
+        assert fake_stage_coverage_module == [], (
+            "a verdict was filed against a fabricated date"
+        )
 
     def test_verdict_call_does_not_raise_on_error_status_path(self, handler_case, fake_stage_coverage_module):
         """The assertion sits after the try/except around compute_and_emit*
@@ -237,7 +282,7 @@ class TestModulePresentVerdictLandsInPayload:
         name, mod, cfg = handler_case
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], side_effect=RuntimeError("boom")):
-            result = mod.handler({}, context=None)
+            result = mod.handler({"run_date": "2026-09-04"}, context=None)
         assert result["status"] == "ERROR"
         assert "stage_coverage" not in result
         assert fake_stage_coverage_module == []
@@ -328,7 +373,7 @@ class TestDryRunNeverAssertsCoverage:
         name, mod, cfg = handler_case
         with patch.object(mod, "_ensure_init"), \
              patch(cfg["compute_target"], return_value=_ok_summary(name)):
-            mod.handler({}, context=None)
+            mod.handler({"run_date": "2026-09-04"}, context=None)
         assert len(fake_stage_coverage_module) == 1
         assert fake_stage_coverage_module[0]["stage"] == cfg["sf_stage"]
 
