@@ -104,6 +104,13 @@ CONCORDANCE_WRITE_RESERVE_S = 45.0
 # was sized on an assumed 3-5s, which is why it could never bind.
 CONCORDANCE_MIN_ITEM_ESTIMATE_S = 30.0
 
+# Bounds the backward S3 scan that names, in the empty-corpus alert, the last
+# dated prefix that actually matched `agent_filter` — a diagnostic aid, never
+# on the hot path (only runs when the configured window found zero
+# candidates). ~13 months caps the worst case for a filter that has been
+# stale a long time rather than scanning to the corpus's epoch.
+EMPTY_CORPUS_ALERT_LOOKBACK_DAYS = 400
+
 
 def _next_item_affordable(remaining_s, latencies_ms: list[int]) -> tuple[bool, float]:
     """Can another replay finish before the deadline?
@@ -192,6 +199,204 @@ def _agent_id_base_from_key(key: str) -> Optional[str]:
         return None
     full_id = parts[-2]
     return full_id.split(":", 1)[0]
+
+
+_META_SUBTREE_SKIP = (
+    "eval", "eval_judge_only", "analysis", "cost", "cost_raw",
+    "replay", "replay_summary",
+)
+
+
+def _day_matches_agent_filter(
+    s3: Any, *, bucket: str, capture_prefix: str, day: datetime,
+    agent_filter: list[str] | None,
+) -> bool:
+    """True if the dated prefix for `day` holds a production capture that
+    matches `agent_filter`. Shared by the window lister's per-day skip
+    logic and the empty-corpus lookback below, so the two never drift on
+    what counts as a "production capture"."""
+    prefix = (
+        f"{capture_prefix}/{day.strftime('%Y')}/"
+        f"{day.strftime('%m')}/{day.strftime('%d')}/"
+    )
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".json"):
+                continue
+            if any(f"/_{p}/" in key for p in _META_SUBTREE_SKIP):
+                continue
+            if agent_filter:
+                base_id = _agent_id_base_from_key(key)
+                if base_id is None or base_id not in agent_filter:
+                    continue
+            return True
+    return False
+
+
+def _find_last_matching_dated_prefix(
+    s3: Any,
+    *,
+    bucket: str,
+    capture_prefix: str,
+    before_date: datetime,
+    agent_filter: list[str] | None,
+    max_lookback_days: int = EMPTY_CORPUS_ALERT_LOOKBACK_DAYS,
+) -> Optional[str]:
+    """Scan backward day-by-day from `before_date` for the most recent
+    dated prefix under `capture_prefix` holding an artifact matching
+    `agent_filter`.
+
+    Diagnostic only, and called ONLY when the configured trailing window
+    found zero candidates (`compute_and_emit_concordance`) — this is what
+    lets the resulting alert name *which* filter went stale and *when* it
+    last matched, rather than just asserting that it did. Bounded by
+    `max_lookback_days` so a permanently-empty corpus costs a fixed number
+    of List calls, not an unbounded scan back to the bucket's epoch.
+    Returns ``None`` (not raise) on any listing failure or exhausted
+    lookback — this must never be the reason the run fails, only the
+    reason the alert is a little less specific.
+    """
+    for day_offset in range(max_lookback_days):
+        day = before_date - timedelta(days=day_offset)
+        try:
+            if _day_matches_agent_filter(
+                s3, bucket=bucket, capture_prefix=capture_prefix,
+                day=day, agent_filter=agent_filter,
+            ):
+                return (
+                    f"{capture_prefix}/{day.strftime('%Y')}/"
+                    f"{day.strftime('%m')}/{day.strftime('%d')}/"
+                )
+        except Exception as exc:  # noqa: BLE001 — diagnostic scan, never fatal
+            logger.warning(
+                "[batch_replay] empty-corpus lookback: listing failed for "
+                "day=%s: %s", day.date().isoformat(), exc,
+            )
+            return None
+    return None
+
+
+def _publish_empty_corpus_alert(
+    *, agent_filter: list[str] | None, window_days: int,
+    last_matching_prefix: Optional[str],
+) -> None:
+    """Ops alert: the configured trailing window matched zero candidate
+    artifacts this run.
+
+    Severity WARNING, not ERROR — a zero-candidate corpus is now a
+    correctly-observed, non-failing run (see
+    `_emit_zero_call_cost_record` — the stage still emits a cost record
+    saying so, closing the fan-in coverage gap this exists alongside).
+    But an `agent_filter` that has gone stale is a finding an operator
+    should see once, not a fact buried in an INFO log line nobody reads
+    until a downstream check trips on it two stages later — which is
+    exactly the 2026-09-12 incident this guards against
+    (alpha-engine-config-I7183).
+    """
+    try:
+        from ops_alerts import publish_ops_alert
+    except Exception as exc:  # noqa: BLE001 — alerting must not break the run
+        logger.warning(
+            "[batch_replay] could not import ops_alerts for empty-corpus "
+            "alert: %s", exc,
+        )
+        return
+    last = last_matching_prefix or (
+        f"(none found in the trailing {EMPTY_CORPUS_ALERT_LOOKBACK_DAYS}-day "
+        f"lookback)"
+    )
+    message = (
+        "ReplayConcordance: zero-candidate corpus\n"
+        f"agent_filter={agent_filter} matched no decision_artifacts in the "
+        f"trailing {window_days}-day window. Last dated prefix with a "
+        f"match: {last}. The replay stage now legitimately makes zero "
+        "model calls every run until agent_filter is repointed at the "
+        "current producer or the stage is retired."
+    )
+    try:
+        publish_ops_alert(
+            message,
+            severity="warning",
+            source="crucible-backtester/replay/batch.py::compute_and_emit_concordance",
+            dedup_key="replay_concordance_empty_corpus",
+            dedup_window_min=10080,  # once per weekly cadence
+        )
+    except Exception as exc:  # noqa: BLE001 — alerting must not break the run
+        logger.warning(
+            "[batch_replay] empty-corpus ops alert publish failed: %s", exc,
+        )
+
+
+def _emit_zero_call_cost_record(target_model: str, target_spec: Any) -> None:
+    """Hand the cost sink one record saying this producer legitimately made
+    zero calls this run.
+
+    ``AggregateCosts``' fan-in check derives its observed-producers set
+    from S3 KEY NAMES under the ``_cost_raw/`` prefix, never from row
+    content (``crucible-research/scripts/cost_coverage.py::
+    observed_producers``), so a record here — priced at zero, marked
+    ``producer_ran_no_calls`` — makes ``replay-concordance`` observed the
+    same way a real call would, without pretending any spend occurred.
+
+    Root cause this exists for: the six-team ``agent_filter`` this module
+    defaults to (sector_quant, sector_qual, sector_peer_review,
+    macro_economist, ic_cio, thesis_update) matched its last artifact
+    2026-07-11 (config-I1580 retired those agents 2026-07-20); every
+    later run legitimately makes zero LLM calls, the sink never receives
+    a real cost row, and the fan-in check read a correctly-silent stage
+    identically to one that swallowed its records — the FAILED weekly SF
+    of 2026-09-12 (alpha-engine-config-I7183).
+
+    Built by hand rather than through ``krepis.cost.record_llm_call`` —
+    that function prices an actual provider response object, and there is
+    no call here to price. The record still carries the columns a real
+    row carries (zeroed) plus an explicit ``event`` marker, so a reader
+    can tell "ran, priced at zero" apart from "ran, lost its records" (the
+    I7179/I7423 shape) without inferring it from an absent token count.
+
+    Never raises — a telemetry fault must not take down the work it
+    measures, the same contract every other cost-sink call site in krepis
+    keeps.
+    """
+    try:
+        from krepis.cost import COST_RECORD_SCHEMA_VERSION
+        from krepis.cost_sink import default_sink_from_env
+
+        sink = default_sink_from_env()
+        if sink is None:
+            return  # no sink configured (local/test/dev run) — nothing to emit
+        provider = getattr(target_spec, "provider", None) or "unknown"
+        model_name = getattr(target_spec, "model", None) or target_model
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "callsite_id": "replay-concordance",
+            "agent_id": "replay-concordance",
+            "provider": provider,
+            "model": model_name,
+            "model_name": model_name,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_create_tokens": 0,
+            "cache_create_1h_tokens": 0,
+            "cost_usd": 0.0,
+            "cost_source": "producer_ran_no_calls",
+            "event": "producer_ran_no_calls",
+            "n_calls": 0,
+            "schema_version": COST_RECORD_SCHEMA_VERSION,
+        }
+        sink(record)
+        logger.info(
+            "[batch_replay] emitted zero-call cost record target=%s "
+            "provider=%s (producer_ran_no_calls)", target_model, provider,
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry must not break the run
+        logger.error(
+            "[batch_replay] failed to emit zero-call cost record for "
+            "target=%s: %s", target_model, exc,
+        )
 
 
 # ── Per-group aggregation ────────────────────────────────────────────────
@@ -436,6 +641,31 @@ def compute_and_emit_concordance(
         target_models, len(keys), agent_filter,
     )
 
+    if not dry_run and len(keys) == 0:
+        # Empty corpus is a finding about the filter, not a quiet cycle —
+        # log + alert once here rather than let it surface only when the
+        # fan-in check trips two stages later (alpha-engine-config-I7183).
+        logger.error(
+            "[batch_replay] zero-candidate corpus: agent_filter=%s matched "
+            "no artifact in the trailing %d-day window ending %s. This "
+            "stage will legitimately make zero model calls this run.",
+            agent_filter, window_days, end.isoformat(),
+        )
+        try:
+            last_prefix = _find_last_matching_dated_prefix(
+                s3, bucket=bucket, capture_prefix=capture_prefix,
+                before_date=window_start, agent_filter=agent_filter,
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostic only
+            logger.warning(
+                "[batch_replay] last-matching-prefix lookback raised: %s", exc,
+            )
+            last_prefix = None
+        _publish_empty_corpus_alert(
+            agent_filter=agent_filter, window_days=window_days,
+            last_matching_prefix=last_prefix,
+        )
+
     if dry_run:
         # A dry run RESOLVES every target, and never raises doing it.
         #
@@ -533,6 +763,13 @@ def compute_and_emit_concordance(
             target_route.get("route"), target_route.get("exec_context"),
             route_is_degraded(target_route),
         )
+
+        if len(keys) == 0:
+            # This target makes zero calls this run (see the empty-corpus
+            # log+alert above). Emit the zero-call cost record now, per
+            # target, so the fan-in check observes `replay-concordance`
+            # even though the loop below is a no-op for an empty `keys`.
+            _emit_zero_call_cost_record(target_model, target_spec)
 
         # Group observations by agent_id_base.
         observations_by_agent: dict[str, list[float]] = defaultdict(list)
