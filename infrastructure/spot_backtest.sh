@@ -92,9 +92,9 @@ BRANCH="${BRANCH:-main}"
 # THIS LAUNCHER's Evaluator invocation hit InsufficientInstanceCapacity
 # for c5.large in subnet-e07166ec / us-east-1f).
 #
-# CORRECTED 2026-08-13 (alpha-engine-config-I7216): this set is 4 GB, 8 GB,
-# 4 GB, 4 GB, and this comment used to call those types "equivalent for the
-# backtester (memory-bound)". A memory-bound job's instance types are not
+# CORRECTED 2026-08-13 (alpha-engine-config-I7216): this set is six 4 GB types
+# followed by one 8 GB type (m5.large), and this comment used to call them all
+# "equivalent for the backtester (memory-bound)". A memory-bound job's instance types are not
 # equivalent across a 2x RAM spread — that pairing made the launcher's memory
 # budget depend on which spot capacity pool answered, so an OOM presented as
 # intermittent flakiness. Every mode that actually needs memory now sets its
@@ -102,7 +102,18 @@ BRANCH="${BRANCH:-main}"
 # the capacity-resilient default for modes with no floor, and must not be
 # read as a statement that its members are interchangeable under memory
 # pressure.
-INSTANCE_TYPES="${INSTANCE_TYPES:-c5.large,m5.large,c6i.large,c5a.large}"
+# ORDER IS LOAD-BEARING, current-generation-first (alpha-engine-config-I11412).
+# krepis.ec2_spot.launch walks types x subnets IN ORDER, and launch_with_fallback
+# buys the FIRST entry on the on-demand rung, so the head of this list is both
+# where spot launches concentrate and what an escalation is billed as. August
+# 2026: 456.8 on-demand BoxUsage:c5.large hours alongside 489.0 spot hours, a 48%
+# escalation rate, because c5.large led. c6a/c7a/c7i were granted by
+# nous-ergon-ops-PR1388 (2 vCPU / 4096 MiB / x86_64, verified against
+# ec2:DescribeInstanceTypes); they add an AMD gen6 and a two-vendor gen7 rung, so
+# the rotation now spans three generations and two silicon vendors instead of
+# exhausting four gen5/gen6 pools and escalating. m5.large stays LAST: it is the
+# only 8 GiB member and the only non-c family here.
+INSTANCE_TYPES="${INSTANCE_TYPES:-c6i.large,c6a.large,c7i.large,c7a.large,c5.large,c5a.large,m5.large}"
 INSTANCE_TYPE=""  # backward-compat: --instance-type X collapses INSTANCE_TYPES to single value
 AMI_ID="ami-0c421724a94bba6d6"      # Amazon Linux 2023 x86_64
 # Spot-side watchdog budget: backtester's 10y simulate + param sweep
@@ -724,7 +735,7 @@ pre_launch_preflight
 # Adding a type is a two-PR change: the declared file first, this constant
 # second. Without this check the operator sees an opaque UnauthorizedOperation
 # from RunInstances and nothing naming the list that refused it.
-ALLOWED_INSTANCE_TYPES="c5.2xlarge,c5.large,c5.xlarge,c5a.large,c6i.2xlarge,c6i.large,c6i.xlarge,m5.large,m5.xlarge,m5a.large,m5a.xlarge,m6i.large,m6i.xlarge,r5.large,r5a.large,r6i.large"
+ALLOWED_INSTANCE_TYPES="c5.2xlarge,c5.large,c5.xlarge,c5a.large,c6a.large,c6i.2xlarge,c6i.large,c6i.xlarge,c7a.large,c7i.large,m5.large,m5.xlarge,m5a.large,m5a.xlarge,m6i.large,m6i.xlarge,r5.large,r5a.large,r6i.large"
 
 # Refuse, before any AWS call, a type IAM will refuse. Placed at the single
 # krepis.ec2_spot chokepoint rather than at argument parsing so that every
