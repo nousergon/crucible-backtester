@@ -236,3 +236,65 @@ def test_config_overrides(tmp_path):
     assert tight["decision_reversal"]["n_reversals"] == 0
     loose = compute_behavioral_anomaly(db, config={"reversal_window_days": 7})
     assert loose["decision_reversal"]["n_reversals"] == 1
+
+
+# ── alpha-engine-config-I11506: the executor's snapshot shape ──────────────
+
+
+def _dict_snap(*pairs):
+    """The shape the executor actually persists: {ticker: {market_value, ...}}
+    (executor/eod_reconcile.py → trade_logger.log_eod)."""
+    return {t: {"shares": 1, "market_value": mv, "sector": "X"} for t, mv in pairs}
+
+
+def test_state_drift_reads_the_executor_dict_snapshot(tmp_path):
+    db = str(tmp_path / "trades.db")
+    _build_trades_db(db, eod_rows=[
+        ("2026-06-01", _dict_snap(("AAPL", 50.0), ("MSFT", 50.0))),
+        ("2026-06-02", _dict_snap(("AAPL", 50.0), ("NVDA", 50.0))),
+        ("2026-06-03", _dict_snap(("AAPL", 50.0), ("NVDA", 50.0))),
+    ])
+    out = compute_behavioral_anomaly(db)["portfolio_state_drift"]
+    assert out["status"] == "ok"
+    assert out["n_unparseable"] == 0
+    assert out["max_daily_drift"] == pytest.approx(0.5)
+
+
+def test_flat_book_is_not_unparseable(tmp_path):
+    db = str(tmp_path / "trades.db")
+    _build_trades_db(db, eod_rows=[
+        ("2026-06-01", {}),
+        ("2026-06-02", _dict_snap(("AAPL", 100.0))),
+        ("2026-06-03", _dict_snap(("AAPL", 100.0))),
+    ])
+    out = compute_behavioral_anomaly(db)["portfolio_state_drift"]
+    assert out["status"] == "ok"
+    assert out["n_unparseable"] == 0
+    assert out["n_empty_book"] == 1
+
+
+def test_all_rows_unparseable_is_a_named_status(tmp_path):
+    db = str(tmp_path / "trades.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE trades (trade_id INTEGER PRIMARY KEY, ticker TEXT, date TEXT, action TEXT, entry_trade_id INTEGER, realized_alpha_pct REAL, slippage_vs_signal REAL)")
+    conn.execute("CREATE TABLE eod_pnl (date TEXT PRIMARY KEY, positions_snapshot TEXT)")
+    for d in ("2026-06-01", "2026-06-02", "2026-06-03"):
+        conn.execute("INSERT INTO eod_pnl VALUES (?, 'not json')", (d,))
+    conn.commit()
+    conn.close()
+    out = compute_behavioral_anomaly(db)["portfolio_state_drift"]
+    assert out["status"] == "snapshots_unparseable"
+    assert "3/3" in out["reason"]
+
+
+def test_top_level_is_degraded_when_any_component_measured_nothing(tmp_path):
+    """The rehearsal graded the whole suite ok because ONE component was ok."""
+    db = str(tmp_path / "trades.db")
+    _build_trades_db(db, eod_rows=[
+        ("2026-06-01", _dict_snap(("AAPL", 50.0), ("MSFT", 50.0))),
+        ("2026-06-02", _dict_snap(("AAPL", 50.0), ("NVDA", 50.0))),
+    ])
+    out = compute_behavioral_anomaly(db)
+    assert out["portfolio_state_drift"]["status"] == "ok"
+    assert out["status"] == "degraded"
+    assert "decision_reversal=insufficient_data" in out["degraded_reason"]

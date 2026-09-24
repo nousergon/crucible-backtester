@@ -31,7 +31,7 @@ Data sources: trades table + eod_pnl table in trades.db (downloaded from
 S3 at runtime), score_performance in research.db — mirroring
 ``exit_timing.py`` / ``barrier_coherence.py``.
 
-Output contract: dict with top-level ``status`` ("ok" | "insufficient_data"
+Output contract: dict with top-level ``status`` ("ok" | "degraded" | "insufficient_data"
 | "error") and one sub-dict per component, each with its own status —
 ALWAYS-EMIT in reporter.py (the evaluator distinguishes "didn't persist"
 from "ran, no data").
@@ -200,24 +200,47 @@ def _compute_cost_adjusted_quality(conn: sqlite3.Connection, drag_threshold: flo
 # ── 4. portfolio-state drift ────────────────────────────────────────────────
 
 
+#: Sentinel for a snapshot that parsed but holds no priced position (a flat
+#: book). Distinct from ``None`` (unparseable): a flat day is a measured state.
+EMPTY_BOOK: dict[str, float] = {}
+
+
 def _weights_from_snapshot(raw: str) -> dict[str, float] | None:
+    """Market-value weights of one ``eod_pnl.positions_snapshot``.
+
+    The executor persists the snapshot as a ``{ticker: {market_value, ...}}``
+    OBJECT (``executor/eod_reconcile.py`` → ``trade_logger.log_eod``). This
+    parser used to accept only a list of ``{ticker, market_value}`` records,
+    so every production row read as unparseable — 136/136 on the 2026-09-23
+    rehearsal (alpha-engine-config-I11506). Both shapes are accepted.
+
+    Returns ``None`` when unparseable, :data:`EMPTY_BOOK` when the snapshot
+    parsed but holds no position with a positive market value.
+    """
     try:
         positions = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
-    if not isinstance(positions, list):
+    if isinstance(positions, dict):
+        items = [
+            (ticker, pos) for ticker, pos in positions.items()
+            if isinstance(pos, dict)
+        ]
+    elif isinstance(positions, list):
+        items = [
+            (pos.get("ticker") or pos.get("symbol"), pos) for pos in positions
+            if isinstance(pos, dict)
+        ]
+    else:
         return None
-    mvs = {}
-    for pos in positions:
-        if not isinstance(pos, dict):
-            continue
-        ticker = pos.get("ticker") or pos.get("symbol")
+    mvs: dict[str, float] = {}
+    for ticker, pos in items:
         mv = pos.get("market_value")
         if ticker and isinstance(mv, (int, float)) and mv > 0:
             mvs[ticker] = mvs.get(ticker, 0.0) + float(mv)
     total = sum(mvs.values())
     if total <= 0:
-        return None
+        return EMPTY_BOOK
     return {t: v / total for t, v in mvs.items()}
 
 
@@ -231,11 +254,17 @@ def _compute_state_drift(conn: sqlite3.Connection, spike_threshold: float) -> di
         return {"status": "insufficient_data", "n_snapshots": int(len(snaps))}
 
     n_unparseable = 0
+    n_empty = 0
     series: list[tuple[str, dict[str, float]]] = []
     for _, row in snaps.iterrows():
         w = _weights_from_snapshot(row["positions_snapshot"])
         if w is None:
             n_unparseable += 1
+            continue
+        if not w:
+            # Flat book: no weight vector to diff against. Skipped, but
+            # counted separately — it is not a parse failure.
+            n_empty += 1
             continue
         series.append((row["date"], w))
     if n_unparseable:
@@ -243,9 +272,18 @@ def _compute_state_drift(conn: sqlite3.Connection, spike_threshold: float) -> di
             "behavioral_anomaly: %d/%d positions_snapshot rows unparseable (skipped)",
             n_unparseable, len(snaps),
         )
+    if n_unparseable == len(snaps):
+        # Every row failed to parse: the component measured nothing. Say so
+        # in the status, never as a quiet skip (alpha-engine-config-I11506).
+        return {
+            "status": "snapshots_unparseable",
+            "reason": f"{n_unparseable}/{len(snaps)} positions_snapshot rows unparseable",
+            "n_snapshots": int(len(snaps)),
+            "n_unparseable": n_unparseable,
+        }
     if len(series) < 2:
         return {"status": "insufficient_data", "n_snapshots": int(len(snaps)),
-                "n_unparseable": n_unparseable}
+                "n_unparseable": n_unparseable, "n_empty_book": n_empty}
 
     drifts = []
     for (d_prev, w_prev), (d_cur, w_cur) in zip(series, series[1:]):
@@ -259,6 +297,7 @@ def _compute_state_drift(conn: sqlite3.Connection, spike_threshold: float) -> di
         "status": "ok",
         "n_days": int(len(drifts)),
         "n_unparseable": n_unparseable,
+        "n_empty_book": n_empty,
         "median_daily_drift": round(float(vals.median()), 4),
         "max_daily_drift": round(float(vals.max()), 4),
         "spike_threshold": spike_threshold,
@@ -319,12 +358,22 @@ def compute_behavioral_anomaly(
     finally:
         conn.close()
 
-    statuses = [c.get("status") for c in components.values()]
-    if any(s == "ok" for s in statuses):
+    statuses = {name: c.get("status") for name, c in components.items()}
+    not_ok = sorted(name for name, s in statuses.items() if s != "ok")
+    if not not_ok:
         status = "ok"
-    elif any(s == "error" for s in statuses):
+    elif len(not_ok) < len(statuses):
+        # Some components measured, some did not. "ok" would hide the
+        # ones that ran on nothing (alpha-engine-config-I11506).
+        status = "degraded"
+    elif any(s == "error" for s in statuses.values()):
         status = "error"
     else:
         status = "insufficient_data"
 
-    return {"status": status, **components}
+    out = {"status": status, **components}
+    if not_ok and status != "ok":
+        out["degraded_reason"] = "; ".join(
+            f"{name}={statuses[name]}" for name in not_ok
+        )
+    return out

@@ -528,7 +528,8 @@ class TestRegressionGuards:
         mock_rb.assert_not_called()
 
     @patch("optimizer.regression_monitor.rollback_all")
-    @patch("optimizer.regression_monitor._refresh_baseline_from_current")
+    @patch("optimizer.regression_monitor._refresh_baseline_from_prior_run",
+           return_value="config/metrics_history/2605091200.json")
     @patch("optimizer.regression_monitor._load_baseline")
     def test_d_stale_baseline_skipped_and_refreshed(
         self, mock_load, mock_refresh, mock_rb,
@@ -556,7 +557,8 @@ class TestRegressionGuards:
         mock_rb.assert_not_called()
 
     @patch("optimizer.regression_monitor.rollback_all")
-    @patch("optimizer.regression_monitor._refresh_baseline_from_current")
+    @patch("optimizer.regression_monitor._refresh_baseline_from_prior_run",
+           return_value="config/metrics_history/2605091200.json")
     @patch("optimizer.regression_monitor._load_baseline")
     def test_d2_custom_max_age_respected(
         self, mock_load, mock_refresh, mock_rb,
@@ -602,3 +604,102 @@ class TestRegressionGuards:
         assert result["regression_detected"] is False
         assert result["rollback_triggered"] is False
         mock_rb.assert_not_called()
+
+
+# ── alpha-engine-config-I11506: a stale baseline is DEGRADED and is never ──
+# ── rebuilt from the metrics under test ───────────────────────────────────
+
+
+class _MetricsHistoryS3:
+    """Fake S3 over config/metrics_history/ with pagination."""
+
+    def __init__(self, snapshots: dict[str, dict], page_size: int = 2):
+        self.objects = {k: json.dumps(v).encode() for k, v in snapshots.items()}
+        self.page_size = page_size
+        self.puts: list[dict] = []
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
+        keys = sorted(k for k in self.objects if k.startswith(Prefix))
+        start = int(ContinuationToken or 0)
+        page = keys[start:start + self.page_size]
+        resp = {"Contents": [{"Key": k} for k in page]}
+        if start + self.page_size < len(keys):
+            resp["IsTruncated"] = True
+            resp["NextContinuationToken"] = str(start + self.page_size)
+        return resp
+
+    def get_object(self, Bucket, Key):
+        return {"Body": MagicMock(read=lambda b=self.objects[Key]: b)}
+
+    def put_object(self, **kw):
+        self.puts.append(kw)
+
+
+_HISTORY = {
+    "config/metrics_history/2609051200.json": {"run_date": "2026-09-05", "sortino_ratio": 0.9},
+    "config/metrics_history/2609121200.json": {"run_date": "2026-09-12", "sortino_ratio": 0.8},
+    # the run under test: already saved by save_rolling_metrics
+    "config/metrics_history/2609231200.json": {"run_date": "2026-09-23", "sortino_ratio": 0.1},
+    "config/metrics_history/latest.json": {"run_date": "2026-09-23", "sortino_ratio": 0.1},
+}
+
+
+class TestStaleBaselineI11506:
+    def test_prior_snapshot_excludes_the_run_under_test(self):
+        from optimizer.regression_monitor import _latest_prior_metrics
+
+        s3 = _MetricsHistoryS3(_HISTORY)
+        snap, key = _latest_prior_metrics("b", "2026-09-23", 21, s3_client=s3)
+        assert key == "config/metrics_history/2609121200.json"
+        assert snap["sortino_ratio"] == 0.8
+
+    def test_prior_snapshot_older_than_window_is_refused(self):
+        from optimizer.regression_monitor import _latest_prior_metrics
+
+        s3 = _MetricsHistoryS3({
+            "config/metrics_history/2608011200.json": {"run_date": "2026-08-01"},
+        })
+        assert _latest_prior_metrics("b", "2026-09-23", 21, s3_client=s3) is None
+
+    def test_refresh_writes_the_prior_run_not_the_current_metrics(self):
+        from optimizer import regression_monitor as rm
+
+        s3 = _MetricsHistoryS3(_HISTORY)
+        with patch.object(rm.boto3, "client", return_value=s3):
+            key = rm._refresh_baseline_from_prior_run("b", "2026-09-23", 21)
+        assert key == "config/metrics_history/2609121200.json"
+        body = json.loads(s3.puts[0]["Body"])
+        assert s3.puts[0]["Key"] == rm.S3_BASELINE_KEY
+        assert body["sortino_ratio"] == 0.8          # not the 0.1 under test
+        assert body["saved_at"] == "2026-09-12"       # its own date, honestly aged
+        assert body["refreshed_from"] == key
+
+    @patch("optimizer.regression_monitor.rollback_all")
+    @patch("optimizer.regression_monitor._load_baseline")
+    def test_stale_with_no_prior_run_writes_nothing_and_degrades(self, mock_load, mock_rb):
+        from completeness import grade_self_reported
+        from optimizer import regression_monitor as rm
+
+        mock_load.return_value = {"sortino_ratio": 0.5, "saved_at": "2026-08-28"}
+        s3 = _MetricsHistoryS3({
+            "config/metrics_history/2609231200.json": {"run_date": "2026-09-23"},
+        })
+        with patch.object(rm.boto3, "client", return_value=s3):
+            result = check_regression(
+                "b", {"sortino_ratio": 0.1, "total_trades": 80, "n_signals": 80},
+                run_date="2026-09-23",
+            )
+        assert s3.puts == []
+        assert result["status"] == "stale_baseline"
+        assert result["reason"] == "baseline_stale_no_prior_run"
+        assert result["details"]["baseline_age_days"] == 26
+        assert grade_self_reported(result)[0] == "degraded"
+        mock_rb.assert_not_called()
+
+    @patch("optimizer.regression_monitor._load_baseline", return_value=None)
+    def test_no_baseline_is_not_graded_ok(self, _mock_load):
+        from completeness import grade_self_reported
+
+        result = check_regression("b", {"sortino_ratio": 0.1})
+        assert result["status"] == "no_baseline"
+        assert grade_self_reported(result)[0] == "degraded"

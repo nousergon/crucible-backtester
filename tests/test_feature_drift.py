@@ -308,3 +308,43 @@ def test_load_features_from_arctic_logs_per_ticker_read_failure(caplog):
     msgs = " ".join(r.getMessage() for r in caplog.records)
     assert "MSFT" in msgs
     assert "RuntimeError" in msgs
+
+
+# ── alpha-engine-config-I11506: zero comparable features is not "stable" ────
+
+
+@patch("analysis.feature_drift._load_training_feature_ics")
+@patch("analysis.feature_drift._load_features_from_arctic")
+@patch("analysis.feature_drift.boto3")
+def test_zero_comparable_features_is_unmeasured_not_stable(
+    mock_boto, mock_arctic, mock_training_ics, mock_db,
+):
+    """The 2026-09-23 rehearsal: training_summary_latest.json carried an empty
+    feature_ics, so 0/0 features were compared and the result read "stable"."""
+    conn = sqlite3.connect(mock_db)
+    outcomes = pd.read_sql_query(
+        "SELECT symbol, prediction_date, actual_log_alpha FROM predictor_outcomes",
+        conn,
+    )
+    conn.close()
+    features = {}
+    for ticker in outcomes["symbol"].unique():
+        rows = outcomes[outcomes["symbol"] == ticker]
+        features[ticker] = pd.DataFrame(
+            {"rsi_14": rows["actual_log_alpha"].values},
+            index=pd.to_datetime(rows["prediction_date"]),
+        )
+    mock_arctic.return_value = features
+    mock_training_ics.return_value = {}
+
+    result = compute_feature_drift(
+        mock_db, "alpha-engine-research", run_date="2026-04-07", lookback_days=120,
+    )
+
+    assert result["total_features"] == 0
+    assert result["recommendation"] == "unmeasured"
+    assert result["status"] == "no_comparable_features"
+    assert "no feature_ics" in result["reason"]
+
+    from completeness import grade_self_reported
+    assert grade_self_reported(result)[0] == "degraded"

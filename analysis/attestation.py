@@ -181,7 +181,7 @@ def _pnl_no_fees() -> float:
     orders = [_enter("2024-01-01", "AAA", 10, 100.),
               _exit("2024-01-04", "AAA", 10, 130.)]
     pf = orders_to_portfolio(orders, prices, init_cash=_INIT_CASH, fees=0.0)
-    return float(portfolio_stats(pf)["total_return"])
+    return float(portfolio_stats(pf, spy_expected=False)["total_return"])
 
 
 def _fee_charged_both_sides() -> float:
@@ -199,7 +199,7 @@ def _fee_charged_both_sides() -> float:
     orders = [_enter("2024-01-01", "AAA", 10, 100.),
               _exit("2024-01-04", "AAA", 10, 130.)]
     pf = orders_to_portfolio(orders, prices, init_cash=_INIT_CASH, fees=0.001)
-    return float(portfolio_stats(pf)["total_return"])
+    return float(portfolio_stats(pf, spy_expected=False)["total_return"])
 
 
 def _drawdown_peak_to_trough() -> float:
@@ -217,7 +217,7 @@ def _drawdown_peak_to_trough() -> float:
     orders = [_enter("2024-01-01", "AAA", 1000, 100.),
               _exit("2024-01-08", "AAA", 1000, 140.)]
     pf = orders_to_portfolio(orders, prices, init_cash=_INIT_CASH, fees=0.0)
-    return float(portfolio_stats(pf)["max_drawdown"])
+    return float(portfolio_stats(pf, spy_expected=False)["max_drawdown"])
 
 
 def _alpha_over_active_window() -> float:

@@ -161,7 +161,9 @@ def _run(prices, orders, *, init_cash: float = _INIT_CASH, fees: float = 0.0,
     from vectorbt_bridge import orders_to_portfolio, portfolio_stats
 
     pf = orders_to_portfolio(orders, prices, init_cash=init_cash, fees=fees)
-    return portfolio_stats(pf, spy_prices=spy_prices)
+    # A case with no SPY is a no-benchmark case by construction.
+    return portfolio_stats(pf, spy_prices=spy_prices,
+                           spy_expected=spy_prices is not None)
 
 
 # ── case 1: single round trip ───────────────────────────────────────────────

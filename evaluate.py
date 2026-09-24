@@ -2109,7 +2109,12 @@ def _run_regression(
             return check_regression(
                 bucket, current_metrics, config, run_date=run_date,
             ) or {"status": "ok"}
-        return {"status": "ok", "note": "frozen or no metrics"}
+        # Nothing was checked: say so rather than grade it ok
+        # (alpha-engine-config-I11506).
+        return {
+            "status": "skipped",
+            "reason": "frozen run" if freeze else "no current metrics",
+        }
 
     return tracker.run_module(
         "regression_monitor",

@@ -31,6 +31,58 @@ class ModuleResult:
     duration_seconds: float = 0.0
 
 
+#: Self-reported ``status`` values that mean "ran, but on no usable input".
+#: Graded ``degraded``, never ``ok`` (alpha-engine-config-I11506).
+_NO_INPUT_STATUSES = frozenset({
+    "degraded", "partial", "incomplete", "skipped", "unreadable",
+    "db_not_found", "alpha_unmeasured", "unmeasured",
+})
+_NO_INPUT_PREFIXES = ("insufficient", "no_", "missing", "stale", "skipped_")
+_NO_INPUT_SUFFIXES = ("_absent", "_unparseable")
+#: ``no_*`` statuses that are a computed DECISION on real inputs, not an
+#: absence of inputs (an optimizer that measured and chose not to move).
+_DECISION_STATUSES = frozenset({"no_change", "no_improvement"})
+#: Self-reported failure returned (not raised) by a module.
+_ERROR_STATUSES = frozenset({"error", "failed", "fail"})
+
+
+def grade_self_reported(output: Any) -> tuple[str | None, str | None]:
+    """Grade a module's own ``status`` field.
+
+    Returns ``(grade, reason)`` where ``grade`` is ``"degraded"`` or
+    ``"error"``, or ``(None, None)`` when the output does not self-report a
+    no-input / failure status. Statuses outside the vocabulary above
+    (``ok``, optimizer decisions such as ``blocked``, ``retired``,
+    ``accruing``) are left to the caller's grade.
+    """
+    if not isinstance(output, dict):
+        return None, None
+    raw = output.get("status")
+    if not isinstance(raw, str):
+        return None, None
+    s = raw.strip().lower()
+    if s in _ERROR_STATUSES:
+        grade = "error"
+    elif s in _DECISION_STATUSES:
+        return None, None
+    elif (
+        s in _NO_INPUT_STATUSES
+        or s.startswith(_NO_INPUT_PREFIXES)
+        or s.endswith(_NO_INPUT_SUFFIXES)
+    ):
+        grade = "degraded"
+    else:
+        return None, None
+    detail = (
+        output.get("reason") or output.get("degraded_reason")
+        or output.get("error") or output.get("note")
+    )
+    reason = f"module reported status={raw}"
+    if detail:
+        reason += f" ({str(detail)[:200]})"
+    return grade, reason
+
+
 class CompletenessTracker:
     """Tracks completeness across all evaluation modules."""
 
@@ -87,13 +139,23 @@ class CompletenessTracker:
             output = fn()
             duration = time.time() - t0
 
+            reasons = [f"ran without: {', '.join(missing)}"] if missing else []
             status = "ok" if not missing else "degraded"
+            # The module's OWN verdict outranks "it returned without raising"
+            # (alpha-engine-config-I11506): a module that ran on zero rows,
+            # stale sources or a missing benchmark and said so must not be
+            # graded ok.
+            self_grade, self_reason = grade_self_reported(output)
+            if self_grade is not None:
+                reasons.append(self_reason)
+                if self_grade == "error" or status == "ok":
+                    status = self_grade
             result = ModuleResult(
                 name=name,
                 status=status,
                 inputs_available=required_inputs,
                 inputs_missing=missing,
-                degradation_reason=f"ran without: {', '.join(missing)}" if missing else None,
+                degradation_reason="; ".join(reasons) or None,
                 result=output if isinstance(output, dict) else {"status": "ok"},
                 duration_seconds=round(duration, 2),
             )
