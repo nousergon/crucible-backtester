@@ -98,7 +98,7 @@ from optimizer import scanner_optimizer, pipeline_optimizer, tech_weight_ablatio
 from optimizer import factor_blend_optimizer
 from optimizer import champion_promotion
 from optimizer import pillar_weight_optimizer
-from optimizer.config_archive import read_params_pit_or_current
+from optimizer.config_archive import pit_degraded_warnings, read_params_pit_or_current
 from emailer import send_digest_email
 from reporter import build_digest, build_report, save, upload_to_s3
 from evaluate_handoff import load_snapshot, write_snapshot
@@ -3147,6 +3147,10 @@ def _main_impl() -> None:
                 stage_warnings.append(
                     f"{summary.get('error', 0)} evaluation stage(s) errored"
                 )
+            # Walk-forward baselines that resolved to genesis defaults: the
+            # optimizers compared against params the system does not run
+            # (config-I11503) — a DEGRADED stage, never a clean one.
+            stage_warnings.extend(pit_degraded_warnings(config))
 
             bucket = config.get("signals_bucket", "alpha-engine-research")
             write_health(

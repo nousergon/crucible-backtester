@@ -24,6 +24,10 @@ Per-(combo, signal) gates evaluated as boolean matrices
                          <= correlation_block_threshold[c]
  11. Shares-round-to-zero — shares[c, s] >= 1 AND
                             dollar_size[c, s] >= min_position_dollar[c]
+ 12. Same-batch caps — gates 8 and 9 re-applied in signal order counting
+                       the dollars already approved from the same batch
+                       (alpha-engine-config-I11504; scalar twin
+                       ``synthetic.batch_exposure``)
 
 Entry passes ⇔ all gates pass. State updates via ``apply_buy``.
 
@@ -1007,6 +1011,35 @@ def compute_vectorized_entries(
     block_reason = np.where(
         (block_reason == BLOCK_NONE) & shares_zero, BLOCK_SHARES_ZERO, block_reason,
     ).astype(np.int8)
+
+    # ── 14. Same-batch sector + equity caps (alpha-engine-config-I11504) ──
+    # Gates 10/11 compare each signal against the PRE-batch book, so a batch
+    # whose signals individually fit is approved in full even when their SUM
+    # crosses the cap. Walk the signals in order, per combo, counting the
+    # dollars already approved from this batch — the scalar twin is
+    # ``synthetic.batch_exposure.enforce_batch_exposure_caps``. The loop is
+    # over signals (tens per date); each step is vectorized over combos.
+    has_sector_cap = sector_idx_per_ticker is not None
+    running_equity = total_equity.astype(np.float64).copy()
+    running_sector = sector_exposure.copy() if has_sector_cap else None
+    for s in range(n_signals):
+        cand = block_reason[:, s] == BLOCK_NONE
+        if not np.any(cand):
+            continue
+        ds = dollar_size[:, s]
+        sec_fail = np.zeros(n_combos, dtype=bool)
+        if has_sector_cap:
+            sec = signal_sector_idx[s]
+            sec_fail = cand & (
+                running_sector[:, sec] + ds > sector_cap_value[:, 0]
+            )
+        eq_fail = cand & ~sec_fail & (running_equity + ds > equity_cap_value)
+        block_reason[sec_fail, s] = BLOCK_SECTOR_CAP
+        block_reason[eq_fail, s] = BLOCK_EQUITY_CAP
+        ok = cand & ~sec_fail & ~eq_fail
+        running_equity = running_equity + np.where(ok, ds, 0.0)
+        if has_sector_cap:
+            running_sector[:, sec] += np.where(ok, ds, 0.0)
 
     entry_passed = block_reason == BLOCK_NONE
     # For final emitted shares, mask out blocked entries (caller doesn't
