@@ -204,6 +204,9 @@ def run_optimizer_backtest(
             "status": result.diagnostics["status"],
             "n_active": result.diagnostics["n_active_positions"],
             "expected_alpha": result.diagnostics["expected_alpha"],
+            # alpha-engine-config-I11507: the one-way turnover the solver's
+            # pins FORCE before alpha is consulted, and what forced it.
+            **_forced_turnover_fields(result.diagnostics),
         })
 
         _populate_target_weights_row(
@@ -219,6 +222,8 @@ def run_optimizer_backtest(
     )
     metrics["n_rebalances"] = len(rebalance_dates)
     metrics["n_solver_failures"] = n_solver_failures
+    metrics.update(summarize_forced_turnover(diagnostics))
+    _log_forced_turnover(metrics)
     metrics["rebalance_freq_days"] = rebalance_freq_days
     metrics["universe_cap"] = universe_cap
 
@@ -238,6 +243,101 @@ def run_optimizer_backtest(
 
 class _InsufficientHistoryError(Exception):
     pass
+
+
+# ── Forced turnover (alpha-engine-config-I11507) ────────────────────────────
+#
+# The executor's optimizer raises its turnover budget to whatever its pins
+# MANDATE (`executor/portfolio_optimizer.py::_mandatory_turnover_floor`), so
+# that a forced exit is never starved of budget. On this backtest the floor
+# is ~0.97 on every rebalance, so the configured budget (0.20) never binds
+# and every gate/cov/gamma sweep cell measures a full-rebuild strategy.
+#
+# The cause is THIS module, not eligibility churn: `_build_optimizer_inputs`
+# hands the solver ``w_prev = 100% cash`` on every rebalance instead of the
+# book the previous rebalance built. The cash-sleeve equality pin
+# (``cash_sleeve_pct``, 0.03) then forces 1 − 0.03 = 0.97 of NAV out of cash
+# before alpha is consulted — exactly the 0.9700 in the log.
+#
+# What changes that is a modelling decision (carry the prior book forward,
+# keep held names in the universe, optionally hysteresis) and is NOT made
+# here. This only makes the forced fraction a first-class number on the
+# stage, so the decision is taken on a measurement.
+
+#: How ``_build_optimizer_inputs`` sets the solver's prior book. Stated on the
+#: metrics so a reader of the artifact knows the turnover figures describe a
+#: from-cash rebuild at every rebalance, not a carried book.
+W_PREV_BASIS = "all_cash_each_rebalance"
+
+
+def _forced_turnover_fields(solver_diagnostics: dict) -> dict:
+    """Per-rebalance forced-turnover fields from ``solve_target_weights``."""
+    d = solver_diagnostics or {}
+    return {
+        "forced_turnover": d.get("turnover_mandatory_floor"),
+        "forced_turnover_by_cause": d.get("turnover_mandatory_floor_by_cause"),
+        "turnover_budget_configured": d.get("turnover_budget_configured"),
+        "turnover_constraint_cap": d.get("turnover_constraint_cap"),
+        "turnover_cap_source": d.get("turnover_cap_source"),
+    }
+
+
+def summarize_forced_turnover(diagnostics: list[dict]) -> dict:
+    """Stage-level summary of the forced (mandatory) one-way turnover.
+
+    ``forced_turnover_share_over_budget`` is the fraction of measured
+    rebalances whose forced floor exceeded the configured budget, i.e. on
+    which the budget could not bind at all. ``None`` everywhere (never 0)
+    when no rebalance reported a floor, so "not measured" cannot read as
+    "no forced turnover".
+    """
+    floors: list[float] = []
+    over = 0
+    causes: dict[str, list[float]] = {}
+    for row in diagnostics:
+        f = row.get("forced_turnover")
+        if not isinstance(f, (int, float)) or not np.isfinite(f):
+            continue
+        floors.append(float(f))
+        budget = row.get("turnover_budget_configured")
+        if isinstance(budget, (int, float)) and f > float(budget) + 1e-9:
+            over += 1
+        for cause, v in (row.get("forced_turnover_by_cause") or {}).items():
+            if cause.startswith("n_"):
+                continue  # name counts, not turnover
+            if isinstance(v, (int, float)) and np.isfinite(v):
+                causes.setdefault(cause, []).append(float(v))
+    n = len(floors)
+    return {
+        "w_prev_basis": W_PREV_BASIS,
+        "forced_turnover_n_rebalances": n,
+        "forced_turnover_mean": float(np.mean(floors)) if n else None,
+        "forced_turnover_median": float(np.median(floors)) if n else None,
+        "forced_turnover_max": float(np.max(floors)) if n else None,
+        "forced_turnover_share_over_budget": (over / n) if n else None,
+        "forced_turnover_by_cause_mean": (
+            {c: float(np.mean(v)) for c, v in sorted(causes.items())} if causes else None
+        ),
+    }
+
+
+def _log_forced_turnover(metrics: dict) -> None:
+    n = metrics.get("forced_turnover_n_rebalances") or 0
+    if not n:
+        logger.warning(
+            "Optimizer backtest: no rebalance reported a forced-turnover floor — "
+            "forced turnover is UNMEASURED this run (alpha-engine-config-I11507)"
+        )
+        return
+    logger.warning(
+        "Optimizer backtest forced turnover (alpha-engine-config-I11507): "
+        "median %.4f, max %.4f one-way per rebalance; the forced floor exceeded "
+        "the configured budget on %.0f%% of %d rebalances; by cause (mean) %s; "
+        "w_prev_basis=%s",
+        metrics["forced_turnover_median"], metrics["forced_turnover_max"],
+        100.0 * (metrics["forced_turnover_share_over_budget"] or 0.0), n,
+        metrics.get("forced_turnover_by_cause_mean"), metrics["w_prev_basis"],
+    )
 
 
 def _ensure_spy_column(price_matrix: pd.DataFrame, spy_prices: pd.Series) -> pd.DataFrame:
@@ -342,6 +442,10 @@ def _build_optimizer_inputs(
             if abs(predictions[t]) < min_score_proxy:
                 eligibility[i] = False
 
+    # Every rebalance starts from 100% cash (W_PREV_BASIS) — the source of the
+    # ~0.97 forced turnover per rebalance (alpha-engine-config-I11507).
+    # Deliberately unchanged here: carrying the prior book is a modelling
+    # decision recorded on the issue.
     w_prev = np.zeros(N)
     w_prev[cash_idx] = 1.0
 
