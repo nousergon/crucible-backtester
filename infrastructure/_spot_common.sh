@@ -763,14 +763,15 @@ spot_common_install_cleanup_trap() {
             # lib / SNS / flow-doctor are unreachable — stdout diagnostic
             # above is primary. This IS the "error-artifact publishing"
             # shared infra named in alpha-engine-config-I4442.
-            local _alert_python _alert_msg
+            local _alert_python _alert_msg _fo_err
             _alert_msg="exit_code=$exit_code last_run_ssm='$last_desc' spot_state=$state spot_reason_code='$reason_code' spot_transition_reason='$state_reason' instance_id=${INSTANCE_ID:-<none>} will_relaunch=$_will_relaunch"
-            if [ -x "$(dirname "$0")/../.venv/bin/python" ]; then
-                _alert_python="$(dirname "$0")/../.venv/bin/python"
-            else
-                _alert_python="$(command -v python3 || command -v python || echo python)"
-            fi
-            (cd "$REPO_ROOT" && "$_alert_python" -c "
+            # alpha-engine-config-I11508: $LIB_PYTHON (set above), never this repo's
+            # .venv or bare python3. The dispatcher box builds only the dashboard
+            # and data venvs, so the old .venv probe fell through to system
+            # python3, which has no nousergon_lib — every fan-out died at import
+            # and the stderr that said so went to /dev/null.
+            _alert_python="$LIB_PYTHON"
+            _fo_err="$( (cd "$REPO_ROOT" && "$_alert_python" -c "
 import sys
 from ops_alerts import publish_ops_alert
 publish_ops_alert(
@@ -779,7 +780,8 @@ publish_ops_alert(
     source='alpha-engine-backtester/${SPOT_STAGE_NAME}',
 )
 " "$_alert_msg" "$_alert_sev") \
-                > /dev/null 2>&1 || echo "    (ops alert fan-out failed; primary stdout diagnostic above is the surface)"
+                2>&1 >/dev/null)" \
+                || echo "    (ops alert fan-out failed via $_alert_python: ${_fo_err##*$'\n'}; primary stdout diagnostic above is the surface)"
         fi
         echo "==> Terminating spot instance $INSTANCE_ID..."
         aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
