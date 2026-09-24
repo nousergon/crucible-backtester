@@ -131,7 +131,12 @@ cvxpy>=1.9.2,<1.10
 # tests/test_no_debug_only_swallows.py cannot import, until it does. If a
 # different nousergon-lib PR merges first and the actual publish lands on a
 # later patch, raise this pin to match.
-nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.115
+# Bumped 0.124.115 -> 0.124.153 (alpha-engine-config-I11393): the first
+# published nousergon-lib carrying ArenaConfig.promote_statistic
+# ("information_ratio", nousergon-lib#444), which the producer arena declares
+# as its primary statistic. LOCKSTEP: crucible-predictor must move to the same
+# tag (lib-pin-cross-repo-guard.yml / the weekly SF's LibPinDriftGate).
+nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.153
 # ── Predictor-replay runtime deps (config#3031) ──────────────────────────────
 # synthetic/predictor_backtest.py and analysis/scanner_predictor_research_free_
 # backfill.py import crucible-predictor CODE in-process (sys.path), so THIS

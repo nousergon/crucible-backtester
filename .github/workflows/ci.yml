@@ -125,6 +125,17 @@ jobs:
       - name: Hermetic-vs-live marker lint
         run: python3 scripts/lint_hermetic_test_marker.py
 
+      # alpha-engine-config-I11490: the producer arm register is DERIVED and
+      # APPEND-ONLY. Fold the committed board snapshot onto the register as it
+      # is on main: red if the committed register is behind its boards, holds
+      # an event the fold would not produce (e.g. a new arm dated under a rule
+      # other than NEW_ARM_CREATED_DATE_RULE), or removed or rewrote an event
+      # main already has. No S3 read: the snapshot stands in for the boards.
+      - name: Producer arm register is append-only and current
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          python scripts/backfill_producer_arena_register.py --check --base-ref FETCH_HEAD
+
       # Several tests import live crucible-executor source (executor.ibkr,
       # executor.deciders, executor.signal_reader, executor.strategies.
       # exit_manager, …) as the scalar/live reference the vectorized

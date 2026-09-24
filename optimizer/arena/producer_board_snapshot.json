@@ -1,0 +1,736 @@
+{
+  "derived_from": "research/producer_leaderboard/{date}.json",
+  "derived_by": "scripts/backfill_producer_arena_register.py",
+  "fields": [
+    "name",
+    "kind",
+    "earliest_cohort"
+  ],
+  "boards": [
+    {
+      "date": "2026-06-30",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-01",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-02",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-06",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-09",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-10",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-13",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-14",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-15",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-16",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-17",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-20",
+      "arms": [
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-21",
+      "arms": [
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-22",
+      "arms": [
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-24",
+      "arms": [
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-27",
+      "arms": [
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-07-31",
+      "arms": [
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-08-03",
+      "arms": [
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-08-04",
+      "arms": [
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-08-07",
+      "arms": [
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-08-10",
+      "arms": [
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-08-12",
+      "arms": [
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-08-14",
+      "arms": [
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-08-21",
+      "arms": [
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "champion",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        }
+      ]
+    },
+    {
+      "date": "2026-08-28",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-10"
+        },
+        {
+          "name": "scanner_top20_predictor",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-16"
+        }
+      ]
+    },
+    {
+      "date": "2026-09-04",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-10"
+        },
+        {
+          "name": "scanner_top20_predictor",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-16"
+        }
+      ]
+    },
+    {
+      "date": "2026-09-11",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-10"
+        },
+        {
+          "name": "scanner_top20_predictor",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-16"
+        }
+      ]
+    },
+    {
+      "date": "2026-09-18",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-10"
+        },
+        {
+          "name": "scanner_top20_predictor",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-16"
+        }
+      ]
+    },
+    {
+      "date": "2026-09-23",
+      "arms": [
+        {
+          "name": "agentic_sector_teams",
+          "kind": "retired",
+          "earliest_cohort": null
+        },
+        {
+          "name": "attractiveness_20",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-29"
+        },
+        {
+          "name": "attractiveness_60",
+          "kind": "challenger",
+          "earliest_cohort": "2026-05-29"
+        },
+        {
+          "name": "no_agent_quant",
+          "kind": "retired",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "predictor_from_60",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "scanner_predictor_direct",
+          "kind": "retired",
+          "earliest_cohort": "2026-07-10"
+        },
+        {
+          "name": "scanner_top20_predictor",
+          "kind": "retired",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "single_agent_quant",
+          "kind": "retired",
+          "earliest_cohort": "2026-07-02"
+        },
+        {
+          "name": "tech_score_20",
+          "kind": "challenger",
+          "earliest_cohort": null
+        },
+        {
+          "name": "thinktank_20",
+          "kind": "challenger",
+          "earliest_cohort": "2026-07-16"
+        },
+        {
+          "name": "thinktank_coverage",
+          "kind": "retired",
+          "earliest_cohort": null
+        }
+      ]
+    }
+  ]
+}

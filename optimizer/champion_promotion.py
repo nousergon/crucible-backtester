@@ -1144,7 +1144,9 @@ def run_weekly_evaluation(
             shadow_only_names=SHADOW_ONLY_ARMS,
             feed_blocked_names=feed_blocked,
         )
-        doc = producer_arena.cycle_document(cycle, gaps)
+        doc = producer_arena.cycle_document(
+            cycle, gaps, producer_arena.arm_statistics(register, tt_leaderboard, run_date),
+        )
         producer_arena.write_arena_cycle(
             bucket, run_date, doc, upload=upload, s3_client=s3_client,
         )

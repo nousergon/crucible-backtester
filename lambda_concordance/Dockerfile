@@ -48,7 +48,7 @@ COPY lambda_concordance/requirements-concordance.txt requirements-concordance.tx
 # Bumped v0.124.99 -> v0.124.115 in lockstep with requirements.txt
 # (alpha-engine-config-I10226, test_lib_pin_lockstep.py requires all
 # four deploy artifacts to carry the SAME nousergon-lib tag).
-RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.115" "krepis[openai]>=0.59.8" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.153" "krepis[openai]>=0.59.8" && \
     pip install --no-cache-dir -r requirements-concordance.txt && \
     rm -rf /root/.cache/pip
 

@@ -47,11 +47,12 @@ enum-typed arm fields cannot NAME ``no_agent_quant`` or
 selection-stage slot graded against anything but the population it selected
 from, and the refusal is load-bearing rather than stylistic: on 2026-08-17
 SPY trailed the drawn-from population by 140bp at 21d, which inverts wins
-and losses outright. The producer leaderboard's own
-``LEADERBOARD_SLOTS["producer"].primary_metric`` is
-``topn_alpha_vs_benchmark`` against SPY; this module therefore reads
-``topn_alpha_vs_population`` and NEVER the SPY figure, and it refuses to
-score rather than substitute one for the other.
+and losses outright. The producer leaderboard also publishes the
+SPY-relative ``topn_alpha_vs_benchmark``; this module reads the per-date
+``topn_alpha_vs_population`` series and NEVER the SPY figure, and it refuses
+to score rather than substitute one for the other. The engine ranks the arms
+on the information ratio of that series (``ARENA_CONFIG.promote_statistic``,
+alpha-engine-config-I11393).
 
 **Fail loud, never fill in.** An arm the register knows about that the board
 cannot supply a series for is recorded as an explicit, named
@@ -87,6 +88,13 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ARENA_CONFIG",
     "ARENA_CYCLE_PREFIX",
+    "BOARD_SNAPSHOT_PATH",
+    "CREATED_DATE_EARLIEST_COHORT",
+    "CREATED_DATE_FIRST_BOARD",
+    "NEW_ARM_CREATED_DATE_RULE",
+    "PINNED_RESEARCH_PREFILTER",
+    "RESEARCH_SLOT_ARM_WIDTHS",
+    "RETIREMENTS_HELD",
     "POINTER_CONTRACT_PATH",
     "POPULATION_SERIES_FIELD",
     "REGISTER_PATH",
@@ -95,7 +103,10 @@ __all__ = [
     "SLOT_KIND",
     "WRITE_FORBIDDEN_ARMS",
     "SeriesGap",
+    "append_only_violations",
     "arm_id_for",
+    "arm_statistics",
+    "board_snapshot",
     "build_series",
     "load_register",
     "pointer_admissible_arms",
@@ -120,6 +131,82 @@ SLOT_KIND = "selection_producer"
 #: ``research/producer_leaderboard/`` history; extended (never rewritten) when
 #: a new arm first appears on the board.
 REGISTER_PATH = Path(__file__).resolve().parent / "arena" / "producer_register.json"
+
+#: The committed projection of every ``research/producer_leaderboard/`` board
+#: the register was last folded from: per board, each arm's name, ``kind`` and
+#: earliest scored cohort — exactly the three facts
+#: :func:`register_events_from_boards` reads, and nothing else.
+#:
+#: It exists so CI can prove the register is not behind its source WITHOUT
+#: S3 credentials: ``scripts/backfill_producer_arena_register.py --check``
+#: re-folds this snapshot onto the committed register and fails if that would
+#: append anything (alpha-engine-config-I11490). The backfill writes both
+#: files in one run, so they cannot be refreshed separately.
+BOARD_SNAPSHOT_PATH = Path(__file__).resolve().parent / "arena" / "producer_board_snapshot.json"
+
+# ── Which date a NEWLY registered arm is created on (OPEN — Brian, I11393) ──
+#
+# ``created_date`` starts an arm's four-week grace period (§6), so it decides
+# whether a new arm can be retired on its first cycle. Two readings exist and
+# the ruling between them is Brian's, not this module's:
+#
+#   CREATED_DATE_FIRST_BOARD       the date of the first producer leaderboard
+#                                  that lists the arm. Grace starts when the
+#                                  arm enters the contest. For the five
+#                                  research-slot arms that is 2026-09-23.
+#   CREATED_DATE_EARLIEST_COHORT   the earliest cohort the board has scored
+#                                  for it, backfilled cohorts included (the
+#                                  derivation's rule before this change). For
+#                                  attractiveness_60 that is 2026-05-29, so
+#                                  its grace period has already elapsed on the
+#                                  day it first appears.
+#
+# Either rule applies ONLY to an arm the committed register does not already
+# hold. An arm already registered keeps the date it was registered with,
+# whichever rule is in force — the register is append-only.
+CREATED_DATE_FIRST_BOARD = "first_board_appearance"
+CREATED_DATE_EARLIEST_COHORT = "earliest_backfilled_cohort"
+CREATED_DATE_RULES = (CREATED_DATE_FIRST_BOARD, CREATED_DATE_EARLIEST_COHORT)
+
+#: DECISION LINE (alpha-engine-config-I11393, open decision 3). Changing the
+#: rule is this one line plus a re-run of the backfill script.
+NEW_ARM_CREATED_DATE_RULE = CREATED_DATE_FIRST_BOARD
+
+#: Arms whose ``kind == "retired"`` on the board is NOT recorded as a
+#: retirement in this register (alpha-engine-config-I11393, open decision 1).
+#:
+#: ``scanner_predictor_direct`` (the live pointer's arm) and
+#: ``scanner_top20_predictor`` are the 60-wide / 20-wide funnel-width
+#: experiment that Amendment 1 of I11393 keeps, and Brian said on 2026-09-24
+#: "don't retire R arms". The research board has marked both retired since
+#: 2026-09-23; this set stops the register copying that.
+#:
+#: DECISION LINE: removing a name records its retirement on the next backfill.
+RETIREMENTS_HELD: frozenset[str] = frozenset({"scanner_predictor_direct", "scanner_top20_predictor"})
+
+# ── The research slot's arms (alpha-engine-config-I11393, Amendment 2) ────
+#
+# The five arms all draw from ONE pinned pre-filter and each emits its own
+# DECLARED width. The width is part of the arm's immutable recipe (§3.1), so
+# it is hashed into the arm id: an arm that changes its width becomes a new
+# arm, it does not keep the old arm's track record.
+#
+# Mirrors crucible-research ``producers/registry.py`` (``PINNED_RESEARCH_
+# PREFILTER`` and each ``ProducerSpec.width``). The board publishes the width
+# each arm actually emitted (``widths``), and :func:`build_series` refuses to
+# score an arm whose emitted width differs from the one declared here.
+PINNED_RESEARCH_PREFILTER = "attractiveness_top_60"
+RESEARCH_SLOT_ARM_WIDTHS: dict[str, int] = {
+    "attractiveness_60": 60,
+    "attractiveness_20": 20,
+    "tech_score_20": 20,
+    "predictor_from_60": 20,
+    "thinktank_20": 20,
+}
+
+#: Lineage recorded on the register (``ArmRecord.supersedes``), from
+#: crucible-research ``ProducerSpec.supersedes``.
+RESEARCH_SLOT_SUPERSEDES: dict[str, str] = {"thinktank_20": "thinktank_coverage"}
 
 #: ``arena/producer/{date}.json`` + ``latest.json`` — the §11 artifact.
 #:
@@ -210,8 +297,9 @@ POINTER_ADMISSIBLE_ARMS: frozenset[str] = pointer_admissible_arms()
 #: makes its silence visible as a named :class:`SeriesGap` every cycle
 #: instead.
 #:
-#: A board that later lists one of these arms WINS: the derivation takes the
-#: minimum, so a real first-observed date always supersedes the seed.
+#: A seed is used only when the arm is not yet registered. If a board also
+#: lists the arm at that point, the earlier of the seed and the board date
+#: wins. Once the arm is registered, its date is never rewritten.
 UNBOARDED_ARMS: dict[str, tuple[str, str]] = {
     "scanner_top20_predictor": (
         "2026-07-30",
@@ -235,8 +323,20 @@ UNBOARDED_ARMS: dict[str, tuple[str, str]] = {
 #                           trading sessions forward, top-N equal weight
 #   benchmark               population (the scanner candidate set the arm
 #                           narrowed) — SPY is REFUSED by the engine here
-#   count-matching width    top_n = 50, held constant across arms by
-#                           crucible-research's producer board
+#   width                   DECLARED PER ARM (RESEARCH_SLOT_ARM_WIDTHS), not
+#                           count-matched. The board sets per_arm_width=true
+#                           (alpha-engine-config-I11393, Amendment 2)
+#   primary statistic       information ratio of each arm over the pair's
+#                           common window (promote_statistic below). A raw
+#                           mean with free widths rewards the narrowest arm
+#                           for stopping early, because mean alpha per name
+#                           falls with depth whenever a ranking has skill.
+#                           IR prices that concentration (IR ~= IC x
+#                           sqrt(breadth))
+#   reported, not ranked    realized_rank_ic per arm, which is ranking skill
+#                           independent of width. It is written to the cycle
+#                           artifact beside the IR (arm_statistics) so a win
+#                           can be attributed to ranking or to breadth
 #
 # ``diff_clip`` — declared bound on a per-date score DIFFERENCE between two
 # arms, in the score's own units (21-day excess return over the drawn-from
@@ -275,6 +375,17 @@ ARENA_CONFIG = ArenaConfig(
     # minimum-week floor on this slot's decision path is deleted by this
     # change (issue deliverable 6).
     min_paired_dates=1,
+    # alpha-engine-config-I11393 methodology: rank on the information ratio,
+    # promote the point-estimate leader once the pair has 2 paired weeks.
+    # That is Brian's universe_cut ruling (2026-09-12, I10546) applied to
+    # this slot, and it needs its own §5.2(B) delta record in
+    # champion-challenger-policy.md. The engine also REQUIRES point evidence
+    # with the IR statistic: the confidence sequence bounds a mean of per-date
+    # differences and says nothing about a difference of two ratios. It is
+    # still computed on mean_diff and emitted for every comparison.
+    promote_statistic="information_ratio",
+    promote_evidence="point",
+    promote_min_weeks=2,
     cap=5,
     grace_weeks=4,
     min_active_arms=3,
@@ -307,19 +418,32 @@ class SeriesGap:
 # ── The register ──────────────────────────────────────────────────────────
 
 
-def _spec_for(name: str) -> dict[str, str]:
+def _spec_for(name: str) -> dict[str, Any]:
     """The immutable identity a producer arm's ``arm_id`` hashes.
 
     Deliberately minimal and STABLE. The arm's real recipe — features,
-    prompt, top-N width, refit cadence — lives in crucible-research's
+    prompt, refit cadence — lives in crucible-research's
     ``producers/registry.py`` and is not published on the leaderboard
     artifact, so hashing anything the board DOES carry (``kind``,
     ``promotion_eligible``) would mint a brand-new arm, and destroy the
     track record, the first time an arm was retired or its eligibility
     changed. Identity is the arm's NAME in the producer registry; the
     register's ``notes`` record where the recipe itself lives.
+
+    A research-slot arm (:data:`RESEARCH_SLOT_ARM_WIDTHS`) also hashes its
+    pinned pre-filter and its declared width. Both are part of its recipe
+    under alpha-engine-config-I11393, so an arm that changed either would get
+    a new id instead of inheriting this one's record. Arms registered before
+    that slot keep their original two-field spec, so their ids do not move.
     """
-    return {"producer_name": name, "registry": "crucible-research/producers/registry.py"}
+    spec: dict[str, Any] = {
+        "producer_name": name,
+        "registry": "crucible-research/producers/registry.py",
+    }
+    if name in RESEARCH_SLOT_ARM_WIDTHS:
+        spec["prefilter_cut"] = PINNED_RESEARCH_PREFILTER
+        spec["width"] = RESEARCH_SLOT_ARM_WIDTHS[name]
+    return spec
 
 
 def arm_id_for(name: str) -> str:
@@ -341,86 +465,176 @@ def load_register(path: Path | None = None) -> ArmRegister:
     return ArmRegister.from_dicts(payload["events"])
 
 
-def register_events_from_boards(boards: list[dict]) -> list[dict]:
-    """DERIVE the register from a chronological list of producer leaderboards.
+def _board_rows(board: dict) -> list[dict]:
+    return [r for r in (board.get("arms") or board.get("specs") or []) if isinstance(r, dict)]
 
-    This is the backfill, expressed as a pure function so the committed
-    artifact is reproducible and testable rather than a hand-typed fixture —
-    three fixtures in this fleet rotted this week by restating a registry as
-    a literal.
 
-    ``created_date`` is the earliest date on which an arm is OBSERVED: the
-    minimum of its own ``dates_scored`` (when the board publishes them) and
-    the date of the earliest board that lists it. That is a lower bound, and
-    the register says so in ``notes`` — an arm whose true registration
-    predates the artifact history gets the honest "first observed on this
-    board" value rather than a guessed one. It never moves once written.
+def _earliest_cohort(row: dict) -> str | None:
+    """The earliest cohort a board row reports, from a full board or a snapshot."""
+    dates = [d for d in (row.get("dates_scored") or []) if isinstance(d, str)]
+    if isinstance(row.get("earliest_cohort"), str):
+        dates.append(row["earliest_cohort"])
+    return min(dates) if dates else None
 
-    An arm the board reports as ``kind == "retired"`` gets a retirement event
-    dated to the first board on which it appeared retired, for the same
-    reason.
+
+def board_snapshot(boards: list[dict]) -> list[dict]:
+    """Project boards onto exactly what :func:`register_events_from_boards` reads.
+
+    Folding the snapshot gives the same events as folding the full boards,
+    which ``tests/test_producer_arena.py`` asserts. That is what lets the
+    committed snapshot stand in for S3 in CI.
     """
-    seen: dict[str, str] = {}
-    seeded: dict[str, str] = {}
-    retired: dict[str, str] = {}
-    order: list[str] = []
+    out: list[dict] = []
+    for board in sorted(boards, key=lambda b: b.get("date") or ""):
+        arms = []
+        for row in _board_rows(board):
+            if not row.get("name"):
+                continue
+            arms.append(
+                {
+                    "name": row["name"],
+                    "kind": row.get("kind"),
+                    "earliest_cohort": _earliest_cohort(row),
+                }
+            )
+        out.append({"date": board["date"], "arms": arms})
+    return out
+
+
+def _registered_record(name: str, created_date: str, notes: str) -> dict:
+    arm_id = arm_id_for(name)
+    supersedes = RESEARCH_SLOT_SUPERSEDES.get(name)
+    return {
+        "kind": "registered",
+        "arm_id": arm_id,
+        "date": created_date,
+        "reason": "",
+        "record": {
+            "arm_id": arm_id,
+            "slot": SLOT,
+            "name": name,
+            "spec_hash": arm_id.rsplit(":", 1)[-1],
+            "created_date": created_date,
+            "supersedes": arm_id_for(supersedes) if supersedes else None,
+            "bootstrap": False,
+            "notes": notes,
+        },
+    }
+
+
+def _new_arm_notes(name: str, rule: str, first_board: str | None, earliest: str | None) -> str:
+    if rule == CREATED_DATE_FIRST_BOARD:
+        basis = (
+            f"created_date is the arm's FIRST APPEARANCE on research/producer_leaderboard/ "
+            f"({first_board}); earlier backfilled cohorts ({earliest or 'none'}) do not "
+            "start its grace period"
+        )
+    else:
+        basis = (
+            "created_date is the EARLIEST COHORT research/producer_leaderboard/ has "
+            f"scored for the arm ({earliest or first_board}), backfilled cohorts "
+            f"included; it first appeared on the board on {first_board}"
+        )
+    parts = [f"{basis} (NEW_ARM_CREATED_DATE_RULE={rule!r})."]
+    if name in RESEARCH_SLOT_ARM_WIDTHS:
+        parts.append(
+            f"Research slot (alpha-engine-config-I11393): pinned pre-filter "
+            f"{PINNED_RESEARCH_PREFILTER}, declared width {RESEARCH_SLOT_ARM_WIDTHS[name]}."
+        )
+    parts.append("Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS.")
+    return " ".join(parts)
+
+
+def register_events_from_boards(
+    boards: list[dict],
+    *,
+    existing_events: list[dict] | tuple[dict, ...] = (),
+    created_date_rule: str | None = None,
+    held_retirements: frozenset[str] | None = None,
+) -> list[dict]:
+    """Fold producer leaderboards onto the register, APPEND-ONLY.
+
+    This is the backfill as a pure function, so the committed artifact is
+    reproducible and testable rather than a hand-typed fixture.
+
+    ``existing_events`` (the committed register) is returned first, verbatim
+    and in order. The fold never rewrites or reorders an existing event. So an
+    arm already registered keeps its ``created_date`` even when S3 later
+    gains boards or cohorts dated earlier than it. The previous version took
+    the minimum over every board on each run, which moved four registered
+    arms' dates between runs (alpha-engine-config-I11490). ``created_date``
+    starts the §6 grace period, so a date that moves makes retirement
+    non-reproducible.
+
+    Appended after the existing events:
+
+    * a ``registered`` event for each arm on a board that the register does
+      not hold, dated by ``created_date_rule`` (default
+      :data:`NEW_ARM_CREATED_DATE_RULE`);
+    * a ``registered`` event for each :data:`UNBOARDED_ARMS` seed not yet held;
+    * a ``retired`` event for each registered arm a board marks
+      ``kind == "retired"`` and the register has not retired, dated to the
+      first such board, unless the arm is in ``held_retirements`` (default
+      :data:`RETIREMENTS_HELD`).
+    """
+    rule = created_date_rule or NEW_ARM_CREATED_DATE_RULE
+    if rule not in CREATED_DATE_RULES:
+        raise ValueError(f"created_date_rule must be one of {CREATED_DATE_RULES}; got {rule!r}")
+    held = RETIREMENTS_HELD if held_retirements is None else held_retirements
+
+    events: list[dict] = [dict(e) for e in existing_events]
+    registered: set[str] = set()
+    retired_ids: set[str] = set()
+    for event in events:
+        if event.get("kind") == "registered":
+            registered.add(event["record"]["name"])
+        elif event.get("kind") == "retired":
+            retired_ids.add(event["arm_id"])
+
+    first_board: dict[str, str] = {}
+    earliest: dict[str, str] = {}
+    first_retired: dict[str, str] = {}
     for board in sorted(boards, key=lambda b: b.get("date") or ""):
         board_date = board["date"]
-        rows: list[dict] = list(board.get("arms") or board.get("specs") or [])
-        for row in rows:
+        for row in _board_rows(board):
             name = row.get("name")
             if not name:
                 continue
-            dates = [d for d in (row.get("dates_scored") or []) if isinstance(d, str)]
-            first_seen = min([board_date, *dates])
-            if name not in seen:
-                seen[name] = first_seen
-                order.append(name)
-            elif first_seen < seen[name]:
-                seen[name] = first_seen
-            if row.get("kind") == "retired" and name not in retired:
-                retired[name] = board_date
+            first_board.setdefault(name, board_date)
+            cohort = _earliest_cohort(row)
+            if cohort is not None and (name not in earliest or cohort < earliest[name]):
+                earliest[name] = cohort
+            if row.get("kind") == "retired":
+                first_retired.setdefault(name, board_date)
 
+    new_arms: list[dict] = []
+    for name, board_date in first_board.items():
+        if name in registered:
+            continue
+        if rule == CREATED_DATE_EARLIEST_COHORT:
+            created = min(board_date, earliest.get(name, board_date))
+        else:
+            created = board_date
+        notes = _new_arm_notes(name, rule, board_date, earliest.get(name))
+        seed = UNBOARDED_ARMS.get(name)
+        if seed is not None and seed[0] < created:
+            created, notes = seed
+        new_arms.append(_registered_record(name, created, notes))
     for name, (seed_date, provenance) in UNBOARDED_ARMS.items():
-        if name not in seen:
-            seen[name] = seed_date
-            order.append(name)
-            seeded[name] = provenance
-        elif seed_date < seen[name]:
-            seen[name] = seed_date
-            seeded[name] = provenance
+        if name not in registered and name not in first_board:
+            new_arms.append(_registered_record(name, seed_date, provenance))
+    new_arms.sort(key=lambda e: (e["date"], e["record"]["name"]))
+    events.extend(new_arms)
 
-    events: list[dict] = []
-    for name in sorted(order, key=lambda n: (seen[n], n)):
+    new_retirements: list[dict] = []
+    for name, retired_date in first_retired.items():
         arm_id = arm_id_for(name)
-        events.append(
-            {
-                "kind": "registered",
-                "arm_id": arm_id,
-                "date": seen[name],
-                "reason": "",
-                "record": {
-                    "arm_id": arm_id,
-                    "slot": SLOT,
-                    "name": name,
-                    "spec_hash": arm_id.rsplit(":", 1)[-1],
-                    "created_date": seen[name],
-                    "supersedes": None,
-                    "bootstrap": False,
-                    "notes": seeded.get(
-                        name,
-                        "created_date is FIRST OBSERVED on research/producer_leaderboard/; "
-                        "the arm's true registration may predate the artifact history. "
-                        "Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS.",
-                    ),
-                },
-            }
-        )
-    for name, retired_date in sorted(retired.items()):
-        events.append(
+        if name in held or arm_id in retired_ids:
+            continue
+        new_retirements.append(
             {
                 "kind": "retired",
-                "arm_id": arm_id_for(name),
+                "arm_id": arm_id,
                 "date": retired_date,
                 "reason": (
                     "kind=='retired' on research/producer_leaderboard/ from this date; "
@@ -428,7 +642,29 @@ def register_events_from_boards(boards: list[dict]) -> list[dict]:
                 ),
             }
         )
+    new_retirements.sort(key=lambda e: (e["date"], e["arm_id"]))
+    events.extend(new_retirements)
     return events
+
+
+def append_only_violations(base_events: list[dict], events: list[dict]) -> list[str]:
+    """How ``events`` fails to extend ``base_events``, or ``[]`` if it does.
+
+    The register is append-only: every event in the base must still be there,
+    unchanged and in the same position. An empty return is the only pass.
+    """
+    problems: list[str] = []
+    if len(events) < len(base_events):
+        problems.append(
+            f"the register shrank from {len(base_events)} to {len(events)} events"
+        )
+    for i, (old, new) in enumerate(zip(base_events, events)):
+        if old != new:
+            problems.append(
+                f"event {i} ({old.get('kind')} {old.get('arm_id')}) was rewritten: "
+                f"{json.dumps(old, sort_keys=True)} -> {json.dumps(new, sort_keys=True)}"
+            )
+    return problems
 
 
 def promotion_eligible_arm_names(register: ArmRegister | None = None) -> tuple[str, ...]:
@@ -460,6 +696,71 @@ def roster_disagreement(register: ArmRegister, leaderboard: dict | None) -> list
 
 
 # ── The series ────────────────────────────────────────────────────────────
+
+
+def _emitted_width(name: str, row: dict, leaderboard: dict | None) -> int | None:
+    """The width the board says this arm emitted: its row's ``top_n``, else ``widths``."""
+    value = row.get("top_n")
+    if value is None and isinstance(leaderboard, dict):
+        value = (leaderboard.get("widths") or {}).get(name)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _width_mismatch(name: str, row: dict, leaderboard: dict | None) -> str:
+    """Why a research-slot arm's series may not be scored as that arm, or ``""``.
+
+    alpha-engine-config-I11393 Amendment 2 (and -I11385 as recast): each arm
+    declares its width, and the emitted width must match it. A series built at
+    another width is a different recipe's track record, so it is refused
+    rather than scored under this arm's id. An arm the board reports no width
+    for is refused too, because the check could not be made.
+    """
+    declared = RESEARCH_SLOT_ARM_WIDTHS.get(name)
+    if declared is None:
+        return ""
+    emitted = _emitted_width(name, row, leaderboard)
+    if emitted == declared:
+        return ""
+    return (
+        f"declared width {declared} (RESEARCH_SLOT_ARM_WIDTHS) but "
+        f"research/producer_leaderboard/ reports it emitted "
+        f"{'no width' if emitted is None else emitted}. An arm's width is part of "
+        "its immutable recipe (alpha-engine-config-I11393 Amendment 2), so a "
+        "series at another width is not this arm's record and is not scored"
+    )
+
+
+def arm_statistics(
+    register: ArmRegister, leaderboard: dict | None, as_of: str,
+) -> dict[str, dict[str, Any]]:
+    """Per-arm width, information ratio and rank IC, as the board reports them.
+
+    REPORTED, never decided on. The pointer is decided by the engine on the IR
+    it computes itself from the paired per-date series (``promote_statistic``).
+    These are the board's whole-history figures, written beside the decision
+    so a reader can see whether an arm's IR came from ranking skill
+    (``realized_rank_ic``, which does not depend on width) or from its breadth
+    (alpha-engine-config-I11393 Amendment 2: "decide the pointer on IR, report
+    IC beside it"). A value the board does not carry is ``None``, never 0.
+    """
+    rows_by_name: dict[str, dict] = {}
+    if isinstance(leaderboard, dict):
+        for row in leaderboard.get("specs") or []:
+            if isinstance(row, dict) and row.get("name"):
+                rows_by_name[row["name"]] = row
+    out: dict[str, dict[str, Any]] = {}
+    for arm_id in register.scored_arms(as_of, ARENA_CONFIG.retired_trailing_cycles):
+        name = register.state(arm_id).record.name
+        row = rows_by_name.get(name) or {}
+        out[name] = {
+            "arm_id": arm_id,
+            "declared_width": RESEARCH_SLOT_ARM_WIDTHS.get(name),
+            "emitted_width": _emitted_width(name, row, leaderboard) if row else None,
+            "information_ratio": row.get("information_ratio"),
+            "realized_rank_ic": row.get("realized_rank_ic"),
+        }
+    return out
+
 
 
 def build_series(
@@ -504,10 +805,15 @@ def build_series(
             )
             series[arm_id] = ArmSeries(arm_id=arm_id, scores={}, misses=frozenset())
             continue
-        by_date = row.get(POPULATION_SERIES_FIELD)
         dates_scored = frozenset(
             d for d in (row.get("dates_scored") or []) if isinstance(d, str)
         )
+        width_problem = _width_mismatch(name, row, leaderboard)
+        if width_problem:
+            gaps.append(SeriesGap(name, arm_id, width_problem))
+            series[arm_id] = ArmSeries(arm_id=arm_id, scores={}, misses=dates_scored)
+            continue
+        by_date = row.get(POPULATION_SERIES_FIELD)
         if not isinstance(by_date, dict) or not by_date:
             gaps.append(
                 SeriesGap(
@@ -664,7 +970,11 @@ def run_arena_cycle(
     return cycle, gaps, reg
 
 
-def cycle_document(cycle: ArenaCycle, gaps: list[SeriesGap]) -> dict[str, Any]:
+def cycle_document(
+    cycle: ArenaCycle,
+    gaps: list[SeriesGap],
+    statistics: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """The durable artifact body, validated against the ``arena_cycle`` contract.
 
     Validation happens HERE — on the producer side, before the write — so a
@@ -677,6 +987,10 @@ def cycle_document(cycle: ArenaCycle, gaps: list[SeriesGap]) -> dict[str, Any]:
     # is refused: the arms this cycle could not score, by name and reason.
     # `scored_arms` alone cannot express "present in the roster, no series".
     doc["series_gaps"] = [g.to_dict() for g in gaps]
+    # Additive for the same reason: each arm's declared and emitted width, IR
+    # and rank IC, reported beside the decision (see arm_statistics).
+    if statistics is not None:
+        doc["arm_statistics"] = statistics
     return doc
 
 

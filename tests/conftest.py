@@ -313,3 +313,29 @@ def _stub_router_resolution(monkeypatch, request, tmp_path_factory):
         if hasattr(mod, "resolve_target_spec"):
             monkeypatch.setattr(mod, "resolve_target_spec", _fake)
     yield
+
+
+@pytest.fixture
+def producer_register_2026_08_28(monkeypatch):
+    """Pin the producer arena to its register as it stood on 2026-08-28.
+
+    The committed register is append-only and grows as arms reach the board,
+    so a test that drives the engine over the 2026-08-28 fixture board must
+    not read it: from 2026-09-23 it holds arms and retirements dated after the
+    fixture's ``as_of``. This fixture points ``REGISTER_PATH`` at a frozen copy
+    of the 2026-08-28 register and re-derives ``VALID_CHAMPIONS`` from it.
+    Tests about the COMMITTED register read ``COMMITTED_REGISTER_PATH``
+    instead (alpha-engine-config-I11393).
+    """
+    from pathlib import Path
+
+    from optimizer import champion_promotion, producer_arena
+
+    path = Path(__file__).resolve().parent / "fixtures" / "producer_register_2026-08-28.json"
+    monkeypatch.setattr(producer_arena, "REGISTER_PATH", path)
+    monkeypatch.setattr(
+        champion_promotion,
+        "VALID_CHAMPIONS",
+        producer_arena.promotion_eligible_arm_names(producer_arena.load_register(path)),
+    )
+    return path
