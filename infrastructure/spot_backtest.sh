@@ -450,7 +450,7 @@ if [ "$USE_VECTORIZED_SWEEP" = "true" ]; then
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Backtester Spot Run — $(date +%Y-%m-%d)"
+echo "  Backtester Spot Run — ${RUN_DATE}"
 echo "═══════════════════════════════════════════════════════════════"
 
 # ── Phase-aware instance-type floor (L4485) ──────────────────────────────────
@@ -1443,9 +1443,15 @@ _smoke_run_evaluator() {
     local start=\$SECONDS
     local status="ok"
 
+    # alpha-engine-config-I11475: --date is the dispatcher's normalized
+    # RUN_DATE, baked in here (unescaped) like the BACKTEST heredoc's
+    # RUN_DATE. Without it evaluate.py defaulted --date to the box's UTC
+    # calendar day, so a run crossing 00:00 UTC probed
+    # backtest/<next day>/attestation.json (NoSuchKey on the 2026-09-23
+    # rehearsal) instead of this cycle's.
     echo ""
-    echo "==> Smoke: evaluate.py --smoke"
-    if ! $REMOTE_PYTHON -u evaluate.py --smoke --log-level INFO 2>&1 | tee "\$log_file"; then
+    echo "==> Smoke: evaluate.py --smoke --date ${RUN_DATE}"
+    if ! $REMOTE_PYTHON -u evaluate.py --smoke --date "${RUN_DATE}" --log-level INFO 2>&1 | tee "\$log_file"; then
         status="FAIL"
     fi
     local dur=\$((SECONDS - start))
@@ -1930,8 +1936,11 @@ else
     # evaluate.py's own imports/config/S3-wiring). Non-fatal here — same
     # rationale as smoke-pit-parity above: loud WARNING, spot run continues,
     # the real pass below will surface the same break if it's real.
+    # alpha-engine-config-I11475: --date is this cycle's RUN_DATE. Without it
+    # evaluate.py defaulted --date to the box's UTC day, and the 2026-09-23
+    # rehearsal's smoke read backtest/2026-09-24/attestation.json (NoSuchKey).
     echo "▶ stage=smoke-evaluator START at \$(date -u +%H:%M:%S)"
-    if ! $REMOTE_PYTHON -u evaluate.py --smoke --log-level INFO 2>&1; then
+    if ! $REMOTE_PYTHON -u evaluate.py --smoke --date "\${RUN_DATE}" --log-level INFO 2>&1; then
         echo "WARNING: smoke-evaluator FAILED — evaluate.py's import/config/S3 wiring is broken. Continuing but the real pass below will likely fail the same way." >&2
     fi
     echo "▶ stage=smoke-evaluator END at \$(date -u +%H:%M:%S)"

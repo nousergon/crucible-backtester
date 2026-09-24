@@ -1467,7 +1467,7 @@ def _run_weight_opt(config: dict, df_base, freeze: bool) -> dict:
     if freeze:
         result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
     else:
-        result["apply_result"] = weight_optimizer.apply_weights(result, bucket)
+        result["apply_result"] = weight_optimizer.apply_weights(result, bucket, run_date=config.get("_run_date"))
 
     # Observe-first significance comparison (config#1426 Phase 2). Stamp what the
     # LIVE gate actually did into the (non-enforcing) significance record and
@@ -1540,7 +1540,7 @@ def _run_veto_opt(config: dict, df_base, freeze: bool) -> dict:
         if freeze:
             result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         else:
-            result["apply_result"] = veto_analysis.apply(result, bucket)
+            result["apply_result"] = veto_analysis.apply(result, bucket, run_date=config.get("_run_date"))
     _emit_significance_observe(
         result.get("significance_observe"),
         did_promote=bool(result.get("apply_result", {}).get("applied")),
@@ -1560,7 +1560,7 @@ def _run_research_opt(config: dict, df_base, freeze: bool) -> dict:
         if freeze:
             rp_result["apply_result"] = {"applied": False, "reason": "frozen (--freeze flag)"}
         else:
-            rp_result["apply_result"] = research_optimizer.apply(rp_result, bucket)
+            rp_result["apply_result"] = research_optimizer.apply(rp_result, bucket, run_date=config.get("_run_date"))
     return rp_result
 
 

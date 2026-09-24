@@ -708,7 +708,7 @@ def produce_artifact(
         return {"written": False, "reason": str(e)}
 
 
-def apply(result: dict, bucket: str) -> dict:
+def apply(result: dict, bucket: str, run_date: str | None = None) -> dict:
     """
     Write recommended veto threshold to S3 if guardrails pass.
 
@@ -726,14 +726,19 @@ def apply(result: dict, bucket: str) -> dict:
 
     Every decision path additionally produces a per-optimizer recommendation
     artifact via ``produce_artifact()``, consumed by the assembler when
-    ``assembler.cutover_enabled`` is true (config#2054).
+    ``assembler.cutover_enabled`` is true (config#2054). ``run_date`` (the
+    cycle's trading day, evaluate.py's normalized ``args.date``) keys that
+    artifact, so it lands in the partition the assembler reads even when the
+    run crosses 00:00 UTC; None falls back to ``today_iso()``
+    (alpha-engine-config-I11475, mirroring config#1017's executor_params
+    optimizers).
 
     Returns ``{"applied": True, ...}`` on production write,
     ``{"applied": False, "reason": ..., "shadow_key": ...}`` on shadow
     write or guardrail rejection.
     """
     if result.get("status") != "ok":
-        produce_artifact(result, bucket, "skip", {}, notes=f"status={result.get('status')}")
+        produce_artifact(result, bucket, "skip", {}, notes=f"status={result.get('status')}", run_date=run_date)
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
     config_default = _cfg.get("current_default_threshold", _CURRENT_DEFAULT_THRESHOLD)
@@ -745,7 +750,7 @@ def apply(result: dict, bucket: str) -> dict:
     current = s3_current if s3_current is not None else result.get("current_threshold", config_default)
 
     if recommended is None:
-        produce_artifact(result, bucket, "skip", {}, notes="no recommended threshold")
+        produce_artifact(result, bucket, "skip", {}, notes="no recommended threshold", run_date=run_date)
         return {"applied": False, "reason": "no recommended threshold"}
 
     # Bootstrap: if no S3 artifact exists (s3_current is None), allow the first write
@@ -757,6 +762,7 @@ def apply(result: dict, bucket: str) -> dict:
         produce_artifact(
             result, bucket, "skip", {"veto_confidence": recommended},
             notes=f"min_threshold_change — |{recommended:.2f} - {current:.2f}| < {min_change}",
+            run_date=run_date,
         )
         return {
             "applied": False,
@@ -779,6 +785,7 @@ def apply(result: dict, bucket: str) -> dict:
                 produce_artifact(
                     result, bucket, "skip", {"veto_confidence": recommended},
                     notes="significance_floor — bootstrap seed blocked (config#1426)",
+                    run_date=run_date,
                 )
                 return {
                     "applied": False,
@@ -850,6 +857,7 @@ def apply(result: dict, bucket: str) -> dict:
         produce_artifact(
             result, bucket, "shadow", payload,
             notes="shadow mode — fit_target=skill_composite, enforce_skill_composite=False",
+            run_date=run_date,
         )
         return {
             "applied": False,
@@ -878,6 +886,7 @@ def apply(result: dict, bucket: str) -> dict:
             produce_artifact(
                 result, bucket, "skip", payload,
                 notes="significance_floor — blocked by significance enforce (config#1426)",
+                run_date=run_date,
             )
             return {
                 "applied": False,
@@ -890,7 +899,7 @@ def apply(result: dict, bucket: str) -> dict:
     # All guardrails passed — this recommendation would be promoted.
     # Produce the artifact BEFORE the cutover gate check so the assembler
     # has it available.
-    produce_artifact(result, bucket, "promote", payload, notes=f"fit_target={fit_target}")
+    produce_artifact(result, bucket, "promote", payload, notes=f"fit_target={fit_target}", run_date=run_date)
 
     # Cutover gate: when assembler.cutover_enabled is true, the assembler
     # is the sole writer of the live key. Skip the legacy live + history

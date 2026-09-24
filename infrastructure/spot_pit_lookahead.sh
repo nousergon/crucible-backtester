@@ -73,7 +73,7 @@ if [ "$SHOW_HELP" = "1" ]; then
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  PitParity ${PIT_PASS} Spot Run — $(date +%Y-%m-%d)"
+echo "  PitParity ${PIT_PASS} Spot Run — $(spot_common_stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Branch        : $BRANCH"
 echo "  Preflight-only: $PREFLIGHT_ONLY"

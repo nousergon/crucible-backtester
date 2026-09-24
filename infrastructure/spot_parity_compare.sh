@@ -67,7 +67,7 @@ if [ "$SHOW_HELP" = "1" ]; then
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  PitParity Compare Spot Run (stage=pit_parity_compare) — $(date +%Y-%m-%d)"
+echo "  PitParity Compare Spot Run (stage=pit_parity_compare) — $(spot_common_stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Branch        : $BRANCH"
 echo "  Preflight-only: $PREFLIGHT_ONLY"

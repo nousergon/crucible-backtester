@@ -429,7 +429,7 @@ def produce_artifact(
         return {"written": False, "reason": str(e)}
 
 
-def apply(result: dict, bucket: str) -> dict:
+def apply(result: dict, bucket: str, run_date: str | None = None) -> dict:
     """
     Write recommended research params to S3 if recommendation is valid.
 
@@ -438,15 +438,20 @@ def apply(result: dict, bucket: str) -> dict:
 
     Every decision path additionally produces a per-optimizer recommendation
     artifact via ``produce_artifact()``, consumed by the assembler when
-    ``assembler.cutover_enabled`` is true (config#2054).
+    ``assembler.cutover_enabled`` is true (config#2054). ``run_date`` (the
+    cycle's trading day, evaluate.py's normalized ``args.date``) keys that
+    artifact, so it lands in the partition the assembler reads even when the
+    run crosses 00:00 UTC; None falls back to ``today_iso()``
+    (alpha-engine-config-I11475, mirroring config#1017's executor_params
+    optimizers).
     """
     if result.get("status") != "ok":
-        produce_artifact(result, bucket, "skip", result.get("recommended_params", {}), notes=f"status={result.get('status')}")
+        produce_artifact(result, bucket, "skip", result.get("recommended_params", {}), notes=f"status={result.get('status')}", run_date=run_date)
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
     recommended = result.get("recommended_params", {})
     if not recommended:
-        produce_artifact(result, bucket, "skip", {}, notes="no recommended params")
+        produce_artifact(result, bucket, "skip", {}, notes="no recommended params", run_date=run_date)
         return {"applied": False, "reason": "no recommended params"}
 
     payload = {
@@ -460,7 +465,7 @@ def apply(result: dict, bucket: str) -> dict:
     # recommend(), which returns status="no_improvement" otherwise) — this
     # recommendation would be promoted. Produce the artifact BEFORE the
     # cutover gate check so the assembler has it available.
-    produce_artifact(result, bucket, "promote", recommended, notes=f"n_samples={result.get('n_samples')}")
+    produce_artifact(result, bucket, "promote", recommended, notes=f"n_samples={result.get('n_samples')}", run_date=run_date)
 
     # Cutover gate: when assembler.cutover_enabled is true, the assembler
     # is the sole writer of the live key. Skip the legacy live + history

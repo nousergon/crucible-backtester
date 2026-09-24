@@ -66,7 +66,7 @@ if [ "$SHOW_HELP" = "1" ]; then
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Parity Replay Spot Run (stage=parity_replay) — $(date +%Y-%m-%d)"
+echo "  Parity Replay Spot Run (stage=parity_replay) — $(spot_common_stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Branch        : $BRANCH"
 echo "  Preflight-only: $PREFLIGHT_ONLY"

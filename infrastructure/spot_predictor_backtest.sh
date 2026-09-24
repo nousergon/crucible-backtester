@@ -67,7 +67,7 @@ fi
 spot_common_compute_phase_flags
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Predictor-Backtest Spot Run (stage=backtest, mode=predictor-backtest) — $(date +%Y-%m-%d)"
+echo "  Predictor-Backtest Spot Run (stage=backtest, mode=predictor-backtest) — $(spot_common_stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Branch        : $BRANCH"
 echo "  Preflight-only: $PREFLIGHT_ONLY"
