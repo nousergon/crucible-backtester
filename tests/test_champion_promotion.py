@@ -78,6 +78,16 @@ from optimizer.champion_promotion import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# The engine-driving tests below score the 2026-08-28 fixture board, so they
+# run against the register as it stood that day (tests/conftest.py). The
+# roster tests read the COMMITTED register, which is what production loads.
+pytestmark = pytest.mark.usefixtures("producer_register_2026_08_28")
+FIXTURE_REGISTER_PATH = REPO_ROOT / "tests" / "fixtures" / "producer_register_2026-08-28.json"
+COMMITTED_REGISTER_PATH = producer_arena.REGISTER_PATH
+FIXTURE_VALID_CHAMPIONS = producer_arena.promotion_eligible_arm_names(
+    producer_arena.load_register(FIXTURE_REGISTER_PATH)
+)
 POINTER_SCHEMA_PATH = REPO_ROOT / "contracts" / "producer_champion.schema.json"
 # Moved to nousergon-lib (alpha-engine-config-I7605): the audit contract now
 # reaches both producer (here) and consumer (crucible-dashboard) via the SAME
@@ -251,21 +261,21 @@ def _weekly_dates(n, start="2026-02-28"):
 def _deciding_board(date_str="2026-08-28", *, winner="no_agent_quant", lead=0.09, n=26):
     """A board on which the arena actually MOVES the pointer.
 
-    The defaults are not arbitrary and they are not gentle: with
-    ``variance_mode="declared"`` and ``diff_clip=0.10`` the sub-Gaussian scale
-    IS 0.10, so the anytime-valid interval is wide and a promotion needs a
-    lead that is both large and sustained. Measured against this config: 26
-    paired cohort dates at a 0.09 per-date lead decides; the same lead over 12
-    dates does not, and a 0.05 lead needs about 52. That is the intended
-    trade, recorded in ``producer_arena.ARENA_CONFIG``'s own comment — a
-    fixture that promoted on two good dates would be testing a bar the slot
-    does not have.
+    The slot ranks on the information ratio and promotes the point-estimate
+    leader after ``promote_min_weeks`` paired weeks (alpha-engine-config-
+    I11393). An IR needs a per-date series with some variance, so every arm
+    carries a small alternating wobble around its mean: ``lead`` for the
+    winner, zero for everyone else. A constant series has no IR, and a board
+    of constants would test "nothing is estimable", not "the leader wins".
     """
     dates = _weekly_dates(n)
     return _producer_board(
         date_str,
         scores={
-            name: {d: (lead if name == winner else 0.0) for d in dates}
+            name: {
+                d: (lead if name == winner else 0.0) + (0.005 if i % 2 else -0.005)
+                for i, d in enumerate(dates)
+            }
             for name in LIVE_COHORTS
         },
     )
@@ -298,14 +308,24 @@ class TestArmRoster:
     """
 
     def test_the_roster_is_the_registers_active_arms(self):
-        register = producer_arena.load_register()
+        register = producer_arena.load_register(COMMITTED_REGISTER_PATH)
         assert VALID_CHAMPIONS == producer_arena.promotion_eligible_arm_names(register)
 
-    def test_the_two_silently_omitted_arms_are_in_it(self):
+    def test_the_two_silently_omitted_arms_were_in_it_while_active(self):
         """The regression, named. Both were scored, ranked and reported — and
-        ineligible for the pointer for no recorded reason."""
-        assert "no_agent_quant" in VALID_CHAMPIONS
-        assert "single_agent_quant" in VALID_CHAMPIONS
+        ineligible for the pointer for no recorded reason. They were in the
+        roster for as long as they were active (the 2026-08-28 register); the
+        board retired both on 2026-09-23 (alpha-engine-config-I11393)."""
+        assert "no_agent_quant" in FIXTURE_VALID_CHAMPIONS
+        assert "single_agent_quant" in FIXTURE_VALID_CHAMPIONS
+
+    def test_the_research_slot_arms_and_the_held_funnel_width_pair_are_in_it(self):
+        """alpha-engine-config-I11393: the five research-slot arms, plus the
+        two arms whose board retirement the register holds pending Brian's
+        ruling (``producer_arena.RETIREMENTS_HELD``)."""
+        assert set(VALID_CHAMPIONS) == (
+            set(producer_arena.RESEARCH_SLOT_ARM_WIDTHS) | producer_arena.RETIREMENTS_HELD
+        )
 
     def test_the_retired_seat_is_not_in_it(self):
         assert "agentic" not in VALID_CHAMPIONS
@@ -339,6 +359,13 @@ class TestArmRoster:
             pytest.skip(
                 "producer_champion_audit enum widen is in nousergon-lib-PR379; "
                 "re-run after lib merge and lockstep pin bump"
+            )
+        if missing and missing <= set(producer_arena.RESEARCH_SLOT_ARM_WIDTHS):
+            pytest.skip(
+                "producer_champion_audit (nousergon-lib) does not yet name the "
+                f"research-slot arms {sorted(missing)}; their enum-typed audit fields "
+                "project to null and arm_scores keeps the measurement "
+                "(alpha-engine-config-I9406, -I11393)"
             )
         assert not missing, (
             "if this failed, widen producer_champion_audit in nousergon-lib "
@@ -526,11 +553,14 @@ class TestWriteChampionPointer:
             )
         s3.put_object.assert_not_called()
 
-    def test_every_arm_in_the_roster_is_writable_today(self):
+    def test_every_arm_in_the_roster_is_writable_today(self, monkeypatch):
         """A measurement, stated as a guard. Every derived-roster arm is in
         the enum as of I9299, so the invariant above binds nothing in
         production — and an arm arriving upstream WITHOUT the enum being
         widened reds this test instead of the executor."""
+        from optimizer import champion_promotion
+
+        monkeypatch.setattr(champion_promotion, "VALID_CHAMPIONS", VALID_CHAMPIONS)
         for arm in VALID_CHAMPIONS:
             write_champion_pointer(
                 "bucket", arm, promotion_source="arena_decided", upload=False,
@@ -846,7 +876,8 @@ class TestDecisionRecordFromCycle:
 
     def test_an_unsupported_lead_holds_and_is_not_a_no_contest(self):
         """A held cycle is a MEASURED cycle. It must not render as a validity
-        failure — the arms were compared and no lead cleared the interval."""
+        failure — the arms were compared and no arm led the incumbent on the
+        slot's statistic (all-zero series: nothing is estimable, so nothing leads)."""
         cycle, gaps, register = _cycle_for(_producer_board())
         assert cycle.decision.status == "held"
         record = decision_record_from_cycle(
@@ -882,7 +913,7 @@ class TestDecisionRecordFromCycle:
         record = decision_record_from_cycle(
             cycle, gaps, register, champion_before=INCUMBENT, freeze=False,
         )
-        for arm in VALID_CHAMPIONS:
+        for arm in FIXTURE_VALID_CHAMPIONS:
             assert arm in record["arm_scores"], arm
             assert record["arm_confidence"][arm] == CONFIDENCE_MEASURED
 
@@ -1049,7 +1080,7 @@ class TestBuildChampionAudit:
         record = self._record(_producer_board())
         audit = build_champion_audit("2026-08-28", record, freeze=False)
         assert audit["arm_scores"] == record["arm_scores"]
-        for arm in VALID_CHAMPIONS:
+        for arm in FIXTURE_VALID_CHAMPIONS:
             assert arm in audit["arm_scores"]
 
     def test_the_internal_projection_fields_never_reach_the_artifact(self):

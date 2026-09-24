@@ -21,6 +21,14 @@ from nousergon_lib.arena import ArenaConfig, ArmRegister
 from nousergon_lib.contracts import validate as validate_contract
 from optimizer import producer_arena
 
+# Engine-driving tests score the 2026-08-28 fixture board, so they run against
+# the register as it stood that day (tests/conftest.py). Tests about the
+# committed artifact read COMMITTED_REGISTER_PATH, captured before any patch.
+pytestmark = pytest.mark.usefixtures("producer_register_2026_08_28")
+COMMITTED_REGISTER_PATH = producer_arena.REGISTER_PATH
+COMMITTED_SNAPSHOT_PATH = producer_arena.BOARD_SNAPSHOT_PATH
+RESEARCH_ARMS = tuple(producer_arena.RESEARCH_SLOT_ARM_WIDTHS)
+
 
 # The real cohort dates each arm produced, read off
 # ``s3://alpha-engine-research/signals_shadow/{arm}/`` on 2026-08-29 and
@@ -102,6 +110,17 @@ class TestArenaConfig:
     def test_the_slot_grades_against_the_population(self):
         assert producer_arena.ARENA_CONFIG.benchmark == "population"
         assert producer_arena.ARENA_CONFIG.slot_kind == "selection_producer"
+
+    def test_the_slot_ranks_on_the_information_ratio(self):
+        """alpha-engine-config-I11393 Amendment 2: arms carry different widths
+        on purpose, so the pointer ranks on IR, which prices concentration. A
+        raw mean would hand the narrowest arm a win it did not earn."""
+        cfg = producer_arena.ARENA_CONFIG
+        assert cfg.promote_statistic == "information_ratio"
+        # The engine refuses IR with anytime-valid evidence; I11393 declares
+        # point-estimate promotion at 2 paired weeks (the I10546 rule).
+        assert cfg.promote_evidence == "point"
+        assert cfg.promote_min_weeks == 2
 
     def test_brians_2026_08_29_ruling_is_the_config(self):
         cfg = producer_arena.ARENA_CONFIG
@@ -187,16 +206,24 @@ class TestRegister:
         assert "no_agent_quant" in derived
         assert "single_agent_quant" in derived
 
-    def test_the_derivation_is_reproducible_from_the_boards(self):
+    @pytest.mark.parametrize(
+        "rule, expected_a",
+        [
+            # The arm's first board, 2026-08-03: grace starts when it enters.
+            (producer_arena.CREATED_DATE_FIRST_BOARD, "2026-08-03"),
+            # Its earliest scored cohort, older than the board that reported it.
+            (producer_arena.CREATED_DATE_EARLIEST_COHORT, "2026-07-31"),
+        ],
+    )
+    def test_the_derivation_is_reproducible_from_the_boards(self, rule, expected_a):
         boards = [
             {"date": "2026-08-03", "specs": [{"name": "a", "kind": "challenger", "dates_scored": ["2026-07-31"]}]},
             {"date": "2026-08-10", "specs": [{"name": "a", "kind": "retired"}, {"name": "b", "kind": "challenger"}]},
         ]
-        events = producer_arena.register_events_from_boards(boards)
+        events = producer_arena.register_events_from_boards(boards, created_date_rule=rule)
+        assert events == producer_arena.register_events_from_boards(boards, created_date_rule=rule)
         register = ArmRegister.from_dicts(events)
-        # created_date is the EARLIEST observation, including a cohort date
-        # older than the board that first reported it.
-        assert register.state(producer_arena.arm_id_for("a")).record.created_date == "2026-07-31"
+        assert register.state(producer_arena.arm_id_for("a")).record.created_date == expected_a
         assert register.state(producer_arena.arm_id_for("a")).retired_date == "2026-08-10"
         assert register.state(producer_arena.arm_id_for("b")).record.created_date == "2026-08-10"
 
@@ -379,12 +406,13 @@ class TestPointerContractAdmission:
     def test_every_registered_arm_is_admitted_today(self):
         """A guard that currently passes, stated as a measurement.
 
-        All five active arms are in the enum as of I9299. This is asserted
+        Every active arm is in the enum: the I9299 pair since 2026-08-29, the
+        five research-slot arms since alpha-engine-config-I11393. This is asserted
         rather than assumed so that an arm appearing upstream WITHOUT the enum
         being widened fails here — in this repo, which owns both the enum and
         the writer — instead of at the executor's planner start.
         """
-        register = producer_arena.load_register()
+        register = producer_arena.load_register(COMMITTED_REGISTER_PATH)
         active = {register.state(a).record.name for a in register.active_arms()}
         assert active <= producer_arena.POINTER_ADMISSIBLE_ARMS, (
             "registered arms absent from contracts/producer_champion.schema.json: "
@@ -528,13 +556,321 @@ class TestArenaCycleArtifact:
 
 class TestCommittedRegisterArtifact:
     def test_it_is_valid_json_with_the_expected_envelope(self):
-        payload = json.loads(producer_arena.REGISTER_PATH.read_text())
+        payload = json.loads(COMMITTED_REGISTER_PATH.read_text())
         assert payload["slot"] == "producer"
         assert payload["derived_by"].endswith("backfill_producer_arena_register.py")
         assert payload["events"]
 
     def test_every_record_declares_where_its_created_date_came_from(self):
-        payload = json.loads(producer_arena.REGISTER_PATH.read_text())
+        payload = json.loads(COMMITTED_REGISTER_PATH.read_text())
         for event in payload["events"]:
             if event["kind"] == "registered":
                 assert event["record"]["notes"]
+
+
+# ── The register is APPEND-ONLY (alpha-engine-config-I11490) ──────────────
+
+
+def _fixture_events():
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent / "fixtures" / "producer_register_2026-08-28.json"
+    return json.loads(path.read_text())["events"]
+
+
+def _snapshot_boards():
+    return json.loads(COMMITTED_SNAPSHOT_PATH.read_text())["boards"]
+
+
+def _created(events, name):
+    return next(e["record"]["created_date"] for e in events
+                if e["kind"] == "registered" and e["record"]["name"] == name)
+
+
+class TestAppendOnlyFold:
+    # The four arms whose dates the old derivation moved when S3 gained boards
+    # dated before the eight it was first run over (I11490, measured 2026-09-24).
+    MOVED_BY_THE_OLD_DERIVATION = {
+        "no_agent_quant": "2026-08-03",
+        "single_agent_quant": "2026-08-03",
+        "scanner_predictor_direct": "2026-08-03",
+        "thinktank_coverage": "2026-08-03",
+        "scanner_top20_predictor": "2026-07-30",
+    }
+
+    def test_the_old_derivation_really_did_move_them(self):
+        """The defect, reproduced on the real board history: folding from
+        scratch with the minimum-over-everything rule moves every one of them
+        earlier. Without this, the test below could pass vacuously."""
+        from_scratch = producer_arena.register_events_from_boards(
+            _snapshot_boards(),
+            created_date_rule=producer_arena.CREATED_DATE_EARLIEST_COHORT,
+            held_retirements=frozenset(),
+        )
+        for name, recorded in self.MOVED_BY_THE_OLD_DERIVATION.items():
+            assert _created(from_scratch, name) < recorded, name
+
+    @pytest.mark.parametrize("rule", producer_arena.CREATED_DATE_RULES)
+    def test_registered_arms_keep_their_dates_under_either_rule(self, rule):
+        base = _fixture_events()
+        events = producer_arena.register_events_from_boards(
+            _snapshot_boards(), existing_events=base, created_date_rule=rule,
+        )
+        for name, recorded in self.MOVED_BY_THE_OLD_DERIVATION.items():
+            assert _created(events, name) == recorded, name
+
+    def test_existing_events_come_first_verbatim(self):
+        base = _fixture_events()
+        events = producer_arena.register_events_from_boards(_snapshot_boards(), existing_events=base)
+        assert events[: len(base)] == base
+        assert producer_arena.append_only_violations(base, events) == []
+
+    def test_folding_twice_appends_nothing(self):
+        once = producer_arena.register_events_from_boards(
+            _snapshot_boards(), existing_events=_fixture_events(),
+        )
+        twice = producer_arena.register_events_from_boards(_snapshot_boards(), existing_events=once)
+        assert twice == once
+
+    def test_the_snapshot_folds_exactly_like_the_boards_it_projects(self):
+        boards = [
+            {"date": "2026-09-23", "arms": [
+                {"name": "x", "kind": "challenger", "dates_scored": ["2026-06-01", "2026-05-29"]},
+                {"name": "y", "kind": "retired", "dates_scored": []},
+            ]},
+            {"date": "2026-09-18", "specs": [{"name": "y", "kind": "challenger"}]},
+        ]
+        for rule in producer_arena.CREATED_DATE_RULES:
+            assert producer_arena.register_events_from_boards(
+                producer_arena.board_snapshot(boards), created_date_rule=rule,
+            ) == producer_arena.register_events_from_boards(boards, created_date_rule=rule)
+
+    def test_append_only_violations_names_a_rewrite_and_a_removal(self):
+        base = _fixture_events()
+        rewritten = [dict(e) for e in base]
+        rewritten[1] = {**rewritten[1], "date": "2026-06-30"}
+        assert producer_arena.append_only_violations(base, rewritten)
+        assert producer_arena.append_only_violations(base, base[:-1])
+        assert producer_arena.append_only_violations(base, base[1:] + base[:1])
+
+    def test_an_unknown_rule_is_refused(self):
+        with pytest.raises(ValueError, match="created_date_rule"):
+            producer_arena.register_events_from_boards([], created_date_rule="whenever")
+
+
+class TestNewArmCreatedDateRule:
+    """alpha-engine-config-I11393 open decision 3, both answers implemented."""
+
+    def _fold(self, rule):
+        return producer_arena.register_events_from_boards(
+            _snapshot_boards(), existing_events=_fixture_events(), created_date_rule=rule,
+        )
+
+    def test_first_board_appearance_starts_grace_on_2026_09_23(self):
+        events = self._fold(producer_arena.CREATED_DATE_FIRST_BOARD)
+        for name in RESEARCH_ARMS:
+            assert _created(events, name) == "2026-09-23", name
+
+    def test_earliest_cohort_backdates_to_the_backfilled_history(self):
+        """The rule the derivation used before this change, measured on the
+        real boards: these are the dates I11490 found."""
+        events = self._fold(producer_arena.CREATED_DATE_EARLIEST_COHORT)
+        assert _created(events, "attractiveness_60") == "2026-05-29"
+        assert _created(events, "thinktank_20") == "2026-07-16"
+        assert _created(events, "attractiveness_20") == "2026-07-29"
+        # No cohort scored yet: the first board is the only observation.
+        assert _created(events, "predictor_from_60") == "2026-09-23"
+        assert _created(events, "tech_score_20") == "2026-09-23"
+
+    def test_the_rule_in_force_is_written_into_each_new_arms_notes(self):
+        events = self._fold(producer_arena.CREATED_DATE_EARLIEST_COHORT)
+        rec = next(e["record"] for e in events if e.get("record", {}).get("name") == "attractiveness_60")
+        assert "earliest_backfilled_cohort" in rec["notes"]
+
+    def test_the_committed_register_follows_the_rule_in_force(self):
+        committed = json.loads(COMMITTED_REGISTER_PATH.read_text())["events"]
+        expected = self._fold(producer_arena.NEW_ARM_CREATED_DATE_RULE)
+        for name in RESEARCH_ARMS:
+            assert _created(committed, name) == _created(expected, name), name
+
+
+class TestHeldRetirements:
+    """alpha-engine-config-I11393 open decision 1. The board has marked the
+    funnel-width pair retired since 2026-09-23; the register holds them."""
+
+    def _board(self):
+        return [{"date": "2026-09-23", "arms": [
+            {"name": "scanner_predictor_direct", "kind": "retired"},
+            {"name": "scanner_top20_predictor", "kind": "retired"},
+            {"name": "no_agent_quant", "kind": "retired"},
+        ]}]
+
+    def test_a_held_arm_is_not_retired(self):
+        events = producer_arena.register_events_from_boards(self._board(), existing_events=_fixture_events())
+        retired = {e["arm_id"] for e in events if e["kind"] == "retired"}
+        for name in producer_arena.RETIREMENTS_HELD:
+            assert producer_arena.arm_id_for(name) not in retired, name
+        assert producer_arena.arm_id_for("no_agent_quant") in retired
+
+    def test_releasing_the_hold_records_the_retirement(self):
+        events = producer_arena.register_events_from_boards(
+            self._board(), existing_events=_fixture_events(), held_retirements=frozenset(),
+        )
+        retired = {e["arm_id"] for e in events if e["kind"] == "retired"}
+        assert producer_arena.arm_id_for("scanner_predictor_direct") in retired
+
+    def test_the_live_pointers_arm_is_active_in_the_committed_register(self):
+        register = producer_arena.load_register(COMMITTED_REGISTER_PATH)
+        active = {register.state(a).record.name for a in register.active_arms()}
+        assert producer_arena.RETIREMENTS_HELD <= active
+
+
+# ── The research slot: declared widths, IR primary, IC reported ───────────
+
+
+def _research_board(widths=None, *, ic=0.12, ir=0.4):
+    dates = ["2026-08-07", "2026-08-14", "2026-08-21", "2026-08-28"]
+    declared = dict(producer_arena.RESEARCH_SLOT_ARM_WIDTHS)
+    emitted = {**declared, **(widths or {})}
+    specs = []
+    for i, name in enumerate(declared):
+        specs.append({
+            "name": name,
+            "kind": "challenger",
+            "top_n": emitted[name],
+            "dates_scored": dates,
+            producer_arena.POPULATION_SERIES_FIELD: {
+                d: 0.01 * i + (0.004 if j % 2 else -0.004) for j, d in enumerate(dates)
+            },
+            "realized_rank_ic": {"mean": ic, "se": 0.03, "n_dates": 4},
+            "information_ratio": {"information_ratio": ir, "n_dates": 4},
+        })
+    return {"date": "2026-08-28", "horizon_days": 21, "per_arm_width": True,
+            "widths": emitted, "specs": specs}
+
+
+def _research_register():
+    events = producer_arena.register_events_from_boards(
+        [{"date": "2026-08-01", "arms": [{"name": n, "kind": "challenger"} for n in RESEARCH_ARMS]}],
+        held_retirements=frozenset(),
+    )
+    # Drop the unboarded seed so the roster is exactly the five arms.
+    keep = {producer_arena.arm_id_for(n) for n in RESEARCH_ARMS}
+    return ArmRegister.from_dicts([e for e in events if e["arm_id"] in keep])
+
+
+class TestResearchSlotArms:
+    def test_the_five_arms_at_their_declared_widths(self):
+        assert producer_arena.RESEARCH_SLOT_ARM_WIDTHS == {
+            "attractiveness_60": 60,
+            "attractiveness_20": 20,
+            "tech_score_20": 20,
+            "predictor_from_60": 20,
+            "thinktank_20": 20,
+        }
+        assert producer_arena.PINNED_RESEARCH_PREFILTER == "attractiveness_top_60"
+
+    def test_the_width_is_part_of_the_arm_id(self, monkeypatch):
+        """§3.1: an arm that changes its width is a new arm."""
+        before = producer_arena.arm_id_for("attractiveness_20")
+        monkeypatch.setitem(producer_arena.RESEARCH_SLOT_ARM_WIDTHS, "attractiveness_20", 25)
+        assert producer_arena.arm_id_for("attractiveness_20") != before
+
+    def test_pre_existing_arm_ids_do_not_move(self):
+        for event in _fixture_events():
+            if event["kind"] == "registered":
+                assert producer_arena.arm_id_for(event["record"]["name"]) == event["arm_id"]
+
+    def test_all_five_are_registered_and_admitted_by_the_pointer_contract(self):
+        register = producer_arena.load_register(COMMITTED_REGISTER_PATH)
+        active = {register.state(a).record.name for a in register.active_arms()}
+        assert set(RESEARCH_ARMS) <= active
+        assert set(RESEARCH_ARMS) <= producer_arena.POINTER_ADMISSIBLE_ARMS
+
+    def test_the_committed_record_carries_its_declared_width(self):
+        committed = json.loads(COMMITTED_REGISTER_PATH.read_text())["events"]
+        for event in committed:
+            name = (event.get("record") or {}).get("name")
+            if name in producer_arena.RESEARCH_SLOT_ARM_WIDTHS:
+                width = producer_arena.RESEARCH_SLOT_ARM_WIDTHS[name]
+                assert f"declared width {width}." in event["record"]["notes"]
+
+    def test_thinktank_20_records_its_lineage(self):
+        committed = json.loads(COMMITTED_REGISTER_PATH.read_text())["events"]
+        rec = next(e["record"] for e in committed if (e.get("record") or {}).get("name") == "thinktank_20")
+        assert rec["supersedes"] == producer_arena.arm_id_for("thinktank_coverage")
+
+    def test_a_width_that_matches_is_scored(self):
+        series, gaps = producer_arena.build_series(_research_register(), _research_board(), "2026-08-28")
+        assert not gaps
+        assert all(s.scores for s in series.values())
+
+    def test_an_arm_emitting_another_width_is_a_named_gap_not_a_score(self):
+        board = _research_board({"attractiveness_20": 25})
+        series, gaps = producer_arena.build_series(_research_register(), board, "2026-08-28")
+        arm = producer_arena.arm_id_for("attractiveness_20")
+        assert series[arm].scores == {}
+        (gap,) = [g for g in gaps if g.arm_id == arm]
+        assert "declared width 20" in gap.reason and "emitted 25" in gap.reason
+
+    def test_an_arm_the_board_gives_no_width_is_refused(self):
+        board = _research_board()
+        for row in board["specs"]:
+            row.pop("top_n")
+        board["widths"] = {}
+        _series, gaps = producer_arena.build_series(_research_register(), board, "2026-08-28")
+        assert {g.arm_name for g in gaps} == set(RESEARCH_ARMS)
+
+    def test_the_cycle_decides_on_ir_and_reports_ic_beside_it(self):
+        register = _research_register()
+        board = _research_board()
+        cycle, gaps, reg = producer_arena.run_arena_cycle(
+            as_of="2026-08-28", leaderboard=board, incumbent_name="attractiveness_60",
+            shadow_only_names=frozenset(), register=register,
+        )
+        assert cycle.decision.status == "decided"
+        assert "information_ratio" in cycle.decision.reason
+        doc = producer_arena.cycle_document(
+            cycle, gaps, producer_arena.arm_statistics(reg, board, "2026-08-28"),
+        )
+        stats = doc["arm_statistics"]
+        assert set(stats) == set(RESEARCH_ARMS)
+        for name, row in stats.items():
+            assert row["declared_width"] == producer_arena.RESEARCH_SLOT_ARM_WIDTHS[name]
+            assert row["emitted_width"] == row["declared_width"]
+            assert row["realized_rank_ic"]["mean"] == 0.12
+            assert row["information_ratio"]["information_ratio"] == 0.4
+
+    def test_a_statistic_the_board_lacks_is_none_never_zero(self):
+        board = _research_board()
+        for row in board["specs"]:
+            row.pop("realized_rank_ic")
+        stats = producer_arena.arm_statistics(_research_register(), board, "2026-08-28")
+        assert all(v["realized_rank_ic"] is None for v in stats.values())
+
+    def test_ir_not_the_raw_mean_decides_between_widths(self):
+        """The Amendment 2 objection, driven end to end. attractiveness_20 has
+        the higher mean (it stopped earlier) and far more variance;
+        attractiveness_60 has the lower mean and the higher IR. Under a raw
+        mean the narrow arm would hold; under IR the wide arm takes it."""
+        dates = ["2026-08-07", "2026-08-14", "2026-08-21", "2026-08-28"]
+
+        def wobble(mean, amp):
+            return {d: mean + (amp if j % 2 else -amp) for j, d in enumerate(dates)}
+
+        series = {
+            "attractiveness_20": wobble(0.020, 0.050),
+            "attractiveness_60": wobble(0.010, 0.002),
+            "tech_score_20": wobble(-0.010, 0.020),
+            "predictor_from_60": wobble(-0.010, 0.020),
+            "thinktank_20": wobble(-0.010, 0.020),
+        }
+        board = _research_board()
+        for row in board["specs"]:
+            row[producer_arena.POPULATION_SERIES_FIELD] = series[row["name"]]
+        cycle, _gaps, _reg = producer_arena.run_arena_cycle(
+            as_of="2026-08-28", leaderboard=board, incumbent_name="attractiveness_20",
+            shadow_only_names=frozenset(), register=_research_register(),
+        )
+        assert cycle.decision.status == "decided"
+        assert cycle.decision.champion == producer_arena.arm_id_for("attractiveness_60")

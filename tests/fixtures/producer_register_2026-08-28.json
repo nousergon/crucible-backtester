@@ -1,0 +1,110 @@
+{
+  "slot": "producer",
+  "derived_from": "research/producer_leaderboard/{date}.json",
+  "derived_by": "scripts/backfill_producer_arena_register.py",
+  "n_boards": 8,
+  "events": [
+    {
+      "kind": "registered",
+      "arm_id": "producer:scanner_top20_predictor:a3db85dd32ca",
+      "date": "2026-07-30",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:scanner_top20_predictor:a3db85dd32ca",
+        "slot": "producer",
+        "name": "scanner_top20_predictor",
+        "spec_hash": "a3db85dd32ca",
+        "created_date": "2026-07-30",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "the top-20 cut began 2026-07-30 \u2014 recorded in this repo at optimizer/champion_promotion.py::_score_scanner_top20_predictor and in crucible-research producers/registry.py. No producer leaderboard has ever carried a row for this arm (verified across every artifact under research/producer_leaderboard/, 2026-08-03 .. 2026-08-28)."
+      }
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:no_agent_quant:979910811b04",
+      "date": "2026-08-03",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:no_agent_quant:979910811b04",
+        "slot": "producer",
+        "name": "no_agent_quant",
+        "spec_hash": "979910811b04",
+        "created_date": "2026-08-03",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "created_date is FIRST OBSERVED on research/producer_leaderboard/; the arm's true registration may predate the artifact history. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:scanner_predictor_direct:79d585ed5b11",
+      "date": "2026-08-03",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:scanner_predictor_direct:79d585ed5b11",
+        "slot": "producer",
+        "name": "scanner_predictor_direct",
+        "spec_hash": "79d585ed5b11",
+        "created_date": "2026-08-03",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "created_date is FIRST OBSERVED on research/producer_leaderboard/; the arm's true registration may predate the artifact history. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:single_agent_quant:862d0e3e9356",
+      "date": "2026-08-03",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:single_agent_quant:862d0e3e9356",
+        "slot": "producer",
+        "name": "single_agent_quant",
+        "spec_hash": "862d0e3e9356",
+        "created_date": "2026-08-03",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "created_date is FIRST OBSERVED on research/producer_leaderboard/; the arm's true registration may predate the artifact history. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:thinktank_coverage:0b8218a97337",
+      "date": "2026-08-03",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:thinktank_coverage:0b8218a97337",
+        "slot": "producer",
+        "name": "thinktank_coverage",
+        "spec_hash": "0b8218a97337",
+        "created_date": "2026-08-03",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "created_date is FIRST OBSERVED on research/producer_leaderboard/; the arm's true registration may predate the artifact history. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:agentic_sector_teams:4c8181bfb5ef",
+      "date": "2026-08-04",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:agentic_sector_teams:4c8181bfb5ef",
+        "slot": "producer",
+        "name": "agentic_sector_teams",
+        "spec_hash": "4c8181bfb5ef",
+        "created_date": "2026-08-04",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "created_date is FIRST OBSERVED on research/producer_leaderboard/; the arm's true registration may predate the artifact history. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "retired",
+      "arm_id": "producer:agentic_sector_teams:4c8181bfb5ef",
+      "date": "2026-08-04",
+      "reason": "kind=='retired' on research/producer_leaderboard/ from this date; scored for the champion-challenger-policy.md \u00a73 trailing window"
+    }
+  ]
+}

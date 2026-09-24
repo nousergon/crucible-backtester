@@ -2,7 +2,8 @@
   "slot": "producer",
   "derived_from": "research/producer_leaderboard/{date}.json",
   "derived_by": "scripts/backfill_producer_arena_register.py",
-  "n_boards": 8,
+  "append_only": true,
+  "n_boards": 29,
   "events": [
     {
       "kind": "registered",
@@ -104,6 +105,104 @@
       "kind": "retired",
       "arm_id": "producer:agentic_sector_teams:4c8181bfb5ef",
       "date": "2026-08-04",
+      "reason": "kind=='retired' on research/producer_leaderboard/ from this date; scored for the champion-challenger-policy.md \u00a73 trailing window"
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:attractiveness_20:702484e2fb39",
+      "date": "2026-09-23",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:attractiveness_20:702484e2fb39",
+        "slot": "producer",
+        "name": "attractiveness_20",
+        "spec_hash": "702484e2fb39",
+        "created_date": "2026-09-23",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "created_date is the arm's FIRST APPEARANCE on research/producer_leaderboard/ (2026-09-23); earlier backfilled cohorts (2026-07-29) do not start its grace period (NEW_ARM_CREATED_DATE_RULE='first_board_appearance'). Research slot (alpha-engine-config-I11393): pinned pre-filter attractiveness_top_60, declared width 20. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:attractiveness_60:ad3af1049767",
+      "date": "2026-09-23",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:attractiveness_60:ad3af1049767",
+        "slot": "producer",
+        "name": "attractiveness_60",
+        "spec_hash": "ad3af1049767",
+        "created_date": "2026-09-23",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "created_date is the arm's FIRST APPEARANCE on research/producer_leaderboard/ (2026-09-23); earlier backfilled cohorts (2026-05-29) do not start its grace period (NEW_ARM_CREATED_DATE_RULE='first_board_appearance'). Research slot (alpha-engine-config-I11393): pinned pre-filter attractiveness_top_60, declared width 60. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:predictor_from_60:ba23a6a08780",
+      "date": "2026-09-23",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:predictor_from_60:ba23a6a08780",
+        "slot": "producer",
+        "name": "predictor_from_60",
+        "spec_hash": "ba23a6a08780",
+        "created_date": "2026-09-23",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "created_date is the arm's FIRST APPEARANCE on research/producer_leaderboard/ (2026-09-23); earlier backfilled cohorts (none) do not start its grace period (NEW_ARM_CREATED_DATE_RULE='first_board_appearance'). Research slot (alpha-engine-config-I11393): pinned pre-filter attractiveness_top_60, declared width 20. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:tech_score_20:964d91575401",
+      "date": "2026-09-23",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:tech_score_20:964d91575401",
+        "slot": "producer",
+        "name": "tech_score_20",
+        "spec_hash": "964d91575401",
+        "created_date": "2026-09-23",
+        "supersedes": null,
+        "bootstrap": false,
+        "notes": "created_date is the arm's FIRST APPEARANCE on research/producer_leaderboard/ (2026-09-23); earlier backfilled cohorts (none) do not start its grace period (NEW_ARM_CREATED_DATE_RULE='first_board_appearance'). Research slot (alpha-engine-config-I11393): pinned pre-filter attractiveness_top_60, declared width 20. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "registered",
+      "arm_id": "producer:thinktank_20:45cc641fe645",
+      "date": "2026-09-23",
+      "reason": "",
+      "record": {
+        "arm_id": "producer:thinktank_20:45cc641fe645",
+        "slot": "producer",
+        "name": "thinktank_20",
+        "spec_hash": "45cc641fe645",
+        "created_date": "2026-09-23",
+        "supersedes": "producer:thinktank_coverage:0b8218a97337",
+        "bootstrap": false,
+        "notes": "created_date is the arm's FIRST APPEARANCE on research/producer_leaderboard/ (2026-09-23); earlier backfilled cohorts (2026-07-16) do not start its grace period (NEW_ARM_CREATED_DATE_RULE='first_board_appearance'). Research slot (alpha-engine-config-I11393): pinned pre-filter attractiveness_top_60, declared width 20. Recipe: crucible-research/producers/registry.py::RESEARCH_PRODUCERS."
+      }
+    },
+    {
+      "kind": "retired",
+      "arm_id": "producer:no_agent_quant:979910811b04",
+      "date": "2026-09-23",
+      "reason": "kind=='retired' on research/producer_leaderboard/ from this date; scored for the champion-challenger-policy.md \u00a73 trailing window"
+    },
+    {
+      "kind": "retired",
+      "arm_id": "producer:single_agent_quant:862d0e3e9356",
+      "date": "2026-09-23",
+      "reason": "kind=='retired' on research/producer_leaderboard/ from this date; scored for the champion-challenger-policy.md \u00a73 trailing window"
+    },
+    {
+      "kind": "retired",
+      "arm_id": "producer:thinktank_coverage:0b8218a97337",
+      "date": "2026-09-23",
       "reason": "kind=='retired' on research/producer_leaderboard/ from this date; scored for the champion-challenger-policy.md \u00a73 trailing window"
     }
   ]
