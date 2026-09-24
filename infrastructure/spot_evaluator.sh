@@ -83,7 +83,7 @@ case "$EVAL_HALF" in
 esac
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Evaluator Spot Run (stage=evaluator, eval-half=$EVAL_HALF) — $(date +%Y-%m-%d)"
+echo "  Evaluator Spot Run (stage=evaluator, eval-half=$EVAL_HALF) — $(spot_common_stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Branch        : $BRANCH"
 echo "  Preflight-only: $PREFLIGHT_ONLY"
@@ -171,8 +171,11 @@ EVAL_HALF="${EVAL_HALF}"
 # config load + S3 reachability) via evaluate.py --smoke. Non-fatal — loud
 # WARNING, spot run continues; the real pass below surfaces the same break
 # if it's real.
+# alpha-engine-config-I11475: --date is this cycle's RUN_DATE. Without it
+# evaluate.py defaulted --date to the box's UTC day, and the 2026-09-23
+# rehearsal's smoke read backtest/2026-09-24/attestation.json (NoSuchKey).
 echo "▶ stage=smoke-evaluator START at \$(date -u +%H:%M:%S)"
-if ! $REMOTE_PYTHON -u evaluate.py --smoke --log-level INFO 2>&1; then
+if ! $REMOTE_PYTHON -u evaluate.py --smoke --date "\${RUN_DATE}" --log-level INFO 2>&1; then
     echo "WARNING: smoke-evaluator FAILED — evaluate.py's import/config/S3 wiring is broken. Continuing but the real pass below will likely fail the same way." >&2
 fi
 echo "▶ stage=smoke-evaluator END at \$(date -u +%H:%M:%S)"

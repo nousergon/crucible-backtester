@@ -834,7 +834,7 @@ def produce_artifact(
         return {"written": False, "reason": str(e)}
 
 
-def apply_weights(result: dict, bucket: str) -> dict:
+def apply_weights(result: dict, bucket: str, run_date: str | None = None) -> dict:
     """
     Apply suggested weights to S3 if guardrails pass.
 
@@ -855,19 +855,29 @@ def apply_weights(result: dict, bucket: str) -> dict:
     Args:
         result: dict returned by compute_weights().
         bucket: S3 bucket (same as signals_bucket).
+        run_date: the cycle's trading day (evaluate.py's normalized
+            ``args.date``), keying every recommendation artifact this call
+            produces. None falls back to ``today_iso()``. alpha-engine-config-
+            I11475: without it this was the one partition keyed by the box's
+            wall clock, so a run crossing 00:00 UTC wrote
+            ``scoring_weights/recommendations/<next day>/`` while its
+            executor_params siblings (which already took run_date, config#1017)
+            and the assembler's read used the cycle date — a real promote would
+            have been silently dropped as ``no_artifacts``.
 
     Returns:
         {"applied": True, "weights": {...}, "n_samples": int, "confidence": str}
         or {"applied": False, "reason": str}
     """
     if result.get("status") != "ok":
-        produce_artifact(result, bucket, "skip", result.get("suggested_weights", {}), notes=f"status={result.get('status')}")
+        produce_artifact(result, bucket, "skip", result.get("suggested_weights", {}), notes=f"status={result.get('status')}", run_date=run_date)
         return {"applied": False, "reason": f"status={result.get('status')}"}
 
     if result.get("oos_passed") is False:
         produce_artifact(
             result, bucket, "skip", result.get("suggested_weights", {}),
             notes=f"oos_degradation={result.get('oos_degradation', 0):.1%}",
+            run_date=run_date,
         )
         return {
             "applied": False,
@@ -877,7 +887,7 @@ def apply_weights(result: dict, bucket: str) -> dict:
 
     confidence = result.get("confidence", "low")
     if confidence == "low":
-        produce_artifact(result, bucket, "skip", result.get("suggested_weights", {}), notes="confidence_below_medium")
+        produce_artifact(result, bucket, "skip", result.get("suggested_weights", {}), notes="confidence_below_medium", run_date=run_date)
         return {
             "applied": False,
             "blocked_by": ["confidence_below_medium"],
@@ -895,6 +905,7 @@ def apply_weights(result: dict, bucket: str) -> dict:
         produce_artifact(
             result, bucket, "skip", result.get("suggested_weights", {}),
             notes=f"max_single_change {max_change:.1%} > {max_single:.0%}",
+            run_date=run_date,
         )
         return {
             "applied": False,
@@ -906,6 +917,7 @@ def apply_weights(result: dict, bucket: str) -> dict:
         produce_artifact(
             result, bucket, "skip", result.get("suggested_weights", {}),
             notes=f"all changes < {min_meaningful:.0%}",
+            run_date=run_date,
         )
         return {
             "applied": False,
@@ -956,7 +968,7 @@ def apply_weights(result: dict, bucket: str) -> dict:
             )
         except Exception as e:
             logger.warning("Shadow weights write failed (non-fatal): %s", e)
-        produce_artifact(result, bucket, "shadow", suggested, notes="shadow mode — skill_composite enabled, enforce_skill_composite=False")
+        produce_artifact(result, bucket, "shadow", suggested, notes="shadow mode — skill_composite enabled, enforce_skill_composite=False", run_date=run_date)
         return {
             "applied": False,
             "reason": "shadow mode — skill_composite enabled, enforce_skill_composite=False",
@@ -986,6 +998,7 @@ def apply_weights(result: dict, bucket: str) -> dict:
             produce_artifact(
                 result, bucket, "skip", suggested,
                 notes="significance_floor — blocked by significance enforce (config#1426)",
+                run_date=run_date,
             )
             return {
                 "applied": False,
@@ -998,7 +1011,7 @@ def apply_weights(result: dict, bucket: str) -> dict:
     # All guardrails passed — this recommendation would be promoted.
     # Produce the per-optimizer recommendation artifact BEFORE the cutover
     # gate check so the assembler (when cutover is enabled) has it available.
-    produce_artifact(result, bucket, "promote", suggested, notes=f"confidence={confidence}, fit_target={fit_target}")
+    produce_artifact(result, bucket, "promote", suggested, notes=f"confidence={confidence}, fit_target={fit_target}", run_date=run_date)
 
     # Cutover gate: when assembler.cutover_enabled is true, the assembler
     # is the sole writer of the live key. Skip the legacy live + history

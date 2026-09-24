@@ -328,6 +328,27 @@ spot_common_collapse_instance_type() {
     fi
 }
 
+# ── Cycle date for banners (alpha-engine-config-I11475) ─────────────────────
+# The date a stage's banner LABELS itself with. Every launcher used to print
+# `$(date +%Y-%m-%d)` — the box's UTC calendar day — so a run crossing
+# 00:00 UTC labelled itself a day ahead of its own cycle: on the 2026-09-23
+# weekly rehearsal (run_date 2026-09-23) the Evaluator banner read
+# `Evaluator Spot Run (...) — 2026-09-24` while the same stage read and wrote
+# backtest/2026-09-23/. Mirrors nousergon-data
+# `infrastructure/_stage_window.sh::stage_run_date` and crucible-predictor
+# `_spot_common.sh::stage_run_date`:
+#   1. $EXECUTION_RUN_DATE — the SF's $.run_date (see I8155 below).
+#   2. The exchange's calendar day (America/New_York) for a manual launch.
+#      Never the UTC day.
+# Banner-only: artifact keys stay on the normalized RUN_DATE.
+spot_common_stage_run_date() {
+    if [ -n "${EXECUTION_RUN_DATE:-}" ]; then
+        printf '%s' "$EXECUTION_RUN_DATE"
+        return 0
+    fi
+    TZ=America/New_York date +%Y-%m-%d
+}
+
 # ── DATE_CONVENTIONS: normalize RUN_DATE to the NYSE trading day ────────────
 # Single dispatcher-side chokepoint, BEFORE RUN_DATE is threaded into the
 # stage's --date and any bash s3 path. Defensive: keep the calendar value if

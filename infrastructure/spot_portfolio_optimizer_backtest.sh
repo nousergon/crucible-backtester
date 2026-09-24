@@ -69,7 +69,7 @@ fi
 spot_common_compute_phase_flags
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Portfolio-Optimizer-Backtest Spot Run (stage=backtest, mode=portfolio-optimizer-backtest) — $(date +%Y-%m-%d)"
+echo "  Portfolio-Optimizer-Backtest Spot Run (stage=backtest, mode=portfolio-optimizer-backtest) — $(spot_common_stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Branch        : $BRANCH"
 echo "  Preflight-only: $PREFLIGHT_ONLY"
