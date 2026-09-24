@@ -911,3 +911,63 @@ class TestRunOptimizerParamSweep:
                 spy_prices=pd.Series(dtype=float), sector_map={}, executor_path="/x",
                 cells=[], backtest_runner=_stub_runner_by_ra_tc({}),
             )
+
+
+# ── alpha-engine-config-I11507: forced turnover is a first-class metric ─────
+
+
+class TestForcedTurnoverSummary:
+    def test_summary_counts_rebalances_where_the_budget_cannot_bind(self):
+        from analysis.portfolio_optimizer_backtest import summarize_forced_turnover
+
+        rows = [
+            {"forced_turnover": 0.97, "turnover_budget_configured": 0.20,
+             "forced_turnover_by_cause": {"cash_sleeve_pin": 0.485, "renormalization": 0.485}},
+            {"forced_turnover": 0.10, "turnover_budget_configured": 0.20,
+             "forced_turnover_by_cause": {"cash_sleeve_pin": 0.05, "renormalization": 0.05}},
+            {"status": "skipped_insufficient_history"},
+        ]
+        out = summarize_forced_turnover(rows)
+        assert out["forced_turnover_n_rebalances"] == 2
+        assert out["forced_turnover_share_over_budget"] == pytest.approx(0.5)
+        assert out["forced_turnover_max"] == pytest.approx(0.97)
+        assert out["forced_turnover_by_cause_mean"]["cash_sleeve_pin"] == pytest.approx(0.2675)
+        assert out["w_prev_basis"] == "all_cash_each_rebalance"
+
+    def test_unmeasured_is_none_not_zero(self):
+        from analysis.portfolio_optimizer_backtest import summarize_forced_turnover
+
+        out = summarize_forced_turnover([{"status": "skipped_insufficient_history"}])
+        assert out["forced_turnover_n_rebalances"] == 0
+        assert out["forced_turnover_mean"] is None
+        assert out["forced_turnover_share_over_budget"] is None
+
+
+@pytest.mark.skipif(
+    _ALPHA_ENGINE_MISSING,
+    reason=executor_missing_reason(_ALPHA_ENGINE_PATH),
+)
+def test_from_cash_rebalance_forces_one_minus_sleeve():
+    """The measured cause of the rehearsal's 0.9700: every rebalance starts
+    from 100% cash, so the cash-sleeve pin alone forces 1 - cash_sleeve_pct."""
+    tickers = ["AAPL", "MSFT", "GOOG", "JNJ", "PG"]
+    sector_map = {t: "Technology" for t in tickers}
+    price_matrix = _synthetic_price_matrix(tickers, n_days=300, seed=0)
+    spy_prices = _synthetic_spy_series(n_days=300, seed=99).reindex(price_matrix.index)
+    predictions = _synthetic_predictions(tickers, price_matrix.index[260:295], seed=42)
+
+    result = run_optimizer_backtest(
+        predictions_by_date=predictions,
+        price_matrix=price_matrix,
+        spy_prices=spy_prices,
+        sector_map=sector_map,
+        executor_path=_ALPHA_ENGINE_PATH,
+        rebalance_freq_days=5,
+        universe_cap=10,
+        optimizer_cfg={"cash_sleeve_pct": 0.03},
+    )
+    m = result.metrics
+    assert m["forced_turnover_n_rebalances"] == result.n_rebalances
+    assert m["forced_turnover_median"] == pytest.approx(0.97, abs=1e-6)
+    solved = [d for d in result.diagnostics_per_rebalance if "forced_turnover" in d]
+    assert solved and all(d["forced_turnover_by_cause"] for d in solved)
