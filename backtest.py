@@ -92,7 +92,7 @@ from krepis.heartbeat import HEARTBEAT_INTERVAL_S, emit_heartbeat_if_elapsed
 
 from analysis import param_sweep
 from optimizer import executor_optimizer
-from optimizer.config_archive import read_params_pit_or_current
+from optimizer.config_archive import pit_degraded_warnings, read_params_pit_or_current
 from emailer import send_digest_email
 from reporter import build_digest, build_report, save, upload_to_s3
 from pipeline_common import (
@@ -1006,6 +1006,7 @@ def _simulate_single_date(
     coverage_by_ticker: dict[str, float] | None = None,
     atr_excluded_counter: dict[str, int] | None = None,
     feature_lookup=None,
+    enforce_batch_exposure_caps: bool = True,
 ) -> tuple[list[dict] | None, str | None]:
     """Run one simulate date through the deciders directly (Tier 2).
 
@@ -1279,6 +1280,40 @@ def _simulate_single_date(
         earnings_by_ticker={},  # backtester intentionally empty
         run_date=signal_date,
     )
+
+    # Same-batch exposure caps (alpha-engine-config-I11504). decide_entries
+    # checks each candidate against the PRE-batch book only, so a batch whose
+    # orders are each under max_equity_pct / max_sector_pct is approved in
+    # full even when their sum crosses the cap (the rehearsal book sat at
+    # 96-101% against 90%). Re-walk the plan in approval order counting the
+    # notional already kept from this batch, and drop what no longer fits.
+    # Must run BEFORE place_market_order: those fills are the book the next
+    # date is checked against. The live-parity replays pass False: their
+    # product is agreement with what the live executor DID, and the live
+    # decider has the same defect (crucible-executor executor/deciders.py
+    # check_order call, current_positions never updated in-batch) — trimming
+    # there would report the live defect as a modelling miss.
+    _batch_blocked: list[dict] = []
+    if enforce_batch_exposure_caps:
+        from synthetic.batch_exposure import (
+            enforce_batch_exposure_caps as _enforce_batch_caps,
+        )
+        _kept_entries, _batch_blocked = _enforce_batch_caps(
+            entry_plan.orders,
+            current_positions=current_positions,
+            portfolio_nav=portfolio_nav,
+            config=merged_config,
+        )
+    if _batch_blocked:
+        entry_plan.orders = _kept_entries
+        entry_plan.n_entered = sum(
+            1 for o in _kept_entries if o.get("action") == "ENTER"
+        )
+        entry_plan.blocked.extend(
+            {"ticker": b["ticker"], "date": signal_date,
+             "block_reason": b["reason"]}
+            for b in _batch_blocked
+        )
 
     # Apply ENTER orders to sim_client so position state carries forward
     # to the next simulate date (already-held check on next iteration).
@@ -2107,6 +2142,9 @@ def _replay_for_dates_per_date_bootstrap(
             # feature maps, so atr_map collapsed to {} and every ENTER
             # aborted. Fixing one call site of a systemic defect is not a fix.
             atr_by_ticker=atr_by_ticker,
+            # Live parity: reproduce the live decider, same-batch defect
+            # included (config-I11504) — see _simulate_single_date.
+            enforce_batch_exposure_caps=False,
             vwap_series_by_ticker=vwap_series_by_ticker,
             coverage_by_ticker=coverage_by_ticker,
             atr_excluded_counter=atr_excluded_counter,
@@ -2426,6 +2464,9 @@ def replay_for_dates(
             vwap_series_by_ticker=vwap_series_by_ticker,
             coverage_by_ticker=coverage_by_ticker,
             atr_excluded_counter=atr_excluded_out,
+            # Live parity: reproduce the live decider, same-batch defect
+            # included (config-I11504) — see _simulate_single_date.
+            enforce_batch_exposure_caps=False,
         )
         if orders and signal_date in requested:
             captured.extend(orders)
@@ -7524,6 +7565,10 @@ def _main_impl() -> None:
                 "upload": args.upload,
             })
     finally:
+        # A walk-forward read that fell back to genesis params means this run
+        # simulated a strategy the executor does not run: the health status
+        # must derive "degraded" from it, never "ok" (config-I11503).
+        _pit_warnings = pit_degraded_warnings(config)
         try:
             from nousergon_lib.health import Deliverable, write_health
             configs_applied = []
@@ -7540,7 +7585,9 @@ def _main_impl() -> None:
                 summary={
                     "mode": args.mode,
                     "configs_applied": configs_applied,
+                    "pit_params_degraded": _pit_warnings,
                 },
+                warnings=_pit_warnings or None,  # config-I11503
                 bucket=bucket,
             )
             # config#646 (Option A): emit the flow's end-of-run status()
