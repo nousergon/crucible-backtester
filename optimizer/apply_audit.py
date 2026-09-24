@@ -17,6 +17,22 @@ the crucible-evaluator consumer is built in parallel against exactly this shape
 Evolution is additive-only; renames/removals require a schema_version bump
 coordinated with the consumer.
 
+**A record, not a gate (alpha-engine-config-I11505).** This module runs
+AFTER the assembler, by design, and nothing here can stop a write that has
+already happened. The ``executor_params`` loop records the
+``executor_optimizer`` sweep recommendation (``executor_rec``) and nothing
+else: its ``alpha_floor`` / ``min_psr`` / … verdicts judge the sweep params
+(min_score, max_position_pct, ATR and time-decay knobs). A
+``field_overlay`` promotion from another executor_params writer — the
+trigger optimizer's ``disabled_triggers`` — is gated by that writer's own
+rules (``trigger_optimizer.recommend``: min trades per trigger, negative
+alpha, win rate, never disable every trigger) and merged by the assembler
+independently of this loop's outcome. So "assembler cut over executor_params"
+and "apply_audit[executor_params]=blocked(alpha_floor)" in the same run is
+the intended combination, not a bypass: the blocked sweep params were NOT
+written; only the overlay's own keys were. Pinned by
+``tests/test_rehearsal_live_write_guard.py``.
+
 **S3 layout:** ``config/apply_audit/{date}.json`` (dated, trading-day keyed)
 plus a ``config/apply_audit/latest.json`` mirror. The write is gated on the
 same ``args.upload``/``--freeze`` gate as sibling artifacts; the audit is
