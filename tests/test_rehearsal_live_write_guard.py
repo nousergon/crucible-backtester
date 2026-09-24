@@ -37,7 +37,7 @@ REPO = Path(__file__).resolve().parent.parent
     # Real weekly runs, their recovery reruns and shell runs are NOT
     # rehearsals — execution names measured live 2026-09-24.
     ({"RUN_TOKEN": "watch-rerun-2026-09-18-4"}, False),
-    ({"RUN_TOKEN": "2b6ab316-8060-4011-8140-cccf0f2194bd"}, False),
+    ({"RUN_TOKEN": "00000000-0000-4000-8000-000000000000"}, False),  # UUID-shaped, as a real execution name is
     ({"RUN_TOKEN": ""}, False),
     ({}, False),
     ({"AE_PIPELINE_ROLE": "weekly"}, False),
