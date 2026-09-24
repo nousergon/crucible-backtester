@@ -159,7 +159,18 @@ def compute_feature_drift(
 
     # ── Recommendation ───────────────────────────────────────────────────────
     drift_fraction = len(drifted_features) / evaluated_count if evaluated_count > 0 else 0
-    if drift_fraction > _DRIFT_FRACTION_TRIGGER:
+    degraded_reason = None
+    if evaluated_count == 0:
+        # Zero features compared is NOT "stable" (alpha-engine-config-I11506:
+        # the 2026-09-23 rehearsal logged "0/0 drifted recommendation=stable"
+        # because training_summary_latest.json carried an empty feature_ics).
+        degraded_reason = (
+            f"0 features comparable: {len(production_ics)} production IC(s), "
+            f"{len(training_ics)} training IC(s)"
+            + ("" if training_ics else " — training_summary_latest.json has no feature_ics")
+        )
+        recommendation = "unmeasured"
+    elif drift_fraction > _DRIFT_FRACTION_TRIGGER:
         recommendation = "retrain_suggested"
     elif drifted_features:
         recommendation = "monitor"
@@ -170,6 +181,7 @@ def compute_feature_drift(
     drifted_features.sort(key=lambda x: x["training_ic"] - x["production_ic"], reverse=True)
 
     result = {
+        "status": "ok" if degraded_reason is None else "no_comparable_features",
         "date": run_date,
         "lookback_days": lookback_days,
         "n_outcomes": len(joined),
@@ -179,6 +191,9 @@ def compute_feature_drift(
         "drift_fraction": round(drift_fraction, 3),
         "recommendation": recommendation,
     }
+    if degraded_reason is not None:
+        result["reason"] = degraded_reason
+        log.warning("Feature drift: UNMEASURED — %s", degraded_reason)
 
     # ── Write to S3 ──────────────────────────────────────────────────────────
     try:

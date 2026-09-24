@@ -140,6 +140,19 @@ def _read_signal_tickers(
         for ticker, s in signals.items()
         if isinstance(s, dict) and s.get("signal") == "ENTER"
     }
+    if not tickers:
+        # Name what the file DID hold, so an empty denominator reads as a
+        # fact about the producer rather than as a lookup failure
+        # (alpha-engine-config-I11506: 903 signals, all HOLD, on 2026-09-23).
+        counts: dict[str, int] = {}
+        for s in signals.values():
+            v = s.get("signal") if isinstance(s, dict) else None
+            counts[str(v)] = counts.get(str(v), 0) + 1
+        breakdown = ", ".join(f"{k}={n}" for k, n in sorted(counts.items()))
+        notes.append(
+            f"s3://{bucket}/{key} read OK: {len(signals)} signal(s), 0 ENTER"
+            + (f" ({breakdown})" if breakdown else "")
+        )
     return tickers
 
 
@@ -378,6 +391,7 @@ def compute_measurement_coverage(
             "gaps_by_stage": gaps_by_stage,
             "stage_availability": stage_availability,
             "notes": notes,
+            **({"reason": "; ".join(notes)} if status != "ok" and notes else {}),
         }
 
     except Exception as e:  # never crash the pipeline on a diagnostic

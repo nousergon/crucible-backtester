@@ -21,8 +21,9 @@ Rollback trigger (post 2026-05-16 spurious-rollback forensic):
   - Rollback is SUPPRESSED (regression may still be reported) on a
     degraded / low-statistical-power week (below min-trades / min-signals
     floors), or when the saved baseline is stale / pre-cutover (in which
-    case the baseline is skipped AND refreshed from current metrics so
-    subsequent runs compare post-cutover).
+    case the check is skipped and graded degraded, and the baseline is
+    re-anchored on the newest PRIOR run's rolling metrics, never on the
+    metrics under test — alpha-engine-config-I11506).
 """
 
 import json
@@ -89,9 +90,12 @@ DEFAULT_MIN_SIGNALS_FOR_ROLLBACK = 30
 # oranges. Age-based staleness is used (no clean canonical cutover constant
 # exists in-repo / lib; age is simpler and self-healing across any future
 # cutover). When the baseline is older than this many days it is treated as
-# not-comparable: regression/rollback is skipped this run AND the baseline is
-# refreshed from current metrics so subsequent runs compare post-cutover.
+# not-comparable: regression/rollback is skipped this run (graded degraded) AND
+# the baseline is re-anchored on the newest prior run's persisted rolling
+# metrics, never on the metrics under test (alpha-engine-config-I11506).
 DEFAULT_BASELINE_MAX_AGE_DAYS = 21
+# How many of the newest rolling-metrics snapshots to scan for a prior run.
+_PRIOR_METRICS_SCAN = 10
 
 
 def extract_metrics(portfolio_stats: dict | None, signal_quality: dict | None) -> dict:
@@ -207,31 +211,85 @@ def _baseline_age_days(baseline: dict, run_date: str | None) -> int | None:
     return (ref_dt - base_dt).days
 
 
-def _refresh_baseline_from_current(
-    bucket: str, current_metrics: dict, run_date: str | None,
-) -> None:
-    """Overwrite the promotion baseline with the current run's metrics.
+def _latest_prior_metrics(
+    bucket: str, run_date: str | None, max_age_days: int, s3_client=None,
+) -> tuple[dict, str] | None:
+    """The newest persisted rolling-metrics snapshot from a run BEFORE
+    ``run_date`` and no older than ``max_age_days``, with its S3 key.
 
-    Called when the existing baseline is not comparable (stale / pre-cutover)
-    so subsequent runs compare against a post-cutover baseline rather than
-    silently continuing to compare against the stale one forever.
+    ``save_rolling_metrics`` runs before ``check_regression``, so the newest
+    snapshot is normally the run under test itself. It is excluded by
+    ``run_date``, never by position. Returns ``None`` when no eligible
+    snapshot exists.
     """
+    s3 = s3_client or boto3.client("s3")
+    keys: list[str] = []
+    token = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": S3_METRICS_PREFIX}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        keys.extend(
+            o["Key"] for o in resp.get("Contents", [])
+            if o["Key"].endswith(".json") and not o["Key"].endswith("/latest.json")
+        )
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    ref = str(run_date)[:10] if run_date else date.today().isoformat()
+    # run_id keys are YYMMDDHHMM, so lexical order is write order.
+    for key in sorted(keys, reverse=True)[:_PRIOR_METRICS_SCAN]:
+        try:
+            snap = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        except (ClientError, ValueError) as e:
+            logger.warning("Rolling metrics snapshot %s unreadable: %s", key, e)
+            continue
+        snap_date = str(snap.get("run_date") or "")[:10]
+        if not snap_date or snap_date >= ref:
+            continue
+        age = _baseline_age_days({"saved_at": snap_date}, ref)
+        if age is None or age > max_age_days:
+            return None  # newest prior snapshot is already too old
+        return snap, key
+    return None
+
+
+def _refresh_baseline_from_prior_run(
+    bucket: str, run_date: str | None, max_age_days: int,
+) -> str | None:
+    """Re-anchor a stale promotion baseline on the newest PRIOR run's
+    persisted rolling metrics. Returns the snapshot key used, or ``None``
+    when there is no eligible prior snapshot (the baseline is left as is).
+
+    It used to be rebuilt from the metrics under test
+    (alpha-engine-config-I11506). A baseline has to predate the run it
+    judges; a baseline copied from the run under test proves nothing about
+    that run, and it rebased onto whatever the stale week produced.
+    ``saved_at`` is the snapshot's own run date, so its age stays honest.
+    """
+    found = _latest_prior_metrics(bucket, run_date, max_age_days)
+    if found is None:
+        return None
+    snap, key = found
+    metrics = {k: v for k, v in snap.items() if k not in ("run_date", "saved_at")}
     payload = {
-        "saved_at": (str(run_date)[:10] if run_date else date.today().isoformat()),
+        "saved_at": str(snap["run_date"])[:10],
         "promoted_configs": [],
         "refreshed_reason": "baseline_stale_refreshed",
-        **current_metrics,
+        "refreshed_from": key,
+        **metrics,
     }
-    s3 = boto3.client("s3")
-    s3.put_object(
+    boto3.client("s3").put_object(
         Bucket=bucket, Key=S3_BASELINE_KEY,
         Body=json.dumps(payload, indent=2),
         ContentType="application/json",
     )
     logger.warning(
-        "Promotion baseline refreshed from current metrics (stale baseline "
-        "skipped) → s3://%s/%s", bucket, S3_BASELINE_KEY,
+        "Promotion baseline re-anchored on prior run %s (%s) → s3://%s/%s",
+        snap.get("run_date"), key, bucket, S3_BASELINE_KEY,
     )
+    return key
 
 
 def _capture_rejected_recommendations(
@@ -390,14 +448,14 @@ def check_regression(
     only post the skilled-risk evaluator revamp). Rollback is suppressed —
     even when a regression is *detected* — when (a) the run is below the
     min-trades / min-signals floor (degraded/low-power week), or (b) the
-    baseline is stale / pre-cutover (in which case it is refreshed), or
+    baseline is stale / pre-cutover (in which case it is re-anchored), or
     (c) the baseline lacks ``sortino_ratio`` (older baseline → not
     comparable on the primary gate).
     """
     baseline = _load_baseline(bucket)
     if baseline is None:
-        logger.info("No promotion baseline found — skipping regression check")
-        return {"checked": False, "reason": "no baseline"}
+        logger.warning("No promotion baseline found — skipping regression check")
+        return {"status": "no_baseline", "checked": False, "reason": "no baseline"}
 
     reg_config = (config or {}).get("regression_monitor", {})
     acc_threshold = reg_config.get("accuracy_drop_threshold_pp", DEFAULT_ACCURACY_DROP_PP)
@@ -425,26 +483,42 @@ def check_regression(
         logger.warning(
             "Baseline is %d days old (> %d-day max) — treating as not "
             "comparable (likely predates a framework/regime cutover). "
-            "Skipping regression check and refreshing baseline from current "
-            "metrics.",
+            "Regression NOT checked this run (DEGRADED); re-anchoring the "
+            "baseline on the newest prior run's rolling metrics.",
             age_days, baseline_max_age_days,
         )
         try:
-            _refresh_baseline_from_current(bucket, current_metrics, run_date)
+            refreshed_from = _refresh_baseline_from_prior_run(
+                bucket, run_date, baseline_max_age_days,
+            )
         except Exception as e:  # refresh failure must not break the run
+            refreshed_from = None
             logger.warning(
                 "Baseline refresh failed (%s) — next run will re-detect "
                 "staleness and retry.", e,
             )
+        reason = (
+            "baseline_stale_refreshed" if refreshed_from
+            else "baseline_stale_no_prior_run"
+        )
+        # Not a check: graded DEGRADED, never ok (alpha-engine-config-I11506).
         return {
+            "status": "stale_baseline",
             "checked": False,
-            "reason": "baseline_stale_refreshed",
+            "reason": reason,
+            "degraded_reason": (
+                f"promotion baseline {age_days}d old (> {baseline_max_age_days}d) "
+                "— regression NOT checked this run; "
+                + (f"re-anchored on {refreshed_from}" if refreshed_from
+                   else "no prior run within the window to re-anchor on")
+            ),
             "regression_detected": False,
             "rollback_triggered": False,
             "details": {
                 "baseline_age_days": age_days,
                 "baseline_max_age_days": baseline_max_age_days,
-                "guard": "baseline_stale_refreshed",
+                "guard": reason,
+                "refreshed_from": refreshed_from,
             },
             "baseline": baseline,
             "current": current_metrics,

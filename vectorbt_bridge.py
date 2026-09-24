@@ -296,9 +296,18 @@ def portfolio_stats(
     ew_high_vol_basket_returns: pd.Series | None = None,
     ew_universe_basket_returns: pd.Series | None = None,
     sector_etf_basket_returns: dict[str, pd.Series] | None = None,
+    *,
+    spy_expected: bool = True,
 ) -> dict:
     """
     Extract key metrics from a vectorbt Portfolio into a plain dict.
+
+    ``spy_expected=False`` is for known-answer harnesses (``analysis/self_test``,
+    ``analysis/attestation``) that measure a statistic with no benchmark on
+    purpose. It only quiets the "spy_prices not provided" WARNING. ``null_legs``
+    still records the missing leg. Without it, 28 harness warnings a week read
+    as "every alpha this run is null" (alpha-engine-config-I11506) and buried
+    the one that would matter: a real consumer losing its benchmark.
 
     Suitable for writing to metrics.json or printing as a summary.
 
@@ -480,7 +489,7 @@ def portfolio_stats(
         missing_warning=(
             "vectorbt_bridge.portfolio_stats: spy_prices not provided — "
             "spy_return/total_alpha emit as null"
-        ),
+        ) if spy_expected else None,
     )
 
     # Compute alpha vs EW-high-vol basket — institutional skill-isolation
