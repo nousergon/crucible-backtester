@@ -1038,6 +1038,16 @@ spot_common_build_env_source() {
     # own shell (via the PYTHON_BIN export in ENV_SOURCE above) — not by
     # this dispatcher.
     REMOTE_PYTHON='$PYTHON_BIN'
+    # Carry the SF execution name onto the spot (alpha-engine-config-I11505).
+    # krepis.ssm_log_capture exports --correlation-id $$.Execution.Name to this
+    # dispatcher as RUN_TOKEN; without forwarding it the spot cannot tell a
+    # rehearsal from a real weekly run, and rehearsal-2026-09-23-2 cut over
+    # live config/executor_params.json. optimizer/run_role.py reads it. The
+    # value is reduced to [A-Za-z0-9._-] (SF execution-name charset) so it is
+    # safe inside the single-quoted export.
+    local _run_token="${RUN_TOKEN:-}"
+    _run_token="${_run_token//[^A-Za-z0-9._-]/}"
+    ENV_SOURCE="${ENV_SOURCE} export RUN_TOKEN='${_run_token}';"
 }
 
 # ── Preflight-only (Friday shell_run dry path) ──────────────────────────────

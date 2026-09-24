@@ -94,7 +94,7 @@ entries:
     tracking: alpha-engine-config-I10226
 
   - path: backtest.py
-    line: 7367
+    line: 7384
     reason: >-
       publish_ops_alert transport failure on the empty-param-sweep path.
       No recording surface -- notification-transport carve-out; the

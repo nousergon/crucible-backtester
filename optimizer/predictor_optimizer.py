@@ -927,6 +927,11 @@ def apply_recommendations(
         log.info("Predictor optimizer: no recommendations to apply")
         return {"applied": False, "reason": "no_recommendations"}
 
+    # Backstop: a rehearsal never writes live config, even if a caller forgot
+    # --freeze (alpha-engine-config-I11505). Raises before any S3 write.
+    from optimizer.run_role import refuse_live_config_write_in_rehearsal
+    refuse_live_config_write_in_rehearsal("config/predictor_params.json")
+
     # Read existing params, merge updates
     s3 = boto3.client("s3")
     existing = {}

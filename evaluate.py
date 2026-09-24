@@ -2131,6 +2131,10 @@ def main() -> None:
 
 def _main_impl() -> None:
     args = _parse_args()
+    # A rehearsal must never write live config (alpha-engine-config-I11505):
+    # forced into --freeze before anything below can reach S3.
+    from optimizer.run_role import freeze_if_rehearsal
+    freeze_if_rehearsal(args, entrypoint="evaluate.py")
 
     # DATE_CONVENTIONS: normalize the run-date label to the NYSE trading day so
     # the evaluator reads/writes backtest/{trading_day}/ — aligned with the

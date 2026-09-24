@@ -4338,12 +4338,20 @@ def run_predictor_param_sweep(config: dict) -> tuple[dict, pd.DataFrame]:
                     exc, exc_info=True,
                 )
 
-            # Apply recommendations to S3 (if any)
+            # Apply recommendations to S3 (if any) — never under --freeze or
+            # a rehearsal (config["_freeze"], alpha-engine-config-I11505).
             try:
-                apply_result = apply_recommendations(
-                    ensemble_result, pruning_result, bucket,
-                    threshold_result=threshold_result,
-                )
+                if config.get("_freeze"):
+                    logger.info(
+                        "Predictor optimizer apply SKIPPED: frozen run "
+                        "(--freeze or rehearsal) — no live config writes",
+                    )
+                    apply_result = {"applied": False, "reason": "frozen (--freeze flag)"}
+                else:
+                    apply_result = apply_recommendations(
+                        ensemble_result, pruning_result, bucket,
+                        threshold_result=threshold_result,
+                    )
                 single_stats["predictor_optimizer_apply"] = apply_result
             except Exception as exc:
                 # This one is especially important — if the apply fails,
@@ -6629,6 +6637,10 @@ def main() -> None:
 
 def _main_impl() -> None:
     args = _parse_args()
+    # A rehearsal must never write live config (alpha-engine-config-I11505):
+    # forced into --freeze before anything below can reach S3.
+    from optimizer.run_role import freeze_if_rehearsal
+    freeze_if_rehearsal(args, entrypoint="backtest.py")
 
     # DATE_CONVENTIONS: normalize the run-date label to the NYSE trading day so
     # every backtest artifact (backtest/{date}/…, incl. pit_parity.json +
@@ -6708,6 +6720,11 @@ def _main_impl() -> None:
     # _apply_smoke_fixture has already executed).
     if getattr(args, "dry_run", False) and not _is_smoke_phase:
         _apply_dry_run_isolation(args)
+    # Deep-pipeline writers without an args handle (the predictor optimizer's
+    # apply_recommendations) read the freeze decision from config — so a
+    # rehearsal or --freeze run cannot write config/predictor_params.json
+    # (alpha-engine-config-I11505).
+    config["_freeze"] = bool(args.freeze)
 
     # Parse + validate phase-selection flags.
     def _split(s: str) -> list[str]:

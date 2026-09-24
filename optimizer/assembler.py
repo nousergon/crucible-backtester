@@ -530,6 +530,12 @@ def _cutover_apply(
     config_type = result.config_type
     live_key = f"config/{config_type}.json"
     previous_key = f"config/{config_type}_previous.json"
+    # Backstop: a rehearsal never cuts over live config, even when the
+    # entrypoint's --freeze was bypassed (alpha-engine-config-I11505 —
+    # rehearsal-2026-09-23-2 wrote config/executor_params.json here). Raised
+    # BEFORE the _previous snapshot so not even the rollback key moves.
+    from optimizer.run_role import refuse_live_config_write_in_rehearsal
+    refuse_live_config_write_in_rehearsal(live_key)
     # Canonical eval-style archive layout per lib v0.8.0 — flat
     # {prefix}/{run_id}.json + latest.json sidecar (YYMMDDHHMM run_id)
     history_run_id = new_eval_run_id()

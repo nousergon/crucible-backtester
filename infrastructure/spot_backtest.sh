@@ -1279,6 +1279,11 @@ CACHE
 # the bootstrap would have left every workload step free to resolve the AMI
 # python3 against wheels installed for 3.12 (alpha-engine-config-I7372).
 ENV_SOURCE='export XDG_CACHE_HOME=/tmp; export PYTHONUNBUFFERED=1; export ALPHA_ENGINE_DECISION_CAPTURE_SUPPRESS=true; export AWS_REGION=us-east-1; export AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1; command -v python3.12 >/dev/null || { echo "FATAL: python3.12 absent on the spot — bootstrap asserted it and deps installed against it. Refusing to run this step on a different interpreter (alpha-engine-config-I7372)." >&2; exit 1; }; PYTHON_BIN=python3.12; export PYTHON_BIN;'
+# Forward the SF execution name so a rehearsal is recognisable on the spot
+# (alpha-engine-config-I11505; same as _spot_common.sh::spot_common_build_env_source).
+_RUN_TOKEN_SAFE="${RUN_TOKEN:-}"
+_RUN_TOKEN_SAFE="${_RUN_TOKEN_SAFE//[^A-Za-z0-9._-]/}"
+ENV_SOURCE="${ENV_SOURCE} export RUN_TOKEN='${_RUN_TOKEN_SAFE}';"
 
 # Spot-side python is resolved inline per SSM step via PYTHON_BIN in the
 # ENV_SOURCE above. The pre-2026-05-27 SSH transport captured this on the
