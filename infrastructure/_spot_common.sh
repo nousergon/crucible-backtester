@@ -44,6 +44,11 @@ fi
 # run's output — an existence-only probe cannot tell those apart.
 _STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
+# What the attempt after a spot interruption does differently (demote the
+# reclaimed pool; final attempt on-demand) lives in ONE file beside this one,
+# mirrored from nousergon-data (alpha-engine-config-I11573).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_spot_relaunch.sh"
+
 # ── Unconditional global defaults ────────────────────────────────────────────
 # Every var a downstream function reads is initialized HERE, unconditionally,
 # regardless of which flags the caller later parses or which code path runs.
@@ -638,11 +643,23 @@ spot_assert_instance_types_allowed() {
 spot_common_launch_instance() {
     spot_assert_instance_types_allowed "$INSTANCE_TYPES" || exit 2
 
-    echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
+    # Arm the EXIT handler BEFORE the first billable call (alpha-engine-config-
+    # I11573, the backtester port of I11574). Every stage script used to arm
+    # it on the line AFTER this function, so an ec2_spot refusal here (exit
+    # 64 = every pool refused capacity, 65 = spot quota) exited with no
+    # handler: no classification, no relaunch, no on-demand rung. Armed here,
+    # a launch-time refusal goes through cleanup's relaunch path, and cleanup
+    # terminates nothing while INSTANCE_ID is still empty.
+    spot_common_install_cleanup_trap
+    # Demote pools this run already saw reclaimed; the final attempt of a
+    # relaunch chain goes on-demand (alpha-engine-config-I11573, _spot_relaunch.sh).
+    spot_launch_plan
+    echo "==> Requesting ${_SPOT_PLAN_MARKET} instance (lib CLI rotation: types=[$_SPOT_PLAN_TYPES], subnets=[$_SPOT_PLAN_SUBNETS], attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS)..."
     local ec2_spot_rc=0
     INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
-        --types "$INSTANCE_TYPES" \
-        --subnets "$SUBNETS" \
+        --types "$_SPOT_PLAN_TYPES" \
+        --subnets "$_SPOT_PLAN_SUBNETS" \
+        "${_SPOT_PLAN_MARKET_ARGS[@]}" \
         --image-id "$AMI_ID" \
         --key-name "$KEY_NAME" \
         --security-group "$SECURITY_GROUP" \
@@ -652,6 +669,9 @@ spot_common_launch_instance() {
     if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$INSTANCE_ID" ]; then
         if [ "$ec2_spot_rc" -eq 64 ]; then
             echo "ERROR: capacity exhausted across all instance_type x subnet combinations" >&2
+        fi
+        if [ "$ec2_spot_rc" -eq 65 ]; then
+            echo "ERROR: spot launch refused by the account's spot quota" >&2
         fi
         if [ "$ec2_spot_rc" -eq 0 ]; then
             # rc=0 with an EMPTY instance id = the launch layer produced
@@ -664,6 +684,7 @@ spot_common_launch_instance() {
         exit "$ec2_spot_rc"
     fi
     echo "  Instance ID: $INSTANCE_ID"
+    spot_capture_launched_pool "$INSTANCE_ID"
 
     # (config-I7442) The launch-time prune retired into
     # `krepis.spot_evidence teardown`, which sweeps both tmp/spot_<slug>/ and
@@ -705,8 +726,10 @@ spot_common_launch_instance() {
 
 # ── Cleanup / reclaim-relaunch / error-artifact publishing ──────────────────
 # Always terminate the instance + clean S3 staging, with diagnostics on
-# failure, and re-exec on a CONFIRMED spot reclaim (#883). Installs a
-# `trap cleanup EXIT` — call once, after INSTANCE_ID is set.
+# failure, and re-exec on a CONFIRMED spot reclaim (#883) or a launch-time
+# capacity/quota refusal (I11573). Installs a `trap cleanup EXIT`.
+# spot_common_launch_instance calls it BEFORE launching, so stage scripts do
+# not call it themselves (alpha-engine-config-I11573).
 spot_common_install_cleanup_trap() {
     spot_common_teardown_staging() {
         local _exit_code="$1"
@@ -736,7 +759,7 @@ spot_common_install_cleanup_trap() {
     # a same-function trap registration as a call site.
     cleanup() {
         local exit_code=$?
-        local _will_relaunch=0 _alert_sev="error"
+        local _will_relaunch=0 _alert_sev="error" _relaunch_reason=""
         echo ""
         echo "==> Dispatcher EXIT (code=$exit_code)"
         local state="<not yet provisioned>" reason_code="<none>" state_reason="<none>"
@@ -756,8 +779,28 @@ spot_common_install_cleanup_trap() {
                 echo "    spot state-reason-code: $reason_code"
                 echo "    spot state-transition-reason: $state_reason"
             fi
+            # Launch-time refusal (alpha-engine-config-I11573): ec2_spot exited
+            # 64 (every pool refused capacity) or 65 (account-wide spot quota)
+            # and no instance exists. Relaunchable within the attempt budget;
+            # _spot_relaunch.sh decides the next launch goes on-demand.
+            if [ -z "${INSTANCE_ID:-}" ] && { [ "$exit_code" -eq 64 ] || [ "$exit_code" -eq 65 ]; }; then
+                if [ "$exit_code" -eq 64 ]; then
+                    _relaunch_reason="launch-capacity-exhausted"
+                else
+                    _relaunch_reason="launch-quota-exceeded"
+                fi
+                if [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
+                    _will_relaunch=1
+                    _alert_sev="warning"
+                else
+                    echo "ERROR: spot interruption (reason=$_relaunch_reason) persisted across all $MAX_SPOT_ATTEMPTS attempt(s) — giving up." >&2
+                fi
+            fi
             # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
-            if [ -n "${INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
+            # Asked on EVERY attempt, including the last: the verdict applies the
+            # budget, but a reclaim on the last attempt must still be RECORDED so
+            # a later launch in this run demotes that pool (I11573).
+            if [ -n "${INSTANCE_ID:-}" ]; then
                 local _decide_json="" _decide_rc=0
                 _decide_json="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
                     --instance-id "$INSTANCE_ID" \
@@ -770,10 +813,18 @@ spot_common_install_cleanup_trap() {
                 if [ "$_decide_rc" -ne 0 ]; then
                     echo "    spot relaunch-decision: CLI failed to answer (rc=$_decide_rc) — treating as hold" >&2
                 else
-                    local _relaunch=""
-                    _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+                    local _relaunch="" _class=""
+                    read -r _relaunch _class <<<"$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; d=json.load(sys.stdin); print("1" if d.get("relaunch") else "0", d.get("classification") or "none")')" || true
                     echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json"
+                    # Record EVERY confirmed reclaim, hold verdicts included, so
+                    # the next launch in this run (this script's relaunch or an
+                    # SF re-issue on the same box) demotes the reclaimed pool
+                    # (alpha-engine-config-I11573). stderr/file only.
+                    if [ "$_class" = "reclaim" ]; then
+                        spot_record_reclaim "$INSTANCE_ID" "$SPOT_STAGE_NAME" || true
+                    fi
                     if [ "$_relaunch" = "1" ]; then
+                        _relaunch_reason="reclaim"
                         _will_relaunch=1
                         _alert_sev="warning"
                     fi
@@ -804,12 +855,24 @@ publish_ops_alert(
                 2>&1 >/dev/null)" \
                 || echo "    (ops alert fan-out failed via $_alert_python: ${_fo_err##*$'\n'}; primary stdout diagnostic above is the surface)"
         fi
-        echo "==> Terminating spot instance $INSTANCE_ID..."
-        aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
+        # The trap is armed before launch (I11573): with no instance there is
+        # nothing to terminate.
+        if [ -n "${INSTANCE_ID:-}" ]; then
+            echo "==> Terminating spot instance $INSTANCE_ID..."
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
+        fi
         spot_common_teardown_staging "$exit_code"
         if [ "$_will_relaunch" = "1" ]; then
-            echo "==> Spot RECLAIMED by AWS (reason_code='$reason_code' state='$state' transition='$state_reason') — relaunching on a fresh spot (attempt $((SPOT_ATTEMPT + 1))/$MAX_SPOT_ATTEMPTS)"
+            if [ "$_relaunch_reason" = "reclaim" ]; then
+                echo "==> Spot RECLAIMED by AWS (reason_code='$reason_code' state='$state' transition='$state_reason') — relaunching (attempt $((SPOT_ATTEMPT + 1))/$MAX_SPOT_ATTEMPTS)"
+            else
+                echo "==> Spot launch refused (reason=$_relaunch_reason) — relaunching (attempt $((SPOT_ATTEMPT + 1))/$MAX_SPOT_ATTEMPTS)"
+            fi
             trap - EXIT
+            # SPOT_RELAUNCH_CAUSE tells the next attempt it is a relaunch, so it
+            # can go on-demand (_spot_relaunch.sh, rule 2).
+            SPOT_RELAUNCH_CAUSE="$(spot_relaunch_cause "$_relaunch_reason")"
+            export SPOT_RELAUNCH_CAUSE
             SPOT_ATTEMPT=$((SPOT_ATTEMPT + 1)) exec bash "$0" ${_ORIG_ARGS[@]+"${_ORIG_ARGS[@]}"}
         fi
         # CRITICAL: re-exit with the captured status — a bash EXIT trap that

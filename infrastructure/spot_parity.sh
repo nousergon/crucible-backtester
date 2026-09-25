@@ -120,8 +120,7 @@ spot_common_pre_launch_preflight \
 spot_common_apply_large_universe_ram_floor
 echo "  Instance types: $INSTANCE_TYPES"
 
-spot_common_launch_instance
-spot_common_install_cleanup_trap
+spot_common_launch_instance   # arms the cleanup EXIT trap before it launches (alpha-engine-config-I11573)
 
 echo "==> Waiting for instance to enter running state..."
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
