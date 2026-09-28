@@ -136,7 +136,9 @@ cvxpy>=1.9.2,<1.10
 # ("information_ratio", nousergon-lib#444), which the producer arena declares
 # as its primary statistic. LOCKSTEP: crucible-predictor must move to the same
 # tag (lib-pin-cross-repo-guard.yml / the weekly SF's LibPinDriftGate).
-nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.153
+# Bumped 0.124.153 -> 0.124.156 (alpha-engine-config-I11660): the shared
+# PhaseRegistry namespaces rehearsal phase markers. LOCKSTEP with the predictor.
+nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.156
 # ── Predictor-replay runtime deps (config#3031) ──────────────────────────────
 # synthetic/predictor_backtest.py and analysis/scanner_predictor_research_free_
 # backfill.py import crucible-predictor CODE in-process (sys.path), so THIS

@@ -400,7 +400,9 @@ class TestColdStartDeferral:
 # MERGE ORDER note (nousergon-lib-PR398 merges and publishes first).
 # Bumped v0.124.115 -> v0.124.153 (alpha-engine-config-I11393):
 # ArenaConfig.promote_statistic, which the producer arena declares.
-_EXPECTED_LIB_TAG = "v0.124.153"
+# Bumped v0.124.153 -> v0.124.156 (alpha-engine-config-I11660): rehearsal
+# phase-marker namespacing, in lockstep with crucible-predictor.
+_EXPECTED_LIB_TAG = "v0.124.156"
 
 
 class TestLibVersionPin:
