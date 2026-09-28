@@ -136,7 +136,7 @@ entries:
     tracking: alpha-engine-config-I10226
 
   - path: pipeline_common.py
-    line: 1391
+    line: 1417
     reason: >-
       sector_map.json miss/read failure at one of two preference-ordered
       S3 prefixes. No recording surface at this per-attempt DEBUG --

@@ -75,6 +75,14 @@ def s3():
     return _FakeS3()
 
 
+@pytest.fixture(autouse=True)
+def _real_run_env(monkeypatch):
+    """Every test is a real run unless it says otherwise: a RUN_TOKEN or
+    AE_PIPELINE_ROLE leaking in from the shell would move the marker keys."""
+    monkeypatch.delenv("RUN_TOKEN", raising=False)
+    monkeypatch.delenv("AE_PIPELINE_ROLE", raising=False)
+
+
 def _make_registry(s3, **kwargs):
     defaults = dict(date="2026-04-23", bucket="test-bucket", s3_client=s3)
     defaults.update(kwargs)
@@ -410,3 +418,71 @@ def test_transient_s3_error_raises(s3):
     r = _make_registry(s3)
     with pytest.raises(ClientError):
         r.should_run("simulate", supports_auto_skip=True)
+
+
+# ── rehearsal namespacing (alpha-engine-config-I11660) ─────────────────────
+
+
+def _ok_marker(date="2026-04-23", phase="simulate"):
+    return {"phase": phase, "date": date, "status": "ok", "schema_version": 1,
+            "artifact_keys": []}
+
+
+def test_rehearsal_writes_its_marker_under_its_own_namespace(s3, monkeypatch):
+    monkeypatch.setenv("RUN_TOKEN", "rehearsal-2026-09-23-2")
+    r = _make_registry(s3)
+    with r.phase("simulate", supports_auto_skip=True):
+        pass
+    call = s3.put_calls[0]
+    assert call["Key"] == (
+        "backtest/2026-04-23/.phases/.rehearsal/rehearsal-2026-09-23-2/simulate.json"
+    )
+    assert json.loads(call["Body"])["rehearsal"] == "rehearsal-2026-09-23-2"
+
+
+def test_real_run_does_not_resume_from_a_rehearsal_marker(s3):
+    s3.store[("test-bucket", _marker_key("2026-04-23", "simulate", "rehearsal-2026-09-23-2"))] = (
+        json.dumps(_ok_marker()).encode()
+    )
+    r = _make_registry(s3)
+    run, _ = r.should_run("simulate", supports_auto_skip=True)
+    assert run is True
+
+
+def test_rehearsal_does_not_resume_from_the_real_marker(s3, monkeypatch):
+    s3.seed("test-bucket", "2026-04-23", "simulate", _ok_marker())
+    monkeypatch.setenv("RUN_TOKEN", "rehearsal-2026-09-23-2")
+    r = _make_registry(s3)
+    run, _ = r.should_run("simulate", supports_auto_skip=True)
+    assert run is True
+
+
+def test_rehearsal_resumes_its_own_marker_but_not_another_rehearsals(s3, monkeypatch):
+    s3.store[("test-bucket", _marker_key("2026-04-23", "simulate", "rehearsal-2026-09-23-1"))] = (
+        json.dumps(_ok_marker()).encode()
+    )
+    monkeypatch.setenv("RUN_TOKEN", "rehearsal-2026-09-23-2")
+    other = _make_registry(s3)
+    assert other.should_run("simulate", supports_auto_skip=True)[0] is True
+
+    monkeypatch.setenv("RUN_TOKEN", "rehearsal-2026-09-23-1")
+    same = _make_registry(s3)
+    assert same.should_run("simulate", supports_auto_skip=True)[0] is False
+
+
+def test_real_run_token_keeps_the_shared_marker(s3, monkeypatch):
+    monkeypatch.setenv("RUN_TOKEN", "weekly-2026-09-26")
+    r = _make_registry(s3)
+    with r.phase("simulate", supports_auto_skip=True):
+        pass
+    assert s3.put_calls[0]["Key"] == "backtest/2026-04-23/.phases/simulate.json"
+
+
+def test_role_override_without_token_uses_the_manual_namespace(s3, monkeypatch):
+    monkeypatch.setenv("AE_PIPELINE_ROLE", "rehearsal")
+    r = _make_registry(s3)
+    with r.phase("simulate", supports_auto_skip=True):
+        pass
+    assert s3.put_calls[0]["Key"] == (
+        "backtest/2026-04-23/.phases/.rehearsal/manual/simulate.json"
+    )
