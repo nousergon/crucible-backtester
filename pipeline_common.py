@@ -384,7 +384,31 @@ _MARKER_SCHEMA_VERSION = 1
 _CRITICAL_PHASES = frozenset({"simulation_pipeline", "predictor_pipeline"})
 
 
-def _marker_key(date: str, phase_name: str) -> str:
+def _rehearsal_namespace(env=None) -> str | None:
+    """The marker namespace of a rehearsal run, or ``None`` for a real run.
+
+    alpha-engine-config-I11660: a weekly-SF rehearsal runs on the real
+    weekly's run_date. Its ``status=ok`` markers at the shared key were
+    auto-skipped by the 2026-09-26 weekly (Backtester simulate/param_sweep,
+    all four PredictorBacktest simulation steps), which then shipped the
+    rehearsal's outputs as its own. A rehearsal's markers therefore live
+    under its execution name, which a real run never reads. It is the same
+    fix `.smoke/` applied to smoke runs, scoped to markers only, because a
+    rehearsal's artifacts must still land where its own later stages read
+    them.
+    """
+    from optimizer.run_role import RUN_TOKEN_ENV, rehearsal_reason
+
+    env = os.environ if env is None else env
+    if rehearsal_reason(env) is None:
+        return None
+    token = (env.get(RUN_TOKEN_ENV) or "").strip()
+    return token or "manual"
+
+
+def _marker_key(date: str, phase_name: str, rehearsal: str | None = None) -> str:
+    if rehearsal:
+        return f"backtest/{date}/.phases/.rehearsal/{rehearsal}/{phase_name}.json"
     return f"backtest/{date}/.phases/{phase_name}.json"
 
 
@@ -536,6 +560,7 @@ class PhaseRegistry:
     ):
         self.date = date
         self.bucket = bucket
+        self.rehearsal = _rehearsal_namespace()
         self._explicit_skip = set(skip_phases or [])
         self._only = set(only_phases) if only_phases else None
         self._force_all = bool(force)
@@ -603,7 +628,7 @@ class PhaseRegistry:
         if phase_name in self._markers:
             return self._markers[phase_name]
 
-        key = _marker_key(self.date, phase_name)
+        key = _marker_key(self.date, phase_name, self.rehearsal)
         try:
             obj = self._client().get_object(Bucket=self.bucket, Key=key)
             body = obj["Body"].read()
@@ -631,7 +656,7 @@ class PhaseRegistry:
             raise
 
     def _write_marker(self, marker: dict) -> None:
-        key = _marker_key(self.date, marker["phase"])
+        key = _marker_key(self.date, marker["phase"], self.rehearsal)
         self._client().put_object(
             Bucket=self.bucket,
             Key=key,
@@ -932,6 +957,7 @@ class PhaseRegistry:
                     "schema_version": _MARKER_SCHEMA_VERSION,
                     "phase": name,
                     "date": self.date,
+                    "rehearsal": self.rehearsal,
                     "status": status,
                     "started_at": started_at,
                     "completed_at": completed_at,
