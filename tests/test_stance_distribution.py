@@ -486,3 +486,97 @@ class TestTheVerdictNamesWhatItMeasured:
     def test_the_pillar_literal_matches_the_predictor_contract(self):
         """A spelling drift here silently makes every run read as unmeasured."""
         assert sd.PILLAR_SOURCE == "pillar"
+
+
+# ── alpha-engine-config-I10530: the current ISO week is never baseline ──────
+
+def test_select_baseline_excludes_the_current_iso_week():
+    """Daily Mon–Fri files: a Friday run's baseline is the 4 PRIOR weeks.
+
+    Before I10530 the filter was only ``d < current``, so Thursday of the
+    run's own ISO week was picked as "the most recent prior week" and the
+    oldest real week fell off the window.
+    """
+    monday = date(2026, 9, 7)
+    weekdays = [
+        date.fromordinal(monday.toordinal() + 7 * week + day)
+        for week in range(4) for day in range(5)
+    ]  # Mon 09-07 .. Fri 10-02, ISO weeks 37-40
+    picked = sd._select_baseline_dates(
+        weekdays, current=date(2026, 10, 2), n_weeks=4,
+    )
+    # Three prior weeks exist (37, 38, 39); week 40 is the run's own.
+    assert picked == [date(2026, 9, 11), date(2026, 9, 18), date(2026, 9, 25)]
+
+
+def test_select_baseline_never_returns_a_date_in_the_current_week():
+    """Including Thursday 2026-10-01 for a Friday 2026-10-02 run is the bug."""
+    all_dates = [
+        date(2026, 9, 4), date(2026, 9, 10), date(2026, 9, 11),
+        date(2026, 9, 17), date(2026, 9, 18), date(2026, 9, 24),
+        date(2026, 9, 25), date(2026, 9, 28), date(2026, 9, 29),
+        date(2026, 9, 30), date(2026, 10, 1), date(2026, 10, 2),
+    ]
+    current = date(2026, 10, 2)
+    picked = sd._select_baseline_dates(all_dates, current=current, n_weeks=4)
+    assert picked == [date(2026, 9, 4), date(2026, 9, 11),
+                      date(2026, 9, 18), date(2026, 9, 25)]
+    current_week = current.isocalendar()[:2]
+    assert all(d.isocalendar()[:2] != current_week for d in picked)
+
+
+def test_select_baseline_excludes_current_week_across_iso_year_boundary():
+    """ISO week keys compare as (year, week): week 1 of 2027 follows week 53."""
+    all_dates = [
+        date(2026, 12, 11), date(2026, 12, 18), date(2026, 12, 24),
+        date(2026, 12, 31), date(2027, 1, 4), date(2027, 1, 7),
+    ]
+    picked = sd._select_baseline_dates(
+        all_dates, current=date(2027, 1, 8), n_weeks=4,
+    )
+    assert picked == [date(2026, 12, 11), date(2026, 12, 18),
+                      date(2026, 12, 24), date(2026, 12, 31)]
+
+
+def _live_counts(momentum: int, value: int, quality: int) -> dict[str, int]:
+    return {"momentum": momentum, "value": value, "quality": quality, "catalyst": 0}
+
+
+def test_2026_10_02_live_shape_is_within_band_against_the_four_prior_weeks():
+    """Replays the live stance counts of the 2026-10-02 run (I10530).
+
+    Counts read from s3://alpha-engine-research/predictor/predictions/ on
+    2026-10-04. Against the old window (09-11, 09-18, 09-25 and Thursday
+    10-01) quality=27 scored z=2.60 and paged; against the four prior
+    Fridays it is z=1.79, inside the unchanged ±2σ band.
+    """
+    file_map = {
+        "2026-09-04": _make_pred_response(_live_counts(10, 5, 15), source="heuristic"),
+        "2026-09-11": _make_pred_response(_live_counts(5, 5, 20), source="heuristic"),
+        "2026-09-18": _make_pred_response(_live_counts(6, 6, 23), source="heuristic"),
+        "2026-09-25": _make_pred_response(_live_counts(6, 6, 23), source="heuristic"),
+        "2026-10-01": _make_pred_response(_live_counts(4, 7, 24), source="heuristic"),
+        "2026-10-02": _make_pred_response(_live_counts(4, 4, 27), source="heuristic"),
+    }
+    report = sd.compute_stance_distribution_drift(
+        bucket="test-bucket", current_date="2026-10-02",
+        s3_client=_make_s3_client(file_map),
+    )
+    assert report["baseline_dates"] == [
+        "2026-09-04", "2026-09-11", "2026-09-18", "2026-09-25",
+    ]
+    assert report["status"] == "ok", report["per_stance"]
+    assert report["per_stance"]["quality"]["deviation"] == pytest.approx(1.788, abs=1e-3)
+
+
+def test_verdict_sentence_no_longer_points_at_a_nonexistent_qual_half():
+    """The heuristic-only verdict must not send readers to the qual half.
+
+    The champion envelope is quant-only (signals.json 2026-10-02:
+    sub_scores.qual null for 904/904 tickers), so "check the upstream
+    signals producer's qual half" named work with no object (I10530).
+    """
+    sentence = sd._verdict_sentence({"heuristic": 35})
+    assert "UNMEASURED" in sentence
+    assert "Check the upstream signals producer" not in sentence
+    assert "quant-only" in sentence

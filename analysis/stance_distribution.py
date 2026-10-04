@@ -111,14 +111,29 @@ def _select_baseline_dates(
     each prior ISO week handles holiday weeks (Mon–Thu only) and missed
     Fridays naturally.
 
+    The current date's OWN ISO week is never a baseline week
+    (alpha-engine-config-I10530). ``current`` is the cycle's last trading
+    day (a Friday in a normal week), so Mon–Thu of that same week are
+    earlier than it and used to be picked as "the most recent prior week".
+    Measured on the live bucket: the 2026-09-11 run compared Friday against
+    a baseline containing Thursday 2026-09-10, and the 2026-10-02 run
+    against one containing Thursday 2026-10-01 — a 3-week + yesterday
+    window, not the 4 prior weeks the Phase 5 criterion names. On
+    2026-10-02 that alone produced the breach (quality z=2.60 against
+    09-11/09-18/09-25/10-01; z=1.79 against the four prior Fridays).
+
     Returns the picked dates sorted ascending.
     """
+    current_iso = current.isocalendar()
+    current_week = (current_iso.year, current_iso.week)
     by_week: dict[tuple[int, int], _dt.date] = {}
     for d in all_dates:
         if d >= current:
             continue
         iso = d.isocalendar()
         key = (iso.year, iso.week)
+        if key >= current_week:
+            continue
         if key not in by_week or d > by_week[key]:
             by_week[key] = d
     sorted_weeks = sorted(by_week.items(), key=lambda kv: kv[0], reverse=True)[:n_weeks]
@@ -300,8 +315,11 @@ def _verdict_sentence(source_totals: dict[str, int]) -> str:
         "criterion is UNMEASURED for this cycle. The band breach above is "
         "real and is a shift in the heuristic distribution — do not read it "
         "as a pillar regression, and do not investigate classify_stance's "
-        "pillar branch. Check the upstream signals producer's qual half "
-        "(config-I7405)."
+        "pillar branch. Heuristic-only is the standing state, not a fault: "
+        "the champion envelope is quant-only, so no qual half exists to "
+        "feed the pillar path (config-I7405, config-I10530). Read the "
+        "share and pick-count context above before treating a count "
+        "breach as a mix shift."
     )
 
 
