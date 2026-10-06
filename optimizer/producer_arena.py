@@ -74,6 +74,7 @@ from typing import Any
 import boto3
 
 from nousergon_lib.arena import (
+    PROMOTE_AGAINST_EVERY_ARM,
     ArenaConfig,
     ArenaCycle,
     ArmRegister,
@@ -386,6 +387,21 @@ ARENA_CONFIG = ArenaConfig(
     promote_statistic="information_ratio",
     promote_evidence="point",
     promote_min_weeks=2,
+    # WHO a challenger must beat. Brian's ruling 2026-10-03
+    # (alpha-engine-config#11849), verbatim: "All arms should be compared each
+    # week, performance tracked, and if after minimum two weeks an arm
+    # outperforms the champion and all other challengers then it gets promoted.
+    # Otherwise we compare the common window of weeks for each arm in making our
+    # comparison." evaluation-policy.md requires `every_arm` on every `point`
+    # slot. A challenger now takes the pointer only if it leads the incumbent
+    # AND every other age-eligible challenger head to head, each pair on its own
+    # longest common window; every head-to-head is recorded on the cycle
+    # (`decision.rivals`). Same declaration as crucible-research's `research`
+    # slot (crucible-research-PR841), so whichever pointer 10-17 reads follows
+    # the same rule (alpha-engine-config-I11931 decision (a)). The engine
+    # refuses this with `anytime_valid`; it is legal here because the evidence
+    # is `point` (above).
+    promote_against=PROMOTE_AGAINST_EVERY_ARM,
     cap=5,
     grace_weeks=4,
     min_active_arms=3,
