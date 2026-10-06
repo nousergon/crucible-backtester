@@ -285,16 +285,24 @@ def _list_recent_candidate_dates(
     *,
     region: str | None = None,
     s3_client=None,
-    lookback_days: int = 120,
+    lookback_days: int | None = 120,
 ) -> list[str]:
     """List ``YYYY-MM-DD`` date strings under ``candidates/{date}/`` in S3
     that are within ``lookback_days`` of today (UTC). Scanner writes one
     ``candidates.json`` per week (``saturday_sf`` cadence), so even a
     multi-year lookback stays well under a single ``list_objects_v2`` page;
     pagination is still handled defensively.
+
+    ``lookback_days=None`` lists every date with no cutoff — used by
+    ``end_to_end._scanner_lift_live``, whose estimator reads the whole
+    published history exactly as ``_scanner_lift`` reads the whole table
+    (alpha-engine-config-I11985).
     """
     s3 = s3_client or boto3.client("s3", **({"region_name": region} if region else {}))
-    cutoff = datetime.now(timezone.utc).date() - timedelta(days=lookback_days)
+    cutoff = (
+        datetime.now(timezone.utc).date() - timedelta(days=lookback_days)
+        if lookback_days is not None else None
+    )
     dates: list[str] = []
     continuation_token = None
     while True:
@@ -310,7 +318,7 @@ def _list_recent_candidate_dates(
                 d = _date.fromisoformat(parts[1])
             except ValueError:
                 continue
-            if d >= cutoff:
+            if cutoff is None or d >= cutoff:
                 dates.append(parts[1])
         if resp.get("IsTruncated"):
             continuation_token = resp.get("NextContinuationToken")
