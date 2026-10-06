@@ -42,6 +42,31 @@ logger = logging.getLogger(__name__)
 # discipline) — does not replace/rename any existing key.
 SCANNER_METRIC_ARM = "tech_score_baseline (retired from live feed 2026-06-29)"
 
+# alpha-engine-config-I11985 / I11155: what the scanner ACTUALLY selected.
+# ``SCANNER_METRIC_ARM`` above labels ``scanner_lift`` honestly, but a label is
+# not a measurement: ``scanner_evaluations`` has had no writer since
+# 2026-07-12, so ``scanner_lift`` is a frozen April–July read of a retired gate
+# republished every week. The live scanner writes its cut to
+# ``candidates/{run_date}/candidates.json::scanner_eval_log`` every cycle
+# (config#3053; ``quant_filter_pass`` is re-marked to the champion ranking arm's
+# cut in crucible-research ``data/scanner_orchestrator.py``), and that cut is
+# what ``agent_input_set`` is built from. ``scanner_lift_live`` grades THAT cut
+# with the same estimator ``scanner_lift`` uses, against the same
+# ``universe_returns`` 21d outcomes. Additive key — ``scanner_lift`` is kept
+# verbatim as the retired arm's historical record.
+SCANNER_LIVE_CUT_ARM = (
+    "scanner_live_cut (the cut the live scanner published — "
+    "candidates/{run_date}/candidates.json::scanner_eval_log.quant_filter_pass)"
+)
+SCANNER_LIVE_CUT_SOURCE = "s3://{bucket}/candidates/{run_date}/candidates.json::scanner_eval_log"
+# One cohort per ISO week: the LATEST candidates artifact published that week.
+# The weekly SF publishes on the Friday run_date; a mid-week artifact is a
+# recovery or rehearsal rerun that a later artifact in the same week replaced.
+# Counting every one would weight a week by how many times it was rerun
+# (2026-08-10..14 published five cuts) — the pseudo-replication config#1164
+# names. Superseded dates are listed on the block, never silently dropped.
+SCANNER_LIVE_COHORT_RULE = "latest_candidates_artifact_per_iso_week"
+
 # config#1580 / config-I2993: the six-team + macro-economist + CIO research
 # orchestration was RETIRED. The live ``ne-weekly-freshness-pipeline`` has no
 # state that invokes that graph; ``research.db`` ``team_candidates`` /
@@ -557,6 +582,18 @@ def compute_lift_metrics(
 
         # 1. Scanner lift
         result["scanner_lift"] = _scanner_lift(conn, ur, date_filter, params)
+
+        # 1-live. The cut the live scanner actually published (alpha-engine-
+        # config-I11985 / I11155) — ``scanner_lift`` above is the retired
+        # tech_score gate's frozen record. Fail-soft: an S3 error must never
+        # break the existing e2e_lift contract; it is recorded, not hidden.
+        try:
+            result["scanner_lift_live"] = _scanner_lift_live(ur, bucket)
+        except Exception as _sll:  # pragma: no cover - defensive
+            logger.warning("scanner_lift_live failed (non-fatal): %s", _sll)
+            result["scanner_lift_live"] = {
+                "status": "error", "reason": str(_sll), "arm": SCANNER_LIVE_CUT_ARM,
+            }
 
         # 1a2. Scanner multi-factor counterfactual (config#967) — would a
         # multi-factor (or single-sleeve) candidate generation beat the
@@ -1169,6 +1206,120 @@ def _scanner_lift(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dic
         return result
     except sqlite3.OperationalError:
         return {"status": "skipped", "reason": "scanner_evaluations table not found"}
+
+
+def _load_live_scanner_cuts(bucket: str, *, s3_client=None) -> tuple[pd.DataFrame, dict]:
+    """Every published live scanner cut, one cohort per ISO week.
+
+    Returns ``(frame, provenance)``. ``frame`` has columns ``ticker``,
+    ``eval_date`` (the artifact's own ``run_date``, the same mapping
+    ``scanner_predictor_research_free_backfill._pending_universe`` uses) and
+    ``quant_filter_pass`` (0/1) over the whole scanned universe of each kept
+    cohort — rejected names are the comparator, so they are kept too.
+    ``provenance`` names the cohorts kept, the ones superseded by a later
+    artifact in the same ISO week, and the artifacts that carried no eval log
+    (pre-config#1458 artifacts are empty by construction).
+    """
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from analysis.scanner_predictor_research_free_backfill import (
+        _CANDIDATES_PREFIX,
+        _list_recent_candidate_dates,
+    )
+
+    s3 = s3_client or boto3.client("s3")
+    listed = _list_recent_candidate_dates(bucket, s3_client=s3, lookback_days=None)
+
+    logs: dict[str, list] = {}
+    without_log: list[str] = []
+    unreadable: list[str] = []
+    for d in listed:
+        key = f"{_CANDIDATES_PREFIX}/{d}/candidates.json"
+        try:
+            artifact = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        except (ClientError, BotoCoreError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.warning("scanner_lift_live: cannot read s3://%s/%s: %s", bucket, key, exc)
+            unreadable.append(d)
+            continue
+        run_date = str(artifact.get("run_date") or d)[:10]
+        eval_log = artifact.get("scanner_eval_log") or []
+        if not eval_log:
+            without_log.append(run_date)
+            continue
+        logs[run_date] = eval_log
+
+    by_week: dict[tuple, list[str]] = {}
+    for rd in logs:
+        try:
+            iso = pd.Timestamp(rd).isocalendar()
+        except ValueError:
+            unreadable.append(rd)
+            continue
+        by_week.setdefault((iso[0], iso[1]), []).append(rd)
+    kept = sorted(max(ds) for ds in by_week.values())
+    superseded = sorted(d for ds in by_week.values() for d in ds if d != max(ds))
+
+    rows = [
+        {
+            "ticker": str(rec.get("ticker")),
+            "eval_date": rd,
+            "quant_filter_pass": 1 if rec.get("quant_filter_pass") else 0,
+        }
+        for rd in kept
+        for rec in logs[rd]
+        if rec.get("ticker")
+    ]
+    frame = pd.DataFrame(rows, columns=["ticker", "eval_date", "quant_filter_pass"])
+    frame = frame.drop_duplicates(subset=["ticker", "eval_date"])
+    provenance = {
+        "cohort_rule": SCANNER_LIVE_COHORT_RULE,
+        "cohort_dates": kept,
+        "superseded_dates": superseded,
+        "artifacts_without_eval_log": sorted(without_log),
+        "unreadable_artifacts": sorted(unreadable),
+        "newest_published_cohort": kept[-1] if kept else None,
+    }
+    return frame, provenance
+
+
+def _scanner_lift_live(ur: pd.DataFrame, bucket: str, *, s3_client=None) -> dict:
+    """Selection edge of the cut the LIVE scanner published (I11985 / I11155).
+
+    Same estimator as ``_scanner_lift`` (``_scanner_lift_block``: precision on
+    ``beat_spy_21d`` against the scanned-universe base rate, plus the 21d
+    log-alpha lift), over the live cohorts from ``_load_live_scanner_cuts``
+    instead of the frozen ``scanner_evaluations`` table. Cohorts whose 21d
+    window has not closed contribute nothing to the 21d blocks
+    (``_classification_for`` / ``_alpha_21d_log_lift`` drop un-matured rows),
+    and the block says which cohorts have matured.
+    """
+    base = {"arm": SCANNER_LIVE_CUT_ARM,
+            "source": SCANNER_LIVE_CUT_SOURCE.format(bucket=bucket, run_date="{run_date}")}
+    se, provenance = _load_live_scanner_cuts(bucket, s3_client=s3_client)
+    base.update(provenance)
+    if se.empty:
+        return {"status": "insufficient_data",
+                "reason": "no candidates.json artifact carries a scanner_eval_log", **base}
+
+    merged = ur.merge(se, on=["ticker", "eval_date"], how="inner")
+    if merged.empty:
+        return {"status": "insufficient_data",
+                "reason": "no published live cohort has universe_returns rows yet", **base}
+
+    result = {"status": "ok", **_scanner_lift_block(merged), **base}
+    dates = sorted(merged["eval_date"].unique())
+    result["n_dates"] = len(dates)
+    result["first_eval_date"] = dates[0]
+    result["last_eval_date"] = dates[-1]
+    matured = (
+        sorted(merged.loc[merged["beat_spy_21d"].notna(), "eval_date"].unique())
+        if "beat_spy_21d" in merged.columns else []
+    )
+    result["n_cohorts_matured_21d"] = len(matured)
+    result["first_matured_eval_date_21d"] = matured[0] if matured else None
+    result["last_matured_eval_date_21d"] = matured[-1] if matured else None
+    return result
 
 
 def _momentum_regime_ic(conn, ur: pd.DataFrame, date_filter: str, params: list) -> dict:
