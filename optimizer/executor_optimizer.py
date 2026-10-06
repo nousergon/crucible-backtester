@@ -46,6 +46,14 @@ from nousergon_lib.eval_artifacts import (
 )
 from botocore.exceptions import ClientError
 
+from optimizer.alpha_floor_predicate import (
+    BLOCKED,
+    BYPASSED_NO_ALPHA,
+    UNMEASURED,
+    evaluate_alpha_floor,
+    passing_mask,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -487,6 +495,21 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
     # ``alpha_floor=0.0`` is the SOTA default; positive values (e.g. require
     # a 200bps alpha cushion) compose cleanly.
     alpha_floor = _cfg.get("alpha_floor")
+    # alpha-engine-config-I10064: the floor's unblock predicate is stated once,
+    # in optimizer/alpha_floor_predicate.py, and this decision is made THROUGH
+    # it. Every result past this point carries the record, so the apply audit,
+    # the report and the Director all read the same verdict this gate acted on.
+    # The record changes no accept/refuse decision below.
+    floor_verdict = evaluate_alpha_floor(
+        valid, alpha_floor, min_valid_combos=min_combos,
+    )
+    floor_record = floor_verdict.to_record()
+    if floor_verdict.state == BYPASSED_NO_ALPHA:
+        logger.warning(
+            "executor_optimizer: alpha_floor=%s is configured but the sweep has "
+            "no total_alpha column — the floor did NOT run (config-I10064).",
+            alpha_floor,
+        )
     if alpha_floor is not None and "total_alpha" in valid.columns:
         n_before = len(valid)
 
@@ -506,8 +529,8 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         # Director as "the optimization loop is broken" and to the weekly plan
         # as a strategy finding, when the truthful reading was "the backtester
         # has no benchmark".
-        n_measured = int(valid["total_alpha"].notna().sum())
-        if n_measured == 0:
+        n_measured = floor_verdict.n_measured
+        if floor_verdict.state == UNMEASURED:
             null_legs = _null_legs_summary(valid)
             return {
                 "status": "alpha_unmeasured",
@@ -524,9 +547,10 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
                     + "Most likely the simulation ran without a benchmark "
                       "(spy_prices not loaded) — see config-I7672."
                 ),
+                "alpha_floor_predicate": floor_record,
             }
 
-        alpha_pos = valid[valid["total_alpha"] >= alpha_floor].copy()
+        alpha_pos = valid[passing_mask(valid, alpha_floor)].copy()
         n_dropped = n_before - len(alpha_pos)
         best_alpha_in_sweep = _safe_float(valid["total_alpha"].max())
         if n_measured < n_before:
@@ -538,7 +562,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
                 "than the sweep (config-I7672).",
                 n_before - n_measured, n_before,
             )
-        if len(alpha_pos) == 0:
+        if floor_verdict.state == BLOCKED:
             return {
                 "status": "alpha_below_floor",
                 "n_measured": n_measured,
@@ -553,6 +577,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
                     f"constraint, not a side-output. Either signal quality "
                     f"or the param sweep grid needs review."
                 ),
+                "alpha_floor_predicate": floor_record,
             }
         logger.info(
             "executor_optimizer: alpha_floor=%s dropped %d/%d combos; "
@@ -572,6 +597,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         if best_trades < min_trades:
             return {
                 "status": "insufficient_trades",
+                "alpha_floor_predicate": floor_record,
                 "best_trades": int(best_trades),
                 "min_required": min_trades,
                 "note": (
@@ -615,6 +641,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         if rank_col not in valid.columns:
             return {
                 "status": "insufficient_data",
+                "alpha_floor_predicate": floor_record,
                 "note": (
                     f"use_skill_composite_target is on (rank_col={rank_col}) "
                     f"but sweep produced no {rank_col} column — cannot rank "
@@ -626,6 +653,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
         if valid_rank == 0:
             return {
                 "status": "insufficient_data",
+                "alpha_floor_predicate": floor_record,
                 "note": (
                     f"All {rank_col} values are NaN — cannot rank by "
                     f"skill-composite."
@@ -751,6 +779,7 @@ def recommend(sweep_df: pd.DataFrame, base_config: dict, current_params: dict | 
 
     common_fields = {
         "fit_target": fit_target,
+        "alpha_floor_predicate": floor_record,
         "n_combos_swept": int(len(valid)),
         "pbo_top_combos": pbo_top_combos,
         "rank_metric": (
