@@ -172,6 +172,12 @@ def run_optimizer_backtest(
     )
     diagnostics: list[dict] = []
     n_solver_failures = 0
+    # alpha-engine-config-I12117: per-name last written target (for the
+    # unfillable-exit count) and per-rebalance solved universe (for the
+    # stale-holding diagnostic).
+    last_target = pd.Series(0.0, index=target_weights.columns)
+    universe_by_date: dict[pd.Timestamp, frozenset] = {}
+    n_unfillable_exits = 0
 
     for rebal_date in rebalance_dates:
         try:
@@ -209,8 +215,18 @@ def run_optimizer_backtest(
             **_forced_turnover_fields(result.diagnostics),
         })
 
-        _populate_target_weights_row(
+        rebal_ts = pd.Timestamp(rebal_date)
+        n_unfillable_exits += _populate_target_weights_row(
             target_weights, rebal_date, kwargs["tickers"], result.weights,
+            close_row=price_matrix.loc[rebal_ts],
+            held=last_target,
+        )
+        # Last WRITTEN target per name: an unfillable (NaN) cell keeps the
+        # prior target, mirroring vectorbt holding the position unchanged.
+        row = target_weights.loc[rebal_ts]
+        last_target = last_target.where(row.isna(), row)
+        universe_by_date[rebal_ts] = frozenset(
+            t for t in kwargs["tickers"] if t != _CASH
         )
 
     metrics, daily_returns, spy_daily_returns = _simulate_and_measure(
@@ -219,7 +235,10 @@ def run_optimizer_backtest(
         spy_prices=spy_prices,
         init_cash=init_cash,
         fees=fees,
+        rebalance_freq_days=rebalance_freq_days,
+        universe_by_date=universe_by_date,
     )
+    metrics["n_unfillable_exits"] = n_unfillable_exits
     metrics["n_rebalances"] = len(rebalance_dates)
     metrics["n_solver_failures"] = n_solver_failures
     metrics.update(summarize_forced_turnover(diagnostics))
@@ -490,13 +509,50 @@ def _populate_target_weights_row(
     rebal_date: str,
     universe: list[str],
     weights: np.ndarray,
-) -> None:
+    close_row: "pd.Series | None" = None,
+    held: "pd.Series | None" = None,
+) -> int:
+    """Write one rebalance row of the target-weight frame.
+
+    Every non-cash column OUTSIDE the solved universe is set to an explicit
+    ``0.0`` before the solved weights are written (alpha-engine-config-I12117,
+    defect A). vectorbt's ``from_orders(size_type="targetpercent")`` reads a
+    ``NaN`` size as *no order*, so a name that left the universe used to keep
+    its position — the simulated book was "optimizer target + stale
+    holdings", and with ``cash_sharing=True`` the stale position also starved
+    new targets of cash.
+
+    Guard: a column whose close is not finite on ``rebal_date`` (a delisted or
+    not-yet-listed name) is left ``NaN`` — an order vectorbt cannot fill. When
+    such a column is still HELD (``held`` carries a positive last target), it
+    is counted and the count is returned, so the stuck exit is visible as
+    ``n_unfillable_exits`` rather than silent.
+
+    ``close_row`` / ``held`` default to ``None`` (no price guard, nothing held)
+    for callers that only need the row written.
+    """
     rebal_ts = pd.Timestamp(rebal_date)
+    cols = [c for c in target_weights.columns if c != _CASH]
+    if close_row is not None:
+        close = pd.to_numeric(close_row.reindex(cols), errors="coerce")
+        fillable = np.isfinite(close.to_numpy(dtype=float))
+    else:
+        fillable = np.ones(len(cols), dtype=bool)
+    fill_cols = [c for c, ok in zip(cols, fillable) if ok]
+    unfillable_cols = [c for c, ok in zip(cols, fillable) if not ok]
+    target_weights.loc[rebal_ts, fill_cols] = 0.0
+
     for i, t in enumerate(universe):
         if t == _CASH:
             continue
         if t in target_weights.columns:
             target_weights.at[rebal_ts, t] = float(weights[i])
+
+    n_unfillable_exits = 0
+    if held is not None and unfillable_cols:
+        held_w = pd.to_numeric(held.reindex(unfillable_cols), errors="coerce").fillna(0.0)
+        n_unfillable_exits = int((held_w > 0).sum())
+    return n_unfillable_exits
 
 
 def _simulate_and_measure(
@@ -505,6 +561,8 @@ def _simulate_and_measure(
     spy_prices: pd.Series,
     init_cash: float,
     fees: float,
+    rebalance_freq_days: int = _DEFAULT_REBALANCE_FREQ,
+    universe_by_date: "dict[pd.Timestamp, frozenset] | None" = None,
 ) -> tuple[dict, "pd.Series | None", "pd.Series | None"]:
     """
     Simulate target-weight trajectory through vectorbt and emit the
@@ -530,8 +588,11 @@ def _simulate_and_measure(
     from vectorbt_bridge import portfolio_stats
 
     aligned_prices = price_matrix.reindex(target_weights.index)
+    # NaN = "no order" in vectorbt. Non-rebalance rows are all-NaN (hold);
+    # on a rebalance row only an unfillable (non-finite close) name is NaN —
+    # every other name outside the solved universe carries an explicit 0.0
+    # (alpha-engine-config-I12117, see _populate_target_weights_row).
     size = target_weights.copy()
-    size[size.isna()] = np.nan
 
     pf = vbt.Portfolio.from_orders(
         close=aligned_prices,
@@ -575,13 +636,13 @@ def _simulate_and_measure(
         per_rebal_active = (valid_weights.abs().sum(axis=1) - valid_weights.get(_SPY, pd.Series(0)).abs())
         mean_active_share = float(per_rebal_active.mean())
         mean_spy_weight = float(valid_weights.get(_SPY, pd.Series(np.nan)).mean()) if _SPY in valid_weights.columns else None
-        diffs = valid_weights.diff().abs().sum(axis=1).dropna()
-        annual_factor = _TRADING_DAYS_PER_YEAR / max(1, (len(valid_weights) - 1))
-        turnover_one_way_ann = float(diffs.mean() * annual_factor)
+        turnover_one_way_ann = _turnover_one_way_ann(valid_weights, rebalance_freq_days)
     else:
         mean_active_share = None
         mean_spy_weight = None
         turnover_one_way_ann = None
+
+    stale_mean, stale_max = _stale_holding_weight(pf, universe_by_date)
 
     metrics = {
         "sortino_ratio": stats.get("sortino_ratio"),
@@ -593,6 +654,9 @@ def _simulate_and_measure(
         "mean_active_share": mean_active_share,
         "mean_spy_weight": mean_spy_weight,
         "turnover_one_way_ann": turnover_one_way_ann,
+        "turnover_basis": _TURNOVER_BASIS,
+        "stale_holding_weight_mean": stale_mean,
+        "stale_holding_weight_max": stale_max,
         "sharpe_ratio": stats.get("sharpe_ratio"),
         "total_return": stats.get("total_return"),
         "spy_return": stats.get("spy_return"),
@@ -601,6 +665,62 @@ def _simulate_and_measure(
         "win_rate": stats.get("win_rate"),
     }
     return metrics, pf_returns_aligned, spy_returns_aligned
+
+
+#: Declares how ``turnover_one_way_ann`` is computed, so an artifact written
+#: before alpha-engine-config-I12117 (two-way Σ|Δw| on overlapping names,
+#: × 252 / (n_rebalance_rows − 1)) is distinguishable from one written after.
+_TURNOVER_BASIS = "half_sum_abs_dw_incl_cash_x_252_over_freq"
+
+
+def _turnover_one_way_ann(
+    rebalance_rows: pd.DataFrame, rebalance_freq_days: int,
+) -> float | None:
+    """One-way turnover, annualised (alpha-engine-config-I12117, defect B).
+
+    ½·Σ|Δw| between consecutive rebalance target rows, cash included as
+    ``1 − Σ non-cash``, averaged over rebalances (the first row has no prior
+    target and is dropped, not averaged in as a zero), × rebalances per year
+    = ``252 / rebalance_freq_days``.
+
+    A ``NaN`` cell on a rebalance row is an unfillable order (no finite
+    close); vectorbt leaves that position unchanged, so it carries the prior
+    row's target here. A name never targeted counts as 0.
+
+    Returns ``None`` (unmeasured, not zero) with fewer than two rebalance rows.
+    """
+    if len(rebalance_rows) < 2:
+        return None
+    filled = rebalance_rows.drop(columns=[_CASH], errors="ignore").ffill().fillna(0.0)
+    filled = filled.assign(**{_CASH: 1.0 - filled.sum(axis=1)})
+    per_rebalance = 0.5 * filled.diff().abs().sum(axis=1).iloc[1:]
+    rebalances_per_year = _TRADING_DAYS_PER_YEAR / max(1, int(rebalance_freq_days))
+    return float(per_rebalance.mean() * rebalances_per_year)
+
+
+def _stale_holding_weight(
+    pf: Any, universe_by_date: "dict[pd.Timestamp, frozenset] | None",
+) -> tuple[float | None, float | None]:
+    """Simulated NAV weight held in names OUTSIDE each rebalance's solved
+    universe, read from ``pf`` at the close of that rebalance bar.
+
+    Measures alpha-engine-config-I12117 defect A directly: on the pre-fix
+    code it is the size of the stale book; after the fix it must read 0
+    apart from counted unfillable exits (``n_unfillable_exits``).
+    """
+    if not universe_by_date:
+        return None, None
+    asset_w = pf.asset_value(group_by=False).div(pf.value(), axis=0)
+    stale: list[float] = []
+    for ts, universe in universe_by_date.items():
+        if ts not in asset_w.index:
+            continue
+        row = asset_w.loc[ts]
+        outside = [c for c in row.index if c not in universe]
+        stale.append(float(row[outside].abs().sum()) if outside else 0.0)
+    if not stale:
+        return None, None
+    return float(np.mean(stale)), float(np.max(stale))
 
 
 _DEFAULT_MIN_PSR = 0.95
