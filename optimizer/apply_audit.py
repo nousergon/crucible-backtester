@@ -33,6 +33,14 @@ the intended combination, not a bypass: the blocked sweep params were NOT
 written; only the overlay's own keys were. Pinned by
 ``tests/test_rehearsal_live_write_guard.py``.
 
+**Alpha-floor unblock predicate (alpha-engine-config-I10064):** when the
+``executor_params`` result carries ``alpha_floor_predicate``, the loop record
+gets it as ``unblock_predicate``. This is an additive key. It records the
+state (``blocked`` / ``unblocked`` / ``unmeasured`` / …), the floor and
+comparator, the measured sample, the best alpha and its margin, and the
+condition that clears the block. A ``blocked [alpha_floor]`` week then reads
+as a measured safety refusal, not a loop that has silently stopped.
+
 **S3 layout:** ``config/apply_audit/{date}.json`` (dated, trading-day keyed)
 plus a ``config/apply_audit/latest.json`` mirror. The write is gated on the
 same ``args.upload``/``--freeze`` gate as sibling artifacts; the audit is
@@ -250,6 +258,16 @@ def classify_loop(
     proposed, current = _proposed_current(loop, result)
     record["proposed"] = proposed
     record["current"] = current
+
+    # alpha-engine-config-I10064: carry the alpha floor's unblock predicate
+    # verbatim (optimizer/alpha_floor_predicate.py). A "blocked [alpha_floor]"
+    # week then says what was measured and what would clear it. Without it, a
+    # reader sees only a counter, and fifteen weeks of a guard refusing
+    # measured-negative alpha read as a broken loop. Additive key: the v1 loop
+    # record does not forbid extra properties.
+    predicate = result.get("alpha_floor_predicate")
+    if loop == "executor_params" and isinstance(predicate, dict):
+        record["unblock_predicate"] = predicate
 
     # Pre-apply statuses (no promotable recommendation reached apply()).
     status_map = _STATUS_MAPS[loop]
