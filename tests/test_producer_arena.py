@@ -122,6 +122,22 @@ class TestArenaConfig:
         assert cfg.promote_evidence == "point"
         assert cfg.promote_min_weeks == 2
 
+    def test_a_challenger_must_beat_every_arm_not_just_the_incumbent(self):
+        """Brian's ruling 2026-10-03 (alpha-engine-config#11849): an arm is
+        promoted only if it outperforms the champion AND all other challengers,
+        each pair on its own common window. evaluation-policy.md requires
+        `every_arm` on every `point` slot; this is decision (a) of
+        alpha-engine-config-I11931, the same declaration as crucible-research's
+        `research` slot (crucible-research-PR841)."""
+        from nousergon_lib.arena import PROMOTE_AGAINST_EVERY_ARM
+
+        cfg = producer_arena.ARENA_CONFIG
+        assert cfg.promote_against == PROMOTE_AGAINST_EVERY_ARM
+        # The engine refuses every_arm under anytime_valid; it is legal here
+        # only because the evidence is point.
+        assert cfg.promote_evidence == "point"
+        assert cfg.to_dict()["promote_against"] == "every_arm"
+
     def test_brians_2026_08_29_ruling_is_the_config(self):
         cfg = producer_arena.ARENA_CONFIG
         assert cfg.cap == 5
@@ -500,6 +516,20 @@ class TestArenaCycleArtifact:
         assert doc["benchmark"] == "population"
         assert doc["slot_kind"] == "selection_producer"
 
+    def test_the_emitted_cycle_records_the_every_arm_rule_and_its_head_to_heads(self):
+        """The rule is on the artifact, not only in code: ``config`` names
+        ``promote_against`` and ``decision.rivals`` carries the challenger-vs-
+        challenger verdicts (Brian 2026-10-03: "all arms compared each week,
+        performance tracked"). The contract admits both."""
+        cycle, gaps, _reg = producer_arena.run_arena_cycle(
+            as_of="2026-08-28", leaderboard=_board(),
+            incumbent_name="scanner_predictor_direct", shadow_only_names=frozenset(),
+        )
+        doc = producer_arena.cycle_document(cycle, gaps)
+        validate_contract("arena_cycle", doc)
+        assert doc["config"]["promote_against"] == "every_arm"
+        assert "rivals" in doc["decision"]
+
     def test_an_unmeasurable_cycle_is_still_emitted_and_says_why(self):
         """§11: a slot that emits nothing is not healthy, it is unobserved."""
         cycle, gaps, _reg = producer_arena.run_arena_cycle(
@@ -847,6 +877,47 @@ class TestResearchSlotArms:
             row.pop("realized_rank_ic")
         stats = producer_arena.arm_statistics(_research_register(), board, "2026-08-28")
         assert all(v["realized_rank_ic"] is None for v in stats.values())
+
+    def test_the_largest_lead_over_the_incumbent_is_not_enough(self):
+        """Brian's ruling 2026-10-03 (alpha-engine-config#11849), end to end,
+        on arms with DIFFERENT histories. tech_score_20 has only the first two
+        weeks, when the incumbent was at its worst, so its lead over the
+        incumbent (on that pair's window) is the largest on the board.
+        attractiveness_60 has all four weeks, and beats tech_score_20 head to
+        head on the two weeks they share. Against the incumbent alone the
+        pointer would go to tech_score_20; under every_arm it goes to the arm
+        that beats the champion AND every other challenger. Verified red with
+        ``promote_against="incumbent"``."""
+        dates = [f"2026-08-{d:02d}" for d in (
+            3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 24, 25, 26, 27, 28)]
+        early, late = dates[:10], dates[10:]
+
+        def wobble(mean, amp, on):
+            return {d: mean + (amp if j % 2 else -amp) for j, d in enumerate(on)}
+
+        series = {
+            "attractiveness_20": {**wobble(-0.020, 0.0005, early), **wobble(0.020, 0.0005, late)},
+            "tech_score_20": wobble(0.005, 0.005, early),
+            "attractiveness_60": wobble(0.012, 0.001, dates),
+            "predictor_from_60": wobble(-0.010, 0.020, dates),
+            "thinktank_20": wobble(-0.010, 0.020, dates),
+        }
+        board = _research_board()
+        for row in board["specs"]:
+            row["dates_scored"] = sorted(series[row["name"]])
+            row[producer_arena.POPULATION_SERIES_FIELD] = series[row["name"]]
+        cycle, _gaps, _reg = producer_arena.run_arena_cycle(
+            as_of="2026-08-28", leaderboard=board, incumbent_name="attractiveness_20",
+            shadow_only_names=frozenset(), register=_research_register(),
+        )
+        assert cycle.decision.status == "decided"
+        assert cycle.decision.champion == producer_arena.arm_id_for("attractiveness_60")
+        head_to_head = {frozenset((v.arm_a, v.arm_b)): v for v in cycle.decision.rivals}
+        verdict = head_to_head[frozenset((
+            producer_arena.arm_id_for("tech_score_20"),
+            producer_arena.arm_id_for("attractiveness_60"),
+        ))]
+        assert verdict.winner == producer_arena.arm_id_for("attractiveness_60")
 
     def test_ir_not_the_raw_mean_decides_between_widths(self):
         """The Amendment 2 objection, driven end to end. attractiveness_20 has
