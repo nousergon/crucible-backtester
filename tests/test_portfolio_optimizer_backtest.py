@@ -1070,3 +1070,49 @@ class TestRebalanceExitsAndTurnover:
             init_cash=1e6, fees=0.0, rebalance_freq_days=5,
         )
         assert metrics["turnover_one_way_ann"] is not None
+
+
+@pytest.mark.skipif(
+    _ALPHA_ENGINE_MISSING,
+    reason=executor_missing_reason(_ALPHA_ENGINE_PATH),
+)
+def test_optimizer_run_sells_names_that_leave_the_universe():
+    """alpha-engine-config-I12117, end to end through the real kernel: the
+    optimizer holds {A,B,C}, then the universe switches to {D,E,F}. The
+    switch rebalance must carry an explicit 0 target for A/B/C (on the
+    pre-fix code those cells were NaN = "no order", so the names were
+    never sold), and the simulated book holds nothing outside the universe."""
+    old, new = ["AAPL", "MSFT", "GOOG"], ["JNJ", "PG", "XOM"]
+    tickers = old + new
+    sector_map = {t: "Technology" for t in tickers}
+    price_matrix = _synthetic_price_matrix(tickers, n_days=300, seed=0)
+    spy_prices = _synthetic_spy_series(n_days=300, seed=99).reindex(price_matrix.index)
+    dates = price_matrix.index[260:295]
+    switch = dates[len(dates) // 2]
+    predictions = {
+        d.strftime("%Y-%m-%d"): {t: 0.05 for t in (old if d < switch else new)}
+        for d in dates
+    }
+
+    result = run_optimizer_backtest(
+        predictions_by_date=predictions,
+        price_matrix=price_matrix,
+        spy_prices=spy_prices,
+        sector_map=sector_map,
+        executor_path=_ALPHA_ENGINE_PATH,
+        rebalance_freq_days=5,
+        universe_cap=3,
+    )
+    tw = result.target_weights
+    rebal_rows = tw.dropna(how="all")
+    before = rebal_rows[rebal_rows.index < switch]
+    after = rebal_rows[rebal_rows.index >= switch]
+    assert len(before) and len(after)
+    # A position that must exit exists: the optimizer held the old names.
+    assert (before.iloc[-1][old] > 0).any()
+    # ...and every rebalance from the switch on orders them to zero.
+    assert after[old].notna().all().all()
+    assert (after[old] == 0.0).all().all()
+    m = result.metrics
+    assert m["stale_holding_weight_max"] == pytest.approx(0.0, abs=1e-9)
+    assert m["n_unfillable_exits"] == 0
