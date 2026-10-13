@@ -342,8 +342,9 @@ def test_entry_triggers_ablated_keeps_baseline_shares_and_exit(tmp_path):
 # evaluates a day's whole candidate list together, so a block and an
 # executed entry are typically same-day siblings) — this is what makes the
 # ablated arm's per-date width diverge from the baseline's on a SHARED
-# cycle, which is what `check_count_match` actually detects (it intersects
-# on date keys; extra dates present ONLY in one arm are invisible to it).
+# cycle. Since alpha-engine-config-I12243 `check_count_match` classes the
+# UNION of both arms' dates, so a block on a day with no executed entry is
+# named as ablated-only support too (tests/test_contribution_lift_support.py).
 _SHADOW_ROWS = [
     {"date": "2026-01-05", "ticker": "CCC", "block_reason": "score 40.0 < min 55.0",
      "intended_shares": 300.0, "intended_dollars": None, "current_price": 100.0},

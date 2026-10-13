@@ -72,6 +72,28 @@ UNIT: str = "log_alpha_21d"
 #: trial_accumulator producer name for this harness.
 TRIAL_PRODUCER: str = "contribution_lift"
 
+#: Version of the additive per-component ``support`` diagnostics block
+#: (alpha-engine-config-I12243). Bumped on any change to its keys or meaning.
+SUPPORT_SCHEMA_VERSION: int = 1
+
+#: The estimand every measured record carries, declared rather than implied.
+#: Each paired sample is the WHOLE-BOOK log-alpha difference over the
+#: ``horizon_days`` rows after one window date in ``ReplayInputs.dates`` — not
+#: a per-entry cohort return, and not one independent selection event per
+#: sample. ``n_samples`` counts sampled windows.
+ESTIMAND: dict = {
+    "name": "whole_book_window_log_alpha_difference",
+    "unit_of_sample": "sampled whole-book horizon window per ReplayInputs.dates entry",
+    "per_entry_cohort": False,
+    "samples_are_independent_selection_events": False,
+}
+
+#: Provenance the support block does NOT yet carry, named so its absence is
+#: explicit on the artifact instead of read as "checked and fine".
+SUPPORT_NOT_COVERED: tuple[str, ...] = (
+    "point_in_time_coefficient_provenance",
+)
+
 _VALID_CRITICALITY = ("critical", "supporting", "diagnostic")
 _VALID_PATTERN = ("substitution", "null_arm")
 _VALID_NA_STATUS = (
@@ -608,9 +630,122 @@ def picks_per_cycle(arm: Arm) -> dict[str, int]:
     return {d: len(t) for d, t in by_date.items()}
 
 
+def _priceable(price_matrix: pd.DataFrame, when: pd.Timestamp, ticker: str) -> bool:
+    """True when the simulator can fill ``ticker`` on ``when`` at all.
+
+    ``vectorbt_bridge.orders_to_portfolio`` drops an order whose date is not a
+    price row or whose ticker is not a column, and vectorbt cannot fill at a
+    missing or non-positive close.
+    """
+    if ticker not in price_matrix.columns or when not in price_matrix.index:
+        return False
+    value = price_matrix.at[when, ticker]
+    return not pd.isna(value) and float(value) > 0.0
+
+
+def entry_census(arm: Arm, arm_set: ArmSet, inputs: ReplayInputs) -> dict:
+    """Per declared date: names requested, ENTER orders generated, priceable.
+
+    The three can differ, and only the first is what count-matching compares
+    (alpha-engine-config-I12243): a picks arm's ``picks_to_orders`` drops a
+    name with no positive close or a whole-share budget of zero, and the
+    simulator drops an order-shaped ENTER it cannot price. Returned as::
+
+        {"by_declared_date": {date: {"requested", "generated", "priceable"}},
+         "priceable_by_order_date": {date: n}}
+
+    ``priceable_by_order_date`` is keyed by the date the ENTER is actually
+    placed on (a picks arm snaps a non-trading cycle date forward), which is
+    the key observed fills are reported under.
+    """
+    pm = inputs.price_matrix
+    by_declared: dict[str, dict[str, int]] = {}
+    by_order_date: dict[str, int] = {}
+    if arm.picks is not None:
+        slots = _slot_count(arm_set)
+        for d, tickers in arm.picks:
+            enters = [
+                o for o in picks_to_orders(
+                    [(d, tickers)], pm,
+                    init_cash=inputs.init_cash,
+                    per_cycle_slots=slots,
+                    hold_days=inputs.horizon_days,
+                )
+                if o["action"] == "ENTER"
+            ]
+            row = by_declared.setdefault(
+                d, {"requested": 0, "generated": 0, "priceable": 0}
+            )
+            row["requested"] += len(tickers)
+            row["generated"] += len(enters)
+            # picks_to_orders only emits an ENTER it could price.
+            row["priceable"] += len(enters)
+            for o in enters:
+                by_order_date[o["date"]] = by_order_date.get(o["date"], 0) + 1
+    else:
+        assert arm.orders is not None
+        names: dict[str, set[str]] = {}
+        for order in arm.orders:
+            if str(order.get("action")) != "ENTER":
+                continue
+            d = str(order.get("date"))
+            ticker = str(order.get("ticker"))
+            names.setdefault(d, set()).add(ticker)
+            row = by_declared.setdefault(
+                d, {"requested": 0, "generated": 0, "priceable": 0}
+            )
+            row["generated"] += 1
+            shares = order.get("shares")
+            if (
+                _priceable(pm, pd.Timestamp(d), ticker)
+                and shares is not None
+                and float(shares) > 0.0
+            ):
+                row["priceable"] += 1
+                by_order_date[d] = by_order_date.get(d, 0) + 1
+        for d, tickers in names.items():
+            by_declared[d]["requested"] = len(tickers)
+    return {
+        "by_declared_date": dict(sorted(by_declared.items())),
+        "priceable_by_order_date": dict(sorted(by_order_date.items())),
+    }
+
+
+def unpriceable_dates(censuses: Sequence[Mapping[str, Any]]) -> set[str]:
+    """Declared dates on which NO arm declaring them can price one entry.
+
+    Neither simulated book trades on such a date, so one-sided declared
+    support there cannot bias the comparison; it is named ``unpriceable`` in
+    the census instead of being reported as a support gap.
+    """
+    declared: dict[str, list[int]] = {}
+    for census in censuses:
+        for d, row in census["by_declared_date"].items():
+            if row["requested"] > 0:
+                declared.setdefault(d, []).append(row["priceable"])
+    return {d for d, counts in declared.items() if not any(counts)}
+
+
 # --------------------------------------------------------------------------
 # Simulation
 # --------------------------------------------------------------------------
+
+
+def _buy_fills_by_date(pf: Any, index: pd.Index) -> dict[str, int]:
+    """``{date: buy fills}`` from the simulated portfolio's own order records.
+
+    The executed-fill witness: an ENTER the simulator could not or did not
+    fill (unpriceable, already held, no cash) is absent here even though it
+    was generated.
+    """
+    records = pf.orders.values
+    out: dict[str, int] = {}
+    for idx, side in zip(records["idx"], records["side"]):
+        if int(side) != 0:  # vectorbt OrderSide.Buy == 0
+            continue
+        d = pd.Timestamp(index[int(idx)]).strftime("%Y-%m-%d")
+        out[d] = out.get(d, 0) + 1
+    return dict(sorted(out.items()))
 
 
 def simulate_arm(arm: Arm, arm_set: ArmSet, inputs: ReplayInputs) -> dict:
@@ -640,6 +775,7 @@ def simulate_arm(arm: Arm, arm_set: ArmSet, inputs: ReplayInputs) -> dict:
     )
     stats = portfolio_stats(pf, spy_prices=inputs.spy_prices)
     stats["n_orders"] = len(orders)
+    stats["buy_fills_by_date"] = _buy_fills_by_date(pf, inputs.price_matrix.index)
     return stats
 
 
@@ -663,6 +799,8 @@ def _na_component(
         "arms": {},
         "dsr": None,
         "pbo": None,
+        # Nothing was replayed, so there is no support to census.
+        "support": None,
     }
 
 
@@ -736,6 +874,103 @@ def _finite(value: Any) -> float | None:
     return f if np.isfinite(f) else None
 
 
+def _arm_support(census: Mapping[str, Any], stats: Mapping[str, Any]) -> dict:
+    by_declared = census["by_declared_date"]
+    priceable_by_order = census["priceable_by_order_date"]
+    fills = stats.get("buy_fills_by_date")
+    out = {
+        "n_declared_dates": sum(1 for r in by_declared.values() if r["requested"] > 0),
+        "requested_picks": sum(r["requested"] for r in by_declared.values()),
+        "generated_enters": sum(r["generated"] for r in by_declared.values()),
+        "priceable_enters": sum(priceable_by_order.values()),
+        "unpriced_declared_dates": sorted(
+            d for d, r in by_declared.items()
+            if r["requested"] > 0 and r["priceable"] < r["requested"]
+        ),
+    }
+    if not isinstance(fills, Mapping):
+        # The simulator did not report fills (never a real vectorbt run). An
+        # explicit null, not a zero: nothing was observed.
+        out |= {
+            "fills_observed": False,
+            "observed_buy_fills": None,
+            "unfilled_order_dates": None,
+        }
+        return out
+    out |= {
+        "fills_observed": True,
+        "observed_buy_fills": int(sum(fills.values())),
+        "unfilled_order_dates": sorted(
+            d for d, n in priceable_by_order.items() if int(fills.get(d, 0)) < n
+        ),
+    }
+    return out
+
+
+def _support_block(
+    *,
+    inputs: ReplayInputs,
+    match: "_objective.CountMatch",
+    censuses: Mapping[str, Mapping[str, Any]],
+    stats: Mapping[str, Mapping[str, Any]],
+    sampled_dates: list[str],
+) -> dict:
+    """The additive, versioned support/fill/sampling/overlap diagnostics.
+
+    alpha-engine-config-I12243. Diagnostics only: nothing here feeds
+    ``status``/``value``/CI, so a reader can see exactly what the count-match
+    verdict and the paired CI rested on without any grade having moved.
+    """
+    declared_union = set()
+    for census in censuses.values():
+        declared_union |= {
+            d for d, r in census["by_declared_date"].items() if r["requested"] > 0
+        }
+    base_rows = censuses["baseline"]["by_declared_date"]
+    abl_rows = censuses["ablated"]["by_declared_date"]
+    effective_mismatch = sorted(
+        d for d in match.matched_dates
+        if base_rows.get(d, {}).get("priceable", 0)
+        != abl_rows.get(d, {}).get("priceable", 0)
+    )
+    without_entry = sorted(d for d in sampled_dates if d not in declared_union)
+    overlap = _objective.window_overlap(
+        sampled_dates, inputs.price_matrix.index, horizon_days=inputs.horizon_days
+    )
+    overlapping = (overlap["n_overlapping_adjacent_pairs"] or 0) > 0
+    return {
+        "schema_version": SUPPORT_SCHEMA_VERSION,
+        "estimand": dict(ESTIMAND),
+        "n_eligible_dates": len(inputs.dates),
+        "n_sampled_windows": len(sampled_dates),
+        "census": match.census(),
+        "effective_width_mismatch_dates": effective_mismatch,
+        "n_sampled_windows_without_entry": len(without_entry),
+        "sampled_windows_without_entry": without_entry,
+        "arms": {
+            label: _arm_support(censuses[label], stats[label])
+            for label in ("baseline", "ablated")
+        },
+        "window_overlap": overlap,
+        "inference_assurance": {
+            "ci_method": "bootstrap",
+            "resampling": "iid_over_paired_windows",
+            "overlap_aware": False,
+            "status": "UNASSURED" if overlapping else "NO_WINDOW_OVERLAP",
+            "reason": (
+                f"{overlap['n_overlapping_adjacent_pairs']}/"
+                f"{overlap['n_adjacent_pairs']} adjacent sampled windows share "
+                f"rows of the same {overlap['horizon_days']}-row NAV path, so "
+                "the iid bootstrap CI is not assured; the estimator is "
+                "unchanged pending the estimator authority"
+                if overlapping else
+                "no two sampled windows share a row"
+            ),
+        },
+        "not_covered": list(SUPPORT_NOT_COVERED),
+    }
+
+
 def run_spec(
     spec: ReplaySpec,
     inputs: ReplayInputs,
@@ -789,10 +1024,25 @@ def run_spec(
 
     baseline_width = picks_per_cycle(built.baseline)
     ablated_width = picks_per_cycle(built.ablated)
-    match = _objective.check_count_match(baseline_width, ablated_width)
+    censuses = {
+        "baseline": entry_census(built.baseline, built, inputs),
+        "ablated": entry_census(built.ablated, built, inputs),
+    }
+    match = _objective.check_count_match(
+        baseline_width,
+        ablated_width,
+        unpriceable=unpriceable_dates(list(censuses.values())),
+    )
 
     paired = _objective.paired_diffs(baseline_alpha, ablated_alpha)
     n_samples = len(paired)
+    component["support"] = _support_block(
+        inputs=inputs,
+        match=match,
+        censuses=censuses,
+        stats={"baseline": baseline_stats, "ablated": ablated_stats},
+        sampled_dates=sorted(set(baseline_alpha) & set(ablated_alpha)),
+    )
 
     component["arms"] = {
         "baseline": _arm_payload(

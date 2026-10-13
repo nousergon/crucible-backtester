@@ -658,7 +658,7 @@ _COMPONENT_KEYS = {
     "name", "module", "criticality", "pattern", "issue", "status",
     "status_reason", "value", "unit", "ci_low", "ci_high", "ci_method",
     "n_samples", "n_floor", "count_matched", "arms", "dsr", "pbo",
-    "source_path",
+    "source_path", "support",
 }
 
 #: Every per-arm key the contract document specifies.
@@ -707,6 +707,13 @@ def test_report_matches_the_contract_shape(monkeypatch):
             assert set(component["dsr"]) == {"baseline", "ablated", "n_trials"}
         else:
             assert component["dsr"] is None
+        # alpha-engine-config-I12243: every replayed component carries the
+        # versioned support census; a component that replayed nothing, null.
+        if component["arms"]:
+            assert component["support"]["schema_version"] == 1
+            assert component["support"]["n_sampled_windows"] == component["n_samples"]
+        else:
+            assert component["support"] is None
         for arm in component["arms"].values():
             assert _ARM_KEYS <= set(arm)
             assert isinstance(arm["per_cycle_log_alpha_21d"], dict)
