@@ -68,18 +68,29 @@ ranking of the ~900-name PIT universe down to the passing pool.
 * baseline — the live selection: the names actually entered that cycle
   (``harness.live_picks_by_date``, config-I7501).
 * ablated  — the same count drawn from the **pre-scanner** PIT population
-  (every ``scanner_evaluations`` row for the as-of research cycle, i.e. the
-  names the scanner had in front of it) with its ranking removed, by the same
-  deterministic rotation. ``scanner_evaluations`` is **NOT live** (corrected
-  2026-08-28, alpha-engine-config-I8757): its writer was retired with the rest
-  of the research graph on 2026-07-12 and the newest row is 2026-07-17. This
-  paragraph claimed the opposite for six weeks, and that claim is precisely
-  what let the component compare a live selection against a July population.
-  The component now emits ``N/A-MISSING-INPUT`` naming the retirement once the
-  population is further behind the replayed cycles than
-  ``retired_table_guard.DEFAULT_MAX_AGE_DAYS`` — a frozen population makes the
-  ablated arm a comparison against a system that no longer exists, which is the
-  same reason ``sector_teams_avg`` below is N/A.
+  (every name the scanner evaluated for the as-of research cycle, pass or
+  fail, i.e. the names the scanner had in front of it) with its ranking
+  removed, by the same deterministic rotation.
+
+  The population comes from the **live** record,
+  ``candidates/{run_date}/candidates.json::scanner_eval_log`` — the
+  standalone Scanner's per-ticker gate verdict over its whole universe,
+  published every cycle since 2026-07-10 (config#3053), read through
+  ``end_to_end._load_live_scanner_cuts`` so this component and
+  ``scanner_lift_live`` share one cohort rule. ``scanner_evaluations`` is
+  **NOT live** (alpha-engine-config-I8757): its writer was retired with the
+  rest of the research graph on 2026-07-12 and its newest row is 2026-07-17.
+  It is read only for research cycles BEFORE the first published live cohort,
+  so the window's spring cycles keep a population; from the first live cohort
+  on, the live record is the only source. Until alpha-engine-config-I12231 the
+  table was the ONLY source, so the component sat at ``N/A-MISSING-INPUT`` on
+  every card while the producer was emitting the population it needed.
+
+  The staleness refusal stays: the component emits ``N/A-MISSING-INPUT`` once
+  the newest population cycle (from either source) is further behind the
+  replayed cycles than ``retired_table_guard.DEFAULT_MAX_AGE_DAYS`` — a frozen
+  population makes the ablated arm a comparison against a system that no
+  longer exists, which is the same reason ``sector_teams_avg`` below is N/A.
 
 ``sector_teams_avg`` and ``cio_selection_skill`` — **N/A-RETIRED**. Their only
 sources are the six-team / CIO research-graph tables, retired 2026-07-12
@@ -93,9 +104,10 @@ value.
 
 Determinism
 -----------
-Every arm is a pure function of :class:`ReplayInputs` plus two read-only
-archive reads (ArcticDB feature history for the exposures, the research SQLite
-for the pre-scanner population). No RNG anywhere: the only non-score ordering
+Every arm is a pure function of :class:`ReplayInputs` plus read-only archive
+reads (ArcticDB feature history for the exposures; the published
+``candidates.json`` artifacts and, for pre-2026-07-10 cycles, the research
+SQLite for the pre-scanner population). No RNG anywhere: the only non-score ordering
 in this module is the ticker sort and the cycle-index rotation.
 """
 
@@ -134,6 +146,11 @@ _DEGENERATE_SD = 1e-12
 _IDENTITY_TOL = 1e-9
 
 _PROFILES_KEY = "factors/profiles/{date}/by_ticker.json"
+
+#: The live pre-scanner population (config#3053; alpha-engine-config-I12231).
+_LIVE_POPULATION_SOURCE = (
+    "s3://{bucket}/candidates/{{run_date}}/candidates.json::scanner_eval_log"
+)
 
 
 # --------------------------------------------------------------------------
@@ -438,6 +455,53 @@ def _pre_scanner_population(research_db_path: str) -> dict[str, tuple[str, ...]]
     }
 
 
+def _live_scanner_population(inputs: ReplayInputs) -> dict[str, tuple[str, ...]]:
+    """``{run_date: (tickers evaluated,)}`` from the live Scanner's published log.
+
+    Reads ``candidates/{run_date}/candidates.json::scanner_eval_log`` through
+    ``end_to_end._load_live_scanner_cuts`` — the reader ``scanner_lift_live``
+    already uses — so both components see the same cohorts (one per ISO week,
+    the latest artifact that week). Every evaluated name is kept, pass or fail:
+    the rejected names are the population the ranking was applied to.
+
+    A directly-constructed :class:`ReplayInputs` with no ``s3_client`` reads
+    nothing here, the same posture ``predictor_ensemble._load_manifest``
+    takes; ``load_replay_inputs`` always supplies one.
+    """
+    if inputs.s3_client is None:
+        return {}
+    from analysis.end_to_end import _load_live_scanner_cuts
+
+    frame, _provenance = _load_live_scanner_cuts(
+        inputs.bucket, s3_client=inputs.s3_client
+    )
+    if frame.empty:
+        return {}
+    return {
+        str(date): tuple(sorted({str(t) for t in group["ticker"]}))
+        for date, group in frame.groupby("eval_date")
+    }
+
+
+def _merged_population(
+    live: Mapping[str, tuple[str, ...]],
+    retired: Mapping[str, tuple[str, ...]],
+) -> dict[str, tuple[str, ...]]:
+    """The live record, with the retired table filling only the dates before it.
+
+    From the first published live cohort on, the live record is the only
+    source: a ``scanner_evaluations`` row dated after it would be the retired
+    writer's population interleaved with the live one, and ``_as_of`` would
+    pick whichever happened to be newer.
+    """
+    if not live:
+        return dict(retired)
+    first_live = min(live)
+    merged = {d: names for d, names in retired.items() if d < first_live}
+    merged.update(live)
+    return merged
+
+
 def _as_of(eval_dates: Sequence[str], cycle_date: str) -> str | None:
     """The last research cycle at or before ``cycle_date`` (PIT-correct)."""
     prior = [d for d in eval_dates if d <= cycle_date]
@@ -452,60 +516,78 @@ def build_scanner_feed_counterfactual_arms(
     if not live_width:
         return _no_enter(inputs)
 
+    live_source = _LIVE_POPULATION_SOURCE.format(bucket=inputs.bucket)
     path = inputs.research_db_path
-    if not path or not Path(path).exists():
-        return NotAvailable(
-            status="N/A-MISSING-INPUT",
-            reason=(
-                "research.db is not available to this run "
-                f"(research_db_path={path!r}) — scanner_evaluations is the only "
-                "record of the pre-scanner PIT population, so the unranked arm "
-                f"cannot be drawn ({ISSUE})"
-            ),
-        )
+    db_present = bool(path) and Path(path).exists()
 
-    population = _pre_scanner_population(path)
+    # alpha-engine-config-I12231: the live Scanner has published the whole
+    # pre-scanner population every cycle since 2026-07-10. This component read
+    # only the retired table, so it went N/A on every card while the producer
+    # was emitting exactly the input it said was missing.
+    live = _live_scanner_population(inputs)
+    retired = _pre_scanner_population(path) if db_present else {}
+    population = _merged_population(live, retired)
     if not population:
         return NotAvailable(
             status="N/A-MISSING-INPUT",
             reason=(
-                f"scanner_evaluations in {path} holds no usable "
-                "(ticker, eval_date) rows — the pre-scanner PIT population is "
-                f"empty, so there is nothing to draw the unranked arm from "
-                f"({ISSUE})"
+                "the pre-scanner PIT population is empty in both sources: no "
+                f"published cohort in {live_source}, and "
+                + (
+                    f"scanner_evaluations in {path} holds no usable "
+                    "(ticker, eval_date) rows"
+                    if db_present
+                    else f"research.db is not available (research_db_path={path!r}) "
+                    "for the pre-2026-07-10 scanner_evaluations record"
+                )
+                + f" — there is nothing to draw the unranked arm from ({ISSUE})"
             ),
         )
 
     eval_dates = sorted(population)
 
     # alpha-engine-config-I8757. `_as_of` takes the last research cycle at or
-    # before each replayed cycle. With the writer retired that is permanently
-    # 2026-07-17, so every cycle after it draws its unranked arm from the same
-    # July population — a live selection measured against a universe that has
-    # not existed for weeks, reported as a lift number. A stale population is
-    # a MISSING current population, so it takes the existing N/A status rather
-    # than inventing a vocabulary the report card has never seen.
+    # before each replayed cycle. If the newest population cycle is far behind
+    # the replay, every later cycle draws its unranked arm from that one old
+    # population — a live selection measured against a universe that has not
+    # existed for weeks, reported as a lift number. That was permanent while
+    # the retired table was the only source; with the live record it fires
+    # only if the Scanner stops publishing. A stale population is a MISSING
+    # current population, so it takes the existing N/A status rather than
+    # inventing a vocabulary the report card has never seen.
     newest_replayed = sorted(live_width)[-1]
     population_age = retired_table_guard.age_days(eval_dates[-1], newest_replayed)
     if (population_age is not None
             and population_age > retired_table_guard.DEFAULT_MAX_AGE_DAYS):
+        newest_source = (
+            live_source if eval_dates[-1] in live
+            else f"scanner_evaluations in {path}"
+        )
         return NotAvailable(
             status="N/A-MISSING-INPUT",
             reason=(
-                f"the pre-scanner PIT population is frozen: the newest "
-                f"scanner_evaluations cycle in {path} is {eval_dates[-1]}, "
+                f"the pre-scanner PIT population is frozen: its newest cycle "
+                f"is {eval_dates[-1]} ({newest_source}), "
                 f"{population_age}d before the newest replayed ENTER cycle "
                 f"{newest_replayed} (bound "
-                f"{retired_table_guard.DEFAULT_MAX_AGE_DAYS}d). Its writer was "
-                "retired 2026-07-12 with the rest of the research graph "
-                "(alpha-engine-config-I8757), so the unranked arm would be "
-                "drawn from a universe that no longer exists and the lift "
-                f"would not be a measurement of this window ({ISSUE})"
+                f"{retired_table_guard.DEFAULT_MAX_AGE_DAYS}d). "
+                + (
+                    "No live cohort is published in "
+                    f"{live_source}, and the scanner_evaluations writer was "
+                    "retired 2026-07-12 with the rest of the research graph "
+                    "(alpha-engine-config-I8757), "
+                    if not live
+                    else "The live Scanner has stopped publishing its eval log, "
+                )
+                + "so the unranked arm would be drawn from a universe that no "
+                f"longer exists and the lift would not be a measurement of "
+                f"this window ({ISSUE})"
             ),
         )
     columns = set(map(str, inputs.price_matrix.columns))
     baseline_cycles: list[dict] = []
     ablated_cycles: list[dict] = []
+    drawn_from_live = 0
     for index, date in enumerate(sorted(live_width)):
         picks = live_width[date]
         n = len(picks)
@@ -515,6 +597,7 @@ def build_scanner_feed_counterfactual_arms(
         pool = sorted(t for t in population[as_of] if t in columns)
         if len(pool) < n:
             continue
+        drawn_from_live += as_of in live
         baseline_cycles.append({"date": date, "picks": picks})
         ablated_cycles.append({
             "date": date,
@@ -526,10 +609,11 @@ def build_scanner_feed_counterfactual_arms(
             status="N/A-MISSING-INPUT",
             reason=(
                 f"none of the {len(live_width)} ENTER cycles has a research "
-                f"cycle at or before it whose priceable scanner_evaluations "
+                f"cycle at or before it whose priceable pre-scanner "
                 f"population is at least as wide as the live selection "
-                f"({len(eval_dates)} research cycles present in {path}) "
-                f"({ISSUE})"
+                f"({len(live)} cycles from {live_source}, "
+                f"{len(eval_dates) - len(live)} earlier from "
+                f"scanner_evaluations in {path}) ({ISSUE})"
             ),
         )
     return ArmSet(
@@ -539,7 +623,10 @@ def build_scanner_feed_counterfactual_arms(
         ),
         ablated=picks_arm(
             "same width drawn unranked from the pre-scanner PIT population "
-            "(cycle-rotated ticker order)",
+            "(cycle-rotated ticker order; "
+            f"{drawn_from_live}/{len(ablated_cycles)} cycles from the live "
+            "candidates.json scanner_eval_log, the rest from the retired "
+            "scanner_evaluations table)",
             ablated_cycles,
         ),
     )
