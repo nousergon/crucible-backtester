@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from typing import Collection
 
 import numpy as np
 import pandas as pd
@@ -25,8 +26,41 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class CountMatch:
+    """The count-match verdict plus the full date-support census behind it.
+
+    ``matched`` is True only when every date in the UNION of both arms'
+    declared supports is either width-matched or named ``unpriceable``, and at
+    least one date is width-matched. The per-class date tuples are the census
+    (alpha-engine-config-I12243): a date one arm trades and the other does not
+    is never silently dropped from the assurance.
+    """
+
     matched: bool
     reason: str
+    matched_dates: tuple[str, ...] = ()
+    mismatched_dates: tuple[str, ...] = ()
+    baseline_only_dates: tuple[str, ...] = ()
+    ablated_only_dates: tuple[str, ...] = ()
+    unpriceable_dates: tuple[str, ...] = ()
+
+    def census(self) -> dict:
+        """Counts per support class plus every non-matched date, named."""
+        return {
+            "n_union_dates": (
+                len(self.matched_dates) + len(self.mismatched_dates)
+                + len(self.baseline_only_dates) + len(self.ablated_only_dates)
+                + len(self.unpriceable_dates)
+            ),
+            "n_matched": len(self.matched_dates),
+            "n_mismatched": len(self.mismatched_dates),
+            "n_baseline_only": len(self.baseline_only_dates),
+            "n_ablated_only": len(self.ablated_only_dates),
+            "n_unpriceable": len(self.unpriceable_dates),
+            "mismatched_dates": list(self.mismatched_dates),
+            "baseline_only_dates": list(self.baseline_only_dates),
+            "ablated_only_dates": list(self.ablated_only_dates),
+            "unpriceable_dates": list(self.unpriceable_dates),
+        }
 
 
 def per_cycle_log_alpha(
@@ -171,39 +205,110 @@ def paired_bootstrap_ci(diffs: list[float]) -> dict:
 
 
 def check_count_match(
-    baseline_width: dict[str, int], ablated_width: dict[str, int]
+    baseline_width: dict[str, int],
+    ablated_width: dict[str, int],
+    *,
+    unpriceable: Collection[str] = (),
 ) -> CountMatch:
-    """Every shared cycle must have identical picks-per-cycle across arms.
+    """Both arms must declare the SAME dates, at identical picks-per-cycle.
 
     Spec §3: a comparison of arms of different width silently favors whichever
     arm trades more and cannot isolate the component's own effect. Such a
     replay reports a GAP naming the mismatch, never a lift.
+
+    The check runs over the UNION of both arms' declared date supports, not
+    their intersection (alpha-engine-config-I12243). Comparing only shared
+    dates let a date that one arm traded and the other did not disappear from
+    the assurance: ``baseline={d1: 2, d2: 2}`` vs ``ablated={d1: 2}`` returned
+    ``matched=True``. Every union date is classed as exactly one of:
+
+    * ``matched`` — both arms declare it at the same width;
+    * ``mismatched`` — both declare it, at different widths;
+    * ``baseline_only`` / ``ablated_only`` — one arm declares it, the other
+      does not. This is unmatched support and is a gap;
+    * ``unpriceable`` — named by the caller in ``unpriceable``: no arm that
+      declares it can price a single one of its entries there, so neither
+      simulated book trades on it and it cannot bias the comparison. It is
+      excluded from matching and reported by name, never silently dropped.
+
+    A zero width is no support (an arm that lists a date with no names trades
+    exactly as one that omits it), so zero-width entries are normalized away
+    before classing.
     """
-    shared = sorted(set(baseline_width) & set(ablated_width))
-    if not shared:
+    base = {str(d): int(w) for d, w in baseline_width.items() if int(w) > 0}
+    abl = {str(d): int(w) for d, w in ablated_width.items() if int(w) > 0}
+    skip = {str(d) for d in unpriceable}
+    union = sorted(set(base) | set(abl))
+
+    matched: list[str] = []
+    mismatched: list[tuple[str, int, int]] = []
+    baseline_only: list[str] = []
+    ablated_only: list[str] = []
+    unpriced: list[str] = []
+    for d in union:
+        if d in skip:
+            unpriced.append(d)
+        elif d in base and d in abl:
+            if base[d] == abl[d]:
+                matched.append(d)
+            else:
+                mismatched.append((d, base[d], abl[d]))
+        elif d in base:
+            baseline_only.append(d)
+        else:
+            ablated_only.append(d)
+
+    def _verdict(ok: bool, reason: str) -> CountMatch:
         return CountMatch(
-            matched=False,
-            reason=(
-                "no cycle is present in both arms "
-                f"(baseline={len(baseline_width)} cycles, "
-                f"ablated={len(ablated_width)} cycles) — nothing to count-match"
-            ),
+            matched=ok,
+            reason=reason,
+            matched_dates=tuple(matched),
+            mismatched_dates=tuple(d for d, _b, _a in mismatched),
+            baseline_only_dates=tuple(baseline_only),
+            ablated_only_dates=tuple(ablated_only),
+            unpriceable_dates=tuple(unpriced),
         )
-    mismatched = [
-        (d, baseline_width[d], ablated_width[d])
-        for d in shared
-        if baseline_width[d] != ablated_width[d]
-    ]
-    if not mismatched:
-        return CountMatch(matched=True, reason="")
-    sample = "; ".join(f"{d}: baseline={b} vs ablated={a}" for d, b, a in mismatched[:3])
-    return CountMatch(
-        matched=False,
-        reason=(
-            f"width mismatch on {len(mismatched)}/{len(shared)} shared cycles "
-            f"({sample}) — an unmatched-width comparison favors whichever arm "
-            "trades more, so this is reported as a gap, not a measured lift"
-        ),
+
+    if not matched and not mismatched:
+        return _verdict(
+            False,
+            "no cycle is present in both arms "
+            f"(baseline={len(base)} cycles, ablated={len(abl)} cycles, "
+            f"unpriceable={len(unpriced)}) — nothing to count-match",
+        )
+
+    problems: list[str] = []
+    shared = len(matched) + len(mismatched)
+    if mismatched:
+        sample = "; ".join(
+            f"{d}: baseline={b} vs ablated={a}" for d, b, a in mismatched[:3]
+        )
+        problems.append(
+            f"width mismatch on {len(mismatched)}/{shared} shared cycles ({sample})"
+        )
+    if baseline_only or ablated_only:
+        parts = []
+        if baseline_only:
+            parts.append(
+                f"{len(baseline_only)} baseline-only date(s) "
+                f"({', '.join(baseline_only[:3])})"
+            )
+        if ablated_only:
+            parts.append(
+                f"{len(ablated_only)} ablated-only date(s) "
+                f"({', '.join(ablated_only[:3])})"
+            )
+        problems.append(
+            "one-sided support: " + " and ".join(parts)
+            + f" beside {shared} shared cycles"
+        )
+    if not problems:
+        return _verdict(True, "")
+    return _verdict(
+        False,
+        "; ".join(problems)
+        + " — an unmatched comparison favors whichever arm trades more (or "
+        "trades at all), so this is reported as a gap, not a measured lift",
     )
 
 
@@ -238,3 +343,60 @@ def compute_pbo(per_arm_alpha: dict[str, dict[str, float]]) -> dict | None:
         )
         return None
     return {"pbo": float(result["pbo"]), "n_trials": len(labels)}
+
+
+def window_overlap(
+    sampled_dates: list[str],
+    trading_axis: pd.DatetimeIndex,
+    *,
+    horizon_days: int,
+) -> dict:
+    """How much the sampled ``horizon_days`` windows overlap each other.
+
+    Each paired sample is the whole-book log-alpha over the ``horizon_days``
+    rows STRICTLY after a cycle date (:func:`per_cycle_log_alpha`). Two cycle
+    dates fewer than ``horizon_days`` rows apart therefore share rows of the
+    same NAV path, and their paired differences are not independent draws.
+    :func:`paired_bootstrap_ci` resamples them iid, so this measures — it does
+    not correct — how far the sample departs from that assumption
+    (alpha-engine-config-I12243). The estimator is unchanged here; changing
+    it is reserved to the critical-metric/estimator authority.
+
+    Returns counts only — no inferred effective-N factor is fabricated:
+
+    * ``n_windows`` — sampled windows (the CI's ``n_samples``);
+    * ``n_adjacent_pairs`` / ``n_overlapping_adjacent_pairs`` — consecutive
+      sampled windows, and how many share at least one row;
+    * ``min/median/max_gap_trading_rows`` — row distance between consecutive
+      window starts;
+    * ``mean_overlap_fraction`` — mean shared-row fraction over adjacent pairs;
+    * ``n_non_overlapping_windows`` — the largest set of sampled windows no two
+      of which share a row (greedy from the earliest, which is optimal for
+      equal-length intervals).
+    """
+    axis = pd.DatetimeIndex(trading_axis).sort_values()
+    starts = sorted(
+        int(axis.searchsorted(pd.Timestamp(d), side="right")) for d in sampled_dates
+    )
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    h = int(horizon_days)
+    overlapping = [g for g in gaps if g < h]
+    non_overlapping = 0
+    next_free = None
+    for s in starts:
+        if next_free is None or s >= next_free:
+            non_overlapping += 1
+            next_free = s + h
+    return {
+        "horizon_days": h,
+        "n_windows": len(starts),
+        "n_adjacent_pairs": len(gaps),
+        "n_overlapping_adjacent_pairs": len(overlapping),
+        "min_gap_trading_rows": min(gaps) if gaps else None,
+        "median_gap_trading_rows": float(np.median(gaps)) if gaps else None,
+        "max_gap_trading_rows": max(gaps) if gaps else None,
+        "mean_overlap_fraction": (
+            float(np.mean([max(0, h - g) / h for g in gaps])) if gaps else None
+        ),
+        "n_non_overlapping_windows": non_overlapping,
+    }
