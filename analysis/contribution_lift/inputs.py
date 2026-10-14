@@ -267,6 +267,8 @@ def load_replay_inputs(
         f"s3://{bucket}/signals/{{date}}/signals.json",
         f"s3://{bucket}/predictor/predictions/{{date}}.json",
         f"s3://{bucket}/factors/profiles/{{date}}/by_ticker.json",
+        # Read lazily by scanner_feed_counterfactual (alpha-engine-config-I12231).
+        f"s3://{bucket}/candidates/{{run_date}}/candidates.json::scanner_eval_log",
         f"arcticdb://{bucket} (store.arctic_reader.load_universe_from_arctic)",
     ]
 

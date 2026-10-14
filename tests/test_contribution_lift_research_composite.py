@@ -15,6 +15,9 @@ Anchors:
 
 from __future__ import annotations
 
+import dataclasses
+import io
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -579,6 +582,139 @@ def test_scanner_population_missing_table_is_empty_not_an_exception(tmp_path):
     path = tmp_path / "bare.db"
     sqlite3.connect(path).close()
     assert rc._pre_scanner_population(str(path)) == {}
+
+
+# alpha-engine-config-I12231: the live Scanner publishes the whole pre-scanner
+# population as candidates/{run_date}/candidates.json::scanner_eval_log. The
+# component used to read only the retired scanner_evaluations table, so it was
+# N/A-MISSING-INPUT on every card while the producer emitted its input.
+
+
+class _CandidatesS3:
+    """A read-only S3 stub holding ``candidates/{date}/candidates.json``."""
+
+    def __init__(self, cohorts: dict[str, list[str]], *, passing: int = 4):
+        self._objects = {
+            f"candidates/{d}/candidates.json": json.dumps({
+                "run_date": d,
+                "scanner_eval_log": [
+                    {"ticker": t, "quant_filter_pass": 1 if i < passing else 0}
+                    for i, t in enumerate(names)
+                ],
+            }).encode()
+            for d, names in cohorts.items()
+        }
+
+    def list_objects_v2(self, **kwargs):
+        assert kwargs["Prefix"] == "candidates/"
+        prefixes = sorted({k.rsplit("/", 1)[0] + "/" for k in self._objects})
+        return {"CommonPrefixes": [{"Prefix": p} for p in prefixes]}
+
+    def get_object(self, Bucket, Key):
+        return {"Body": io.BytesIO(self._objects[Key])}
+
+
+def _weekly(dates: list[str]) -> list[str]:
+    """One date per ISO week (the live reader keeps one cohort per week)."""
+    seen: dict[tuple, str] = {}
+    for d in dates:
+        iso = pd.Timestamp(d).isocalendar()
+        seen.setdefault((iso[0], iso[1]), d)
+    return sorted(seen.values())
+
+
+def _with_s3(inputs: ReplayInputs, s3) -> ReplayInputs:
+    return dataclasses.replace(inputs, s3_client=s3)
+
+
+def test_scanner_reads_the_live_population_when_the_table_is_frozen(tmp_path):
+    """The production state on 2026-10-09: scanner_evaluations stops early in
+    the window, the live record covers the rest. Before I12231 this returned
+    N/A-MISSING-INPUT ("population is frozen")."""
+    axis = _axis()
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:40]]
+    db = _research_db(tmp_path, [(t, dates[0]) for t in TICKERS])
+    live_dates = _weekly(dates[10:])
+    s3 = _CandidatesS3({d: list(TICKERS) for d in live_dates})
+    inputs = _with_s3(_cycle_inputs(research_db_path=db), s3)
+
+    arms = rc.build_scanner_feed_counterfactual_arms(inputs)
+
+    assert isinstance(arms, ArmSet), getattr(arms, "reason", arms)
+    assert _matched(arms) is True
+    ablated = dict(arms.ablated.picks)
+    assert dates[-1] in ablated
+    # Spring cycles still draw from the retired table, the rest from live.
+    assert dates[5] in ablated
+    assert f"{len(dates) - 10}/{len(dates)} cycles from the live" in arms.ablated.label
+
+
+def test_scanner_reads_the_live_population_without_a_research_db():
+    axis = _axis()
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:40]]
+    s3 = _CandidatesS3({d: list(TICKERS) for d in _weekly(dates)})
+    inputs = _with_s3(_cycle_inputs(), s3)
+
+    arms = rc.build_scanner_feed_counterfactual_arms(inputs)
+
+    assert isinstance(arms, ArmSet), getattr(arms, "reason", arms)
+    assert {d for d, _ in arms.baseline.picks} == set(dates)
+
+
+def test_scanner_live_population_keeps_names_the_gate_rejected():
+    """Rejected names are the population the ranking was applied to."""
+    axis = _axis()
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:40]]
+    s3 = _CandidatesS3({d: list(TICKERS) for d in _weekly(dates)}, passing=1)
+    population = rc._live_scanner_population(_with_s3(_cycle_inputs(), s3))
+
+    assert population and all(set(v) == set(TICKERS) for v in population.values())
+
+
+def test_scanner_live_record_wins_from_its_first_cohort_on(tmp_path):
+    """A table row dated after the first live cohort is never used."""
+    axis = _axis()
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:40]]
+    live_dates = _weekly(dates[10:])
+    db = _research_db(
+        tmp_path,
+        [(t, dates[0]) for t in TICKERS]
+        + [(t, d) for d in dates[10:] for t in TICKERS[:6]],
+    )
+    s3 = _CandidatesS3({d: list(TICKERS[6:]) for d in live_dates})
+    inputs = _with_s3(_cycle_inputs(research_db_path=db), s3)
+
+    arms = rc.build_scanner_feed_counterfactual_arms(inputs)
+
+    ablated = dict(arms.ablated.picks)
+    for d in dates[10:]:
+        assert set(ablated[d]) <= set(TICKERS[6:])
+    assert dates[5] in ablated
+
+
+def test_scanner_still_refuses_when_the_live_record_goes_stale():
+    """The I8757 guard survives: a Scanner that stops publishing is N/A."""
+    axis = _axis()
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:40]]
+    s3 = _CandidatesS3({dates[0]: list(TICKERS)})
+    inputs = _with_s3(_cycle_inputs(), s3)
+
+    na = rc.build_scanner_feed_counterfactual_arms(inputs)
+
+    assert isinstance(na, NotAvailable)
+    assert na.status == "N/A-MISSING-INPUT"
+    assert "frozen" in na.reason
+    assert "candidates.json::scanner_eval_log" in na.reason
+
+
+def test_scanner_merge_keeps_the_table_only_before_the_live_record():
+    merged = rc._merged_population(
+        {"2026-07-10": ("B",), "2026-07-17": ("C",)},
+        {"2026-07-03": ("A",), "2026-07-10": ("X",), "2026-07-17": ("Y",)},
+    )
+    assert merged == {
+        "2026-07-03": ("A",), "2026-07-10": ("B",), "2026-07-17": ("C",)
+    }
 
 
 # --------------------------------------------------------------------------
