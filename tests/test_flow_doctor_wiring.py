@@ -402,7 +402,10 @@ class TestColdStartDeferral:
 # ArenaConfig.promote_statistic, which the producer arena declares.
 # Bumped v0.124.153 -> v0.124.156 (alpha-engine-config-I11660): rehearsal
 # phase-marker namespacing, in lockstep with crucible-predictor.
-_EXPECTED_LIB_TAG = "v0.124.156"
+# Bumped v0.124.156 -> v0.124.165 (alpha-engine-config-I11931): the producer
+# arena declares ArenaConfig.promote_against="every_arm", in lockstep with
+# crucible-predictor.
+_EXPECTED_LIB_TAG = "v0.124.165"
 
 
 class TestLibVersionPin:
