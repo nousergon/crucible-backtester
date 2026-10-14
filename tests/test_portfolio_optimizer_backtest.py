@@ -971,3 +971,148 @@ def test_from_cash_rebalance_forces_one_minus_sleeve():
     assert m["forced_turnover_median"] == pytest.approx(0.97, abs=1e-6)
     solved = [d for d in result.diagnostics_per_rebalance if "forced_turnover" in d]
     assert solved and all(d["forced_turnover_by_cause"] for d in solved)
+
+
+# ── alpha-engine-config-I12117: exits execute; turnover is one-way + annualised
+
+
+def _three_name_frame(close_c=100.0):
+    idx = pd.date_range("2026-01-01", periods=10, freq="D")
+    close = pd.DataFrame(
+        {"A": np.linspace(100, 110, 10), "B": 100.0, "C": close_c}, index=idx,
+    )
+    spy = pd.Series(np.linspace(400, 404, 10), index=idx)
+    tw = pd.DataFrame(np.nan, index=idx, columns=close.columns)
+    return idx, close, spy, tw
+
+
+class TestRebalanceExitsAndTurnover:
+    def test_name_leaving_universe_is_sold_and_new_name_reaches_target(self):
+        """Defect A: a NaN size is "no order" in vectorbt, so a name that left
+        the universe was never sold and, with shared cash, the new target C
+        got ~0%. The rebalance row must carry an explicit 0 for A."""
+        import vectorbt as vbt
+
+        from analysis.portfolio_optimizer_backtest import (
+            _populate_target_weights_row,
+            _simulate_and_measure,
+        )
+
+        idx, close, spy, tw = _three_name_frame()
+        _populate_target_weights_row(tw, str(idx[0].date()), ["A", "B"], np.array([0.5, 0.5]))
+        _populate_target_weights_row(tw, str(idx[5].date()), ["B", "C"], np.array([0.5, 0.5]))
+        assert tw.at[idx[5], "A"] == 0.0
+
+        # Same from_orders call as _simulate_and_measure.
+        pf = vbt.Portfolio.from_orders(
+            close=close, size=tw, size_type="targetpercent", init_cash=1e6,
+            cash_sharing=True, group_by=True, fees=0.0, freq="D",
+        )
+        w = pf.asset_value(group_by=False).div(pf.value(), axis=0).loc[idx[5]]
+        assert w["A"] == pytest.approx(0.0, abs=1e-9)
+        assert w["B"] == pytest.approx(0.5, abs=1e-6)
+        assert w["C"] == pytest.approx(0.5, abs=1e-6)
+
+        metrics, _, _ = _simulate_and_measure(
+            target_weights=tw, price_matrix=close, spy_prices=spy,
+            init_cash=1e6, fees=0.0, rebalance_freq_days=5,
+            universe_by_date={idx[0]: frozenset({"A", "B"}), idx[5]: frozenset({"B", "C"})},
+        )
+        assert metrics["stale_holding_weight_max"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_turnover_is_half_sum_abs_dw_annualised_by_rebalance_freq(self):
+        """Defect B: {A,B} -> {B,C} at 50/50 is 0.5 one-way per rebalance;
+        at freq 5 that is 0.5 x 252/5 = 25.2/yr. The pre-fix formula skipped
+        the exit/entry NaNs, did not halve, and annualised by
+        252/(n_rows - 1), reading 0.0 here."""
+        from analysis.portfolio_optimizer_backtest import (
+            _populate_target_weights_row,
+            _simulate_and_measure,
+        )
+
+        idx, close, spy, tw = _three_name_frame()
+        _populate_target_weights_row(tw, str(idx[0].date()), ["A", "B"], np.array([0.5, 0.5]))
+        _populate_target_weights_row(tw, str(idx[5].date()), ["B", "C"], np.array([0.5, 0.5]))
+
+        metrics, _, _ = _simulate_and_measure(
+            target_weights=tw, price_matrix=close, spy_prices=spy,
+            init_cash=1e6, fees=0.0, rebalance_freq_days=5,
+        )
+        assert metrics["turnover_one_way_ann"] == pytest.approx(25.2)
+
+    def test_held_name_with_no_close_is_left_unordered_and_counted(self):
+        """A delisted (NaN-close) held name gets no order vectorbt cannot fill:
+        the cell stays NaN, the simulation does not raise, and the stuck exit
+        is counted for ``n_unfillable_exits``."""
+        from analysis.portfolio_optimizer_backtest import (
+            _populate_target_weights_row,
+            _simulate_and_measure,
+        )
+
+        idx, close, spy, tw = _three_name_frame()
+        close.loc[idx[5]:, "A"] = np.nan  # A delists before rebalance 2
+        held = pd.Series(0.0, index=tw.columns)
+
+        n1 = _populate_target_weights_row(
+            tw, str(idx[0].date()), ["A", "B"], np.array([0.5, 0.5]),
+            close_row=close.loc[idx[0]], held=held,
+        )
+        held = held.where(tw.loc[idx[0]].isna(), tw.loc[idx[0]])
+        n2 = _populate_target_weights_row(
+            tw, str(idx[5].date()), ["B", "C"], np.array([0.5, 0.5]),
+            close_row=close.loc[idx[5]], held=held,
+        )
+        assert (n1, n2) == (0, 1)
+        assert np.isnan(tw.at[idx[5], "A"])
+
+        metrics, _, _ = _simulate_and_measure(
+            target_weights=tw, price_matrix=close, spy_prices=spy,
+            init_cash=1e6, fees=0.0, rebalance_freq_days=5,
+        )
+        assert metrics["turnover_one_way_ann"] is not None
+
+
+@pytest.mark.skipif(
+    _ALPHA_ENGINE_MISSING,
+    reason=executor_missing_reason(_ALPHA_ENGINE_PATH),
+)
+def test_optimizer_run_sells_names_that_leave_the_universe():
+    """alpha-engine-config-I12117, end to end through the real kernel: the
+    optimizer holds {A,B,C}, then the universe switches to {D,E,F}. The
+    switch rebalance must carry an explicit 0 target for A/B/C (on the
+    pre-fix code those cells were NaN = "no order", so the names were
+    never sold), and the simulated book holds nothing outside the universe."""
+    old, new = ["AAPL", "MSFT", "GOOG"], ["JNJ", "PG", "XOM"]
+    tickers = old + new
+    sector_map = {t: "Technology" for t in tickers}
+    price_matrix = _synthetic_price_matrix(tickers, n_days=300, seed=0)
+    spy_prices = _synthetic_spy_series(n_days=300, seed=99).reindex(price_matrix.index)
+    dates = price_matrix.index[260:295]
+    switch = dates[len(dates) // 2]
+    predictions = {
+        d.strftime("%Y-%m-%d"): {t: 0.05 for t in (old if d < switch else new)}
+        for d in dates
+    }
+
+    result = run_optimizer_backtest(
+        predictions_by_date=predictions,
+        price_matrix=price_matrix,
+        spy_prices=spy_prices,
+        sector_map=sector_map,
+        executor_path=_ALPHA_ENGINE_PATH,
+        rebalance_freq_days=5,
+        universe_cap=3,
+    )
+    tw = result.target_weights
+    rebal_rows = tw.dropna(how="all")
+    before = rebal_rows[rebal_rows.index < switch]
+    after = rebal_rows[rebal_rows.index >= switch]
+    assert len(before) and len(after)
+    # A position that must exit exists: the optimizer held the old names.
+    assert (before.iloc[-1][old] > 0).any()
+    # ...and every rebalance from the switch on orders them to zero.
+    assert after[old].notna().all().all()
+    assert (after[old] == 0.0).all().all()
+    m = result.metrics
+    assert m["stale_holding_weight_max"] == pytest.approx(0.0, abs=1e-9)
+    assert m["n_unfillable_exits"] == 0
