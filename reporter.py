@@ -2967,21 +2967,22 @@ def _section_trigger_scorecard(result: dict) -> list[str]:
     summary = result.get("summary", {})
     lines += [
         "",
-        f"_{summary.get('total_entries', 0)} total entries analyzed_",
+        f"_{summary.get('total_entries', 0)} total entries analyzed; "
+        f"{summary.get('n_closed', 0)} closed (alpha and win rate are over closed entries)_",
         "",
-        "| Trigger | n | Avg slip vs signal | Avg slip vs open | Avg alpha | Win rate |",
-        "|---------|---|--------------------|------------------|-----------|---------|",
+        "| Trigger | n | closed | Avg slip vs signal | Avg slip vs open | Avg alpha | Win rate |",
+        "|---------|---|--------|--------------------|------------------|-----------|---------|",
     ]
     for t in result.get("triggers", []):
         lines.append(
-            f"| {t['trigger']} | {t['n_trades']} | "
+            f"| {t['trigger']} | {t['n_trades']} | {t.get('n_closed', 0)} | "
             f"{_pct_pts(t.get('avg_slippage_vs_signal'))} | "
             f"{_pct_pts(t.get('avg_slippage_vs_open'))} | "
             f"{_pct_pts(t.get('avg_realized_alpha'))} | "
             f"{_pct(t.get('win_rate_vs_spy'))} |"
         )
     lines.append(
-        f"| **All** | {summary.get('total_entries', 0)} | "
+        f"| **All** | {summary.get('total_entries', 0)} | {summary.get('n_closed', 0)} | "
         f"{_pct_pts(summary.get('avg_slippage_vs_signal'))} | "
         f"{_pct_pts(summary.get('avg_slippage_vs_open'))} | "
         f"{_pct_pts(summary.get('avg_realized_alpha'))} | "
