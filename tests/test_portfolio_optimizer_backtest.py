@@ -1116,3 +1116,147 @@ def test_optimizer_run_sells_names_that_leave_the_universe():
     m = result.metrics
     assert m["stale_holding_weight_max"] == pytest.approx(0.0, abs=1e-9)
     assert m["n_unfillable_exits"] == 0
+
+
+# ── alpha-engine-config-I11507: the carried-book basis ──────────────────────
+
+
+class TestCarriedBook:
+    def test_drift_book_follows_realised_returns(self):
+        from analysis.portfolio_optimizer_backtest import _drift_book
+
+        idx = pd.date_range("2026-01-01", periods=2, freq="D")
+        prices = pd.DataFrame({"A": [100.0, 200.0], "B": [50.0, 50.0]}, index=idx)
+        out = _drift_book(pd.Series({"A": 0.5, "B": 0.3}), prices, idx[0], idx[1])
+        # A doubles: 1.0 + 0.3 + 0.2 cash = 1.5 of starting NAV.
+        assert out["A"] == pytest.approx(1.0 / 1.5)
+        assert out["B"] == pytest.approx(0.3 / 1.5)
+
+    def test_drift_book_holds_an_unpriced_name_at_its_last_price(self):
+        from analysis.portfolio_optimizer_backtest import _drift_book
+
+        idx = pd.date_range("2026-01-01", periods=2, freq="D")
+        prices = pd.DataFrame({"A": [100.0, np.nan], "B": [50.0, 50.0]}, index=idx)
+        out = _drift_book(pd.Series({"A": 0.5, "B": 0.3}), prices, idx[0], idx[1])
+        assert out == {"A": pytest.approx(0.5), "B": pytest.approx(0.3)}
+
+    def test_held_name_outside_the_cut_stays_in_the_universe(self):
+        """Mirrors the executor's _build_universe: a held name joins the
+        solve with today's alpha (0 when none), is exempt from the score
+        proxy, and w_prev is the held book."""
+        from analysis.portfolio_optimizer_backtest import _build_optimizer_inputs
+
+        tickers = ["AAPL", "MSFT", "GOOG"]
+        price_matrix = _synthetic_price_matrix(tickers, n_days=200, seed=0)
+        price_matrix["SPY"] = _synthetic_spy_series(n_days=200, seed=99).reindex(price_matrix.index)
+        kwargs = _build_optimizer_inputs(
+            rebal_date=str(price_matrix.index[150].date()),
+            predictions={"AAPL": 0.04, "MSFT": 0.02},
+            price_matrix=price_matrix,
+            sector_map={t: "Technology" for t in tickers},
+            universe_cap=1,
+            max_position_pct=0.08,
+            min_score_proxy=0.03,
+            cfg={},
+            held_weights={"MSFT": 0.20, "GOOG": 0.10, "SPY": 0.30},
+        )
+        t = kwargs["tickers"]
+        assert set(t) == {"AAPL", "GOOG", "MSFT", "SPY", "CASH"}
+        w = dict(zip(t, kwargs["w_prev"]))
+        assert w["MSFT"] == pytest.approx(0.20)
+        assert w["GOOG"] == pytest.approx(0.10)
+        assert w["SPY"] == pytest.approx(0.30)
+        assert w["AAPL"] == 0.0
+        assert w["CASH"] == pytest.approx(0.40)
+        alpha = dict(zip(t, kwargs["alpha_hat"]))
+        assert alpha["GOOG"] == 0.0 and alpha["MSFT"] == pytest.approx(0.02)
+        elig = dict(zip(t, kwargs["eligibility"]))
+        # Both held names sit under the 0.03 proxy and stay eligible.
+        assert elig["MSFT"] and elig["GOOG"] and elig["AAPL"]
+        assert kwargs["carry"] == {
+            "n_held": 2, "n_held_outside_cut": 2, "held_weight_not_carried": 0.0,
+        }
+
+    def test_held_name_without_history_is_counted_not_carried(self):
+        from analysis.portfolio_optimizer_backtest import _build_optimizer_inputs
+
+        tickers = ["AAPL", "MSFT"]
+        price_matrix = _synthetic_price_matrix(tickers, n_days=200, seed=0)
+        price_matrix["SPY"] = _synthetic_spy_series(n_days=200, seed=99).reindex(price_matrix.index)
+        price_matrix.iloc[140:, price_matrix.columns.get_loc("MSFT")] = np.nan
+        kwargs = _build_optimizer_inputs(
+            rebal_date=str(price_matrix.index[150].date()),
+            predictions={"AAPL": 0.04},
+            price_matrix=price_matrix,
+            sector_map={},
+            universe_cap=5,
+            max_position_pct=0.08,
+            min_score_proxy=None,
+            cfg={},
+            held_weights={"MSFT": 0.15},
+        )
+        assert "MSFT" not in kwargs["tickers"]
+        assert kwargs["carry"]["held_weight_not_carried"] == pytest.approx(0.15)
+        assert dict(zip(kwargs["tickers"], kwargs["w_prev"]))["CASH"] == pytest.approx(1.0)
+
+    def test_all_cash_basis_is_unchanged(self):
+        from analysis.portfolio_optimizer_backtest import _build_optimizer_inputs
+
+        tickers = ["AAPL", "MSFT"]
+        price_matrix = _synthetic_price_matrix(tickers, n_days=200, seed=0)
+        price_matrix["SPY"] = _synthetic_spy_series(n_days=200, seed=99).reindex(price_matrix.index)
+        kwargs = _build_optimizer_inputs(
+            rebal_date=str(price_matrix.index[150].date()),
+            predictions={"AAPL": 0.04, "MSFT": 0.02},
+            price_matrix=price_matrix, sector_map={}, universe_cap=1,
+            max_position_pct=0.08, min_score_proxy=None, cfg={},
+        )
+        assert kwargs["tickers"] == ["AAPL", "SPY", "CASH"]
+        assert list(kwargs["w_prev"]) == [0.0, 0.0, 1.0]
+
+    def test_unknown_basis_raises(self):
+        with pytest.raises(ValueError, match="w_prev_basis"):
+            run_optimizer_backtest(
+                predictions_by_date={}, price_matrix=pd.DataFrame(),
+                spy_prices=pd.Series(dtype=float), sector_map={},
+                executor_path="/x", w_prev_basis="bogus",
+            )
+
+
+@pytest.mark.skipif(
+    _ALPHA_ENGINE_MISSING,
+    reason=executor_missing_reason(_ALPHA_ENGINE_PATH),
+)
+def test_carried_basis_lets_the_turnover_budget_bind():
+    """alpha-engine-config-I11507 end to end on the real kernel: with the book
+    carried, only the first rebalance is a from-cash rebuild. Every later
+    rebalance's forced floor sits far below 0.97 and under the budget."""
+    from analysis.portfolio_optimizer_backtest import W_PREV_BASIS_CARRIED
+
+    tickers = ["AAPL", "MSFT", "GOOG", "JNJ", "PG"]
+    price_matrix = _synthetic_price_matrix(tickers, n_days=300, seed=0)
+    spy_prices = _synthetic_spy_series(n_days=300, seed=99).reindex(price_matrix.index)
+    predictions = _synthetic_predictions(tickers, price_matrix.index[260:295], seed=42)
+
+    result = run_optimizer_backtest(
+        predictions_by_date=predictions,
+        price_matrix=price_matrix,
+        spy_prices=spy_prices,
+        sector_map={t: "Technology" for t in tickers},
+        executor_path=_ALPHA_ENGINE_PATH,
+        rebalance_freq_days=5,
+        universe_cap=3,
+        optimizer_cfg={"cash_sleeve_pct": 0.03},
+        w_prev_basis=W_PREV_BASIS_CARRIED,
+    )
+    m = result.metrics
+    assert m["w_prev_basis"] == "carried_drifted"
+    solved = [d for d in result.diagnostics_per_rebalance if "forced_turnover" in d]
+    assert len(solved) >= 3
+    assert solved[0]["forced_turnover"] == pytest.approx(0.97, abs=1e-6)
+    later = [d["forced_turnover"] for d in solved[1:]]
+    assert max(later) < 0.20
+    assert m["forced_turnover_share_over_budget"] == pytest.approx(1 / len(solved))
+    assert m["carry_n_rebalances"] == len(solved)
+    assert m["held_weight_not_carried_max"] == 0.0
+    assert m["stale_holding_weight_max"] == pytest.approx(0.0, abs=1e-9)

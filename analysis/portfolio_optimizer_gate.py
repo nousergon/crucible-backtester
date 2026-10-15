@@ -291,6 +291,7 @@ def run_gate_against_predictor_backtest(
     """
     import os
     from analysis.portfolio_optimizer_backtest import (
+        W_PREV_BASIS,
         compare_to_legacy,
         run_optimizer_backtest,
     )
@@ -378,7 +379,7 @@ def run_gate_against_predictor_backtest(
         f"({report['n_pass']} pass / {report['n_fail']} fail / {report['n_skipped']} skipped)"
     )
 
-    return {
+    out = {
         "comparison": comparison,
         "gate_report": report,
         "optimizer_diagnostics": opt_result.diagnostics_per_rebalance,
@@ -386,4 +387,73 @@ def run_gate_against_predictor_backtest(
         "n_solver_failures": opt_result.n_solver_failures,
         "signal_source": signal_source,
         "production_window": pred_result.get("production_window"),
+    }
+
+    shadow_basis = _shadow_w_prev_basis(config)
+    if shadow_basis is not None and shadow_basis != W_PREV_BASIS:
+        out["shadow"] = _run_shadow_basis(
+            shadow_basis, pred_result, executor_path, rebalance_freq_days,
+            universe_cap, legacy_metrics, signal_source,
+        )
+    return out
+
+
+def _shadow_w_prev_basis(config: dict) -> str | None:
+    """``portfolio_optimizer_gate.shadow_w_prev_basis`` (default
+    ``carried_drifted``; ``null`` disables). alpha-engine-config-I11507: the
+    carried-book basis runs beside the gate on identical inputs for one
+    cycle before it replaces the all-cash basis the gate scores."""
+    from analysis.portfolio_optimizer_backtest import W_PREV_BASIS_CARRIED
+
+    section = config.get("portfolio_optimizer_gate") or {}
+    return section.get("shadow_w_prev_basis", W_PREV_BASIS_CARRIED)
+
+
+def _run_shadow_basis(
+    basis: str,
+    pred_result: dict,
+    executor_path: str,
+    rebalance_freq_days: int,
+    universe_cap: int,
+    legacy_metrics: dict | None,
+    signal_source: str,
+) -> dict:
+    """Same inputs, same kernel, a different prior-book basis. Observability
+    only: a failure is recorded on the artifact and logged at ERROR, never
+    raised, so the shadow cannot sink the gate verdict it sits beside."""
+    from analysis.portfolio_optimizer_backtest import (
+        compare_to_legacy,
+        run_optimizer_backtest,
+    )
+
+    try:
+        res = run_optimizer_backtest(
+            predictions_by_date=pred_result["predictions_by_date"],
+            price_matrix=pred_result["price_matrix"],
+            spy_prices=pred_result["spy_prices"],
+            sector_map=pred_result["sector_map"],
+            executor_path=executor_path,
+            rebalance_freq_days=rebalance_freq_days,
+            universe_cap=universe_cap,
+            w_prev_basis=basis,
+        )
+    except Exception as exc:  # recorded on the artifact, never raised
+        logger.exception("Gate runner: shadow w_prev_basis=%s FAILED", basis)
+        return {"status": "error", "w_prev_basis": basis, "error": f"{type(exc).__name__}: {exc}"}
+
+    comparison = compare_to_legacy(res.metrics, legacy_metrics, signal_source=signal_source)
+    report = evaluate_gate(comparison)
+    logger.info(
+        "Gate runner: SHADOW w_prev_basis=%s verdict=%s (%d pass / %d fail / %d skipped)",
+        basis, report["verdict"], report["n_pass"], report["n_fail"], report["n_skipped"],
+    )
+    return {
+        "status": "ok",
+        "w_prev_basis": basis,
+        "comparison": comparison,
+        "gate_report": report,
+        "passed": gate_passed(report),
+        "optimizer_diagnostics": res.diagnostics_per_rebalance,
+        "n_rebalances": res.n_rebalances,
+        "n_solver_failures": res.n_solver_failures,
     }

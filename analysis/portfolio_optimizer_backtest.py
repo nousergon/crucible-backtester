@@ -66,6 +66,25 @@ _BENCH_SECTOR = "__benchmark__"
 _CASH_SECTOR = "__cash__"
 _CASH_ALPHA_HINT = -1e-6
 
+#: How ``_build_optimizer_inputs`` sets the solver's prior book. Stated on the
+#: metrics so a reader of the artifact knows whether the turnover figures
+#: describe a from-cash rebuild at every rebalance or a carried book.
+#:
+#: ``W_PREV_BASIS_CARRIED`` (alpha-engine-config-I11507, Brian 2026-10-15):
+#: the prior book is the previous rebalance's target drifted by realised
+#: returns to the new date and renormalised, and every held name stays in the
+#: solver's universe (exempt from the score proxy, as live held names are
+#: exempt from ``min_score_to_enter``). This mirrors the executor's
+#: ``optimizer_shadow._build_w_prev`` / ``_build_universe``. The first
+#: rebalance has no prior book and starts from cash.
+W_PREV_BASIS_ALL_CASH = "all_cash_each_rebalance"
+W_PREV_BASIS_CARRIED = "carried_drifted"
+W_PREV_BASES = (W_PREV_BASIS_ALL_CASH, W_PREV_BASIS_CARRIED)
+#: Default for every caller. Stays all-cash until the one-cycle shadow
+#: (``portfolio_optimizer_gate`` writes the carried basis beside the gate
+#: artifact) has been compared; flipping it moves every sweep and the gate.
+W_PREV_BASIS = W_PREV_BASIS_ALL_CASH
+
 
 @dataclass
 class OptimizerBacktestResult:
@@ -101,6 +120,7 @@ def run_optimizer_backtest(
     min_score_proxy: float | None = None,
     alpha_uncertainty_by_date: dict[str, dict[str, float]] | None = None,
     keep_daily_returns: bool = False,
+    w_prev_basis: str = W_PREV_BASIS,
 ) -> OptimizerBacktestResult:
     """
     Backtest the constrained MVO optimizer over historical synthetic predictions.
@@ -147,6 +167,8 @@ def run_optimizer_backtest(
             "root and that cvxpy + scikit-learn are installed."
         ) from e
 
+    if w_prev_basis not in W_PREV_BASES:
+        raise ValueError(f"w_prev_basis must be one of {W_PREV_BASES}, got {w_prev_basis!r}")
     if optimizer_cfg is None:
         optimizer_cfg = {}
     effective_cfg = {**OPTIMIZER_CONFIG_DEFAULTS, **optimizer_cfg}
@@ -164,7 +186,8 @@ def run_optimizer_backtest(
     logger.info(
         f"Optimizer backtest: {len(rebalance_dates)} rebalances "
         f"({rebalance_dates[0]} → {rebalance_dates[-1]}), "
-        f"universe_cap={universe_cap}, freq={rebalance_freq_days}d"
+        f"universe_cap={universe_cap}, freq={rebalance_freq_days}d, "
+        f"w_prev_basis={w_prev_basis}"
     )
 
     target_weights = pd.DataFrame(
@@ -178,8 +201,16 @@ def run_optimizer_backtest(
     last_target = pd.Series(0.0, index=target_weights.columns)
     universe_by_date: dict[pd.Timestamp, frozenset] = {}
     n_unfillable_exits = 0
+    carry = w_prev_basis == W_PREV_BASIS_CARRIED
+    last_rebal_ts: pd.Timestamp | None = None
 
     for rebal_date in rebalance_dates:
+        held_weights: dict[str, float] | None = None
+        if carry and last_rebal_ts is not None:
+            held_weights = _drift_book(
+                last_target.drop(labels=[_CASH], errors="ignore"),
+                price_matrix, last_rebal_ts, pd.Timestamp(rebal_date),
+            )
         try:
             kwargs = _build_optimizer_inputs(
                 rebal_date=rebal_date,
@@ -195,6 +226,7 @@ def run_optimizer_backtest(
                     if alpha_uncertainty_by_date is not None
                     else None
                 ),
+                held_weights=held_weights,
             )
         except _InsufficientHistoryError as e:
             logger.debug(f"{rebal_date}: skipped — {e}")
@@ -202,6 +234,7 @@ def run_optimizer_backtest(
             continue
 
         alpha_uncertainty = kwargs.pop("alpha_uncertainty", None)
+        carry_diag = kwargs.pop("carry")
         result = solve_target_weights(**kwargs, alpha_uncertainty=alpha_uncertainty)
         if result.diagnostics["status"] == "infeasible_fallback":
             n_solver_failures += 1
@@ -213,6 +246,7 @@ def run_optimizer_backtest(
             # alpha-engine-config-I11507: the one-way turnover the solver's
             # pins FORCE before alpha is consulted, and what forced it.
             **_forced_turnover_fields(result.diagnostics),
+            **({"carry": carry_diag} if carry else {}),
         })
 
         rebal_ts = pd.Timestamp(rebal_date)
@@ -228,6 +262,7 @@ def run_optimizer_backtest(
         universe_by_date[rebal_ts] = frozenset(
             t for t in kwargs["tickers"] if t != _CASH
         )
+        last_rebal_ts = rebal_ts
 
     metrics, daily_returns, spy_daily_returns = _simulate_and_measure(
         target_weights=target_weights,
@@ -241,7 +276,9 @@ def run_optimizer_backtest(
     metrics["n_unfillable_exits"] = n_unfillable_exits
     metrics["n_rebalances"] = len(rebalance_dates)
     metrics["n_solver_failures"] = n_solver_failures
-    metrics.update(summarize_forced_turnover(diagnostics))
+    metrics.update(summarize_forced_turnover(diagnostics, w_prev_basis=w_prev_basis))
+    if carry:
+        metrics.update(_summarize_carry(diagnostics))
     _log_forced_turnover(metrics)
     metrics["rebalance_freq_days"] = rebalance_freq_days
     metrics["universe_cap"] = universe_cap
@@ -283,10 +320,7 @@ class _InsufficientHistoryError(Exception):
 # here. This only makes the forced fraction a first-class number on the
 # stage, so the decision is taken on a measurement.
 
-#: How ``_build_optimizer_inputs`` sets the solver's prior book. Stated on the
-#: metrics so a reader of the artifact knows the turnover figures describe a
-#: from-cash rebuild at every rebalance, not a carried book.
-W_PREV_BASIS = "all_cash_each_rebalance"
+#: ``W_PREV_BASIS*`` constants: see the module top.
 
 
 def _forced_turnover_fields(solver_diagnostics: dict) -> dict:
@@ -301,7 +335,9 @@ def _forced_turnover_fields(solver_diagnostics: dict) -> dict:
     }
 
 
-def summarize_forced_turnover(diagnostics: list[dict]) -> dict:
+def summarize_forced_turnover(
+    diagnostics: list[dict], w_prev_basis: str = W_PREV_BASIS,
+) -> dict:
     """Stage-level summary of the forced (mandatory) one-way turnover.
 
     ``forced_turnover_share_over_budget`` is the fraction of measured
@@ -328,7 +364,7 @@ def summarize_forced_turnover(diagnostics: list[dict]) -> dict:
                 causes.setdefault(cause, []).append(float(v))
     n = len(floors)
     return {
-        "w_prev_basis": W_PREV_BASIS,
+        "w_prev_basis": w_prev_basis,
         "forced_turnover_n_rebalances": n,
         "forced_turnover_mean": float(np.mean(floors)) if n else None,
         "forced_turnover_median": float(np.median(floors)) if n else None,
@@ -337,6 +373,23 @@ def summarize_forced_turnover(diagnostics: list[dict]) -> dict:
         "forced_turnover_by_cause_mean": (
             {c: float(np.mean(v)) for c, v in sorted(causes.items())} if causes else None
         ),
+    }
+
+
+def _summarize_carry(diagnostics: list[dict]) -> dict:
+    """Carried-basis bookkeeping: how much of the book sat outside the
+    top-``universe_cap`` cut (kept in the universe by the carry), and how
+    much could not be carried for lack of history (sold by the simulation)."""
+    rows = [r["carry"] for r in diagnostics if isinstance(r.get("carry"), dict)]
+    if not rows:
+        return {"carry_n_rebalances": 0, "held_outside_cut_mean": None,
+                "held_weight_not_carried_mean": None, "held_weight_not_carried_max": None}
+    not_carried = [float(r["held_weight_not_carried"]) for r in rows]
+    return {
+        "carry_n_rebalances": len(rows),
+        "held_outside_cut_mean": float(np.mean([r["n_held_outside_cut"] for r in rows])),
+        "held_weight_not_carried_mean": float(np.mean(not_carried)),
+        "held_weight_not_carried_max": float(np.max(not_carried)),
     }
 
 
@@ -394,7 +447,19 @@ def _build_optimizer_inputs(
     min_score_proxy: float | None,
     cfg: dict,
     alpha_uncertainty_for_date: dict[str, float] | None = None,
+    held_weights: dict[str, float] | None = None,
 ) -> dict:
+    """Solver kwargs for one rebalance.
+
+    ``held_weights`` is the carried prior book ({ticker: NAV weight}, cash
+    implied as the remainder; SPY allowed). ``None`` keeps the all-cash
+    basis. When given, every held name with a full return history in the
+    lookback window joins the universe beside the top-``universe_cap`` cut,
+    with today's predicted alpha (0 when it has none), and ``w_prev`` is the
+    held book. A held name that cannot join (no finite history) is sold by
+    the simulation; its weight is reported as ``held_weight_not_carried``
+    and handed to the solver as cash.
+    """
     rebal_ts = pd.Timestamp(rebal_date)
     if rebal_ts not in price_matrix.index:
         raise _InsufficientHistoryError(f"{rebal_date} not in price_matrix index")
@@ -413,6 +478,24 @@ def _build_optimizer_inputs(
 
     ranked = sorted(tickers_with_alpha, key=lambda t: abs(predictions[t]), reverse=True)
     selected = ranked[:universe_cap]
+
+    held = {
+        t: float(w) for t, w in (held_weights or {}).items()
+        if t not in (_SPY, _CASH) and np.isfinite(w) and w > 0.0
+    }
+    held_not_carried = 0.0
+    for t in sorted(held):
+        if t in selected:
+            continue
+        if (
+            t in history.columns
+            and t in price_matrix.columns
+            and np.isfinite(price_matrix.at[rebal_ts, t])
+            and history[t].notna().all()
+        ):
+            selected.append(t)
+        else:
+            held_not_carried += held[t]
 
     universe = list(selected) + [_SPY, _CASH]
     spy_idx = universe.index(_SPY)
@@ -441,7 +524,8 @@ def _build_optimizer_inputs(
 
     alpha_hat = np.zeros(N)
     for i, t in enumerate(selected):
-        alpha_hat[i] = float(predictions[t])
+        a = predictions.get(t)
+        alpha_hat[i] = float(a) if a is not None and pd.notna(a) else 0.0
     alpha_hat[spy_idx] = 0.0
     alpha_hat[cash_idx] = _CASH_ALPHA_HINT
 
@@ -458,15 +542,23 @@ def _build_optimizer_inputs(
     eligibility = np.ones(N, dtype=bool)
     if min_score_proxy is not None:
         for i, t in enumerate(selected):
-            if abs(predictions[t]) < min_score_proxy:
+            if t in held:
+                continue  # live: held names are exempt from the entry score gate
+            if abs(alpha_hat[i]) < min_score_proxy:
                 eligibility[i] = False
 
-    # Every rebalance starts from 100% cash (W_PREV_BASIS) — the source of the
-    # ~0.97 forced turnover per rebalance (alpha-engine-config-I11507).
-    # Deliberately unchanged here: carrying the prior book is a modelling
-    # decision recorded on the issue.
+    # All-cash basis: every rebalance starts from 100% cash — the source of
+    # the ~0.97 forced turnover per rebalance (alpha-engine-config-I11507).
+    # Carried basis: the held book, as the executor's ``_build_w_prev``.
     w_prev = np.zeros(N)
-    w_prev[cash_idx] = 1.0
+    if held_weights is None:
+        w_prev[cash_idx] = 1.0
+    else:
+        for i, t in enumerate(selected):
+            w_prev[i] = held.get(t, 0.0)
+        spy_w = (held_weights or {}).get(_SPY, 0.0)
+        w_prev[spy_idx] = float(spy_w) if np.isfinite(spy_w) and spy_w > 0 else 0.0
+        w_prev[cash_idx] = max(0.0, 1.0 - float(w_prev.sum()))
 
     # B.4 (optimizer-sota-upgrades-260526.md §B.4b): per-ticker σ_α̂ from
     # the BayesianRidge posterior. None when caller didn't pass uncertainty
@@ -501,7 +593,38 @@ def _build_optimizer_inputs(
         "cash_idx": cash_idx,
         "cfg": cfg,
         "alpha_uncertainty": alpha_uncertainty,
+        "carry": {
+            "n_held": len(held),
+            "n_held_outside_cut": sum(1 for t in held if t not in ranked[:universe_cap]),
+            "held_weight_not_carried": held_not_carried,
+        },
     }
+
+
+def _drift_book(
+    book: pd.Series,
+    price_matrix: pd.DataFrame,
+    from_ts: pd.Timestamp,
+    to_ts: pd.Timestamp,
+) -> dict[str, float]:
+    """Drift a target book ({ticker: NAV weight}, cash = 1 − Σ) by realised
+    price moves from ``from_ts`` to ``to_ts`` and renormalise.
+
+    A name without a finite price on either date is held at its last price
+    (ratio 1), matching vectorbt, which cannot trade or mark it.
+    """
+    w = book[book > 0.0]
+    if w.empty:
+        return {}
+    cash = max(0.0, 1.0 - float(w.sum()))
+    p0 = pd.to_numeric(price_matrix.loc[from_ts].reindex(w.index), errors="coerce")
+    p1 = pd.to_numeric(price_matrix.loc[to_ts].reindex(w.index), errors="coerce")
+    ratio = (p1 / p0).where(np.isfinite(p1 / p0) & (p0 > 0), 1.0)
+    grown = w * ratio
+    total = float(grown.sum()) + cash
+    if not np.isfinite(total) or total <= 0.0:
+        return {}
+    return {t: float(v) for t, v in (grown / total).items()}
 
 
 def _populate_target_weights_row(

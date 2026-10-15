@@ -2915,6 +2915,9 @@ def run_portfolio_optimizer_gate(
     )
     key = f"{prefix}/{run_date}.json"
     latest_key = f"{prefix}/latest.json"
+    # alpha-engine-config-I11507: the carried-book shadow goes to its own
+    # sibling key and NEVER into latest.json, the promotion lever.
+    shadow = gate_result.pop("shadow", None)
     payload = {
         "run_date": run_date,
         "signal_source": signal_source,
@@ -2945,6 +2948,24 @@ def run_portfolio_optimizer_gate(
             f"s3://{bucket}/{key}"
         ) from exc
     logger.info("portfolio_optimizer_gate: persisted s3://%s/%s", bucket, key)
+
+    if shadow is not None:
+        shadow_key = f"{prefix}/shadow_{shadow.get('w_prev_basis')}/{run_date}.json"
+        shadow_body = json.dumps(
+            {"run_date": run_date, "signal_source": signal_source, **shadow},
+            default=str, indent=2,
+        ).encode("utf-8")
+        # Observability, not the promotion lever: a failed shadow PUT is
+        # logged at ERROR and recorded on the returned payload, never raised.
+        try:
+            s3.put_object(Bucket=bucket, Key=shadow_key, Body=shadow_body,
+                          ContentType="application/json")
+            payload["shadow_key"] = shadow_key
+            logger.info("portfolio_optimizer_gate: persisted shadow s3://%s/%s", bucket, shadow_key)
+        except Exception as exc:
+            logger.exception("portfolio_optimizer_gate: shadow persist FAILED s3://%s/%s",
+                             bucket, shadow_key)
+            payload["shadow_persist_error"] = f"{type(exc).__name__}: {exc}"
 
     verdict = (gate_result.get("gate_report") or {}).get("verdict")
     logger.info(
