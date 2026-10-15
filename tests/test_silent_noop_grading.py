@@ -45,6 +45,10 @@ from completeness import CompletenessTracker, grade_self_reported
     ({"status": "alpha_unmeasured"}, "degraded"),
     ({"status": "snapshots_unparseable"}, "degraded"),
     ({"status": "stance_column_absent"}, "degraded"),
+    ({"status": "unmeasurable"}, "degraded"),
+    ({"status": "unservable"}, "degraded"),
+    ({"status": "vacuous"}, "degraded"),
+    ({"status": "not_run"}, "degraded"),
     # a failure returned rather than raised
     ({"status": "error", "error": "boom"}, "error"),
 ])
@@ -61,6 +65,24 @@ def test_reason_carries_the_module_detail():
     grade, reason = grade_self_reported({"status": "skipped", "reason": "no_db"})
     assert grade == "degraded"
     assert "no_db" in reason
+
+
+def test_regime_sortino_unmeasurable_is_degraded_with_its_reason():
+    """The T2 runner's stale-input verdict (gap (a) on I11506): the lib's
+    own constant, not a literal, so a renamed status fails here."""
+    from analysis.regime_stratified_sortino import STATUS_OK, STATUS_UNMEASURABLE
+
+    reason = "newest measured input is 2026-07-10 — 91 calendar days before"
+    tracker = CompletenessTracker()
+    tracker.run_module(
+        "regime_stratified_sortino",
+        lambda: {"status": STATUS_UNMEASURABLE, "status_reason": reason},
+        required_inputs={"research_db": True},
+    )
+    rec = tracker.results[0]
+    assert rec.status == "degraded"
+    assert reason in rec.degradation_reason
+    assert grade_self_reported({"status": STATUS_OK}) == (None, None)
 
 
 def test_missing_input_and_self_report_both_named():
