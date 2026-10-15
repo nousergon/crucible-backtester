@@ -54,31 +54,56 @@ def test_win_rate_majority_wins():
 # ── compute_trigger_scorecard (sqlite-backed) ───────────────────────────────
 
 
-def _build_trades_db(path, rows):
-    conn = sqlite3.connect(path)
-    conn.execute("""
-        CREATE TABLE trades (
-            ticker TEXT,
-            date TEXT,
-            action TEXT,
-            fill_price REAL,
-            price_at_order REAL,
-            signal_price REAL,
-            trigger_type TEXT,
-            trigger_price REAL,
-            realized_return_pct REAL,
-            realized_alpha_pct REAL,
-            spy_return_during_hold REAL,
-            slippage_vs_signal REAL,
-            days_held REAL
-        )
-    """)
-    conn.executemany(
-        "INSERT INTO trades VALUES (:ticker,:date,:action,:fill_price,:price_at_order,"
-        ":signal_price,:trigger_type,:trigger_price,:realized_return_pct,"
-        ":realized_alpha_pct,:spy_return_during_hold,:slippage_vs_signal,:days_held)",
-        rows,
+_OUTCOME_KEYS = ("realized_return_pct", "realized_alpha_pct", "spy_return_during_hold", "days_held")
+_COLUMNS = (
+    "trade_id", "entry_trade_id", "ticker", "date", "action", "fill_price",
+    "price_at_order", "signal_price", "trigger_type", "trigger_price",
+    "realized_return_pct", "realized_alpha_pct", "spy_return_during_hold",
+    "slippage_vs_signal", "days_held",
+)
+
+
+def _create_trades_table(conn):
+    conn.execute(
+        "CREATE TABLE trades (trade_id TEXT, entry_trade_id TEXT, ticker TEXT, "
+        "date TEXT, action TEXT, fill_price REAL, price_at_order REAL, "
+        "signal_price REAL, trigger_type TEXT, trigger_price REAL, "
+        "realized_return_pct REAL, realized_alpha_pct REAL, "
+        "spy_return_during_hold REAL, slippage_vs_signal REAL, days_held REAL)"
     )
+
+
+def _insert(conn, rows):
+    conn.executemany(
+        f"INSERT INTO trades ({', '.join(_COLUMNS)}) "
+        f"VALUES ({', '.join(':' + c for c in _COLUMNS)})",
+        [{c: r.get(c) for c in _COLUMNS} for r in rows],
+    )
+
+
+def _build_trades_db(path, rows):
+    """Write entries the way the executor does (crucible-executor daemon.py).
+
+    Each ``_row`` describes one ENTRY and the outcome it went on to realize.
+    The executor never writes that outcome on the ENTER row: it lands on the
+    closing EXIT leg, linked back by ``entry_trade_id``. So every row with an
+    outcome becomes an ENTER row with NULL outcome fields plus an EXIT row
+    carrying them; a row whose ``realized_alpha_pct`` is None stays open.
+    """
+    conn = sqlite3.connect(path)
+    _create_trades_table(conn)
+    stored = []
+    for i, r in enumerate(rows):
+        entry = dict(r, trade_id=r.get("trade_id") or f"E{i}", action="ENTER")
+        outcome = {k: entry.pop(k, None) for k in _OUTCOME_KEYS}
+        stored.append(entry)
+        if outcome["realized_alpha_pct"] is not None:
+            stored.append(dict(
+                outcome, trade_id=f"X{i}", entry_trade_id=entry["trade_id"],
+                ticker=entry["ticker"], date="2026-04-15", action="EXIT",
+                trigger_type="atr_trail",
+            ))
+    _insert(conn, stored)
     conn.commit()
     conn.close()
 
@@ -197,3 +222,120 @@ def test_compute_trigger_scorecard_unknown_trigger_excluded_below_min(tmp_path):
     result = compute_trigger_scorecard(str(db), min_trades=3)
     assert result["status"] == "insufficient_data"
     assert result["total_entries"] == 2
+
+
+# ── Outcome join: ENTER -> EXIT on entry_trade_id (alpha-engine-config-I12231) ──
+
+
+def _enter(trade_id, trigger="VWAP discount 0.6% (VWAP=$100.00)", **kw):
+    return dict({
+        "trade_id": trade_id, "ticker": trade_id, "date": "2026-09-01",
+        "action": "ENTER", "fill_price": 100.0, "price_at_order": 100.0,
+        "signal_price": 100.0, "trigger_type": trigger,
+    }, **kw)
+
+
+def _leg(trade_id, entry_id, alpha, action="EXIT", date="2026-09-10", **kw):
+    return dict({
+        "trade_id": trade_id, "entry_trade_id": entry_id, "ticker": entry_id,
+        "date": date, "action": action, "trigger_type": "atr_trail",
+        "realized_alpha_pct": alpha, "realized_return_pct": alpha + 1.0,
+        "spy_return_during_hold": 1.0, "days_held": 9,
+    }, **kw)
+
+
+def _raw_db(path, rows):
+    conn = sqlite3.connect(path)
+    _create_trades_table(conn)
+    _insert(conn, rows)
+    conn.commit()
+    conn.close()
+
+
+def test_outcome_on_the_enter_row_is_not_read(tmp_path):
+    """The executor never writes an outcome on ENTER; a value there (which the
+    old query read, and found NULL on 261/261 live rows) is not an outcome."""
+    db = tmp_path / "trades.db"
+    _raw_db(db, [_enter(f"E{i}", realized_alpha_pct=5.0) for i in range(3)])
+    result = compute_trigger_scorecard(str(db))
+    assert result["status"] == "ok"
+    assert result["summary"]["n_closed"] == 0
+    assert result["summary"]["win_rate_vs_spy"] is None
+    assert result["triggers"][0]["n_closed"] == 0
+
+
+def test_outcome_comes_from_the_linked_exit_leg(tmp_path):
+    db = tmp_path / "trades.db"
+    _raw_db(db, [
+        _enter("E1"), _enter("E2"), _enter("E3"), _enter("E4"),
+        _leg("X1", "E1", 2.0),
+        _leg("X2", "E2", -3.0),
+        _leg("X3", "E3", -1.0),
+        # E4 is still open: no EXIT, so no outcome.
+    ])
+    result = compute_trigger_scorecard(str(db))
+    vwap = result["triggers"][0]
+    assert vwap["trigger"] == "vwap"
+    assert vwap["n_trades"] == 4
+    assert vwap["n_closed"] == 3
+    assert vwap["tp"] == 1 and vwap["fp"] == 2
+    assert vwap["win_rate_vs_spy"] == pytest.approx(1 / 3, abs=1e-4)
+    assert vwap["avg_realized_alpha"] == pytest.approx(-2 / 3, abs=1e-4)
+    assert vwap["avg_realized_return"] == pytest.approx(1 / 3, abs=1e-4)
+    assert vwap["avg_days_held"] == pytest.approx(9.0)
+    summary = result["summary"]
+    assert summary["total_entries"] == 4
+    assert summary["n_closed"] == 3
+    assert summary["outcome_source"] == "exit_leg_via_entry_trade_id"
+    assert summary["alpha_unit"] == "pct_points"
+
+
+def test_join_ignores_reduce_legs_unlinked_exits_and_takes_the_last_exit(tmp_path):
+    db = tmp_path / "trades.db"
+    _raw_db(db, [
+        _enter("E1"), _enter("E2"), _enter("E3"),
+        # E1: a partial REDUCE is not the entry's outcome; only its EXIT is.
+        _leg("R1", "E1", 9.0, action="REDUCE", date="2026-09-05"),
+        _leg("X1", "E1", -2.0),
+        # E2: closed only by a REDUCE -> no EXIT outcome.
+        _leg("R2", "E2", 4.0, action="REDUCE"),
+        # E3: two EXIT legs (should not happen) -> the later one wins.
+        _leg("X3b", "E3", 6.0, date="2026-09-12"),
+        _leg("X3a", "E3", -6.0, date="2026-09-11"),
+        # An EXIT whose entry is not in the table, and one with no link.
+        _leg("X9", "E-missing", 7.0),
+        _leg("X0", None, 8.0),
+    ])
+    result = compute_trigger_scorecard(str(db))
+    summary = result["summary"]
+    assert summary["total_entries"] == 3
+    assert summary["n_closed"] == 2
+    assert summary["tp"] == 1  # E3 (+6.0)
+    assert summary["fp"] == 1  # E1 (-2.0)
+    assert summary["avg_realized_alpha"] == pytest.approx(2.0)
+
+
+def test_table_without_linkage_columns_yields_no_outcomes_not_an_error(tmp_path):
+    db = tmp_path / "trades.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE trades (ticker TEXT, date TEXT, action TEXT, fill_price REAL, "
+        "price_at_order REAL, signal_price REAL, trigger_type TEXT, "
+        "trigger_price REAL, slippage_vs_signal REAL, realized_alpha_pct REAL)"
+    )
+    conn.executemany(
+        "INSERT INTO trades VALUES ('T', '2026-09-01', 'ENTER', 101, 100, 100, 'pullback', 100, 1, 3.0)",
+        [()] * 3,
+    )
+    conn.commit()
+    conn.close()
+    result = compute_trigger_scorecard(str(db))
+    assert result["status"] == "ok"
+    assert result["summary"]["n_closed"] == 0
+    assert result["summary"]["avg_slippage_vs_signal"] == pytest.approx(1.0)
+
+
+def test_graduated_entry_is_its_own_category():
+    assert _categorize_trigger(
+        "graduated_entry (+0.1% vs morning $143.12, limit 1.0%)"
+    ) == "graduated_entry"

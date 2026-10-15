@@ -6,8 +6,23 @@ If a trigger type has consistently negative entry timing alpha over
 sufficient samples, recommends disabling it by writing a disabled_triggers
 list to config/executor_params.json on S3.
 
-Min-data gate: requires >= 50 trades per trigger type before recommending
+Min-data gate: requires >= 50 CLOSED entries (entries with a realized
+outcome, the scorecard's ``n_closed``) per trigger type before recommending
 any disabling. Until then, all triggers remain active.
+
+Units (alpha-engine-config-I12231): the scorecard reports alpha and slippage
+in PERCENT POINTS. The thresholds below are fractions (alpha) and basis
+points (slippage), so the values are converted before every comparison.
+
+OBSERVE-ONLY (alpha-engine-config-I12231, Brian's ruling #19 option (a),
+2026-10-14): with a truthful join the scorecard now carries outcomes, and
+this optimizer's recommendation would reach the LIVE
+``config/executor_params.json`` either directly (``apply()``) or through the
+assembler (a ``promote`` artifact). Until a later, explicit flip it does
+neither: ``apply()`` never touches the live key, and the recommendation
+artifact is written with ``promotion_intent="shadow"``, which the assembler
+records but never merges. The flip is ``trigger_optimizer.live_apply: true``
+in the backtester config, and only the literal boolean ``True`` arms it.
 """
 
 import json
@@ -21,9 +36,28 @@ logger = logging.getLogger(__name__)
 
 S3_PARAMS_KEY = "config/executor_params.json"
 
-_MIN_TRADES_PER_TRIGGER = 50
+_MIN_TRADES_PER_TRIGGER = 50  # compared against n_closed, not n_trades
+# A FRACTION (-0.005 = -0.5%). The scorecard's avg_realized_alpha is in
+# percent points and is divided by 100 before it is compared with this.
 _MAX_NEGATIVE_ALPHA_PCT = -0.005  # -0.5% avg alpha → candidate for disabling
 _MAX_UNFAVORABLE_SLIPPAGE_BPS = 20  # 20bps mean unfavorable slippage
+_MIN_WIN_RATE = 0.40
+
+# Scorecard category -> the key the executor's EntryTriggerEngine checks in
+# ``disabled_triggers`` (crucible-executor executor/entry_triggers.py). A
+# category with no entry here cannot be disabled: ``time_expiry`` is the
+# executor's unconditional near-close fallback, and ``other`` / ``unknown``
+# name no single trigger. Emitting a scorecard category the executor does not
+# check (e.g. "vwap" for "vwap_discount") would be a silent no-op.
+_EXECUTOR_TRIGGER_KEYS = {
+    "pullback": "pullback",
+    "vwap": "vwap_discount",
+    "support": "support_bounce",
+    "graduated_entry": "graduated_entry",
+}
+
+APPLY_MODE_OBSERVE = "observe"
+APPLY_MODE_LIVE = "live"
 
 _cfg: dict = {}
 
@@ -31,6 +65,15 @@ _cfg: dict = {}
 def init_config(config: dict) -> None:
     global _cfg
     _cfg = config.get("trigger_optimizer", {})
+
+
+def apply_mode() -> str:
+    """``observe`` unless the config explicitly arms the live write.
+
+    Only the literal boolean ``True`` arms it, so a stray string such as
+    ``"false"`` can never flip the trading path live.
+    """
+    return APPLY_MODE_LIVE if _cfg.get("live_apply") is True else APPLY_MODE_OBSERVE
 
 
 def analyze(trigger_scorecard: dict) -> dict:
@@ -60,16 +103,32 @@ def analyze(trigger_scorecard: dict) -> dict:
 
     for t in triggers:
         name = t.get("trigger", "unknown")
-        n = t.get("n_trades", 0)
-        avg_alpha = t.get("avg_realized_alpha", 0)
-        avg_slippage_vs_open = t.get("avg_slippage_vs_open_pct", 0)
+        n_entries = t.get("n_trades", 0)
+        # Every gate below is over CLOSED entries: the win rate and alpha are
+        # computed over them, so the sample-size gate must count them too. A
+        # scorecard without ``n_closed`` predates the outcome join and has no
+        # outcomes at all.
+        n_closed = t.get("n_closed") or 0
+        executor_key = _EXECUTOR_TRIGGER_KEYS.get(name)
 
-        if n < min_trades:
+        if executor_key is None:
             recommendations.append({
                 "trigger": name,
                 "action": "keep",
-                "reason": f"insufficient data ({n} < {min_trades} trades)",
-                "n_trades": n,
+                "reason": "not a disable-able executor trigger",
+                "n_trades": n_entries,
+                "n_closed": n_closed,
+            })
+            continue
+
+        if n_closed < min_trades:
+            recommendations.append({
+                "trigger": name,
+                "executor_key": executor_key,
+                "action": "keep",
+                "reason": f"insufficient data ({n_closed} < {min_trades} closed entries)",
+                "n_trades": n_entries,
+                "n_closed": n_closed,
             })
             continue
 
@@ -77,38 +136,41 @@ def analyze(trigger_scorecard: dict) -> dict:
         should_disable = False
         reasons = []
 
+        avg_alpha_pct = t.get("avg_realized_alpha")  # percent points
+        avg_alpha = avg_alpha_pct / 100.0 if avg_alpha_pct is not None else None
         if avg_alpha is not None and avg_alpha < alpha_threshold:
             should_disable = True
             reasons.append(f"negative avg alpha ({avg_alpha:.3%})")
 
-        if avg_slippage_vs_open is not None and avg_slippage_vs_open * 10000 > slippage_threshold:
-            reasons.append(f"high slippage ({avg_slippage_vs_open * 10000:.0f}bps)")
+        slip_open_pct = t.get("avg_slippage_vs_open")  # percent points
+        slip_open_bps = slip_open_pct * 100.0 if slip_open_pct is not None else None
+        if slip_open_bps is not None and slip_open_bps > slippage_threshold:
+            reasons.append(f"high slippage ({slip_open_bps:.0f}bps)")
 
         win_rate = t.get("win_rate_vs_spy")
-        if win_rate is not None and win_rate < 0.40 and n >= min_trades:
+        if win_rate is not None and win_rate < _MIN_WIN_RATE:
             should_disable = True
             reasons.append(f"low win rate ({win_rate:.0%})")
 
         action = "disable" if should_disable else "keep"
         if should_disable:
-            disable_list.append(name)
+            disable_list.append(executor_key)
 
         recommendations.append({
             "trigger": name,
+            "executor_key": executor_key,
             "action": action,
             "reasons": reasons,
-            "n_trades": n,
-            "avg_alpha": round(avg_alpha, 4) if avg_alpha is not None else None,
+            "n_trades": n_entries,
+            "n_closed": n_closed,
+            "avg_alpha": round(avg_alpha, 6) if avg_alpha is not None else None,
+            "avg_alpha_pct": round(avg_alpha_pct, 4) if avg_alpha_pct is not None else None,
             "win_rate": round(win_rate, 3) if win_rate is not None else None,
         })
 
-    # Never disable ALL triggers — always keep at least time_expiry as fallback
-    if len(disable_list) >= len([t for t in triggers if t.get("n_trades", 0) >= min_trades]):
-        disable_list = [d for d in disable_list if d != "time_expiry"]
-        for r in recommendations:
-            if r["trigger"] == "time_expiry" and r["action"] == "disable":
-                r["action"] = "keep"
-                r["reasons"] = ["preserved as fallback — cannot disable all triggers"]
+    # No "never disable all" carve-out is needed: time_expiry is not in
+    # _EXECUTOR_TRIGGER_KEYS, and the executor fires it unconditionally near
+    # the close, so every approved entry keeps a fallback.
 
     return {
         "status": "ok" if total_evaluated > 0 else "insufficient_data",
@@ -116,6 +178,7 @@ def analyze(trigger_scorecard: dict) -> dict:
         "recommendations": recommendations,
         "disabled_triggers": disable_list,
         "min_trades_threshold": min_trades,
+        "apply_mode": apply_mode(),
     }
 
 
@@ -159,6 +222,11 @@ def produce_artifact(
         if result.get("status") == "ok":
             params, overlay_keys = _build_overlay_params(result)
             intent = derive_promotion_intent(result)
+            if apply_mode() != APPLY_MODE_LIVE:
+                # Observe-only: the assembler merges ONLY ``promote``
+                # artifacts, so ``shadow`` records the would-be overlay for
+                # audit without it ever reaching the live key.
+                intent = "shadow"
         else:
             params = {}
             overlay_keys = None
@@ -172,6 +240,7 @@ def produce_artifact(
             )
             if result.get(k) is not None
         }
+        diagnostic["apply_mode"] = apply_mode()
         artifact = RecommendationArtifact(
             fit_target="entry_timing_alpha",
             optimizer_name="trigger_optimizer",
@@ -212,6 +281,20 @@ def apply(result: dict, bucket: str, run_date: str | None = None) -> dict:
     # Always produce the artifact — captures every invocation for audit.
     # Thread the backfill run_date (config#1017) through to the artifact.
     produce_artifact(result, bucket, run_date=run_date)
+
+    # Observe-only gate (alpha-engine-config-I12231): checked BEFORE the
+    # cutover branch and before any S3 client exists, so the live key is
+    # neither read nor written whichever writer is active.
+    if apply_mode() != APPLY_MODE_LIVE:
+        return {
+            "applied": False,
+            "reason": (
+                "observe_only — trigger_optimizer.live_apply is not true "
+                "(alpha-engine-config-I12231); recommendation recorded as a "
+                "shadow artifact only"
+            ),
+            "would_disable": result.get("disabled_triggers", []),
+        }
 
     # Cutover gate: when assembler.cutover_enabled is true, the assembler
     # is the sole writer of the live key.
