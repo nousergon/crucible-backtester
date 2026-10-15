@@ -36,6 +36,11 @@ class ModuleResult:
 _NO_INPUT_STATUSES = frozenset({
     "degraded", "partial", "incomplete", "skipped", "unreadable",
     "db_not_found", "alpha_unmeasured", "unmeasured",
+    # A measurement the module itself declared impossible: the lib's
+    # ``regime_sortino.STATUS_UNMEASURABLE`` (inputs past the horizon's
+    # freshness allowance) was graded ``[OK]`` on the 2026-09-26 and
+    # 2026-10-10 weekly runs because it was outside this vocabulary.
+    "unmeasurable", "unservable", "vacuous", "not_run",
 })
 _NO_INPUT_PREFIXES = ("insufficient", "no_", "missing", "stale", "skipped_")
 _NO_INPUT_SUFFIXES = ("_absent", "_unparseable")
@@ -74,7 +79,8 @@ def grade_self_reported(output: Any) -> tuple[str | None, str | None]:
     else:
         return None, None
     detail = (
-        output.get("reason") or output.get("degraded_reason")
+        output.get("reason") or output.get("status_reason")
+        or output.get("degraded_reason")
         or output.get("error") or output.get("note")
     )
     reason = f"module reported status={raw}"
