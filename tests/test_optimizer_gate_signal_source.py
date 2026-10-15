@@ -132,3 +132,71 @@ class TestWrapperPersistenceNamespace:
             "predictor/optimizer_gate/latest.json",
         }
         assert mock_gate.call_args.kwargs["signal_source"] == "synthetic"
+
+
+class TestCarriedBasisShadow:
+    """alpha-engine-config-I11507: the carried-book basis runs beside the
+    gate on the same inputs and never reaches latest.json."""
+
+    @patch("analysis.portfolio_optimizer_backtest.run_optimizer_backtest")
+    @patch("synthetic.predictor_backtest.run")
+    def test_shadow_runs_the_carried_basis_by_default(self, mock_synth, mock_opt, cfg):
+        mock_synth.return_value = {
+            "status": "ok", "predictions_by_date": {"2026-01-05": {"AAPL": 0.1}},
+            "price_matrix": MagicMock(), "spy_prices": MagicMock(), "sector_map": {},
+        }
+        mock_opt.return_value = _opt_result()
+        out = run_gate_against_predictor_backtest(cfg)
+        bases = [c.kwargs.get("w_prev_basis") for c in mock_opt.call_args_list]
+        assert bases == [None, "carried_drifted"]
+        assert out["shadow"]["status"] == "ok"
+        assert out["shadow"]["w_prev_basis"] == "carried_drifted"
+        assert "gate_report" in out["shadow"]
+
+    @patch("analysis.portfolio_optimizer_backtest.run_optimizer_backtest")
+    @patch("synthetic.predictor_backtest.run")
+    def test_shadow_disabled_by_null(self, mock_synth, mock_opt, cfg):
+        mock_synth.return_value = {
+            "status": "ok", "predictions_by_date": {"2026-01-05": {"AAPL": 0.1}},
+            "price_matrix": MagicMock(), "spy_prices": MagicMock(), "sector_map": {},
+        }
+        mock_opt.return_value = _opt_result()
+        cfg["portfolio_optimizer_gate"] = {"shadow_w_prev_basis": None}
+        out = run_gate_against_predictor_backtest(cfg)
+        assert mock_opt.call_count == 1
+        assert "shadow" not in out
+
+    @patch("analysis.portfolio_optimizer_backtest.run_optimizer_backtest")
+    @patch("synthetic.predictor_backtest.run")
+    def test_shadow_failure_does_not_sink_the_gate(self, mock_synth, mock_opt, cfg):
+        mock_synth.return_value = {
+            "status": "ok", "predictions_by_date": {"2026-01-05": {"AAPL": 0.1}},
+            "price_matrix": MagicMock(), "spy_prices": MagicMock(), "sector_map": {},
+        }
+        mock_opt.side_effect = [_opt_result(), RuntimeError("boom")]
+        out = run_gate_against_predictor_backtest(cfg)
+        assert out["gate_report"]["verdict"]
+        assert out["shadow"]["status"] == "error"
+        assert "boom" in out["shadow"]["error"]
+
+    @patch("analysis.portfolio_optimizer_gate.run_gate_against_predictor_backtest")
+    def test_shadow_persists_to_a_sibling_key_not_latest(self, mock_gate):
+        shadow = {"status": "ok", "w_prev_basis": "carried_drifted",
+                  "gate_report": {"verdict": "fail"}}
+        mock_gate.return_value = {
+            "gate_report": {"verdict": "pass"}, "signal_source": "synthetic",
+            "shadow": shadow,
+        }
+        s3 = MagicMock()
+        payload = bt.run_portfolio_optimizer_gate(
+            config={"signals_bucket": "b"}, run_date="2026-05-15", s3_client=s3,
+        )
+        bodies = {c.kwargs["Key"]: c.kwargs["Body"] for c in s3.put_object.call_args_list}
+        assert set(bodies) == {
+            "predictor/optimizer_gate/2026-05-15.json",
+            "predictor/optimizer_gate/latest.json",
+            "predictor/optimizer_gate/shadow_carried_drifted/2026-05-15.json",
+        }
+        assert b"shadow" not in bodies["predictor/optimizer_gate/latest.json"]
+        assert payload["passed"] is True
+        assert payload["shadow_key"].endswith("shadow_carried_drifted/2026-05-15.json")

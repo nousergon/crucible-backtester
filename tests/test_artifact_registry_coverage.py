@@ -118,7 +118,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # the registry validator is satisfied; a dedicated freshness row is tracked
     # as alpha-engine-config-I7209 rather than added here, because the decision
     # of whether position_sizing keeps its weight at all is open in I7210.
-    "backtest.py": 14,
+    # +1 (14->15) 2026-10-15: alpha-engine-config-I11507 — the carried-book
+    # shadow of the optimizer gate, predictor/optimizer_gate/shadow_<basis>/
+    # {run_date}.json. OBSERVE-only for the one-cycle comparison before the
+    # gate's w_prev basis flips; never written to latest.json, never read by a
+    # consumer. Grandfathered rather than given a freshness row, and removed
+    # with the shadow once the basis flips.
+    "backtest.py": 15,
     # config#1405 research-free backfill parquet (predictor/research_free_backfill/
     # predictor_outcomes_research_free.parquet) — the durable producer→consumer wire
     # for the scanner→predictor-direct counterfactual (research.db pulls are
