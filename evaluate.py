@@ -2230,6 +2230,11 @@ def _main_impl() -> None:
     factor_blend_optimizer.init_config(config)
     champion_promotion.init_config(config)
     pillar_weight_optimizer.init_config(config)
+    # alpha-engine-config-I12231: never wired before, so the documented
+    # `trigger_optimizer:` config section was dead. Its `live_apply` key is
+    # the only thing that can arm the live disabled_triggers write; absent
+    # (today), the optimizer stays observe-only.
+    trigger_optimizer.init_config(config)
 
     # Set the assembler-cutover flag from config — when true, individual
     # optimizers' apply() skip their legacy live-key writes and the
