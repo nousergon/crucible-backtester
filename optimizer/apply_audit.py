@@ -497,9 +497,13 @@ def load_history(bucket: str, s3_client=None) -> list[dict]:
             key = obj.get("Key", "")
             if _DATED_KEY.search(key):
                 keys.append(key)
-        if not resp.get("IsTruncated"):
+        # Strict: only a literal True with a real token continues. Anything
+        # else (absent, malformed, a stub client) ends the listing, so the
+        # loop cannot spin forever on a response that never says False.
+        token = resp.get("NextContinuationToken")
+        if resp.get("IsTruncated") is not True or not isinstance(token, str) or not token:
             break
-        kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+        kwargs["ContinuationToken"] = token
     audits = []
     for key in sorted(keys):
         obj = s3.get_object(Bucket=bucket, Key=key)
