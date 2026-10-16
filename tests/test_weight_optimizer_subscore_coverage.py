@@ -135,9 +135,10 @@ class TestAuditClassification:
     def test_disabled_neither_increments_nor_resets_the_blocked_streak(self):
         """Mirrors research_params' "retired" handling: a by-design-off loop
         must not accrue a `blocked` streak the report card escalates on."""
-        assert apply_audit._carry_forward(
-            "disabled", {"consecutive_blocked_weeks": 9},
-        ) == 9
+        n, _week = apply_audit._carry_forward(
+            "disabled", {"consecutive_blocked_weeks": 9}, "2026-07-05",
+        )
+        assert n == 9
 
 
 # ── 3. The renormaliser ─────────────────────────────────────────────────────

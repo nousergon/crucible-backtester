@@ -51,6 +51,26 @@ unconditional; only the S3 persistence is gated).
 PRIOR ``latest.json`` and incremented on ``blocked`` / reset on ``promoted``
 or ``insufficient_data`` / carried unchanged on ``error`` and ``disabled``
 (an error or disabled week is evidence of neither blocking nor unblocking).
+
+**It counts distinct ISO weeks, not audit writes** (alpha-engine-config-I10064
+item 3, Brian's ruling #18). Until 2026-10 it added 1 per audit WRITE, so a
+re-run on another date in the same week counted that week twice: the
+``executor_params`` streak read 16 "weeks" over 16 audits that fell in 12 ISO
+weeks (W30 to W41). Each loop record now also carries
+``last_blocked_iso_week`` (``"YYYY-Www"``, the ISO week of the latest blocked
+audit the streak counted); a blocked audit in that same week does not add
+another. An audit on the SAME ``as_of`` is still an idempotent re-run that
+carries the prior record's counters unchanged.
+
+**One-time rebase from history.** A prior ``latest.json`` written before this
+rule carries no ``last_blocked_iso_week``, and its counter holds the
+overcount. On that first run the streak is recomputed by replaying every
+dated ``config/apply_audit/{date}.json`` under the ISO-week rule, and the
+artifact records that it did so in ``counter_rebase``. The replay is used
+only when it is coherent (it parses every dated audit, and its last one is
+the prior ``latest.json``); otherwise the run logs a warning and carries the
+legacy counter under the new rule, so the overcount stays visible rather
+than being guessed away.
 This is a carry-forward read-then-write of a SINGLE-OWNER artifact — only
 this module (one Saturday evaluate run at a time) ever writes the
 ``config/apply_audit/`` prefix, so the rebuild-writer-clobbers-other-owner
@@ -62,7 +82,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 from typing import Any
 
 import boto3
@@ -231,6 +252,7 @@ def classify_loop(
         "outcome": "error",
         "blocked_by": None,
         "consecutive_blocked_weeks": 0,  # rewritten by the carry-forward pass
+        "last_blocked_iso_week": None,  # rewritten by the carry-forward pass
         "detail": "",
         "proposed": None,
         "current": None,
@@ -371,20 +393,170 @@ def classify_loop(
     return record
 
 
-def _carry_forward(outcome: str, prior_record: dict | None) -> int:
-    """consecutive_blocked_weeks: +1 on blocked (absent prior ⇒ 1), reset on
-    promoted/insufficient_data, carried unchanged on error/disabled."""
+def iso_week(as_of: str) -> str:
+    """ISO-8601 week label (``"2026-W41"``) of a ``YYYY-MM-DD`` date."""
+    year, week, _ = date.fromisoformat(as_of).isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _prior_last_blocked_week(prior_record: dict | None, prior_as_of: str | None) -> str | None:
+    """The ISO week the prior streak last counted.
+
+    A record written under the ISO-week rule carries it as
+    ``last_blocked_iso_week``. A legacy record does not; the only week it
+    provably counted is its own, and only if it was itself ``blocked``."""
+    if not isinstance(prior_record, dict):
+        return None
+    if "last_blocked_iso_week" in prior_record:
+        week = prior_record.get("last_blocked_iso_week")
+        return week if isinstance(week, str) else None
+    if prior_record.get("outcome") == "blocked" and prior_as_of:
+        try:
+            return iso_week(prior_as_of)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _carry_forward(
+    outcome: str,
+    prior_record: dict | None,
+    as_of: str,
+    prior_as_of: str | None = None,
+) -> tuple[int, str | None]:
+    """``(consecutive_blocked_weeks, last_blocked_iso_week)`` for this run.
+
+    ``blocked`` adds 1 only when its ISO week is not already counted (absent
+    prior => 1); ``promoted`` / ``insufficient_data`` reset to ``(0, None)``;
+    ``error`` / ``disabled`` carry both unchanged."""
     prior_n = 0
     if isinstance(prior_record, dict):
         try:
             prior_n = int(prior_record.get("consecutive_blocked_weeks", 0))
         except (TypeError, ValueError):
             prior_n = 0
+    prior_week = _prior_last_blocked_week(prior_record, prior_as_of)
     if outcome == "blocked":
-        return prior_n + 1
+        week = iso_week(as_of)
+        if prior_week == week and prior_n > 0:
+            return prior_n, week
+        return prior_n + 1, week
     if outcome in ("promoted", "insufficient_data"):
-        return 0
-    return prior_n  # error / disabled
+        return 0, None
+    return prior_n, prior_week  # error / disabled
+
+
+_DATED_KEY = re.compile(r"/(\d{4}-\d{2}-\d{2})\.json$")
+
+
+def _is_legacy_prior(prior: dict | None) -> bool:
+    """True when the prior artifact predates the ISO-week rule (some loop
+    record lacks ``last_blocked_iso_week``), so its counters may overcount."""
+    if not isinstance(prior, dict):
+        return False
+    loops = prior.get("loops")
+    if not isinstance(loops, dict) or not loops:
+        return False
+    return any(
+        isinstance(rec, dict) and "last_blocked_iso_week" not in rec
+        for rec in loops.values()
+    )
+
+
+def replay_history(audits: list[dict]) -> dict:
+    """Recompute every loop's streak by replaying dated audits, oldest first,
+    under the ISO-week rule. Returns a prior-shaped artifact whose ``as_of``
+    is the last audit's and whose loop records carry the replayed counters.
+
+    Same-``as_of`` duplicates are impossible here (one dated key per date)."""
+    state: dict[str, dict] = {}
+    last_as_of = None
+    for audit in sorted(audits, key=lambda a: a["as_of"]):
+        as_of = audit["as_of"]
+        for loop, rec in audit["loops"].items():
+            outcome = rec["outcome"]
+            n, week = _carry_forward(outcome, state.get(loop), as_of)
+            state[loop] = {
+                "outcome": outcome,
+                "consecutive_blocked_weeks": n,
+                "last_blocked_iso_week": week,
+            }
+        last_as_of = as_of
+    return {"schema_version": SCHEMA_VERSION, "as_of": last_as_of, "loops": state}
+
+
+def load_history(bucket: str, s3_client=None) -> list[dict]:
+    """Read every dated ``config/apply_audit/{date}.json``. RAISES on any
+    list/read/parse failure — the caller decides how to degrade."""
+    s3 = s3_client or boto3.client("s3")
+    keys: list[str] = []
+    kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": f"{S3_AUDIT_PREFIX}/"}
+    while True:
+        resp = s3.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []) or []:
+            key = obj.get("Key", "")
+            if _DATED_KEY.search(key):
+                keys.append(key)
+        # Strict: only a literal True with a real token continues. Anything
+        # else (absent, malformed, a stub client) ends the listing, so the
+        # loop cannot spin forever on a response that never says False.
+        token = resp.get("NextContinuationToken")
+        if resp.get("IsTruncated") is not True or not isinstance(token, str) or not token:
+            break
+        kwargs["ContinuationToken"] = token
+    audits = []
+    for key in sorted(keys):
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        audit = json.loads(obj["Body"].read())
+        as_of = audit.get("as_of") or _DATED_KEY.search(key).group(1)
+        iso_week(as_of)  # validates the date; raises ValueError if malformed
+        loops = audit.get("loops")
+        if not isinstance(loops, dict) or not all(
+            isinstance(r, dict) and r.get("outcome") in OUTCOMES for r in loops.values()
+        ):
+            raise ValueError(f"unreadable loop records in s3://{bucket}/{key}")
+        audits.append({"as_of": as_of, "loops": loops})
+    return audits
+
+
+def rebase_prior_from_history(bucket: str, prior: dict, s3_client=None) -> tuple[dict, dict | None]:
+    """One-time migration of a legacy ``latest.json`` (see module docstring).
+
+    Returns ``(prior_to_use, counter_rebase_or_None)``. Falls back to the
+    legacy prior, unchanged, with a WARN when the history cannot be read or
+    does not end at the prior artifact."""
+    try:
+        audits = load_history(bucket, s3_client=s3_client)
+    except Exception as e:  # noqa: BLE001 — degraded-read carve-out: the
+        # legacy counter is carried under the new rule, and the overcount
+        # stays visible in it; the write path still raises below.
+        logger.warning("Apply-audit history replay failed (%s) — legacy counter carried", e)
+        return prior, None
+    if not audits:
+        logger.warning("Apply-audit history replay found no dated audits — legacy counter carried")
+        return prior, None
+    replayed = replay_history(audits)
+    if replayed["as_of"] != prior.get("as_of"):
+        logger.warning(
+            "Apply-audit history ends at %s but latest.json is %s — legacy counter carried",
+            replayed["as_of"], prior.get("as_of"),
+        )
+        return prior, None
+    rebase = {
+        "source": "history_replay",
+        "n_audits": len(audits),
+        "from": {
+            loop: (rec or {}).get("consecutive_blocked_weeks")
+            for loop, rec in (prior.get("loops") or {}).items()
+            if isinstance(rec, dict)
+        },
+        "to": {
+            loop: rec["consecutive_blocked_weeks"]
+            for loop, rec in replayed["loops"].items()
+        },
+    }
+    logger.info("Apply-audit counters rebased from %d dated audits: %s", len(audits), rebase)
+    return replayed, rebase
 
 
 def load_prior(bucket: str, s3_client=None) -> dict | None:
@@ -417,6 +589,7 @@ def build_audit(
     assembler_summaries: dict[str, dict | None] | None = None,
     prior: dict | None = None,
     run_error: str | None = None,
+    counter_rebase: dict | None = None,
 ) -> dict:
     """Build the audit artifact body (schema v1) from the run's results.
 
@@ -427,10 +600,13 @@ def build_audit(
             config types, so this is keyed per-loop rather than a single
             scalar). A loop absent from this dict gets ``None`` (matches
             "cutover was off or the assembler did not run for this loop").
+        counter_rebase: set when ``prior`` was rebuilt from history by
+            ``rebase_prior_from_history``; recorded verbatim in the artifact.
     """
     assembler_summaries = assembler_summaries or {}
     prior_loops = (prior or {}).get("loops", {}) if isinstance(prior, dict) else {}
     is_idempotent_rerun = isinstance(prior, dict) and prior.get("as_of") == as_of
+    prior_as_of = prior.get("as_of") if isinstance(prior, dict) else None
     loops: dict[str, dict] = {}
     for loop, results_key in LOOPS.items():
         record = classify_loop(
@@ -439,19 +615,27 @@ def build_audit(
             assembler_summary=assembler_summaries.get(loop),
             run_error=run_error,
         )
+        prior_record = prior_loops.get(loop)
         if is_idempotent_rerun:
-            record["consecutive_blocked_weeks"] = prior_loops.get(loop, {}).get("consecutive_blocked_weeks", 0)
+            prior_record = prior_record if isinstance(prior_record, dict) else {}
+            record["consecutive_blocked_weeks"] = prior_record.get("consecutive_blocked_weeks", 0)
+            record["last_blocked_iso_week"] = _prior_last_blocked_week(prior_record, as_of)
         else:
-            record["consecutive_blocked_weeks"] = _carry_forward(
-                record["outcome"], prior_loops.get(loop),
+            n, week = _carry_forward(
+                record["outcome"], prior_record, as_of, prior_as_of=prior_as_of,
             )
+            record["consecutive_blocked_weeks"] = n
+            record["last_blocked_iso_week"] = week
         loops[loop] = record
-    return {
+    audit = {
         "schema_version": SCHEMA_VERSION,
         "as_of": as_of,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "loops": loops,
     }
+    if counter_rebase is not None:
+        audit["counter_rebase"] = counter_rebase
+    return audit
 
 
 def write_audit(bucket: str, run_date: str, audit: dict, s3_client=None) -> str:
@@ -521,6 +705,9 @@ def emit_apply_audit(
             ``executor_params``).
     """
     prior = load_prior(bucket, s3_client=s3_client) if upload else None
+    counter_rebase = None
+    if upload and _is_legacy_prior(prior):
+        prior, counter_rebase = rebase_prior_from_history(bucket, prior, s3_client=s3_client)
     assembler_summaries = {
         config_type: summarize_assembler(result)
         for config_type, result in (assembler_results or {}).items()
@@ -531,6 +718,7 @@ def emit_apply_audit(
         assembler_summaries=assembler_summaries,
         prior=prior,
         run_error=str(run_error) if run_error else None,
+        counter_rebase=counter_rebase,
     )
     for loop, rec in audit["loops"].items():
         logger.info(
