@@ -398,30 +398,45 @@ def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict)
     if avail["research_db"]:
         _check_data_freshness(db_path)
 
+    # Load df_base for downstream modules. Outcome columns are re-sourced from
+    # the long-format score_performance_outcomes store (config#1483/#1528/#1529)
+    # inside load_score_performance (the repo's single accessor) — every
+    # downstream consumer of df_base reads long-format outcome data under the
+    # HorizonPolicy-derived column names. Loaded BEFORE signal_quality so the
+    # input-freshness verdict below grades it too.
+    df_base = None
+    if avail["research_db"]:
+        try:
+            df_base = signal_quality.load_score_performance(db_path)
+        except Exception:
+            df_base = None
+
+    # A module that computes "ok" from score_performance rows months behind
+    # the trading day is a silent no-op (alpha-engine-config-I11506: rows
+    # ending 2026-07-10 graded [OK] on the 2026-10-09 run). Most consumers
+    # carry no freshness self-check, so the verdict is made once here and
+    # handed to the grader for every score_performance consumer.
+    sp_stale = {
+        "score_performance": _score_performance_staleness(df_base, config.get("_run_date")),
+    }
+    config["_score_performance_stale"] = sp_stale["score_performance"]
+
     sq_result = tracker.run_module(
         "signal_quality",
         lambda: _compute_signal_quality(config),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
+        stale_inputs=sp_stale,
     )
 
     if sq_result.get("status") in ("skipped", "error", "db_not_found"):
         return sq_result, [], [], {"status": "skipped"}, None
 
-    # Load df_base for downstream modules. Outcome columns are re-sourced from
-    # the long-format score_performance_outcomes store (config#1483/#1528/#1529)
-    # inside load_score_performance (the repo's single accessor) — every
-    # downstream consumer of df_base reads long-format outcome data under the
-    # HorizonPolicy-derived column names.
-    try:
-        df_base = signal_quality.load_score_performance(db_path)
-    except Exception:
-        df_base = None
-
     regime_rows = tracker.run_module(
         "regime_analysis",
         lambda: _compute_regime(config),
         required_inputs={"research_db": avail["research_db"]},
+        stale_inputs=sp_stale,
     )
     if not isinstance(regime_rows, list):
         regime_rows = regime_rows.get("rows", []) if isinstance(regime_rows, dict) else []
@@ -439,6 +454,7 @@ def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict)
         lambda: attribution.compute_attribution(df_base) if df_base is not None else {"status": "skipped"},
         required_inputs={"research_db": avail["research_db"], "df_base": df_base is not None},
         skip_if_missing=["df_base"],
+        stale_inputs=sp_stale,
     )
 
     # Compute and push predictor rolling metrics (evaluation output, not data collection)
@@ -446,6 +462,33 @@ def _run_signal_quality(config: dict, tracker: CompletenessTracker, avail: dict)
         push_predictor_rolling_metrics(config, db_path or "")
 
     return sq_result, regime_rows, score_rows, attr_result, df_base
+
+
+def _score_performance_staleness(df_base, run_date: str | None) -> str | None:
+    """Reason string when score_performance's newest row is too old, else None.
+
+    Uses the lib's horizon-aware predicate (``assess_input_freshness``, the
+    one ``regime_stratified_sortino`` already self-reports with), so a healthy
+    run whose newest rows lag by the primary horizon is never flagged. Returns
+    None when there is no run date to measure against or no frame was loaded;
+    that absence is already graded through ``required_inputs``.
+    """
+    if df_base is None or not run_date:
+        return None
+    from analysis.regime_stratified_sortino import (
+        assess_input_freshness,
+        input_window,
+    )
+
+    status, reason = assess_input_freshness(
+        input_window(df_base),
+        trading_day=str(run_date),
+        horizon_days=int(_HORIZON_POLICY.primary_horizon),
+    )
+    if status == "ok":
+        return None
+    logger.warning("score_performance input is stale: %s", reason)
+    return reason
 
 
 def _check_data_freshness(db_path: str) -> None:
@@ -543,6 +586,9 @@ def _run_diagnostics(
     db_path = config.get("research_db")
     trades_db = config.get("_trades_db")
     results = {}
+    # score_performance freshness verdict from _run_signal_quality
+    # (alpha-engine-config-I11506), graded onto every consumer below.
+    sp_stale = {"score_performance": config.get("_score_performance_stale")}
 
     # Historical factor loadings (ArcticDB) for the e2e_lift counterfactuals
     # (config#1142 neutralized composite, config#967 consolidation + scanner
@@ -665,6 +711,7 @@ def _run_diagnostics(
         lambda: alpha_distribution.compute_alpha_distribution(db_path),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
+        stale_inputs=sp_stale,
     )
 
     # Score calibration curve
@@ -673,6 +720,7 @@ def _run_diagnostics(
         lambda: alpha_distribution.compute_score_calibration(db_path),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
+        stale_inputs=sp_stale,
     )
 
     # Net veto value
@@ -768,6 +816,7 @@ def _run_diagnostics(
             "df_base": df_base is not None,
         },
         skip_if_missing=["df_base"],
+        stale_inputs=sp_stale,
     )
 
     # Factor-blend COUNTERFACTUAL REPLAY (config#749) — the "real" optimizer
@@ -833,6 +882,7 @@ def _run_diagnostics(
         lambda: _run_monte_carlo(config),
         required_inputs={"research_db": avail["research_db"]},
         skip_if_missing=["research_db"],
+        stale_inputs=sp_stale,
     )
 
     # Production health monitoring
