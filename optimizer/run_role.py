@@ -90,3 +90,21 @@ def refuse_live_config_write_in_rehearsal(
             f"refusing to write live config key {key!r} from a rehearsal run "
             f"({reason}) — alpha-engine-config-I11505"
         )
+
+
+#: flow-doctor config a rehearsal reports through (see ``flow_doctor_yaml``).
+REHEARSAL_FLOW_DOCTOR_YAML = "flow-doctor.rehearsal.yaml"
+
+
+def flow_doctor_yaml(repo_root: str, *, env: Mapping[str, str] | None = None) -> str:
+    """The flow-doctor yaml this process reports through.
+
+    A rehearsal's errors are real findings about the code, so they are kept:
+    they still reach the flow-doctor store and file a ``rehearsal-finding``
+    issue, which the nightly sweep reads. They do not page. On 2026-10-16
+    ``rehearsal-2026-10-16-1`` sent Brian ten ERROR/WARNING alerts by email
+    and Telegram, every one from a rehearsal running on deliberately stale
+    data, indistinguishable from a production failure.
+    """
+    name = REHEARSAL_FLOW_DOCTOR_YAML if rehearsal_reason(env) else "flow-doctor.yaml"
+    return os.path.join(repo_root, name)

@@ -74,7 +74,9 @@ from pathlib import Path
 # only after observing real ERROR-level noise during a backtest run.
 from nousergon_lib.logging import setup_logging, get_flow_doctor, guard_entrypoint
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
-_FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
+# A rehearsal reports through flow-doctor.rehearsal.yaml: tracked, never paged.
+from optimizer.run_role import flow_doctor_yaml as _flow_doctor_yaml
+_FLOW_DOCTOR_YAML = _flow_doctor_yaml(os.path.dirname(os.path.abspath(__file__)))
 setup_logging(
     "backtest",
     flow_doctor_yaml=_FLOW_DOCTOR_YAML,
@@ -175,9 +177,16 @@ def _setup_simulation(config: dict) -> tuple:
     # key unset → allowlist stays None → reader behavior unchanged.
     smoke_tickers = config.get("smoke_tickers")
     _allowlist = set(smoke_tickers) if smoke_tickers else None
+    # A rehearsal runs on whatever data exists when it is launched, so its
+    # freshness is measured against the day it simulates, not the wall clock
+    # (Brian 2026-10-16: rehearsals must be runnable any time, on stale data
+    # if needed). A real run keeps the wall-clock reference unchanged.
+    from optimizer.run_role import rehearsal_reason
+    _as_of = config.get("_run_date") if rehearsal_reason() else None
     price_matrix = price_loader.build_matrix(
         dates, bucket, _ohlcv_out=ohlcv_by_ticker,
         tickers_allowlist=_allowlist,
+        as_of=_as_of,
     )
 
     if price_matrix.empty:

@@ -57,7 +57,9 @@ from pathlib import Path
 from nousergon_lib.logging import setup_logging, guard_entrypoint
 from nousergon_lib.quant.horizons import DEFAULT_POLICY as _HORIZON_POLICY
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
-_FLOW_DOCTOR_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-doctor.yaml")
+# A rehearsal reports through flow-doctor.rehearsal.yaml: tracked, never paged.
+from optimizer.run_role import flow_doctor_yaml as _flow_doctor_yaml
+_FLOW_DOCTOR_YAML = _flow_doctor_yaml(os.path.dirname(os.path.abspath(__file__)))
 setup_logging(
     "evaluate",
     flow_doctor_yaml=_FLOW_DOCTOR_YAML,
@@ -1966,6 +1968,7 @@ def _load_ohlcv_for_excursion(config: dict, registry) -> tuple[dict | None, str 
 
 def _load_phase_artifact(
     config: dict, registry, *, phase: str, suffix: str, loader, label: str,
+    on_key_missing=None,
 ):
     """Read one artifact this date's pipeline already persisted, by phase marker.
 
@@ -1998,6 +2001,9 @@ def _load_phase_artifact(
     keys = marker.get("artifact_keys") or []
     matches = [k for k in keys if k.endswith(suffix)]
     if not matches:
+        upstream = on_key_missing(marker) if on_key_missing else None
+        if upstream is not None:
+            return None, upstream
         logger.error(
             "%s: %s marker present but carries no %s artifact key "
             "(artifact_keys=%s)", label, phase, suffix, keys,
@@ -2071,13 +2077,49 @@ def _load_portfolio_daily_returns(config: dict, registry):
     research graph was retired 2026-07-12), so the old sleeve was empty on every
     run and the CI published ``insufficient_data`` unconditionally.
     """
-    from phase_artifacts import load_series
+    from phase_artifacts import load_json, load_series
+
+    def _simulate_declined(marker: dict) -> str | None:
+        # The simulation ran and DECLINED (e.g. stale_prices), so there is no
+        # series to persist. That is an upstream gap with its own alert, not a
+        # missing key on our side; reporting it as defect:*_artifact_key_missing
+        # paged twice more for one stale-price refusal (rehearsal-2026-10-16-1).
+        status = _simulate_refusal_status(config, registry, marker, load_json)
+        if status is None:
+            return None
+        return (
+            f"insufficient_data:portfolio_daily_returns_simulation_{status}: "
+            f"the simulate phase declined to run ({status}), so no daily-return "
+            f"series exists for this date"
+        )
 
     return _load_phase_artifact(
         config, registry, phase="simulate",
         suffix="/portfolio_daily_returns.parquet", loader=load_series,
-        label="portfolio_daily_returns",
+        label="portfolio_daily_returns", on_key_missing=_simulate_declined,
     )
+
+
+def _simulate_refusal_status(config: dict, registry, marker: dict, load_json) -> str | None:
+    """The simulate phase's own non-ok ``status`` (e.g. ``stale_prices``) when
+    it declined to simulate, else ``None``. Anything unreadable returns
+    ``None`` and the caller's normal defect path applies."""
+    keys = (marker or {}).get("artifact_keys") or []
+    stats_keys = [k for k in keys if k.endswith("/portfolio_stats.json")]
+    if not stats_keys:
+        return None
+    try:
+        stats = load_json(
+            config.get("signals_bucket", "alpha-engine-research"), stats_keys[0],
+            s3_client=registry.s3_client,
+        )
+    except Exception as e:  # noqa: BLE001 - the defect path below still fires
+        logger.warning("simulate portfolio_stats read failed (%s): %s", stats_keys[0], e)
+        return None
+    status = stats.get("status") if isinstance(stats, dict) else None
+    if status and status != "ok":
+        return str(status)
+    return None
 
 
 #: Holding-window horizon for every computation in the evaluator-revamp metric

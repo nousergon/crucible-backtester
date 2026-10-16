@@ -1,0 +1,28 @@
+# flow-doctor config for a weekly-SF REHEARSAL run (optimizer/run_role.py
+# ::flow_doctor_yaml). Same flow, store and dedup as flow-doctor.yaml, with
+# the paging channels removed: no email, no Telegram. A rehearsal error is
+# still a real finding about the code, so it is recorded in the store and
+# files a GitHub issue labelled rehearsal-finding, which the nightly sweep
+# picks up. A rehearsal must never page as a production failure: on
+# 2026-10-16 rehearsal-2026-10-16-1 sent ten alerts that read exactly like one.
+flow_name: backtester-rehearsal
+repo: nousergon/crucible-backtester
+owner: "@brianmcmahon"
+notify:
+  - type: github
+    repo: nousergon/alpha-engine-config
+    token: ${FLOW_DOCTOR_GITHUB_TOKEN}
+    labels: [flow-doctor, area:backtester, rehearsal-finding]
+    notify_on_category: [CODE, CONFIG]
+store:
+  type: dynamodb
+  table_name: flow-doctor-store
+  region: us-east-1
+dedup_cooldown_minutes: 60
+dependencies:
+  - predictor-training
+  - data-phase1
+rate_limits:
+  max_alerts_per_day: 10
+  max_issues_per_day: 3
+  max_diagnosed_per_day: 3
