@@ -522,6 +522,20 @@ def compute_stance_distribution_drift(
     }
 
     if failures and publish_alert:
-        _publish_drift_alert(report)
+        if _phase5_measurable(report["source_totals"]):
+            _publish_drift_alert(report)
+        else:
+            # The alert exists to catch a PILLAR regression (Phase 5). With no
+            # pillar-sourced entry that check did not run, and a shift in the
+            # heuristic mix — the standing state, config-I7405/I10530 — has no
+            # owner to act on it. It paged as ERROR on 10-03, 10-09 and 10-16
+            # with a body that says "do not investigate". The breach stays in
+            # this report, which the evaluator writes; it just does not page.
+            report["alert_suppressed_reason"] = "phase5_unmeasured_heuristic_only"
+            logger.warning(
+                "[stance_distribution] %d stance(s) outside the band on %s, "
+                "heuristic-only (Phase 5 unmeasured) — recorded, not paged: %s",
+                len(failures), current_date, ", ".join(failures),
+            )
 
     return report

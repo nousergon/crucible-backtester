@@ -70,6 +70,22 @@ REGIME_STRATIFIED_SORTINO_PREFIX = "regime/stratified_sortino"
 # it resolves the canonical decimal ``log_alpha_21d`` the store publishes.
 OUTCOME_RETURN_UNITS = ReturnUnits.PERCENT
 
+# score_performance is FROZEN at this score_date by ruling, not broken: its
+# seed path inserts only rating == "BUY" and the quant-only signals envelope
+# has rated every name HOLD since 2026-07-18 (alpha-engine-config-I11609;
+# nousergon-data collectors/signal_returns.py
+# ::_SCORE_PERFORMANCE_V1_FROZEN_THROUGH, which this must equal). T2 is
+# therefore unmeasurable every week until v2 supplies an outcome source, and
+# an ERROR that fires every week for a recorded decision pages for nothing.
+SCORE_PERFORMANCE_V1_FROZEN_THROUGH = "2026-07-10"
+
+
+def _unmeasurable_because_frozen(window: InputWindow) -> bool:
+    """The newest input is exactly the declared freeze point. Any OTHER stale
+    newest date is a producer that stopped for an undeclared reason, and that
+    still logs at ERROR."""
+    return window.max_score_date == SCORE_PERFORMANCE_V1_FROZEN_THROUGH
+
 
 def run_regime_stratified_sortino(
     *,
@@ -120,7 +136,17 @@ def run_regime_stratified_sortino(
     status, status_reason = assess_input_freshness(
         window, trading_day=str(dual.trading_day), horizon_days=primary_horizon,
     )
-    if status == STATUS_UNMEASURABLE:
+    if status == STATUS_UNMEASURABLE and _unmeasurable_because_frozen(window):
+        status_reason = (
+            f"{status_reason} Expected: score_performance is frozen through "
+            f"{SCORE_PERFORMANCE_V1_FROZEN_THROUGH} by ruling "
+            f"(alpha-engine-config-I11609, alpha-engine-config-I11481)."
+        )
+        logger.warning(
+            "[T2] regime_stratified_sortino is UNMEASURABLE (declared freeze): %s",
+            status_reason,
+        )
+    elif status == STATUS_UNMEASURABLE:
         logger.error(
             "[T2] regime_stratified_sortino is UNMEASURABLE: %s", status_reason,
         )

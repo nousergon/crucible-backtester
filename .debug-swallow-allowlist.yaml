@@ -94,7 +94,7 @@ entries:
     tracking: alpha-engine-config-I10226
 
   - path: backtest.py
-    line: 7405
+    line: 7414
     reason: >-
       publish_ops_alert transport failure on the empty-param-sweep path.
       No recording surface -- notification-transport carve-out; the
@@ -124,7 +124,7 @@ entries:
 
   # ── Preference-ordered fallback chains (final source validated/raises) ───
   - path: evaluate.py
-    line: 1218
+    line: 1220
     reason: >-
       config/scoring_weights.json S3 read/parse failed -- first of three
       preference-ordered scoring-weight sources. No recording surface --

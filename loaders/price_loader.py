@@ -50,6 +50,7 @@ def build_matrix(
     signals_prefix: str = "signals",
     _ohlcv_out: dict | None = None,
     tickers_allowlist: set[str] | None = None,
+    as_of: str | None = None,
 ) -> pd.DataFrame:
     """
     Build a price matrix for vectorbt: rows = dates, columns = tickers.
@@ -78,6 +79,11 @@ def build_matrix(
                  with this allowlist BEFORE the ArcticDB read so we don't pay
                  full-universe cost for smoke fixtures. Production default
                  None (full universe). See smoke harness fixture wiring.
+    as_of : Optional "YYYY-MM-DD" the freshness check measures against.
+                 Default None = today. A rehearsal passes its own run date:
+                 it deliberately runs on data that is old relative to the
+                 wall clock, and the question it can answer is whether the
+                 data is fresh for the day it simulates.
 
     Returns
     -------
@@ -274,8 +280,14 @@ def build_matrix(
     stale_circuit_break = False
     if not df.empty:
         last_price_date = df.index.max()
-        expected_recent = pd.Timestamp.now() - pd.tseries.offsets.BDay(2)
-        expected_max    = pd.Timestamp.now() - pd.tseries.offsets.BDay(_MAX_STALENESS_BDAYS)
+        # Compare DATES, not instants. Price rows are midnight-stamped, so
+        # measuring against a time-of-day "now" made a series exactly
+        # _MAX_STALENESS_BDAYS old read as stale and printed the
+        # self-contradiction "last date 2026-10-09, expected >= 2026-10-09"
+        # (rehearsal-2026-10-16-1).
+        reference = (pd.Timestamp(as_of) if as_of else pd.Timestamp.now()).normalize()
+        expected_recent = reference - pd.tseries.offsets.BDay(2)
+        expected_max    = reference - pd.tseries.offsets.BDay(_MAX_STALENESS_BDAYS)
         if last_price_date < expected_max:
             staleness_warning = (
                 f"STALE price data: last date {last_price_date.date()}, "

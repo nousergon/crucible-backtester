@@ -29,14 +29,25 @@ def publish_ops_alert(
     dedup_key: str | None = None,
     dedup_window_min: int | None = None,
 ) -> Any:
-    """SNS via ``nousergon_lib.alerts.publish(telegram=False)`` + Telegram via flow-doctor."""
+    """SNS via ``nousergon_lib.alerts.publish(telegram=False)`` + Telegram via flow-doctor.
+
+    In a rehearsal the alert is tagged and SNS (email) is skipped: it still
+    reaches the Overseer intake event, which records it, but pages nobody.
+    The flow-doctor half goes through ``flow-doctor.rehearsal.yaml``, which
+    has no paging channel (optimizer/run_role.py::flow_doctor_yaml).
+    """
     from nousergon_lib import alerts as _alerts
+    from optimizer.run_role import rehearsal_reason
+
+    rehearsal = rehearsal_reason()
+    if rehearsal:
+        message = f"[REHEARSAL {rehearsal}] {message}"
 
     kwargs: dict[str, Any] = {
         "message": message,
         "severity": severity,
         "source": source,
-        "sns": True,
+        "sns": not rehearsal,
         "telegram": False,
     }
     if dedup_key is not None:

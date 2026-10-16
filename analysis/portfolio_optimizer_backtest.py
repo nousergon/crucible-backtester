@@ -44,6 +44,7 @@ Design notes:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
@@ -235,7 +236,8 @@ def run_optimizer_backtest(
 
         alpha_uncertainty = kwargs.pop("alpha_uncertainty", None)
         carry_diag = kwargs.pop("carry")
-        result = solve_target_weights(**kwargs, alpha_uncertainty=alpha_uncertainty)
+        with _simulated_gate_off_is_not_an_incident():
+            result = solve_target_weights(**kwargs, alpha_uncertainty=alpha_uncertainty)
         if result.diagnostics["status"] == "infeasible_fallback":
             n_solver_failures += 1
         diagnostics.append({
@@ -321,6 +323,42 @@ class _InsufficientHistoryError(Exception):
 # stage, so the decision is taken on a measurement.
 
 #: ``W_PREV_BASIS*`` constants: see the module top.
+
+
+#: The live executor's "turnover is unthrottled" alarm (crucible-executor
+#: ``_alert_gate_off_without_sigma``, alpha-engine-config-I11791).
+_GATE_OFF_ALERT_PREFIX = "Conviction gate OFF ("
+
+
+class _DemoteSimulatedGateOff(logging.Filter):
+    """Demote the executor's gate-off ERROR to INFO inside a simulation.
+
+    That ERROR means "today's LIVE discretionary turnover is unthrottled".
+    Here the executor's solver runs over historical predictions that mostly
+    carry no sigma, so the same line fired from every weekly backtest that
+    reached a turnover-budgeted solve and paged as a live-trading fault
+    (three times from rehearsal-2026-10-16-1, one per spot retry). The
+    simulated gate state is not lost: it is in every rebalance's
+    ``conviction_gate_reason`` diagnostic. Any other ERROR passes untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR and str(record.msg).startswith(_GATE_OFF_ALERT_PREFIX):
+            record.levelno = logging.INFO
+            record.levelname = "INFO"
+            record.msg = "[simulated solve, not the live book] " + str(record.msg)
+        return True
+
+
+@contextlib.contextmanager
+def _simulated_gate_off_is_not_an_incident():
+    target = logging.getLogger("executor.portfolio_optimizer")
+    f = _DemoteSimulatedGateOff()
+    target.addFilter(f)
+    try:
+        yield
+    finally:
+        target.removeFilter(f)
 
 
 def _forced_turnover_fields(solver_diagnostics: dict) -> dict:
@@ -645,8 +683,9 @@ def _populate_target_weights_row(
     holdings", and with ``cash_sharing=True`` the stale position also starved
     new targets of cash.
 
-    Guard: a column whose close is not finite on ``rebal_date`` (a delisted or
-    not-yet-listed name) is left ``NaN`` — an order vectorbt cannot fill. When
+    Guard: a column whose close is not finite and positive on ``rebal_date``
+    (a delisted or not-yet-listed name), solved or not, is left ``NaN`` — an
+    order vectorbt cannot fill. When
     such a column is still HELD (``held`` carries a positive last target), it
     is counted and the count is returned, so the stuck exit is visible as
     ``n_unfillable_exits`` rather than silent.
@@ -657,18 +696,28 @@ def _populate_target_weights_row(
     rebal_ts = pd.Timestamp(rebal_date)
     cols = [c for c in target_weights.columns if c != _CASH]
     if close_row is not None:
-        close = pd.to_numeric(close_row.reindex(cols), errors="coerce")
-        fillable = np.isfinite(close.to_numpy(dtype=float))
+        close = pd.to_numeric(close_row.reindex(cols), errors="coerce").to_numpy(dtype=float)
+        # vectorbt refuses any order whose price is not finite AND > 0
+        # ("order.price must be finite and greater than 0").
+        with np.errstate(invalid="ignore"):
+            fillable = np.isfinite(close) & (close > 0)
     else:
         fillable = np.ones(len(cols), dtype=bool)
     fill_cols = [c for c, ok in zip(cols, fillable) if ok]
     unfillable_cols = [c for c, ok in zip(cols, fillable) if not ok]
     target_weights.loc[rebal_ts, fill_cols] = 0.0
 
+    unfillable = set(unfillable_cols)
     for i, t in enumerate(universe):
         if t == _CASH:
             continue
-        if t in target_weights.columns:
+        # A SOLVED name can be unfillable too: the optimizer reads history up
+        # to the rebalance date, so a name whose close is bad ON that date
+        # (missing, or a zero / negative vendor print) still gets a weight.
+        # Writing it handed vectorbt an order at a non-positive price, which
+        # raised "order.price must be finite and greater than 0" and lost the
+        # whole optimizer backtest (twice in rehearsal-2026-10-16-1).
+        if t in target_weights.columns and t not in unfillable:
             target_weights.at[rebal_ts, t] = float(weights[i])
 
     n_unfillable_exits = 0

@@ -337,9 +337,9 @@ def test_alert_carries_source_mix_and_n(monkeypatch):
     monkeypatch.setenv("ALPHA_ENGINE_STANCE_DRIFT_ALERT_DISABLED", "0")
     baseline = _healthy_distribution()
     collapsed = {**baseline, "quality": 0, "value": baseline["value"] + 12}
-    file_map = {d: _make_pred_response(baseline, source="heuristic")
+    file_map = {d: _make_pred_response(baseline, source="pillar")
                 for d in _FRIDAYS[:-1]}
-    file_map["2026-05-15"] = _make_pred_response(collapsed, source="heuristic")
+    file_map["2026-05-15"] = _make_pred_response(collapsed, source="pillar")
     s3 = _make_s3_client(file_map)
 
     fake_result = MagicMock()
@@ -356,7 +356,30 @@ def test_alert_carries_source_mix_and_n(monkeypatch):
     call_msg = mock_publish.call_args.args[0]
     # Share + n are in the breach line: 0 of 32 picks, 0.0%.
     assert "(0.0% of 32 picks)" in call_msg
-    assert "Source mix: heuristic 32 (100.0%) (32/32 classified)" in call_msg
+    assert "Source mix: pillar 32 (100.0%) (32/32 classified)" in call_msg
+
+
+def test_heuristic_only_breach_is_recorded_not_paged(monkeypatch):
+    """No pillar-sourced entry means the Phase 5 check did not run: the breach
+    stays in the report but publishes nothing (rehearsal-2026-10-16-1 paged
+    on a heuristic shift whose own text said not to investigate it)."""
+    monkeypatch.setenv("ALPHA_ENGINE_STANCE_DRIFT_ALERT_DISABLED", "0")
+    baseline = _healthy_distribution()
+    collapsed = {**baseline, "quality": 0, "value": baseline["value"] + 12}
+    file_map = {d: _make_pred_response(baseline, source="heuristic")
+                for d in _FRIDAYS[:-1]}
+    file_map["2026-05-15"] = _make_pred_response(collapsed, source="heuristic")
+    s3 = _make_s3_client(file_map)
+
+    with patch("ops_alerts.publish_ops_alert") as mock_publish:
+        report = sd.compute_stance_distribution_drift(
+            bucket="test-bucket", current_date="2026-05-15", s3_client=s3,
+        )
+
+    assert report["status"] == "fail"
+    assert "quality" in report["failures"]
+    assert report["alert_suppressed_reason"] == "phase5_unmeasured_heuristic_only"
+    mock_publish.assert_not_called()
 
 
 def test_alert_publish_called_on_fail(monkeypatch):
@@ -364,8 +387,8 @@ def test_alert_publish_called_on_fail(monkeypatch):
     monkeypatch.setenv("ALPHA_ENGINE_STANCE_DRIFT_ALERT_DISABLED", "0")
     baseline = _healthy_distribution()
     collapsed = {**baseline, "quality": 0, "value": baseline["value"] + 12}
-    file_map = {d: _make_pred_response(baseline) for d in _FRIDAYS[:-1]}
-    file_map["2026-05-15"] = _make_pred_response(collapsed)
+    file_map = {d: _make_pred_response(baseline, source="pillar") for d in _FRIDAYS[:-1]}
+    file_map["2026-05-15"] = _make_pred_response(collapsed, source="pillar")
     s3 = _make_s3_client(file_map)
 
     fake_result = MagicMock()
