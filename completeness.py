@@ -111,6 +111,7 @@ class CompletenessTracker:
         fn: Callable[..., dict],
         required_inputs: dict[str, bool],
         skip_if_missing: list[str] | None = None,
+        stale_inputs: dict[str, str | None] | None = None,
     ) -> dict:
         """Run a module function with completeness tracking.
 
@@ -119,6 +120,13 @@ class CompletenessTracker:
             fn: Callable that returns a result dict. Called with no args.
             required_inputs: {input_name: is_available} map.
             skip_if_missing: Input names that cause a skip (not error) when missing.
+            stale_inputs: {input_name: staleness_reason} for inputs that are
+                PRESENT but whose newest row is too old for the run to mean
+                anything. A truthy reason grades an otherwise-ok module
+                ``degraded`` (alpha-engine-config-I11506): a module computing
+                ``ok`` from months-old rows is a silent no-op, and most modules
+                carry no freshness self-check of their own. ``None`` means the
+                input was checked and is fresh.
 
         Returns:
             The module's result dict (or a status dict on skip/error).
@@ -147,6 +155,10 @@ class CompletenessTracker:
 
             reasons = [f"ran without: {', '.join(missing)}"] if missing else []
             status = "ok" if not missing else "degraded"
+            stale = {k: v for k, v in (stale_inputs or {}).items() if v}
+            if stale:
+                reasons.extend(f"stale input {k}: {v}" for k, v in stale.items())
+                status = "degraded"
             # The module's OWN verdict outranks "it returned without raising"
             # (alpha-engine-config-I11506): a module that ran on zero rows,
             # stale sources or a missing benchmark and said so must not be
