@@ -88,6 +88,20 @@ W_PREV_BASES = (W_PREV_BASIS_ALL_CASH, W_PREV_BASIS_CARRIED)
 #: now runs as the gate shadow for one cycle so the old numbers stay readable.
 W_PREV_BASIS = W_PREV_BASIS_CARRIED
 
+#: Post-solve churn controls (crucible-executor decision-precedence note,
+#: 2026-10-15). ``none`` trades the solve as the live executor does;
+#: ``partial_adjustment`` trades a fraction ``gp_k`` of each name's move
+#: toward the solved target (Garleanu-Pedersen); ``reversal_guard`` holds a
+#: name whose move would reverse its last trade within ``guard_sessions``
+#: rebalances. Neither touches an ineligible name (tiers 0/1 force it), and
+#: SPY absorbs the freed weight, as the executor's no-conviction fill.
+TURNOVER_CONTROL_NONE = "none"
+TURNOVER_CONTROL_PARTIAL = "partial_adjustment"
+TURNOVER_CONTROL_GUARD = "reversal_guard"
+TURNOVER_CONTROLS = (TURNOVER_CONTROL_NONE, TURNOVER_CONTROL_PARTIAL, TURNOVER_CONTROL_GUARD)
+#: Window for the ``reversed_share`` churn metric, in rebalances.
+_REVERSAL_WINDOW = 3
+
 
 @dataclass
 class OptimizerBacktestResult:
@@ -124,6 +138,10 @@ def run_optimizer_backtest(
     alpha_uncertainty_by_date: dict[str, dict[str, float]] | None = None,
     keep_daily_returns: bool = False,
     w_prev_basis: str = W_PREV_BASIS,
+    turnover_control: str = TURNOVER_CONTROL_NONE,
+    gp_k: float = 0.5,
+    guard_sessions: int = 3,
+    rebalance_band: float = 0.0,
 ) -> OptimizerBacktestResult:
     """
     Backtest the constrained MVO optimizer over historical synthetic predictions.
@@ -151,6 +169,11 @@ def run_optimizer_backtest(
         min_score_proxy: optional |alpha_hat| threshold below which a ticker
             is marked ineligible. None disables (all alpha-bearing tickers
             eligible).
+        turnover_control / gp_k / guard_sessions: post-solve churn control
+            (``TURNOVER_CONTROLS``). Anything but ``none`` needs the carried
+            basis: on the all-cash basis there is no prior book to damp.
+        rebalance_band: a name whose move is smaller than this stays put
+            (the live executor's ``rebalance_band_pct``). 0 disables.
 
     Returns:
         OptimizerBacktestResult with target_weights DataFrame (date × ticker),
@@ -172,6 +195,14 @@ def run_optimizer_backtest(
 
     if w_prev_basis not in W_PREV_BASES:
         raise ValueError(f"w_prev_basis must be one of {W_PREV_BASES}, got {w_prev_basis!r}")
+    if turnover_control not in TURNOVER_CONTROLS:
+        raise ValueError(
+            f"turnover_control must be one of {TURNOVER_CONTROLS}, got {turnover_control!r}"
+        )
+    if turnover_control != TURNOVER_CONTROL_NONE and w_prev_basis != W_PREV_BASIS_CARRIED:
+        raise ValueError("a turnover_control needs w_prev_basis='carried_drifted'")
+    if not 0.0 < gp_k <= 1.0:
+        raise ValueError(f"gp_k must be in (0, 1], got {gp_k}")
     if optimizer_cfg is None:
         optimizer_cfg = {}
     effective_cfg = {**OPTIMIZER_CONFIG_DEFAULTS, **optimizer_cfg}
@@ -206,8 +237,9 @@ def run_optimizer_backtest(
     n_unfillable_exits = 0
     carry = w_prev_basis == W_PREV_BASIS_CARRIED
     last_rebal_ts: pd.Timestamp | None = None
+    churn = _ChurnTracker(turnover_control, gp_k, guard_sessions, rebalance_band)
 
-    for rebal_date in rebalance_dates:
+    for rebal_n, rebal_date in enumerate(rebalance_dates):
         held_weights: dict[str, float] | None = None
         if carry and last_rebal_ts is not None:
             held_weights = _drift_book(
@@ -242,6 +274,10 @@ def run_optimizer_backtest(
             result = solve_target_weights(**kwargs, alpha_uncertainty=alpha_uncertainty)
         if result.diagnostics["status"] == "infeasible_fallback":
             n_solver_failures += 1
+        weights = churn.apply(
+            rebal_n, kwargs["tickers"], result.weights, kwargs["w_prev"],
+            kwargs["eligibility"], kwargs["spy_idx"], kwargs["cash_idx"],
+        )
         diagnostics.append({
             "date": rebal_date,
             "status": result.diagnostics["status"],
@@ -255,7 +291,7 @@ def run_optimizer_backtest(
 
         rebal_ts = pd.Timestamp(rebal_date)
         n_unfillable_exits += _populate_target_weights_row(
-            target_weights, rebal_date, kwargs["tickers"], result.weights,
+            target_weights, rebal_date, kwargs["tickers"], weights,
             close_row=price_matrix.loc[rebal_ts],
             held=last_target,
         )
@@ -283,6 +319,7 @@ def run_optimizer_backtest(
     metrics.update(summarize_forced_turnover(diagnostics, w_prev_basis=w_prev_basis))
     if carry:
         metrics.update(_summarize_carry(diagnostics))
+        metrics.update(churn.summary())
     _log_forced_turnover(metrics)
     metrics["rebalance_freq_days"] = rebalance_freq_days
     metrics["universe_cap"] = universe_cap
@@ -431,6 +468,73 @@ def _summarize_carry(diagnostics: list[dict]) -> dict:
         "held_weight_not_carried_mean": float(np.mean(not_carried)),
         "held_weight_not_carried_max": float(np.max(not_carried)),
     }
+
+
+class _ChurnTracker:
+    """Applies the post-solve churn control and the band, and measures the
+    churn the book actually trades (one-way, ex SPY and cash)."""
+
+    def __init__(self, control: str, gp_k: float, guard_sessions: int, band: float):
+        self.control = control
+        self.gp_k = float(gp_k)
+        self.guard_sessions = int(guard_sessions)
+        self.band = float(band)
+        self.last_dir: dict[str, tuple[int, int]] = {}
+        self.traded = 0.0
+        self.reversed = 0.0
+        self.n_guard_holds = 0
+
+    def apply(
+        self, n: int, tickers: list[str], solved: np.ndarray, w_prev: np.ndarray,
+        eligibility: np.ndarray, spy_idx: int, cash_idx: int,
+    ) -> np.ndarray:
+        tgt = np.asarray(solved, dtype=float).copy()
+        for i, t in enumerate(tickers):
+            if i in (spy_idx, cash_idx):
+                continue
+            forced = not bool(eligibility[i])
+            delta = tgt[i] - w_prev[i]
+            if forced:
+                continue  # tiers 0/1: the solve's exit stands, untouched
+            if self.control == TURNOVER_CONTROL_PARTIAL:
+                tgt[i] = w_prev[i] + self.gp_k * delta
+                delta = tgt[i] - w_prev[i]
+            elif self.control == TURNOVER_CONTROL_GUARD and t in self.last_dir:
+                last_n, sign = self.last_dir[t]
+                if n - last_n <= self.guard_sessions and np.sign(delta) == -sign:
+                    tgt[i] = w_prev[i]
+                    self.n_guard_holds += 1
+                    continue
+            if abs(delta) < self.band:
+                tgt[i] = w_prev[i]
+        if self.control != TURNOVER_CONTROL_NONE or self.band > 0.0:
+            tgt[spy_idx] += 1.0 - float(tgt.sum())  # SPY: the no-conviction fill
+            if tgt[spy_idx] < 0.0:
+                tgt[cash_idx] += tgt[spy_idx]
+                tgt[spy_idx] = 0.0
+        for i, t in enumerate(tickers):
+            if i in (spy_idx, cash_idx):
+                continue
+            delta = tgt[i] - w_prev[i]
+            if abs(delta) < 1e-6:
+                continue
+            self.traded += abs(delta)
+            prior = self.last_dir.get(t)
+            if prior is not None and n - prior[0] <= _REVERSAL_WINDOW and np.sign(delta) == -prior[1]:
+                self.reversed += abs(delta)
+            self.last_dir[t] = (n, int(np.sign(delta)))
+        return tgt
+
+    def summary(self) -> dict:
+        return {
+            "turnover_control": self.control,
+            "gp_k": self.gp_k if self.control == TURNOVER_CONTROL_PARTIAL else None,
+            "guard_sessions": self.guard_sessions if self.control == TURNOVER_CONTROL_GUARD else None,
+            "rebalance_band": self.band,
+            "names_traded_one_way_sum": self.traded,
+            "reversed_share": self.reversed / self.traded if self.traded else 0.0,
+            "n_guard_holds": self.n_guard_holds,
+        }
 
 
 def _log_forced_turnover(metrics: dict) -> None:

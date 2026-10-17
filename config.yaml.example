@@ -255,6 +255,14 @@ portfolio_optimizer_tuner:
 # latest.json. null disables it.
 portfolio_optimizer_gate:
   shadow_w_prev_basis: all_cash_each_rebalance
+  # Churn-control challenger arms at the live daily stride, carried book,
+  # live 0.5% band: champion vs partial adjustment (k=0.5) vs a 3-session
+  # reversal guard. Written to optimizer_gate/churn_arms/, never latest.json.
+  # Omit for the defaults; null disables.
+  churn_arms:
+    rebalance_freq_days: 1
+    rebalance_band: 0.005
+    budget_minutes: 50
 
 # ── Stance-sizing optimizer (L300) ───────────────────────────────────────────
 # Offline-IC gate for the stance_size_* multipliers (replaces the inert

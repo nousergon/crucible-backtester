@@ -124,7 +124,12 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # gate's w_prev basis flips; never written to latest.json, never read by a
     # consumer. Grandfathered rather than given a freshness row, and removed
     # with the shadow once the basis flips.
-    "backtest.py": 15,
+    # +1 (15->16) 2026-10-17: the churn-control challenger arms,
+    # predictor/optimizer_gate/churn_arms/{run_date}.json (champion vs
+    # partial adjustment vs reversal guard at the live daily stride).
+    # OBSERVE-only, never latest.json, never read by a consumer;
+    # grandfathered like the shadow and removed with the arms.
+    "backtest.py": 16,
     # config#1405 research-free backfill parquet (predictor/research_free_backfill/
     # predictor_outcomes_research_free.parquet) — the durable producer→consumer wire
     # for the scanner→predictor-direct counterfactual (research.db pulls are
