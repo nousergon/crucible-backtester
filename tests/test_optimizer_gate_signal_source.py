@@ -148,7 +148,7 @@ class TestCarriedBasisShadow:
         mock_opt.return_value = _opt_result()
         out = run_gate_against_predictor_backtest(cfg)
         bases = [c.kwargs.get("w_prev_basis") for c in mock_opt.call_args_list]
-        assert bases == [None, "all_cash_each_rebalance"]
+        assert bases[:2] == [None, "all_cash_each_rebalance"]
         assert out["shadow"]["status"] == "ok"
         assert out["shadow"]["w_prev_basis"] == "all_cash_each_rebalance"
         assert "gate_report" in out["shadow"]
@@ -161,7 +161,7 @@ class TestCarriedBasisShadow:
             "price_matrix": MagicMock(), "spy_prices": MagicMock(), "sector_map": {},
         }
         mock_opt.return_value = _opt_result()
-        cfg["portfolio_optimizer_gate"] = {"shadow_w_prev_basis": None}
+        cfg["portfolio_optimizer_gate"] = {"shadow_w_prev_basis": None, "churn_arms": None}
         out = run_gate_against_predictor_backtest(cfg)
         assert mock_opt.call_count == 1
         assert "shadow" not in out
@@ -173,6 +173,7 @@ class TestCarriedBasisShadow:
             "status": "ok", "predictions_by_date": {"2026-01-05": {"AAPL": 0.1}},
             "price_matrix": MagicMock(), "spy_prices": MagicMock(), "sector_map": {},
         }
+        cfg["portfolio_optimizer_gate"] = {"churn_arms": None}
         mock_opt.side_effect = [_opt_result(), RuntimeError("boom")]
         out = run_gate_against_predictor_backtest(cfg)
         assert out["gate_report"]["verdict"]
@@ -200,3 +201,77 @@ class TestCarriedBasisShadow:
         assert b"shadow" not in bodies["predictor/optimizer_gate/latest.json"]
         assert payload["passed"] is True
         assert payload["shadow_key"].endswith("shadow_carried_drifted/2026-05-15.json")
+
+
+class TestChurnArms:
+    """Decision-precedence note 2026-10-15: the churn controls run as
+    challenger arms beside a same-stride champion, never as the verdict."""
+
+    _PRED = {
+        "status": "ok", "predictions_by_date": {"2026-01-05": {"AAPL": 0.1}},
+        "price_matrix": MagicMock(), "spy_prices": MagicMock(), "sector_map": {},
+    }
+
+    @patch("analysis.portfolio_optimizer_backtest.run_optimizer_backtest")
+    @patch("synthetic.predictor_backtest.run")
+    def test_default_arms_run_daily_on_the_carried_book(self, mock_synth, mock_opt, cfg):
+        mock_synth.return_value = dict(self._PRED)
+        mock_opt.return_value = _opt_result()
+        out = run_gate_against_predictor_backtest(cfg)
+        arm_calls = mock_opt.call_args_list[2:]
+        assert [c.kwargs["turnover_control"] for c in arm_calls] == [
+            "none", "partial_adjustment", "reversal_guard",
+        ]
+        for c in arm_calls:
+            assert c.kwargs["rebalance_freq_days"] == 1
+            assert c.kwargs["w_prev_basis"] == "carried_drifted"
+            assert c.kwargs["rebalance_band"] == 0.005
+        assert [a["status"] for a in out["churn_arms"]["arms"]] == ["ok"] * 3
+        assert "verdict" in out["churn_arms"]["arms"][0]
+
+    @patch("analysis.portfolio_optimizer_backtest.run_optimizer_backtest")
+    @patch("synthetic.predictor_backtest.run")
+    def test_failed_arm_is_recorded_and_the_rest_still_run(self, mock_synth, mock_opt, cfg):
+        mock_synth.return_value = dict(self._PRED)
+        cfg["portfolio_optimizer_gate"] = {"shadow_w_prev_basis": None}
+        mock_opt.side_effect = [_opt_result(), _opt_result(), RuntimeError("boom"), _opt_result()]
+        out = run_gate_against_predictor_backtest(cfg)
+        assert out["gate_report"]["verdict"]
+        assert [a["status"] for a in out["churn_arms"]["arms"]] == ["ok", "error", "ok"]
+
+    def test_arms_past_the_budget_are_skipped(self):
+        from analysis.portfolio_optimizer_gate import run_churn_arms
+
+        ticks = iter([0.0, 0.0, 0.0, 10.0, 10.0, 999.0, 999.0])
+        cfg = {"arms": [{"name": "a", "turnover_control": "none"},
+                        {"name": "b", "turnover_control": "none"}],
+               "rebalance_freq_days": 1, "rebalance_band": 0.0, "budget_minutes": 1}
+        with patch("analysis.portfolio_optimizer_backtest.run_optimizer_backtest",
+                   return_value=_opt_result()):
+            out = run_churn_arms(cfg, dict(self._PRED), "/x", 30, None, "synthetic",
+                                 clock=lambda: next(ticks))
+        assert [a["status"] for a in out["arms"]] == ["ok", "skipped_budget"]
+
+    @patch("analysis.portfolio_optimizer_backtest.run_optimizer_backtest")
+    @patch("synthetic.predictor_backtest.run")
+    def test_disabled_by_null(self, mock_synth, mock_opt, cfg):
+        mock_synth.return_value = dict(self._PRED)
+        mock_opt.return_value = _opt_result()
+        cfg["portfolio_optimizer_gate"] = {"churn_arms": None}
+        out = run_gate_against_predictor_backtest(cfg)
+        assert "churn_arms" not in out
+
+    @patch("analysis.portfolio_optimizer_gate.run_gate_against_predictor_backtest")
+    def test_arms_persist_to_their_own_key_not_latest(self, mock_gate):
+        mock_gate.return_value = {
+            "gate_report": {"verdict": "pass"}, "signal_source": "synthetic",
+            "churn_arms": {"rebalance_freq_days": 1, "arms": [{"name": "champion", "status": "ok"}]},
+        }
+        s3 = MagicMock()
+        payload = bt.run_portfolio_optimizer_gate(
+            config={"signals_bucket": "b"}, run_date="2026-05-15", s3_client=s3,
+        )
+        bodies = {c.kwargs["Key"]: c.kwargs["Body"] for c in s3.put_object.call_args_list}
+        assert "predictor/optimizer_gate/churn_arms/2026-05-15.json" in bodies
+        assert b"churn_arms" not in bodies["predictor/optimizer_gate/latest.json"]
+        assert payload["churn_arms_key"].endswith("churn_arms/2026-05-15.json")

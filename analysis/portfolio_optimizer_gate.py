@@ -27,6 +27,7 @@ Decision rule:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -395,7 +396,127 @@ def run_gate_against_predictor_backtest(
             shadow_basis, pred_result, executor_path, rebalance_freq_days,
             universe_cap, legacy_metrics, signal_source,
         )
+    churn_cfg = _churn_arms_config(config)
+    if churn_cfg is not None and signal_source == "synthetic":
+        out["churn_arms"] = run_churn_arms(
+            churn_cfg, pred_result, executor_path, universe_cap,
+            legacy_metrics, signal_source,
+        )
     return out
+
+
+#: Churn-control challenger arms (crucible-executor decision precedence,
+#: 2026-10-15). The live executor re-solves DAILY, so the arms run at a
+#: daily stride, and the champion runs beside them at the same stride so the
+#: comparison is like for like. All three carry the book and apply the live
+#: 0.5% band. Observability only: never latest.json, never the verdict.
+DEFAULT_CHURN_ARMS = (
+    {"name": "champion", "turnover_control": "none"},
+    {"name": "partial_adjustment_k0.5", "turnover_control": "partial_adjustment", "gp_k": 0.5},
+    {"name": "reversal_guard_3", "turnover_control": "reversal_guard", "guard_sessions": 3},
+)
+_CHURN_ARMS_DEFAULTS = {
+    "rebalance_freq_days": 1,
+    "rebalance_band": 0.005,
+    "budget_minutes": 50.0,
+}
+#: Metrics copied into each arm's summary row (the full comparison is kept too).
+_CHURN_SUMMARY_KEYS = (
+    "total_return", "spy_return", "total_alpha", "sortino_ratio", "sharpe_ratio",
+    "psr", "max_drawdown", "cvar_95", "turnover_one_way_ann",
+    "names_traded_one_way_sum", "reversed_share", "n_guard_holds",
+    "tracking_error_ann", "mean_active_share", "mean_spy_weight",
+    "n_rebalances", "n_solver_failures",
+)
+
+
+def _churn_arms_config(config: dict) -> dict | None:
+    """``portfolio_optimizer_gate.churn_arms``: ``null``/``false`` disables;
+    a mapping overrides ``arms`` / ``rebalance_freq_days`` / ``rebalance_band``
+    / ``budget_minutes``; absent runs the defaults."""
+    section = config.get("portfolio_optimizer_gate") or {}
+    raw = section.get("churn_arms", {})
+    if raw is None or raw is False:
+        return None
+    raw = raw if isinstance(raw, dict) else {}
+    cfg = {**_CHURN_ARMS_DEFAULTS, **{k: v for k, v in raw.items() if k != "arms"}}
+    cfg["arms"] = list(raw.get("arms") or DEFAULT_CHURN_ARMS)
+    return cfg
+
+
+def run_churn_arms(
+    churn_cfg: dict,
+    pred_result: dict,
+    executor_path: str,
+    universe_cap: int,
+    legacy_metrics: dict | None,
+    signal_source: str,
+    clock: Callable[[], float] | None = None,
+) -> dict:
+    """Run each arm on identical inputs. A failed arm is recorded and the rest
+    still run; an arm that would start past ``budget_minutes`` is recorded as
+    ``skipped_budget`` so the stage's SSM timeout is never at risk."""
+    import time
+
+    from analysis.portfolio_optimizer_backtest import (
+        W_PREV_BASIS_CARRIED,
+        compare_to_legacy,
+        run_optimizer_backtest,
+    )
+
+    now = clock or time.monotonic
+    start = now()
+    budget_s = float(churn_cfg["budget_minutes"]) * 60.0
+    freq = int(churn_cfg["rebalance_freq_days"])
+    band = float(churn_cfg["rebalance_band"])
+    rows: list[dict] = []
+    for arm in churn_cfg["arms"]:
+        name = str(arm.get("name") or arm.get("turnover_control"))
+        elapsed = now() - start
+        if elapsed >= budget_s:
+            logger.warning("Gate runner: churn arm %s skipped, budget spent (%.0fs)", name, elapsed)
+            rows.append({"name": name, "status": "skipped_budget"})
+            continue
+        t0 = now()
+        try:
+            res = run_optimizer_backtest(
+                predictions_by_date=pred_result["predictions_by_date"],
+                price_matrix=pred_result["price_matrix"],
+                spy_prices=pred_result["spy_prices"],
+                sector_map=pred_result["sector_map"],
+                executor_path=executor_path,
+                rebalance_freq_days=freq,
+                universe_cap=universe_cap,
+                w_prev_basis=W_PREV_BASIS_CARRIED,
+                turnover_control=str(arm.get("turnover_control", "none")),
+                gp_k=float(arm.get("gp_k", 0.5)),
+                guard_sessions=int(arm.get("guard_sessions", 3)),
+                rebalance_band=band,
+            )
+        except Exception as exc:  # recorded on the artifact, never raised
+            logger.exception("Gate runner: churn arm %s FAILED", name)
+            rows.append({"name": name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        comparison = compare_to_legacy(res.metrics, legacy_metrics, signal_source=signal_source)
+        report = evaluate_gate(comparison)
+        m = res.metrics
+        rows.append({
+            "name": name,
+            "status": "ok",
+            "arm": dict(arm),
+            "seconds": round(now() - t0, 1),
+            "summary": {k: m.get(k) for k in _CHURN_SUMMARY_KEYS},
+            "verdict": report["verdict"],
+            "comparison": comparison,
+            "gate_report": report,
+        })
+        logger.info("Gate runner: churn arm %s verdict=%s in %.0fs", name, report["verdict"], now() - t0)
+    return {
+        "rebalance_freq_days": freq,
+        "rebalance_band": band,
+        "budget_minutes": churn_cfg["budget_minutes"],
+        "arms": rows,
+    }
 
 
 def _shadow_w_prev_basis(config: dict) -> str | None:
