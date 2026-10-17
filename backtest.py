@@ -5806,6 +5806,30 @@ def _init_pipeline(args: argparse.Namespace, config: dict) -> None:
     )
 
 
+_SIMULATE_STATS_SUFFIX = "/simulate/portfolio_stats.json"
+
+
+def _simulate_stats_key(keys: list[str]) -> str:
+    """The ``portfolio_stats.json`` key among a simulate marker's artifacts.
+
+    The simulate phase records two artifacts: ``portfolio_stats.json`` and,
+    since config-I7616, ``portfolio_daily_returns.parquet``. The marker stores
+    them ``sorted()``, so the parquet always comes first. The auto-skip reload
+    used to take ``keys[0]`` and fed parquet bytes to ``json.loads``:
+    ``UnicodeDecodeError: ... byte 0xd0 in position 7`` on the 2026-09-26
+    weekly retry (alpha-engine-config-I11618). Select by name, as
+    ``_reload_simulation_setup`` does, and fail loud when it is absent.
+    """
+    matches = [k for k in keys if k.endswith(_SIMULATE_STATS_SUFFIX)]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "simulate auto-skip: expected exactly one artifact ending "
+            f"{_SIMULATE_STATS_SUFFIX!r} in the marker, found {len(matches)} "
+            f"(artifact_keys={keys}) — cannot reload portfolio_stats"
+        )
+    return matches[0]
+
+
 def _run_simulation_pipeline(
     args: argparse.Namespace,
     config: dict,
@@ -5939,7 +5963,9 @@ def _run_simulation_pipeline(
                             "simulate auto-skip: marker has no artifact_keys — "
                             "cannot reload portfolio_stats"
                         )
-                    portfolio_stats = load_json(bucket, keys[0], s3_client=s3)
+                    portfolio_stats = load_json(
+                        bucket, _simulate_stats_key(keys), s3_client=s3,
+                    )
                 else:
                     if _sim_setup is None:
                         raise RuntimeError("Simulation setup failed — cannot run simulate")
