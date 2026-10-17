@@ -927,7 +927,7 @@ class TestForcedTurnoverSummary:
              "forced_turnover_by_cause": {"cash_sleeve_pin": 0.05, "renormalization": 0.05}},
             {"status": "skipped_insufficient_history"},
         ]
-        out = summarize_forced_turnover(rows)
+        out = summarize_forced_turnover(rows, w_prev_basis="all_cash_each_rebalance")
         assert out["forced_turnover_n_rebalances"] == 2
         assert out["forced_turnover_share_over_budget"] == pytest.approx(0.5)
         assert out["forced_turnover_max"] == pytest.approx(0.97)
@@ -965,6 +965,7 @@ def test_from_cash_rebalance_forces_one_minus_sleeve():
         rebalance_freq_days=5,
         universe_cap=10,
         optimizer_cfg={"cash_sleeve_pct": 0.03},
+        w_prev_basis="all_cash_each_rebalance",
     )
     m = result.metrics
     assert m["forced_turnover_n_rebalances"] == result.n_rebalances
@@ -1102,6 +1103,9 @@ def test_optimizer_run_sells_names_that_leave_the_universe():
         executor_path=_ALPHA_ENGINE_PATH,
         rebalance_freq_days=5,
         universe_cap=3,
+        # Pins the zero-fill mechanism: on the carried basis the old names stay
+        # in the solve and are sold down under the turnover budget instead.
+        w_prev_basis="all_cash_each_rebalance",
     )
     tw = result.target_weights
     rebal_rows = tw.dropna(how="all")
@@ -1260,3 +1264,96 @@ def test_carried_basis_lets_the_turnover_budget_bind():
     assert m["carry_n_rebalances"] == len(solved)
     assert m["held_weight_not_carried_max"] == 0.0
     assert m["stale_holding_weight_max"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_default_basis_is_the_carried_book():
+    """alpha-engine-config-I11507 (flipped 2026-10-17): every caller that does
+    not name a basis, the gate and all sweeps included, scores the carried book."""
+    from analysis.portfolio_optimizer_backtest import W_PREV_BASIS, summarize_forced_turnover
+
+    assert W_PREV_BASIS == "carried_drifted"
+    assert summarize_forced_turnover([])["w_prev_basis"] == "carried_drifted"
+
+
+class TestChurnTracker:
+    """Post-solve churn controls (decision-precedence note 2026-10-15)."""
+
+    _T = ["A", "B", "SPY", "CASH"]
+
+    def _tracker(self, control, **kw):
+        from analysis.portfolio_optimizer_backtest import _ChurnTracker
+
+        return _ChurnTracker(control, kw.get("gp_k", 0.5), kw.get("guard", 3), kw.get("band", 0.0))
+
+    def test_none_without_band_passes_the_solve_through(self):
+        tr = self._tracker("none")
+        solved = np.array([0.30, 0.10, 0.57, 0.03])
+        out = tr.apply(0, self._T, solved, np.array([0.1, 0.1, 0.77, 0.03]),
+                       np.ones(4, bool), 2, 3)
+        assert np.allclose(out, solved)
+
+    def test_partial_adjustment_moves_k_of_the_way_and_spy_fills(self):
+        tr = self._tracker("partial_adjustment", gp_k=0.5)
+        w_prev = np.array([0.10, 0.20, 0.67, 0.03])
+        out = tr.apply(0, self._T, np.array([0.30, 0.00, 0.67, 0.03]), w_prev,
+                       np.ones(4, bool), 2, 3)
+        assert out[0] == pytest.approx(0.20) and out[1] == pytest.approx(0.10)
+        assert out.sum() == pytest.approx(1.0)
+
+    def test_partial_adjustment_never_damps_a_forced_exit(self):
+        tr = self._tracker("partial_adjustment", gp_k=0.5)
+        out = tr.apply(0, self._T, np.array([0.0, 0.2, 0.77, 0.03]),
+                       np.array([0.2, 0.2, 0.57, 0.03]), np.array([False, True, True, True]), 2, 3)
+        assert out[0] == 0.0
+
+    def test_reversal_guard_holds_a_reversal_inside_the_window(self):
+        tr = self._tracker("reversal_guard", guard=3)
+        e = np.ones(4, bool)
+        tr.apply(0, self._T, np.array([0.2, 0.1, 0.67, 0.03]), np.array([0.1, 0.1, 0.77, 0.03]), e, 2, 3)
+        out = tr.apply(2, self._T, np.array([0.1, 0.1, 0.77, 0.03]), np.array([0.2, 0.1, 0.67, 0.03]), e, 2, 3)
+        assert out[0] == pytest.approx(0.2) and tr.n_guard_holds == 1
+        out = tr.apply(9, self._T, np.array([0.1, 0.1, 0.77, 0.03]), np.array([0.2, 0.1, 0.67, 0.03]), e, 2, 3)
+        assert out[0] == pytest.approx(0.1)
+
+    def test_band_holds_small_moves_and_reversals_are_measured(self):
+        tr = self._tracker("none", band=0.005)
+        e = np.ones(4, bool)
+        out = tr.apply(0, self._T, np.array([0.103, 0.2, 0.667, 0.03]), np.array([0.1, 0.1, 0.77, 0.03]), e, 2, 3)
+        assert out[0] == pytest.approx(0.1) and out[1] == pytest.approx(0.2)
+        tr.apply(1, self._T, np.array([0.1, 0.1, 0.77, 0.03]), out, e, 2, 3)
+        s = tr.summary()
+        assert s["names_traded_one_way_sum"] == pytest.approx(0.2)
+        assert s["reversed_share"] == pytest.approx(0.5)
+
+    def test_controls_need_the_carried_basis(self):
+        with pytest.raises(ValueError, match="carried_drifted"):
+            run_optimizer_backtest(
+                predictions_by_date={}, price_matrix=pd.DataFrame(), spy_prices=pd.Series(dtype=float),
+                sector_map={}, executor_path=_ALPHA_ENGINE_PATH,
+                w_prev_basis="all_cash_each_rebalance", turnover_control="reversal_guard",
+            )
+
+
+@pytest.mark.skipif(
+    _ALPHA_ENGINE_MISSING,
+    reason=executor_missing_reason(_ALPHA_ENGINE_PATH),
+)
+@pytest.mark.parametrize("control", ["partial_adjustment", "reversal_guard"])
+def test_churn_controls_run_daily_on_the_real_kernel(control):
+    tickers = ["AAPL", "MSFT", "GOOG", "JNJ", "PG"]
+    price_matrix = _synthetic_price_matrix(tickers, n_days=300, seed=0)
+    spy_prices = _synthetic_spy_series(n_days=300, seed=99).reindex(price_matrix.index)
+    predictions = _synthetic_predictions(tickers, price_matrix.index[270:290], seed=42)
+    kw = dict(
+        predictions_by_date=predictions, price_matrix=price_matrix, spy_prices=spy_prices,
+        sector_map={t: "Technology" for t in tickers}, executor_path=_ALPHA_ENGINE_PATH,
+        rebalance_freq_days=1, universe_cap=3, rebalance_band=0.005,
+    )
+    base = run_optimizer_backtest(**kw).metrics
+    arm = run_optimizer_backtest(**kw, turnover_control=control).metrics
+    assert arm["turnover_control"] == control
+    assert arm["n_solver_failures"] == 0
+    if control == "partial_adjustment":
+        assert arm["names_traded_one_way_sum"] < base["names_traded_one_way_sum"]
+    else:
+        assert arm["reversed_share"] <= base["reversed_share"]

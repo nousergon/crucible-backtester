@@ -2927,6 +2927,7 @@ def run_portfolio_optimizer_gate(
     # alpha-engine-config-I11507: the carried-book shadow goes to its own
     # sibling key and NEVER into latest.json, the promotion lever.
     shadow = gate_result.pop("shadow", None)
+    churn_arms = gate_result.pop("churn_arms", None)
     payload = {
         "run_date": run_date,
         "signal_source": signal_source,
@@ -2975,6 +2976,24 @@ def run_portfolio_optimizer_gate(
             logger.exception("portfolio_optimizer_gate: shadow persist FAILED s3://%s/%s",
                              bucket, shadow_key)
             payload["shadow_persist_error"] = f"{type(exc).__name__}: {exc}"
+
+    if churn_arms is not None:
+        # Churn-control challenger arms (decision-precedence note 2026-10-15):
+        # observability, never latest.json; a failed PUT is logged, not raised.
+        arms_key = f"{prefix}/churn_arms/{run_date}.json"
+        arms_body = json.dumps(
+            {"run_date": run_date, "signal_source": signal_source, **churn_arms},
+            default=str, indent=2,
+        ).encode("utf-8")
+        try:
+            s3.put_object(Bucket=bucket, Key=arms_key, Body=arms_body,
+                          ContentType="application/json")
+            payload["churn_arms_key"] = arms_key
+            logger.info("portfolio_optimizer_gate: persisted churn arms s3://%s/%s", bucket, arms_key)
+        except Exception as exc:
+            logger.exception("portfolio_optimizer_gate: churn arms persist FAILED s3://%s/%s",
+                             bucket, arms_key)
+            payload["churn_arms_persist_error"] = f"{type(exc).__name__}: {exc}"
 
     verdict = (gate_result.get("gate_report") or {}).get("verdict")
     logger.info(
