@@ -247,14 +247,14 @@ portfolio_optimizer_tuner:
   promote_margin: 0.15           # winner must beat baseline Sortino by 15%+ to write live
 
 # ── Optimizer gate: prior-book basis shadow (alpha-engine-config-I11507) ─────
-# The gate and every sweep score the optimizer rebuilding the book from cash at
-# each rebalance. The carried basis starts each solve from the previous target
-# drifted by realised returns, with held names kept in the universe, as live
-# trading does. It runs beside the gate on the same inputs and writes
+# The gate and every sweep score the carried book: each solve starts from the
+# previous target drifted by realised returns, with held names kept in the
+# universe, as live trading does. The retired all-cash basis (a rebuild from
+# cash at every rebalance) runs beside the gate on the same inputs and writes
 # predictor/optimizer_gate/[production/]shadow_<basis>/{run_date}.json, never
 # latest.json. null disables it.
 portfolio_optimizer_gate:
-  shadow_w_prev_basis: carried_drifted
+  shadow_w_prev_basis: all_cash_each_rebalance
 
 # ── Stance-sizing optimizer (L300) ───────────────────────────────────────────
 # Offline-IC gate for the stance_size_* multipliers (replaces the inert

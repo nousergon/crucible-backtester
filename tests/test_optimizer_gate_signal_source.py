@@ -135,12 +135,12 @@ class TestWrapperPersistenceNamespace:
 
 
 class TestCarriedBasisShadow:
-    """alpha-engine-config-I11507: the carried-book basis runs beside the
+    """alpha-engine-config-I11507: the retired all-cash basis runs beside the
     gate on the same inputs and never reaches latest.json."""
 
     @patch("analysis.portfolio_optimizer_backtest.run_optimizer_backtest")
     @patch("synthetic.predictor_backtest.run")
-    def test_shadow_runs_the_carried_basis_by_default(self, mock_synth, mock_opt, cfg):
+    def test_shadow_runs_the_all_cash_basis_by_default(self, mock_synth, mock_opt, cfg):
         mock_synth.return_value = {
             "status": "ok", "predictions_by_date": {"2026-01-05": {"AAPL": 0.1}},
             "price_matrix": MagicMock(), "spy_prices": MagicMock(), "sector_map": {},
@@ -148,9 +148,9 @@ class TestCarriedBasisShadow:
         mock_opt.return_value = _opt_result()
         out = run_gate_against_predictor_backtest(cfg)
         bases = [c.kwargs.get("w_prev_basis") for c in mock_opt.call_args_list]
-        assert bases == [None, "carried_drifted"]
+        assert bases == [None, "all_cash_each_rebalance"]
         assert out["shadow"]["status"] == "ok"
-        assert out["shadow"]["w_prev_basis"] == "carried_drifted"
+        assert out["shadow"]["w_prev_basis"] == "all_cash_each_rebalance"
         assert "gate_report" in out["shadow"]
 
     @patch("analysis.portfolio_optimizer_backtest.run_optimizer_backtest")

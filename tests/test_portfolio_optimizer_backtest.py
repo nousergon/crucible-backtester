@@ -927,7 +927,7 @@ class TestForcedTurnoverSummary:
              "forced_turnover_by_cause": {"cash_sleeve_pin": 0.05, "renormalization": 0.05}},
             {"status": "skipped_insufficient_history"},
         ]
-        out = summarize_forced_turnover(rows)
+        out = summarize_forced_turnover(rows, w_prev_basis="all_cash_each_rebalance")
         assert out["forced_turnover_n_rebalances"] == 2
         assert out["forced_turnover_share_over_budget"] == pytest.approx(0.5)
         assert out["forced_turnover_max"] == pytest.approx(0.97)
@@ -965,6 +965,7 @@ def test_from_cash_rebalance_forces_one_minus_sleeve():
         rebalance_freq_days=5,
         universe_cap=10,
         optimizer_cfg={"cash_sleeve_pct": 0.03},
+        w_prev_basis="all_cash_each_rebalance",
     )
     m = result.metrics
     assert m["forced_turnover_n_rebalances"] == result.n_rebalances
@@ -1102,6 +1103,9 @@ def test_optimizer_run_sells_names_that_leave_the_universe():
         executor_path=_ALPHA_ENGINE_PATH,
         rebalance_freq_days=5,
         universe_cap=3,
+        # Pins the zero-fill mechanism: on the carried basis the old names stay
+        # in the solve and are sold down under the turnover budget instead.
+        w_prev_basis="all_cash_each_rebalance",
     )
     tw = result.target_weights
     rebal_rows = tw.dropna(how="all")
@@ -1260,3 +1264,12 @@ def test_carried_basis_lets_the_turnover_budget_bind():
     assert m["carry_n_rebalances"] == len(solved)
     assert m["held_weight_not_carried_max"] == 0.0
     assert m["stale_holding_weight_max"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_default_basis_is_the_carried_book():
+    """alpha-engine-config-I11507 (flipped 2026-10-17): every caller that does
+    not name a basis, the gate and all sweeps included, scores the carried book."""
+    from analysis.portfolio_optimizer_backtest import W_PREV_BASIS, summarize_forced_turnover
+
+    assert W_PREV_BASIS == "carried_drifted"
+    assert summarize_forced_turnover([])["w_prev_basis"] == "carried_drifted"
