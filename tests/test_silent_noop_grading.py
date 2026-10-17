@@ -190,3 +190,64 @@ def test_attestation_and_self_test_emit_no_spy_warning(caplog):
               "shares": 1, "price_at_order": 10.}],
         )
     assert "spy_prices not provided" not in caplog.text
+
+
+# ── a module that returned nothing did nothing (I11506) ───────────────────
+
+
+@pytest.mark.parametrize("output", [None, {}, [], ""])
+def test_empty_output_is_graded_degraded_not_ok(output):
+    """``None`` / ``{}`` / ``[]`` used to grade ``[OK]``; a None was handed
+    back to the caller as a fabricated ``{"status": "ok"}``."""
+    tracker = CompletenessTracker()
+    returned = tracker.run_module("m", lambda: output, required_inputs={"x": True})
+    rec = tracker.results[0]
+    assert rec.status == "degraded"
+    assert "module returned no output" in rec.degradation_reason
+    assert returned.get("status") != "ok"
+    # whatever the caller gets back re-grades as degraded too
+    if not isinstance(output, dict):
+        assert grade_self_reported(returned)[0] == "degraded"
+
+
+def test_empty_output_does_not_mask_an_error_or_a_missing_input():
+    tracker = CompletenessTracker()
+    tracker.run_module("m", lambda: None, required_inputs={"x": False})
+    rec = tracker.results[0]
+    assert rec.status == "degraded"
+    assert "ran without: x" in rec.degradation_reason
+    assert "module returned no output" in rec.degradation_reason
+
+
+def test_non_empty_output_is_unchanged():
+    tracker = CompletenessTracker()
+    out = {"status": "ok", "rows": [1]}
+    assert tracker.run_module("m", lambda: out, required_inputs={}) is out
+    assert tracker.results[0].status == "ok"
+
+
+def test_regime_analysis_with_zero_rows_is_not_ok(monkeypatch):
+    """Zero regime buckets reaching min_samples is a measurement of nothing."""
+    import evaluate
+
+    monkeypatch.setattr(evaluate.regime_analysis, "load_with_regime", lambda _p: pd.DataFrame())
+    monkeypatch.setattr(evaluate.regime_analysis, "accuracy_by_regime", lambda _d, min_samples=5: [])
+    tracker = CompletenessTracker()
+    out = tracker.run_module(
+        "regime_analysis", lambda: evaluate._compute_regime({"research_db": "x.db"}),
+        required_inputs={"research_db": True},
+    )
+    assert out["rows"] == []
+    assert tracker.results[0].status == "degraded"
+    assert "insufficient_samples" in tracker.results[0].degradation_reason
+
+    monkeypatch.setattr(
+        evaluate.regime_analysis, "accuracy_by_regime",
+        lambda _d, min_samples=5: [{"regime": "bull", "n": 9}],
+    )
+    tracker = CompletenessTracker()
+    tracker.run_module(
+        "regime_analysis", lambda: evaluate._compute_regime({"research_db": "x.db"}),
+        required_inputs={"research_db": True},
+    )
+    assert tracker.results[0].status == "ok"
