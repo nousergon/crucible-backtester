@@ -81,10 +81,12 @@ _CASH_ALPHA_HINT = -1e-6
 W_PREV_BASIS_ALL_CASH = "all_cash_each_rebalance"
 W_PREV_BASIS_CARRIED = "carried_drifted"
 W_PREV_BASES = (W_PREV_BASIS_ALL_CASH, W_PREV_BASIS_CARRIED)
-#: Default for every caller. Stays all-cash until the one-cycle shadow
-#: (``portfolio_optimizer_gate`` writes the carried basis beside the gate
-#: artifact) has been compared; flipping it moves every sweep and the gate.
-W_PREV_BASIS = W_PREV_BASIS_ALL_CASH
+#: Default for every caller: the gate, the cov/gamma/param sweeps and the
+#: deployed-strategy report. Flipped to carried on 2026-10-17 after the
+#: 10-17 weekly's shadow (10 years, 399 rebalances): forced turnover over
+#: budget 100% -> 0.5%, one-way turnover 31.1 -> 10.3/yr. The all-cash basis
+#: now runs as the gate shadow for one cycle so the old numbers stay readable.
+W_PREV_BASIS = W_PREV_BASIS_CARRIED
 
 
 @dataclass

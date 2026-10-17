@@ -400,13 +400,13 @@ def run_gate_against_predictor_backtest(
 
 def _shadow_w_prev_basis(config: dict) -> str | None:
     """``portfolio_optimizer_gate.shadow_w_prev_basis`` (default
-    ``carried_drifted``; ``null`` disables). alpha-engine-config-I11507: the
-    carried-book basis runs beside the gate on identical inputs for one
-    cycle before it replaces the all-cash basis the gate scores."""
-    from analysis.portfolio_optimizer_backtest import W_PREV_BASIS_CARRIED
+    ``all_cash_each_rebalance``; ``null`` disables). alpha-engine-config-I11507:
+    the gate scores the carried book; the retired all-cash basis runs beside
+    it on identical inputs for one cycle so the change stays readable."""
+    from analysis.portfolio_optimizer_backtest import W_PREV_BASIS_ALL_CASH
 
     section = config.get("portfolio_optimizer_gate") or {}
-    return section.get("shadow_w_prev_basis", W_PREV_BASIS_CARRIED)
+    return section.get("shadow_w_prev_basis", W_PREV_BASIS_ALL_CASH)
 
 
 def _run_shadow_basis(
