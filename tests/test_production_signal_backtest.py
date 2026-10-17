@@ -61,6 +61,34 @@ class TestAlphaOf:
         assert psb._alpha_of({"predicted_alpha": float("inf")}) == 0.0
 
 
+class TestAlphaStdOf:
+    """alpha-engine-config-I12374: mirrors the executor's
+    ``_build_alpha_uncertainty`` rule for ``predicted_alpha_std``."""
+
+    def test_valid(self):
+        assert psb._alpha_std_of({"predicted_alpha_std": 0.098}) == pytest.approx(0.098)
+
+    def test_zero_is_kept(self):
+        assert psb._alpha_std_of({"predicted_alpha_std": 0.0}) == 0.0
+
+    @pytest.mark.parametrize(
+        "pred",
+        [
+            {},
+            {"predicted_alpha_std": None},
+            {"predicted_alpha_std": "junk"},
+            {"predicted_alpha_std": float("nan")},
+            {"predicted_alpha_std": float("inf")},
+            {"predicted_alpha_std": -0.1},
+        ],
+    )
+    def test_unusable_is_none(self, pred):
+        assert psb._alpha_std_of(pred) is None
+
+    def test_epistemic_is_not_substituted(self):
+        assert psb._alpha_std_of({"predicted_alpha_std_epistemic": 0.02}) is None
+
+
 class TestIsIsoDate:
     @pytest.mark.parametrize("tok", ["2026-05-15", "2026-01-01"])
     def test_valid(self, tok):
@@ -174,6 +202,38 @@ def test_happy_path_shape_and_cohort(patched_price_layer):
         "AAPL": pytest.approx(0.03), "NVDA": pytest.approx(0.10),
     }
     assert out["production_window"] == ["2026-05-14", "2026-05-15"]
+
+
+def test_alpha_uncertainty_threaded_from_same_archive(patched_price_layer):
+    """alpha-engine-config-I12374: σ_α̂ comes off the same predictions file as
+    α̂, one entry per cohort date, empty where that file carried no std."""
+    signals = {
+        "2026-05-14": {"universe": [{"ticker": "AAPL"}, {"ticker": "MSFT"}]},
+        "2026-05-15": {"universe": [{"ticker": "AAPL"}]},
+    }
+    preds = {
+        "2026-05-14": {"predictions": [
+            {"ticker": "AAPL", "predicted_alpha": 0.07, "predicted_alpha_std": 0.09,
+             "predicted_alpha_std_epistemic": 0.01},
+            {"ticker": "MSFT", "predicted_alpha": -0.02, "predicted_alpha_std": None},
+        ]},
+        "2026-05-15": {"predictions": [
+            {"ticker": "AAPL", "predicted_alpha": 0.03},
+        ]},
+    }
+    s3 = _fake_s3(
+        ["2026-05-14", "2026-05-15"], ["2026-05-14", "2026-05-15"],
+        signals, preds,
+    )
+    out = psb.build_production_signal_inputs({"signals_bucket": "b"}, s3_client=s3)
+
+    assert out["status"] == "ok"
+    assert out["alpha_uncertainty_by_date"] == {
+        "2026-05-14": {"AAPL": pytest.approx(0.09)},
+        "2026-05-15": {},
+    }
+    assert set(out["alpha_uncertainty_by_date"]) == set(out["predictions_by_date"])
+    assert out["n_dates_with_alpha_std"] == 1
 
 
 def test_only_intersection_of_archives_used(patched_price_layer):

@@ -60,6 +60,26 @@ def test_happy_path_returns_metrics(monkeypatch, tmp_path):
     assert out["risk_matched"]["status"] == "insufficient_data"
 
 
+def test_alpha_uncertainty_reaches_the_optimizer_backtest(monkeypatch, tmp_path):
+    """alpha-engine-config-I12374: the headline backtest passes the archive's
+    predicted_alpha_std so the simulated conviction gate evaluates."""
+    sigma = {"2026-06-12": {"AAA": 0.05}}
+    _patch_inputs(monkeypatch, alpha_uncertainty_by_date=sigma, n_dates_with_alpha_std=1)
+    seen: dict = {}
+
+    def _fake_run(**kw):
+        seen.update(kw)
+        return _FakeOpt()
+
+    monkeypatch.setattr(
+        "analysis.portfolio_optimizer_backtest.run_optimizer_backtest", _fake_run,
+    )
+    out = B.run_production_strategy_backtest({"executor_paths": [str(tmp_path)]})
+    assert out["status"] == "ok"
+    assert seen["alpha_uncertainty_by_date"] == sigma
+    assert out["n_dates_with_alpha_std"] == 1
+
+
 class TestComputeRiskMatchedHeadline:
     """config#1053 part 2 — beta-matched SPY risk-matched headline."""
 
