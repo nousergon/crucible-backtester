@@ -572,6 +572,14 @@ def _compute_regime(config: dict) -> dict:
         return {"status": "skipped", "rows": []}
     df_regime = regime_analysis.load_with_regime(db_path)
     rows = regime_analysis.accuracy_by_regime(df_regime, min_samples=min_samples)
+    if not rows:
+        # Zero regime buckets cleared min_samples: nothing was measured, so
+        # this is not an ok verdict (alpha-engine-config-I11506).
+        return {
+            "status": "insufficient_samples",
+            "reason": f"no regime bucket reached min_samples={min_samples}",
+            "rows": [],
+        }
     return {"status": "ok", "rows": rows}
 
 
