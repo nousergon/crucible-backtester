@@ -82,6 +82,9 @@ export HOME="${HOME:-/home/ec2-user}"
 # OUTPUT_BUCKET) now lives in config.yaml — already staged to S3 and fetched
 # by the spot — so no .env is staged, fetched, or sourced anywhere below.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Execution code pin for the worker's checkouts (alpha-engine-config-I11570);
+# the same helper _spot_common.sh sources.
+source "$SCRIPT_DIR/_exec_code_pin_render.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -1051,6 +1054,10 @@ run_ssm() {
 # split, so the paths are reproduced EXACTLY. URLs are the new slugs as
 # launcher-side literals rather than a rename/transfer 301 redirect.
 echo "==> Bootstrapping spot (SSM watchdog, hard timeout, python, 3 clones, configs)..."
+exec_code_pin_render_args \
+    /home/ec2-user/alpha-engine-backtester \
+    /home/ec2-user/alpha-engine \
+    /home/ec2-user/alpha-engine-predictor || exit 1
 BOOTSTRAP_SCRIPT="$("$LIB_PYTHON" -m krepis.spot_bootstrap render \
     --repo-url "https://github.com/nousergon/crucible-backtester.git" \
     --checkout /home/ec2-user/alpha-engine-backtester \
@@ -1062,7 +1069,8 @@ BOOTSTRAP_SCRIPT="$("$LIB_PYTHON" -m krepis.spot_bootstrap render \
     --extra-clone "/home/ec2-user/alpha-engine-predictor=https://github.com/nousergon/crucible-predictor.git@${BRANCH:-main}" \
     --config-copy "config.yaml:/home/ec2-user/alpha-engine-backtester/config.yaml" \
     --config-copy "risk.yaml:/home/ec2-user/alpha-engine/config/risk.yaml" \
-    --config-copy-if "${STAGED_PREDICTOR_CONFIG}:predictor.yaml:/home/ec2-user/alpha-engine-predictor/config/predictor.yaml")"
+    --config-copy-if "${STAGED_PREDICTOR_CONFIG}:predictor.yaml:/home/ec2-user/alpha-engine-predictor/config/predictor.yaml" \
+    ${EXEC_PIN_RENDER_ARGS[@]+"${EXEC_PIN_RENDER_ARGS[@]}"})"
 # Here-STRING, not a pipe: `run_ssm` records LAST_SSM_DESC for the EXIT trap's
 # "last run_ssm" diagnostic, and a pipeline would run it in a subshell where
 # that assignment dies with the subshell.
