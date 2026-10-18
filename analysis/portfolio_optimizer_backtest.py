@@ -286,6 +286,13 @@ def run_optimizer_backtest(
             # alpha-engine-config-I11507: the one-way turnover the solver's
             # pins FORCE before alpha is consulted, and what forced it.
             **_forced_turnover_fields(result.diagnostics),
+            # alpha-engine-config-I12374: the simulated conviction gate's
+            # state, so a run can show it evaluated (sigma present) rather
+            # than sat OFF on ``no_alpha_uncertainty_vector``.
+            "conviction_gate_reason": result.diagnostics.get("conviction_gate_reason"),
+            "conviction_budget_multiplier": result.diagnostics.get(
+                "conviction_budget_multiplier"
+            ),
             **({"carry": carry_diag} if carry else {}),
         })
 
@@ -316,6 +323,10 @@ def run_optimizer_backtest(
     metrics["n_unfillable_exits"] = n_unfillable_exits
     metrics["n_rebalances"] = len(rebalance_dates)
     metrics["n_solver_failures"] = n_solver_failures
+    metrics["n_rebalances_conviction_gate_evaluated"] = sum(
+        1 for d in diagnostics
+        if d.get("conviction_gate_reason") in _CONVICTION_GATE_EVALUATED_REASONS
+    )
     metrics.update(summarize_forced_turnover(diagnostics, w_prev_basis=w_prev_basis))
     if carry:
         metrics.update(_summarize_carry(diagnostics))
@@ -340,6 +351,16 @@ def run_optimizer_backtest(
 
 class _InsufficientHistoryError(Exception):
     pass
+
+
+#: ``conviction_gate_reason`` values for which the executor's conviction gate
+#: actually computed its IR statistic (crucible-executor
+#: ``compute_conviction_budget_multiplier``). Every other reason is the gate
+#: OFF or inevaluable — e.g. ``no_alpha_uncertainty_vector`` when the caller
+#: passed no sigma (alpha-engine-config-I12374).
+_CONVICTION_GATE_EVALUATED_REASONS = frozenset(
+    {"signal_quality_ok", "alpha_spread_below_own_noise"}
+)
 
 
 # ── Forced turnover (alpha-engine-config-I11507) ────────────────────────────

@@ -189,3 +189,38 @@ class TestTrialCountAccumulator:
             "trial-count increment failed" in record.message
             for record in caplog.records
         )
+
+
+class TestAlphaUncertaintyThreaded:
+    """alpha-engine-config-I12374: every sweep cell runs with the archive's
+    predicted_alpha_std, so the simulated conviction gate is live."""
+
+    def test_sweep_receives_alpha_uncertainty(
+        self, stub_config, stub_inputs, stub_sweep_report
+    ):
+        from backtest import run_optimizer_param_sweep_stage
+
+        sigma = {"2026-05-27": {"AAPL": 0.08}}
+        inputs = {**stub_inputs, "alpha_uncertainty_by_date": sigma,
+                  "n_dates_with_alpha_std": 1}
+        with patch(
+            "synthetic.production_signal_backtest.build_production_signal_inputs",
+            return_value=inputs,
+        ), patch(
+            "analysis.portfolio_optimizer_backtest.run_optimizer_param_sweep",
+            return_value=stub_sweep_report,
+        ) as sweep, patch(
+            "optimizer.portfolio_optimizer_optimizer.recommend",
+            return_value={"status": "ok"},
+        ), patch(
+            "optimizer.portfolio_optimizer_optimizer.apply",
+            return_value={"applied": False},
+        ), patch(
+            "nousergon_lib.quant.stats.trial_accumulator.increment_trial_count",
+        ):
+            payload = run_optimizer_param_sweep_stage(
+                config=stub_config, run_date="2026-05-27", s3_client=MagicMock(),
+            )
+
+        assert sweep.call_args.kwargs["alpha_uncertainty_by_date"] == sigma
+        assert payload["n_dates_with_alpha_std"] == 1
