@@ -49,6 +49,12 @@ _STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 # mirrored from nousergon-data (alpha-engine-config-I11573).
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_spot_relaunch.sh"
 
+# A worker checks out the SF execution's code SHA for each checkout the launcher
+# has a pin for, instead of the branch tip at worker launch — so a relaunch or a
+# re-issued stage re-runs the same code (alpha-engine-config-I11570). Shared
+# with spot_backtest.sh, which cannot source this file.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_exec_code_pin_render.sh"
+
 # ── Unconditional global defaults ────────────────────────────────────────────
 # Every var a downstream function reads is initialized HERE, unconditionally,
 # regardless of which flags the caller later parses or which code path runs.
@@ -983,6 +989,10 @@ run_ssm() {
 # on an existing directory.
 spot_common_bootstrap() {
     echo "==> Bootstrapping spot (SSM watchdog, hard timeout, python, 3 clones, configs)..."
+    exec_code_pin_render_args \
+        /home/ec2-user/alpha-engine-backtester \
+        /home/ec2-user/alpha-engine \
+        /home/ec2-user/alpha-engine-predictor || return 1
     local _script
     _script="$("$LIB_PYTHON" -m krepis.spot_bootstrap render \
         --repo-url "https://github.com/nousergon/crucible-backtester.git" \
@@ -995,7 +1005,8 @@ spot_common_bootstrap() {
         --extra-clone "/home/ec2-user/alpha-engine-predictor=https://github.com/nousergon/crucible-predictor.git@${BRANCH:-main}" \
         --config-copy "config.yaml:/home/ec2-user/alpha-engine-backtester/config.yaml" \
         --config-copy "risk.yaml:/home/ec2-user/alpha-engine/config/risk.yaml" \
-        --config-copy-if "${STAGED_PREDICTOR_CONFIG}:predictor.yaml:/home/ec2-user/alpha-engine-predictor/config/predictor.yaml")"
+        --config-copy-if "${STAGED_PREDICTOR_CONFIG}:predictor.yaml:/home/ec2-user/alpha-engine-predictor/config/predictor.yaml" \
+        ${EXEC_PIN_RENDER_ARGS[@]+"${EXEC_PIN_RENDER_ARGS[@]}"})"
     # Here-STRING, not a pipe: `run_ssm` records LAST_SSM_DESC for the EXIT
     # trap's "last run_ssm" diagnostic, and a pipeline would run it in a
     # subshell where that assignment dies with the subshell.
