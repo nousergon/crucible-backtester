@@ -79,6 +79,25 @@ Both arms are priced and sized by the harness's own equal-weight sizing
 (``picks_to_orders``) at the SAME cost model, so the only degree of freedom
 between the two arms is which names populate the top-N.
 
+A window in which the gate NEVER binds is N/A, not a 0.0 measurement
+(alpha-engine-config-I12390). ``gbm_veto`` fires on "predicted DOWN + high
+confidence", so a vetoed name carries a negative ``predicted_alpha`` and ranks
+below every non-vetoed UP name. Whenever at least ``width`` non-vetoed names
+outrank every vetoed one, the two top-N rankings are the same list and the
+cycle's paired difference is exactly 0 by construction. If that holds on EVERY
+cycle, the arms are identical end to end and the harness would report
+``value=0.0, CI [0, 0]``, status ``ok`` — a zero-width interval read against a
+``red_line`` of 0.0 as a precise RED finding about the gate, when no cycle
+could have shown anything else. Measured on backtest/2026-10-16: 89 cycles,
+371 vetoed name-dates on 50 of them, every one with ``predicted_alpha < 0``,
+the best-ranked vetoed name at least one place below the width on every
+cycle, 0 cycles where the arms differed. That is the same "provable no-op
+rather than a measurement" the ``macro_agent`` and ``cost_adjusted_quality``
+replays already return as ``N/A-MISSING-INPUT``; this replay now does too,
+naming the counts. A window where the veto binds on at least one cycle is
+measured as before, and the non-binding cycles in it stay in both arms as the
+honest zeros they are.
+
 ``trades_db_path`` is required only to read the live width N — not to price
 or size anything (the harness's picks_arm/picks_to_orders path handles
 that identically for both arms via ``ReplayInputs.price_matrix``). Absent
@@ -229,6 +248,9 @@ def build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
 
     baseline_cycles: list[dict] = []
     ablated_cycles: list[dict] = []
+    n_binding_cycles = 0
+    n_vetoed_name_dates = 0
+    n_cycles_with_a_veto = 0
     for date in inputs.dates:
         n_live = live_counts.get(date)
         if not n_live:
@@ -260,6 +282,10 @@ def build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
                 continue
         baseline_cycles.append({"date": date, "picks": baseline_picks})
         ablated_cycles.append({"date": date, "picks": ablated_picks})
+        n_vetoed = len(candidates) - len(non_vetoed)
+        n_vetoed_name_dates += n_vetoed
+        n_cycles_with_a_veto += n_vetoed > 0
+        n_binding_cycles += baseline_picks != ablated_picks
 
     if not baseline_cycles:
         return NotAvailable(
@@ -268,6 +294,22 @@ def build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
                 "no cycle in the replay window has both a live executed ENTER "
                 "count and at least one predictor candidate with a scored "
                 f"predicted_alpha — nothing to rank ({ISSUE})"
+            ),
+        )
+
+    if n_binding_cycles == 0:
+        return NotAvailable(
+            status="N/A-MISSING-INPUT",
+            reason=(
+                f"gbm_veto never changed the top-N on any of the "
+                f"{len(baseline_cycles)} replayable cycle(s): "
+                f"{n_vetoed_name_dates} vetoed name-date(s) on "
+                f"{n_cycles_with_a_veto} cycle(s), none ranked inside the "
+                "live width by predicted_alpha, so the baseline and ablated "
+                "arms are identical on every cycle and the lift would be a "
+                "trivial 0.0 with a zero-width CI — the ablation is a "
+                "provable no-op rather than a measurement "
+                f"(alpha-engine-config-I12390, {ISSUE})"
             ),
         )
 
