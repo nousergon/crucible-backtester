@@ -255,7 +255,12 @@ psutil>=7.2.2
 # floor, `krepis.dates` silently misclassifies every pre-2025 US market
 # holiday as a trading day; at/above it, a date before 2016-01-01 instead
 # raises `TradingCalendarPrecedesCoverageError` rather than guessing.
-krepis[openai]>=0.59.53  # floor raised for alpha-engine-config-I10141 (was >=0.59.39) — NYSE trading-calendar coverage/precedes-coverage fix, krepis-PR206
+# Raised to >=0.59.77 (alpha-engine-config-I12312): replay/runner.py passes
+# `LLMClient(trace_capture=)`, which krepis-PR247 added in 0.59.74; below it
+# the keyword is a TypeError on every replay call. 0.59.77 also carries
+# krepis-PR250, which nulls `error.message` under `hash_only` (an exception's
+# text can quote the prompt or output), the level replay declares.
+krepis[openai]>=0.59.77  # floor raised for alpha-engine-config-I12312 (was >=0.59.53, alpha-engine-config-I10141; was >=0.59.39) — NYSE trading-calendar coverage/precedes-coverage fix, krepis-PR206
 # Raised to >=0.59.23 (alpha-engine-config-I7925, krepis-PR175): the first
 # published krepis carrying `krepis.aws remove-lambda-env`, the removal
 # counterpart to merge-lambda-env — deploy_concordance.sh / deploy_

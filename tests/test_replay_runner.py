@@ -35,6 +35,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
 
@@ -936,3 +938,92 @@ class TestRoutedPathIsHermetic:
         # Absence stays absence: an empty dict, not a zero-filled one that
         # would read as a measured zero on the cost surface.
         assert _usage_dict_from_llm_usage(None) == {}
+
+
+# ── declared trace capture (ruling C, alpha-engine-config-I12312) ──────────
+#
+# Brian ruled 2026-10-18 that replay is `hash_only` until a vendor-terms check
+# clears the news/filings excerpts its prompts carry for `full`. The call site
+# passes the level explicitly instead of leaving it to krepis's environment
+# default (which is `full`), and passes `off` where no sink is configured.
+
+_SINK_ENV = {
+    "KREPIS_TRACE_SINK_BUCKET": "alpha-engine-research",
+    "KREPIS_TRACE_SINK_PREFIX": "llm_traces/v1",
+}
+
+
+@pytest.fixture
+def no_trace_env(monkeypatch):
+    for name in (*_SINK_ENV, "KREPIS_TRACE_CAPTURE"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def memory_trace_sink(monkeypatch, no_trace_env):
+    """Route krepis's process-default trace sink to memory. LLMClient, its
+    trace_capture handling and build_trace_record all run for real."""
+    from krepis import trace_sink as ts
+
+    sink = ts.InMemoryTraceSink()
+    monkeypatch.setattr(ts, "default_trace_sink_from_env", lambda *, s3_client=None: sink)
+    for name, value in _SINK_ENV.items():
+        monkeypatch.setenv(name, value)
+    return sink
+
+
+def _replay_once():
+    from nousergon_lib.agent_schemas import QuantAnalystOutput
+    from replay.runner import replay_artifact
+
+    artifact = _make_captured_artifact()
+    s3 = _make_s3_stub(artifact)
+    factory, _ = _make_krepis_factory(
+        content=json.dumps(QuantAnalystOutput(ranked_picks=[]).model_dump()),
+    )
+    return replay_artifact(
+        artifact_key="k.json",
+        target_model="deepseek-v4-flash",
+        s3_client=s3, client_factory=factory,
+    )
+
+
+class TestDeclaredTraceCapture:
+    def test_replay_declares_hash_only(self):
+        from replay import runner
+
+        assert runner.REPLAY_TRACE_CAPTURE == "hash_only"
+
+    def test_sink_env_names_match_krepis(self):
+        from krepis import trace_sink as ts
+
+        from replay import runner
+
+        assert runner.TRACE_SINK_ENV_VARS == (ts.BUCKET_ENV_VAR, ts.PREFIX_ENV_VAR)
+
+    def test_no_sink_configured_passes_off_and_replays(self, no_trace_env):
+        from replay import runner
+
+        assert runner.replay_trace_capture() == "off"
+        assert _replay_once().replay_error is None
+
+    def test_a_configured_sink_writes_a_hash_only_row_with_no_bodies(
+        self, memory_trace_sink
+    ):
+        from replay import runner
+
+        assert runner.replay_trace_capture() == "hash_only"
+        replay = _replay_once()
+        assert replay.replay_error is None, replay.replay_error
+        assert len(memory_trace_sink.rows) == 1
+        assert memory_trace_sink.rows[0]["krepis"]["content"]["capture"] == "hash_only"
+        assert memory_trace_sink.blobs == {}, "hash_only must store no prompt/output body"
+
+    def test_an_env_full_cannot_raise_the_declared_level(
+        self, memory_trace_sink, monkeypatch
+    ):
+        monkeypatch.setenv("KREPIS_TRACE_CAPTURE", "full")
+        assert _replay_once().replay_error is None
+        assert len(memory_trace_sink.rows) == 1
+        assert memory_trace_sink.rows[0]["krepis"]["content"]["capture"] == "hash_only"
+        assert memory_trace_sink.blobs == {}
