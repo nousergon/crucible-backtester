@@ -320,6 +320,38 @@ def _build_messages(system_prompt: str, user_prompt: str) -> list[dict]:
 #: not "fix" a router outage by widening what this context admits.
 REPLAY_EXEC_CONTEXT = os.environ.get("KREPIS_EXEC_CONTEXT", "lambda")
 
+#: The ``llm_trace.v1`` capture level the replay call sites DECLARE
+#: (``replay-concordance`` and ``replay-batch-concordance``, which delegates
+#: here). Brian's ruling C on alpha-engine-config-I12312 (2026-10-18):
+#: ``hash_only`` — hashes, offsets, usage, route and timing, no prompt or
+#: output bodies — because a replayed prompt carries news and filings
+#: excerpts, and whether those vendors' terms allow storing derived excerpts
+#: is unverified. The ruling promotes replay to ``full`` once a one-line
+#: vendor-terms check confirms they may be stored. It must match the
+#: ``trace_capture`` field of both LLM_CALLSITE_REGISTRY rows.
+#:
+#: Passed explicitly rather than left to krepis's default, which traces at
+#: ``full`` as soon as a ``KREPIS_TRACE_SINK_*`` env reaches this process.
+REPLAY_TRACE_CAPTURE = "hash_only"
+
+#: The env pair krepis's process-default trace sink reads
+#: (``krepis.trace_sink.BUCKET_ENV_VAR`` / ``PREFIX_ENV_VAR``).
+TRACE_SINK_ENV_VARS = ("KREPIS_TRACE_SINK_BUCKET", "KREPIS_TRACE_SINK_PREFIX")
+
+
+def replay_trace_capture() -> str:
+    """The ``trace_capture=`` a replay ``LLMClient`` is constructed with.
+
+    :data:`REPLAY_TRACE_CAPTURE` when a trace sink is configured on the
+    process, ``off`` when none is: krepis refuses, at construction, a
+    declared level that writes nowhere, and the replay Lambda has no trace
+    env today. A HALF-configured env is not masked: krepis's own env check
+    raises on it, and the invocation's existing error path records it.
+    """
+    if any(os.environ.get(name, "").strip() for name in TRACE_SINK_ENV_VARS):
+        return REPLAY_TRACE_CAPTURE
+    return "off"
+
 
 def resolve_target_spec(
     target_model: str,
@@ -435,6 +467,9 @@ def _invoke_target_with_schema(
         client = LLMClient(
             spec,
             callsite_id="replay-concordance",
+            # Declared `hash_only` (ruling C, alpha-engine-config-I12312), or
+            # `off` when no trace sink is configured. See replay_trace_capture.
+            trace_capture=replay_trace_capture(),
             client_factory=client_factory,
         )
         result = client.structured(

@@ -253,6 +253,17 @@ def handler(event: dict, context) -> dict:
             # (floor is >=0.59.8). Cost records for this run are lost, and
             # AggregateCosts' fan-in coverage check will say so by name.
             logger.error("cost-sink flush unavailable — records lost: %s", exc)
+        # The `llm_trace.v1` sink's twin of the flush above, for the same
+        # frozen-container reason (alpha-engine-config-I12312). Returns 0 and
+        # writes nothing unless KREPIS_TRACE_SINK_BUCKET/PREFIX are set on
+        # the process; never raises.
+        try:
+            from krepis.trace_sink import flush_default_trace_sink
+            _n = flush_default_trace_sink()
+            if _n:
+                logger.info("[lambda_concordance] trace sink flushed: %d object(s)", _n)
+        except ImportError as exc:
+            logger.error("trace-sink flush unavailable — trace rows lost: %s", exc)
 
 
 def _run(event: dict, context) -> dict:
