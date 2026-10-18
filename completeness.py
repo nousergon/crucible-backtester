@@ -89,6 +89,23 @@ def grade_self_reported(output: Any) -> tuple[str | None, str | None]:
     return grade, reason
 
 
+#: Status handed back to the caller for a module that returned ``None`` (or
+#: another empty non-dict). Matches ``_NO_INPUT_PREFIXES`` so anything that
+#: re-grades the returned dict reads it as degraded too.
+NO_OUTPUT_STATUS = "no_output"
+
+
+def _is_empty_output(output: Any) -> bool:
+    """True when a module returned nothing to grade: ``None``, or an empty
+    dict / list / tuple / string. A non-empty non-dict (e.g. a row list) is
+    output and is left alone."""
+    if output is None:
+        return True
+    if isinstance(output, (dict, list, tuple, set, str, bytes)):
+        return len(output) == 0
+    return False
+
+
 class CompletenessTracker:
     """Tracks completeness across all evaluation modules."""
 
@@ -168,17 +185,31 @@ class CompletenessTracker:
                 reasons.append(self_reason)
                 if self_grade == "error" or status == "ok":
                     status = self_grade
+            # A module that returned NOTHING did nothing the grader can see
+            # (alpha-engine-config-I11506). ``None`` / ``{}`` / ``[]`` used to
+            # be graded ``ok`` and — for a non-dict — handed back to the
+            # caller as a fabricated ``{"status": "ok"}``, so a module whose
+            # body silently fell through to an implicit ``return None``
+            # rendered as a pass in completeness.json and the report header.
+            if _is_empty_output(output):
+                reasons.append(f"module returned no output ({type(output).__name__})")
+                if status == "ok":
+                    status = "degraded"
+                if not isinstance(output, dict):
+                    output = {"status": NO_OUTPUT_STATUS,
+                              "reason": "module returned no output"}
+            returned = output if isinstance(output, dict) else {"status": "ok"}
             result = ModuleResult(
                 name=name,
                 status=status,
                 inputs_available=required_inputs,
                 inputs_missing=missing,
                 degradation_reason="; ".join(reasons) or None,
-                result=output if isinstance(output, dict) else {"status": "ok"},
+                result=returned,
                 duration_seconds=round(duration, 2),
             )
             self.record(result)
-            return output if isinstance(output, dict) else {"status": "ok"}
+            return returned
 
         except Exception as e:
             duration = time.time() - t0
