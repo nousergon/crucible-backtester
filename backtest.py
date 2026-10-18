@@ -2823,6 +2823,9 @@ def run_production_strategy_backtest(config: dict, s3_client=None) -> dict:
             spy_prices=inputs["spy_prices"],
             sector_map=inputs["sector_map"],
             executor_path=executor_path,
+            # alpha-engine-config-I12374: the archive's predicted_alpha_std,
+            # so the simulated conviction gate evaluates as it does live.
+            alpha_uncertainty_by_date=inputs.get("alpha_uncertainty_by_date"),
             keep_daily_returns=True,
         )
 
@@ -2845,6 +2848,7 @@ def run_production_strategy_backtest(config: dict, s3_client=None) -> dict:
             "risk_matched": risk_matched,
             "production_window": inputs.get("production_window"),
             "n_production_dates": inputs.get("n_production_dates"),
+            "n_dates_with_alpha_std": inputs.get("n_dates_with_alpha_std"),
             "n_rebalances": opt.n_rebalances,
             "n_solver_failures": opt.n_solver_failures,
         }
@@ -3405,6 +3409,9 @@ def run_optimizer_param_sweep_stage(
         spy_prices=inputs["spy_prices"],
         sector_map=inputs["sector_map"],
         executor_path=executor_path,
+        # alpha-engine-config-I12374: without the archive's sigma every cell
+        # ran with the executor's conviction gate OFF, a book live never builds.
+        alpha_uncertainty_by_date=inputs.get("alpha_uncertainty_by_date"),
     )
 
     bucket = config.get("signals_bucket", "alpha-engine-research")
@@ -3436,6 +3443,7 @@ def run_optimizer_param_sweep_stage(
         "status": "ok",
         "production_window": inputs.get("production_window"),
         "n_production_dates": inputs.get("n_production_dates"),
+        "n_dates_with_alpha_std": inputs.get("n_dates_with_alpha_std"),
         "recommendation": recommendation,
         "apply_result": apply_result,
         "n_trials": n_trials,

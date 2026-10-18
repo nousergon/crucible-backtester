@@ -1357,3 +1357,72 @@ def test_churn_controls_run_daily_on_the_real_kernel(control):
         assert arm["names_traded_one_way_sum"] < base["names_traded_one_way_sum"]
     else:
         assert arm["reversed_share"] <= base["reversed_share"]
+
+
+# ── alpha-engine-config-I12374: the simulated conviction gate is live ──────
+
+
+@pytest.mark.skipif(
+    _ALPHA_ENGINE_MISSING,
+    reason=executor_missing_reason(_ALPHA_ENGINE_PATH),
+)
+class TestConvictionGateInSimulation:
+    """With the archive's predicted_alpha_std threaded in, the executor's
+    conviction gate evaluates on every solve, as it does live. Without it the
+    gate sits OFF on ``no_alpha_uncertainty_vector`` and the backtest measures
+    a book the live system would not build."""
+
+    _TICKERS = ["AAPL", "MSFT", "GOOG", "JNJ", "PG"]
+
+    def _run(self, sigma: float | None):
+        sector_map = {t: "Technology" for t in self._TICKERS}
+        price_matrix = _synthetic_price_matrix(self._TICKERS, n_days=300, seed=0)
+        spy_prices = _synthetic_spy_series(n_days=300, seed=99).reindex(price_matrix.index)
+        predictions = _synthetic_predictions(
+            self._TICKERS, price_matrix.index[260:295], seed=42,
+        )
+        sigma_by_date = None
+        if sigma is not None:
+            sigma_by_date = {
+                d: {t: sigma for t in row} for d, row in predictions.items()
+            }
+        return run_optimizer_backtest(
+            predictions_by_date=predictions,
+            price_matrix=price_matrix,
+            spy_prices=spy_prices,
+            sector_map=sector_map,
+            executor_path=_ALPHA_ENGINE_PATH,
+            rebalance_freq_days=5,
+            universe_cap=10,
+            alpha_uncertainty_by_date=sigma_by_date,
+        )
+
+    @staticmethod
+    def _solved(result):
+        return [d for d in result.diagnostics_per_rebalance if "conviction_gate_reason" in d]
+
+    def test_gate_off_without_sigma(self):
+        result = self._run(sigma=None)
+        solved = self._solved(result)
+        assert solved
+        assert {d["conviction_gate_reason"] for d in solved} == {"no_alpha_uncertainty_vector"}
+        assert result.metrics["n_rebalances_conviction_gate_evaluated"] == 0
+
+    def test_gate_on_with_sigma(self):
+        result = self._run(sigma=0.01)
+        solved = self._solved(result)
+        assert solved
+        for d in solved:
+            assert d["conviction_gate_reason"] in (
+                "signal_quality_ok", "alpha_spread_below_own_noise",
+            ), d
+        assert result.metrics["n_rebalances_conviction_gate_evaluated"] == len(solved)
+
+    def test_noisy_sigma_throttles_the_budget(self):
+        """σ well above the cross-sectional α̂ spread (~0.03) puts the IR below
+        the floor, so the gate scales the discretionary budget down."""
+        result = self._run(sigma=1.0)
+        solved = self._solved(result)
+        assert solved
+        assert all(d["conviction_gate_reason"] == "alpha_spread_below_own_noise" for d in solved)
+        assert all(d["conviction_budget_multiplier"] < 1.0 for d in solved)

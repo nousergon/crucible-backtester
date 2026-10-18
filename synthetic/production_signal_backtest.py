@@ -27,6 +27,9 @@ sourced from the **production archive** instead of the synthetic GBM:
 * α̂ per ticker     = ``predicted_alpha or canonical_predicted_alpha or 0.0``
   (mirrors ``executor.optimizer_shadow._build_alpha_hat`` /
   ``executor.signal_reader.read_predictions``)
+* σ_α̂ per ticker   = ``predicted_alpha_std`` when finite and >= 0, else
+  absent (mirrors ``executor.optimizer_shadow._build_alpha_uncertainty``;
+  the conviction gate's input, alpha-engine-config-I12374)
 
 The downstream ``run_optimizer_backtest`` already drives the *production*
 solver (``executor.portfolio_optimizer.solve_target_weights``), so swapping
@@ -165,6 +168,27 @@ def _alpha_of(pred: dict) -> float:
     return a if math.isfinite(a) else 0.0
 
 
+def _alpha_std_of(pred: dict) -> float | None:
+    """Mirror executor.optimizer_shadow._build_alpha_uncertainty's per-ticker
+    rule for the TOTAL predictive std (``predicted_alpha_std``): a finite
+    value >= 0, else ``None`` (the solver then sees NaN for that name).
+
+    This is the conviction gate's input on the live path. The epistemic
+    vintage (``predicted_alpha_std_epistemic``) is a different number with a
+    different consumer (the GUW penalty) and is never substituted for it
+    (alpha-engine-config-I9446 / I9452)."""
+    import math
+
+    raw = pred.get("predicted_alpha_std")
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v >= 0.0 else None
+
+
 def build_production_signal_inputs(
     config: dict,
     s3_client=None,
@@ -180,10 +204,18 @@ def build_production_signal_inputs(
         max_dates: if set, keep only the most-recent N production dates.
 
     Returns:
-        ``{"status": "ok", "predictions_by_date", "price_matrix",
-        "spy_prices", "sector_map", "signal_source": "production",
-        "n_production_dates", "production_window"}`` on success, or
+        ``{"status": "ok", "predictions_by_date", "alpha_uncertainty_by_date",
+        "price_matrix", "spy_prices", "sector_map", "signal_source":
+        "production", "n_production_dates", "n_dates_with_alpha_std",
+        "production_window"}`` on success, or
         ``{"status": "no_production_data" | "error", ...}``.
+
+    ``alpha_uncertainty_by_date`` is ``{date: {ticker: predicted_alpha_std}}``
+    read off the SAME predictions file as α̂, with one entry for every
+    cohort date (empty where that day's file carried no std). Passing it to
+    ``run_optimizer_backtest`` is what lets the executor's conviction gate
+    evaluate inside the simulation, as it does live; without it every solve
+    reports ``no_alpha_uncertainty_vector`` (alpha-engine-config-I12374).
     """
     bucket = config.get("signals_bucket", "alpha-engine-research")
     s3 = s3_client or boto3.client("s3")
@@ -203,6 +235,7 @@ def build_production_signal_inputs(
         }
 
     predictions_by_date: dict[str, dict[str, float]] = {}
+    alpha_uncertainty_by_date: dict[str, dict[str, float]] = {}
     cohort: set[str] = set()
     for d in dates:
         sig = _load_json(s3, bucket, f"signals/{d}/signals.json")
@@ -220,6 +253,12 @@ def build_production_signal_inputs(
         if row:
             predictions_by_date[d] = row
             cohort.update(row)
+            sigma_row: dict[str, float] = {}
+            for t in row:
+                std = _alpha_std_of(preds.get(t, {}))
+                if std is not None:
+                    sigma_row[t] = std
+            alpha_uncertainty_by_date[d] = sigma_row
 
     if not predictions_by_date:
         return {
@@ -262,19 +301,22 @@ def build_production_signal_inputs(
     sector_map = load_sector_map(predictor_path)
 
     window = (min(predictions_by_date), max(predictions_by_date))
+    n_dates_with_alpha_std = sum(1 for v in alpha_uncertainty_by_date.values() if v)
     logger.info(
         "Production-signal inputs: %d dates (%s → %s), cohort=%d tickers, "
-        "price_matrix=%d×%d",
+        "price_matrix=%d×%d, dates_with_predicted_alpha_std=%d",
         len(predictions_by_date), window[0], window[1], len(cohort),
-        len(price_matrix), len(price_matrix.columns),
+        len(price_matrix), len(price_matrix.columns), n_dates_with_alpha_std,
     )
     return {
         "status": "ok",
         "predictions_by_date": predictions_by_date,
+        "alpha_uncertainty_by_date": alpha_uncertainty_by_date,
         "price_matrix": price_matrix,
         "spy_prices": spy_prices,
         "sector_map": sector_map,
         "signal_source": "production",
         "n_production_dates": len(predictions_by_date),
+        "n_dates_with_alpha_std": n_dates_with_alpha_std,
         "production_window": list(window),
     }
