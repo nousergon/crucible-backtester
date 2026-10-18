@@ -2927,6 +2927,7 @@ def run_portfolio_optimizer_gate(
     # alpha-engine-config-I11507: the carried-book shadow goes to its own
     # sibling key and NEVER into latest.json, the promotion lever.
     shadow = gate_result.pop("shadow", None)
+    churn_arms = gate_result.pop("churn_arms", None)
     payload = {
         "run_date": run_date,
         "signal_source": signal_source,
@@ -2975,6 +2976,24 @@ def run_portfolio_optimizer_gate(
             logger.exception("portfolio_optimizer_gate: shadow persist FAILED s3://%s/%s",
                              bucket, shadow_key)
             payload["shadow_persist_error"] = f"{type(exc).__name__}: {exc}"
+
+    if churn_arms is not None:
+        # Churn-control challenger arms (decision-precedence note 2026-10-15):
+        # observability, never latest.json; a failed PUT is logged, not raised.
+        arms_key = f"{prefix}/churn_arms/{run_date}.json"
+        arms_body = json.dumps(
+            {"run_date": run_date, "signal_source": signal_source, **churn_arms},
+            default=str, indent=2,
+        ).encode("utf-8")
+        try:
+            s3.put_object(Bucket=bucket, Key=arms_key, Body=arms_body,
+                          ContentType="application/json")
+            payload["churn_arms_key"] = arms_key
+            logger.info("portfolio_optimizer_gate: persisted churn arms s3://%s/%s", bucket, arms_key)
+        except Exception as exc:
+            logger.exception("portfolio_optimizer_gate: churn arms persist FAILED s3://%s/%s",
+                             bucket, arms_key)
+            payload["churn_arms_persist_error"] = f"{type(exc).__name__}: {exc}"
 
     verdict = (gate_result.get("gate_report") or {}).get("verdict")
     logger.info(
@@ -5806,6 +5825,30 @@ def _init_pipeline(args: argparse.Namespace, config: dict) -> None:
     )
 
 
+_SIMULATE_STATS_SUFFIX = "/simulate/portfolio_stats.json"
+
+
+def _simulate_stats_key(keys: list[str]) -> str:
+    """The ``portfolio_stats.json`` key among a simulate marker's artifacts.
+
+    The simulate phase records two artifacts: ``portfolio_stats.json`` and,
+    since config-I7616, ``portfolio_daily_returns.parquet``. The marker stores
+    them ``sorted()``, so the parquet always comes first. The auto-skip reload
+    used to take ``keys[0]`` and fed parquet bytes to ``json.loads``:
+    ``UnicodeDecodeError: ... byte 0xd0 in position 7`` on the 2026-09-26
+    weekly retry (alpha-engine-config-I11618). Select by name, as
+    ``_reload_simulation_setup`` does, and fail loud when it is absent.
+    """
+    matches = [k for k in keys if k.endswith(_SIMULATE_STATS_SUFFIX)]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "simulate auto-skip: expected exactly one artifact ending "
+            f"{_SIMULATE_STATS_SUFFIX!r} in the marker, found {len(matches)} "
+            f"(artifact_keys={keys}) — cannot reload portfolio_stats"
+        )
+    return matches[0]
+
+
 def _run_simulation_pipeline(
     args: argparse.Namespace,
     config: dict,
@@ -5939,7 +5982,9 @@ def _run_simulation_pipeline(
                             "simulate auto-skip: marker has no artifact_keys — "
                             "cannot reload portfolio_stats"
                         )
-                    portfolio_stats = load_json(bucket, keys[0], s3_client=s3)
+                    portfolio_stats = load_json(
+                        bucket, _simulate_stats_key(keys), s3_client=s3,
+                    )
                 else:
                     if _sim_setup is None:
                         raise RuntimeError("Simulation setup failed — cannot run simulate")
