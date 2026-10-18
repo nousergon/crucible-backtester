@@ -12,6 +12,7 @@ tests/test_contribution_lift.py's own fixture style).
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 import sys
 import tempfile
@@ -181,9 +182,14 @@ def test_veto_gate_precision_arms_are_count_matched_and_differ_on_the_vetoed_nam
 
 def test_veto_gate_precision_width_caps_at_the_live_enter_count():
     axis = _axis(200)
-    dates = [d.strftime("%Y-%m-%d") for d in axis[:3]]
-    # Live book has only 1 ENTER that day even though 3 non-vetoed candidates exist.
-    enter_rows = [(d, "AAA") for d in dates]
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:4]]
+    # Live book has only 1 ENTER on the first three days even though 3
+    # non-vetoed candidates exist. The fourth day opens 2, so the veto binds
+    # somewhere in the window and the replay is a measurement, not the
+    # all-identical no-op covered below (alpha-engine-config-I12390).
+    enter_rows = [(d, "AAA") for d in dates[:3]] + [
+        (dates[3], "AAA"), (dates[3], "CCC"),
+    ]
     with tempfile.TemporaryDirectory() as td:
         db_path = _make_trades_db(Path(td), enter_rows)
         inputs = _inputs(
@@ -196,6 +202,87 @@ def test_veto_gate_precision_width_caps_at_the_live_enter_count():
 
     assert arms.baseline.picks[0][1] == ("AAA",)
     assert arms.ablated.picks[0][1] == ("AAA",)
+    assert arms.baseline.picks[3][1] == ("AAA", "CCC")
+    assert arms.ablated.picks[3][1] == ("AAA", "BBB")
+
+
+# Shape of the live record (backtest/2026-10-16): gbm_veto fires only on
+# "predicted DOWN + high confidence", so every vetoed name has a negative
+# predicted_alpha and ranks below the non-vetoed UP names that fill the width.
+_PER_TICKER_VETO_BELOW_WIDTH = {
+    "AAA": {"predicted_alpha": 0.05, "gbm_veto": False},
+    "BBB": {"predicted_alpha": 0.03, "gbm_veto": False},
+    "CCC": {"predicted_alpha": -0.01, "gbm_veto": False},
+    "DDD": {"predicted_alpha": -0.04, "gbm_veto": True},
+}
+
+
+def _veto_below_width_inputs(td: str, dates: list[str], axis) -> ReplayInputs:
+    enter_rows = [(d, t) for d in dates for t in ("AAA", "BBB")]
+    db_path = _make_trades_db(Path(td), enter_rows)
+    return _inputs(
+        axis=axis, dates=dates,
+        signals_by_date=_signals(dates, list(_PER_TICKER_VETO_BELOW_WIDTH)),
+        predictions_by_date=_predictions(dates, _PER_TICKER_VETO_BELOW_WIDTH),
+        trades_db_path=db_path,
+    )
+
+
+def test_veto_gate_precision_is_na_when_the_veto_never_binds():
+    """I12390: identical arms on every cycle are a no-op, not a 0.0 lift."""
+    axis = _axis(200)
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:5]]
+    with tempfile.TemporaryDirectory() as td:
+        result = predictor_gates.build_arms(_veto_below_width_inputs(td, dates, axis))
+
+    assert isinstance(result, NotAvailable)
+    assert result.status == "N/A-MISSING-INPUT"
+    assert "never changed the top-N on any of the 5 replayable cycle(s)" in result.reason
+    assert "5 vetoed name-date(s) on 5 cycle(s)" in result.reason
+    assert "provable no-op" in result.reason
+    assert "I12390" in result.reason
+
+
+def test_run_spec_reports_na_not_a_zero_width_zero_when_the_veto_never_binds(
+    monkeypatch,
+):
+    """The degenerate read the Director flagged: value 0.0, CI [0, 0], ok."""
+    axis = _axis(200)
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:60]]
+
+    def _never_called(*_a, **_k):
+        raise AssertionError("an inert ablation must not be simulated")
+
+    monkeypatch.setattr(harness, "simulate_arm", _never_called)
+    with tempfile.TemporaryDirectory() as td:
+        component = harness.run_spec(
+            predictor_gates.SPEC, _veto_below_width_inputs(td, dates, axis), n_trials=1
+        )
+
+    assert component["status"] == "N/A-MISSING-INPUT"
+    assert component["value"] is None
+    assert component["ci_low"] is None and component["ci_high"] is None
+
+
+def test_veto_gate_precision_still_measures_when_the_veto_binds_on_one_cycle():
+    """One binding cycle is enough; the non-binding ones stay as honest zeros."""
+    axis = _axis(200)
+    dates = [d.strftime("%Y-%m-%d") for d in axis[:5]]
+    binding = dict(_PER_TICKER_VETO_BELOW_WIDTH)
+    binding["DDD"] = {"predicted_alpha": 0.04, "gbm_veto": True}
+    predictions = _predictions(dates, _PER_TICKER_VETO_BELOW_WIDTH)
+    predictions[dates[2]] = dict(binding)
+    with tempfile.TemporaryDirectory() as td:
+        inputs = _veto_below_width_inputs(td, dates, axis)
+        inputs = dataclasses.replace(inputs, predictions_by_date=predictions)
+        arms = predictor_gates.build_arms(inputs)
+
+    assert isinstance(arms, harness.ArmSet)
+    assert len(arms.baseline.picks) == len(arms.ablated.picks) == 5
+    differing = [
+        b[0] for b, a in zip(arms.baseline.picks, arms.ablated.picks) if b[1] != a[1]
+    ]
+    assert differing == [dates[2]]
 
 
 def test_veto_gate_precision_measures_a_lift_end_to_end(monkeypatch):
