@@ -260,7 +260,7 @@ psutil>=7.2.2
 # the keyword is a TypeError on every replay call. 0.59.77 also carries
 # krepis-PR250, which nulls `error.message` under `hash_only` (an exception's
 # text can quote the prompt or output), the level replay declares.
-krepis[openai]>=0.59.77  # floor raised for alpha-engine-config-I12312 (was >=0.59.53, alpha-engine-config-I10141; was >=0.59.39) — NYSE trading-calendar coverage/precedes-coverage fix, krepis-PR206
+krepis[openai]>=0.59.78  # floor raised for alpha-engine-config-I12351 (krepis-PR252: stage-coverage verdicts and RSS rows of a rehearsal RUN_TOKEN stay in its namespace; was >=0.59.77 for alpha-engine-config-I12312, was >=0.59.53, alpha-engine-config-I10141; was >=0.59.39) — NYSE trading-calendar coverage/precedes-coverage fix, krepis-PR206
 # Raised to >=0.59.23 (alpha-engine-config-I7925, krepis-PR175): the first
 # published krepis carrying `krepis.aws remove-lambda-env`, the removal
 # counterpart to merge-lambda-env — deploy_concordance.sh / deploy_

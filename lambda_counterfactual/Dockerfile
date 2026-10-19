@@ -31,11 +31,16 @@ RUN microdnf install -y git && microdnf clean all
 # built against the old floor would emit NOTHING and look exactly like an
 # assertion that found nothing wrong (config-I7334). The floor is the only
 # thing making the assertion measurable in the deployed artifact.
+#
+# Raised >=0.59.4 -> >=0.59.78 (alpha-engine-config-I12351, krepis-PR252):
+# the first krepis whose assert_stage_coverage takes execution_name, which
+# handler.py now passes so a weekly-SF rehearsal's verdict stays in the
+# rehearsal namespace. Older krepis would TypeError on the keyword.
 COPY lambda_counterfactual/requirements-counterfactual.txt requirements-counterfactual.txt
 # Bumped v0.124.99 -> v0.124.115 in lockstep with requirements.txt
 # (alpha-engine-config-I10226, test_lib_pin_lockstep.py requires all
 # four deploy artifacts to carry the SAME nousergon-lib tag).
-RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.165" "krepis>=0.59.4" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.165" "krepis>=0.59.78" && \
     pip install --no-cache-dir -r requirements-counterfactual.txt && \
     rm -rf /root/.cache/pip
 

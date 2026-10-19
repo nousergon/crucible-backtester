@@ -160,8 +160,8 @@ def fake_stage_coverage_module():
     teardown so this fixture cannot leak into other tests."""
     calls = []
 
-    def _assert_stage_coverage(stage, *, run_date, window_start):
-        calls.append({"stage": stage, "run_date": run_date, "window_start": window_start})
+    def _assert_stage_coverage(stage, *, run_date, window_start, **extra):
+        calls.append({"stage": stage, "run_date": run_date, "window_start": window_start, **extra})
         return {"stage": stage, "run_date": run_date, "status": "COVERED"}
 
     fake_mod = types.ModuleType("krepis.stage_coverage")
@@ -195,6 +195,23 @@ class TestModulePresentVerdictLandsInPayload:
         assert "stage_coverage" in result, f"{name}: verdict did not land in the returned payload"
         assert result["stage_coverage"]["stage"] == cfg["sf_stage"]
         assert result["stage_coverage"]["status"] == "COVERED"
+
+    def test_counterfactual_forwards_the_execution_name(self, fake_stage_coverage_module):
+        """alpha-engine-config-I12351: rehearsal-2026-10-16-2 wrote
+        Counterfactual's verdict at the live `_stage_coverage/<date>/` key.
+        The SF's execution_name reaches krepis, which namespaces a rehearsal."""
+        cfg = _HANDLERS["lambda_counterfactual"]
+        mod = _load_handler_module("lambda_counterfactual", cfg["path"])
+        for event, expected in (
+            ({"run_date": "2026-10-15", "execution_name": "rehearsal-2026-10-16-2"},
+             "rehearsal-2026-10-16-2"),
+            ({"run_date": "2026-10-16"}, None),
+        ):
+            fake_stage_coverage_module.clear()
+            with patch.object(mod, "_ensure_init"), \
+                 patch(cfg["compute_target"], return_value=_ok_summary("lambda_counterfactual")):
+                mod.handler(event, context=None)
+            assert fake_stage_coverage_module[0]["execution_name"] == expected
 
     def test_called_with_correct_sf_stage_name(self, handler_case, fake_stage_coverage_module):
         name, mod, cfg = handler_case
@@ -411,3 +428,8 @@ class TestPrimitiveIsActuallyInstalled:
         mod = importlib.import_module("krepis.stage_coverage")
         sig = inspect.signature(mod.assert_stage_coverage)
         sig.bind("ReplayConcordance", run_date="2026-05-09", window_start=None)
+        # alpha-engine-config-I12351: Counterfactual also passes execution_name.
+        sig.bind(
+            "Counterfactual", run_date="2026-05-09", window_start=None,
+            execution_name="rehearsal-2026-10-16-2",
+        )

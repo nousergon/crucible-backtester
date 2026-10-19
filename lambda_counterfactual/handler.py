@@ -282,6 +282,12 @@ def _run(event: dict, context) -> dict:
         result["stage_coverage"] = {
             **assert_stage_coverage(
                 "Counterfactual", run_date=_coverage_run_date, window_start=_started,
+                # alpha-engine-config-I12351: the SF's $$.Execution.Name. A
+                # weekly-SF rehearsal's verdict is recorded under
+                # _stage_coverage/.rehearsal/<exec>/ with no StageCoverage
+                # metric (krepis >= 0.59.78); rehearsal-2026-10-16-2 wrote it
+                # at the live key. Absent or production: unchanged.
+                execution_name=(str(event.get("execution_name") or "").strip() or None),
             ),
             # alpha-engine-config-I10171: which field the partition key came
             # from travels WITH the verdict, into the SF execution history.
