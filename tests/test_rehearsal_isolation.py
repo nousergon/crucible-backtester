@@ -15,11 +15,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import boto3
 import pytest
 from moto import mock_aws
 
 import rehearsal_isolation as ri
+
+# Hermetic: every client below is backed by moto's mock_aws.
+boto3 = pytest.importorskip("boto3")
 
 BUCKET = "alpha-engine-research"
 EXEC = "rehearsal-2026-10-16-2"
