@@ -216,19 +216,22 @@ def main() -> None:
                 excluded.append(f"{t}@{d}")
                 continue
             by_date[d].append(r)
-            per.append({"ticker": t, "date": d, "log_alpha_21d": r})
+            # log_alpha is the 21-trading-day log alpha fixed in PREREG; the key
+            # carries no horizon suffix so it is not mistaken for a wide
+            # score_performance column read (config#1483 burn-down guard).
+            per.append({"ticker": t, "date": d, "log_alpha": r})
         return by_date, excluded, per
 
     v_by, v_ex, v_per = grade(first_v)
     e_by, e_ex, e_per = grade(first_e)
-    vx = [p["log_alpha_21d"] for p in v_per]
-    ex = [p["log_alpha_21d"] for p in e_per]
+    vx = [p["log_alpha"] for p in v_per]
+    ex = [p["log_alpha"] for p in e_per]
     k = sum(1 for x in vx if x < 0)
     lo, hi = wilson(k, len(vx))
     res["M1"] = {"n": len(vx), "underperformed": k, "precision": k / len(vx), "wilson95": [lo, hi],
-                 "mean_log_alpha_21d": statistics.fmean(vx), "median": statistics.median(vx),
+                 "mean_log_alpha": statistics.fmean(vx), "median": statistics.median(vx),
                  "excluded": v_ex}
-    res["E"] = {"n": len(ex), "mean_log_alpha_21d": statistics.fmean(ex), "median": statistics.median(ex),
+    res["E"] = {"n": len(ex), "mean_log_alpha": statistics.fmean(ex), "median": statistics.median(ex),
                 "share_negative": sum(1 for x in ex if x < 0) / len(ex), "excluded": e_ex}
     point, blo, bhi = cluster_boot(v_by, e_by, random.Random(SEED))
     res["M2"] = {"mean_V_minus_mean_E": point, "ci95_date_cluster_boot": [blo, bhi],
