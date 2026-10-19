@@ -16,12 +16,15 @@ import json
 from pathlib import Path
 
 import pytest
-from moto import mock_aws
 
 import rehearsal_isolation as ri
 
-# Hermetic: every client below is backed by moto's mock_aws.
+# Hermetic: every client below is backed by moto's mock_aws. moto is an
+# optional test dep in this repo (see test_backfill_cumulative_trial_count.py);
+# tests/test_rehearsal_isolation_stubbed.py covers the hook without it.
 boto3 = pytest.importorskip("boto3")
+moto = pytest.importorskip("moto")
+mock_aws = moto.mock_aws
 
 BUCKET = "alpha-engine-research"
 EXEC = "rehearsal-2026-10-16-2"
