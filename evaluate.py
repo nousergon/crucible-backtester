@@ -2240,6 +2240,11 @@ def _main_impl() -> None:
     # forced into --freeze before anything below can reach S3.
     from optimizer.run_role import freeze_if_rehearsal
     freeze_if_rehearsal(args, entrypoint="evaluate.py")
+    # A rehearsal must never write ANY live key (alpha-engine-config-I12351):
+    # --freeze stops live config only, so every S3 write this process makes
+    # from here on is re-keyed under rehearsal/<execution>/. Production: no-op.
+    from rehearsal_isolation import activate as _isolate_rehearsal
+    _isolate_rehearsal(entrypoint="evaluate.py")
 
     # DATE_CONVENTIONS: normalize the run-date label to the NYSE trading day so
     # the evaluator reads/writes backtest/{trading_day}/ — aligned with the
