@@ -23,8 +23,10 @@ the sibling PR). Because it touches live trading, the safeguards ARE the feature
     is registered in ``rollback.CONFIG_KEYS``, so ``save_previous`` snapshots the
     prior config before overwrite (one-command revert) AND the weekly regression
     monitor auto-reverts it if next week's portfolio Sortino regresses.
-  - **Kill-switch** — ``portfolio_optimizer_tuner.auto_apply_enabled`` (default
-    True). Off → recommendation is shadow-archived only, live config untouched.
+  - **Kill-switch** — ``portfolio_optimizer_tuner.auto_apply_enabled``, FAIL-SAFE:
+    auto-apply is on only when a config sets it to the boolean ``true``; an absent
+    key (or any non-``true`` value) is OFF. Off → recommendation is shadow-archived
+    only, live config untouched.
   - **Shadow audit** — every recommendation is shadow-archived regardless of
     whether it applies.
   - **Independent live nets** — even an applied config can't bypass the turnover
@@ -82,6 +84,23 @@ _MARGIN_DENOM_FLOOR = 0.05
 
 def _tuner_cfg(config: dict | None) -> dict:
     return (config or {}).get("portfolio_optimizer_tuner", {}) or {}
+
+
+def _auto_apply_enabled(config: dict | None) -> bool:
+    """Kill-switch, fail-safe: True only when ``auto_apply_enabled`` is the
+    boolean ``true``. An absent key (e.g. the experiments/reference config, which
+    ``load_config`` prefers when an alpha-engine-config clone is nearby) or any
+    other value is OFF, so a missing key can never silently enable live writes."""
+    value = _tuner_cfg(config).get("auto_apply_enabled")
+    if value is True:
+        return True
+    if value is None:
+        logger.info(
+            "portfolio-optimizer auto-apply OFF: portfolio_optimizer_tuner."
+            "auto_apply_enabled is absent from the resolved config (set it to true "
+            "explicitly to enable live writes)"
+        )
+    return False
 
 
 def _effective_param_bounds(config: dict | None) -> dict[str, tuple[float, float]]:
@@ -179,12 +198,13 @@ def apply(result: dict, bucket: str, *, config: dict | None = None) -> dict:
     rollback-snapshotted, shadow-audited. Returns ``{"applied": bool, ...}``.
 
     Live write happens only when ``result["status"] == "ok"`` AND
-    ``portfolio_optimizer_tuner.auto_apply_enabled`` (default True). Otherwise the
+    ``portfolio_optimizer_tuner.auto_apply_enabled`` is explicitly ``true`` (an
+    absent key is OFF — fail-safe). Otherwise the
     recommendation is shadow-archived only (audit trail) and live config is
     untouched."""
     status = result.get("status")
     recommended = result.get("recommended_params", {}) or {}
-    auto_apply = bool(_tuner_cfg(config).get("auto_apply_enabled", True))
+    auto_apply = _auto_apply_enabled(config)
 
     if status != "ok" or not recommended:
         return {"applied": False, "reason": f"no promotable recommendation (status={status})"}

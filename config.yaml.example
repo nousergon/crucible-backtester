@@ -240,7 +240,7 @@ executor_optimizer:
 # bands); the winner must beat baseline Sortino by promote_margin AND clear the
 # sweep's risk floors; every apply is rollback-snapshotted + regression-
 # auto-reverted; the turnover governor / drawdown circuit breaker / caps are
-# never auto-tuned. auto_apply_enabled=false → recommendation is shadow-archived
+# never auto-tuned. auto_apply_enabled absent or false → recommendation is shadow-archived
 # only, live config untouched.
 portfolio_optimizer_tuner:
   auto_apply_enabled: true

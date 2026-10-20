@@ -140,6 +140,70 @@ class TestApply:
         assert any(S3_SHADOW_PREFIX in k for k in keys)    # shadow written
         assert S3_PARAMS_KEY not in keys                   # live NOT touched
 
+    @pytest.mark.parametrize("config", [
+        None,
+        {},
+        {"portfolio_optimizer_tuner": {}},
+        {"portfolio_optimizer_tuner": {"risk_aversion_floor": 1.0}},   # reference-config shape
+        {"portfolio_optimizer_tuner": {"auto_apply_enabled": None}},
+        {"portfolio_optimizer_tuner": {"auto_apply_enabled": "false"}},  # non-bool never enables
+    ])
+    @patch("optimizer.portfolio_optimizer_optimizer.boto3")
+    def test_shadow_only_when_key_absent_or_not_true(self, mock_boto3, config):
+        """Fail-safe kill switch: only an explicit boolean true applies live."""
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        with patch("optimizer.rollback.save_previous") as save_prev:
+            out = apply(self._ok_rec(), "bkt", config=config)
+        assert out["applied"] is False
+        assert out["shadow_only"] is True
+        keys = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        assert any(S3_SHADOW_PREFIX in k for k in keys)    # shadow still written
+        assert S3_PARAMS_KEY not in keys                   # live NOT touched
+        save_prev.assert_not_called()
+
+    @patch("optimizer.portfolio_optimizer_optimizer.boto3")
+    def test_absent_key_logs_why_auto_apply_is_off(self, mock_boto3, caplog):
+        mock_boto3.client.return_value = MagicMock()
+        with caplog.at_level("INFO", logger="optimizer.portfolio_optimizer_optimizer"):
+            apply(self._ok_rec(), "bkt", config={"portfolio_optimizer_tuner": {}})
+        assert any("auto-apply OFF" in r.getMessage() and "absent" in r.getMessage()
+                   for r in caplog.records)
+
+    @patch("optimizer.portfolio_optimizer_optimizer.boto3")
+    def test_reference_config_without_key_beats_local_false_but_stays_off(
+            self, mock_boto3, tmp_path, monkeypatch):
+        """Precedence: load_config prefers experiments/reference/... from an
+        alpha-engine-config clone. That file carries no auto_apply_enabled, so the
+        old default-True applied live even though the local config said false."""
+        import yaml
+        import nousergon_lib.config as nlc
+        import pipeline_common
+
+        home = tmp_path / "home"
+        ref = home / "alpha-engine-config" / "experiments" / "reference" / "backtester" / "config.yaml"
+        ref.parent.mkdir(parents=True)
+        ref.write_text(yaml.safe_dump({
+            "signals_bucket": "alpha-engine-research",
+            "portfolio_optimizer_tuner": {"risk_aversion_floor": 1.0},
+        }))
+        local = tmp_path / "local_config.yaml"
+        local.write_text(yaml.safe_dump({
+            "signals_bucket": "alpha-engine-research",
+            "portfolio_optimizer_tuner": {"auto_apply_enabled": False},
+        }))
+        monkeypatch.setattr(nlc, "_config_roots", lambda *a, **k: [home / "alpha-engine-config"])
+        monkeypatch.delenv("ALPHA_ENGINE_EXPERIMENT_ID", raising=False)
+
+        config = pipeline_common.load_config(str(local))
+        assert "auto_apply_enabled" not in config["portfolio_optimizer_tuner"]  # reference won
+
+        s3 = MagicMock()
+        mock_boto3.client.return_value = s3
+        out = apply(self._ok_rec(), "bkt", config=config)
+        assert out["applied"] is False and out["shadow_only"] is True
+        assert S3_PARAMS_KEY not in [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+
     @patch("optimizer.portfolio_optimizer_optimizer.boto3")
     def test_not_applied_when_status_not_ok(self, mock_boto3):
         mock_boto3.client.return_value = MagicMock()
@@ -153,7 +217,7 @@ class TestApply:
         rec = self._ok_rec()
         rec["recommended_params"] = {"risk_aversion": 999.0, "tcost_bps": 2.0}  # out of band
         with patch("optimizer.rollback.save_previous"):
-            apply(rec, "bkt")
+            apply(rec, "bkt", config={"portfolio_optimizer_tuner": {"auto_apply_enabled": True}})
         live = [c for c in s3.put_object.call_args_list if c.kwargs["Key"] == S3_PARAMS_KEY]
         body = json.loads(live[0].kwargs["Body"])
         assert body["risk_aversion"] == PARAM_BOUNDS["risk_aversion"][1]  # clamped to hi
