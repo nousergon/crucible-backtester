@@ -177,6 +177,14 @@ def test_off_horizon_rows_cannot_flip_the_published_sign(tmp_path, _no_s3, monke
 # ── The honesty guard: the artifact describes its own estimator ──────────────
 
 
+def _recent_date() -> str:
+    """A prediction date inside the 60-day lookback at ANY run date. These two
+    tests hardcoded 2026-08-20, which aged out of the window on 2026-10-20 and
+    turned the first red and the second vacuous (rows filtered, IC None)."""
+    import datetime as _dt
+    return (_dt.date.today() - _dt.timedelta(days=5)).strftime("%Y-%m-%d")
+
+
 def test_realized_ic_block_reports_effective_n_not_just_rows(tmp_path, _no_s3, monkeypatch):
     """`rolling_n` counts (ticker, date) rows over overlapping 21-day label
     windows. The brief rendered the IC beside that count as if it were the N
@@ -185,7 +193,7 @@ def test_realized_ic_block_reports_effective_n_not_just_rows(tmp_path, _no_s3, m
     monkeypatch.setattr(pipeline_common, "_load_active_horizon_days", lambda: 21)
 
     rows = [
-        _row(i, "2026-08-20", 21.0, p_up=0.5 + i * 0.01, alpha=0.001 * i)
+        _row(i, _recent_date(), 21.0, p_up=0.5 + i * 0.01, alpha=0.001 * i)
         for i in range(20)
     ]
     db = _make_db(tmp_path, rows)
@@ -220,7 +228,7 @@ def test_ic_ir_is_never_a_bare_nan(tmp_path, _no_s3, monkeypatch):
 
     # Every row identical → zero variance in both legs → NaN correlations.
     rows = [
-        _row(i, "2026-08-20", 21.0, p_up=0.6, alpha=0.01)
+        _row(i, _recent_date(), 21.0, p_up=0.6, alpha=0.01)
         for i in range(20)
     ]
     db = _make_db(tmp_path, rows)
