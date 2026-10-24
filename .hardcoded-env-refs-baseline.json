@@ -1,0 +1,346 @@
+{
+  "schema_version": 1,
+  "guard": "hardcoded-env-refs",
+  "tracker": "alpha-engine-config-I12492",
+  "note": "Shrink-only ceiling of hard-coded account/bucket literals per file. Never raise an entry; lower it with `python3 hardcoded_env_refs.py --repo . --update` when a literal is removed.",
+  "totals": {
+    "account_hits": 2,
+    "account_files": 2,
+    "bucket_hits": 335,
+    "bucket_files": 109,
+    "files": 110
+  },
+  "files": {
+    ".github/workflows/alert-class-pr-guard.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/changelog.yml": {
+      "account": 1,
+      "bucket": 1
+    },
+    ".github/workflows/deploy.yml": {
+      "account": 1
+    },
+    "analysis/action_entropy.py": {
+      "bucket": 1
+    },
+    "analysis/agent_justification.py": {
+      "bucket": 1
+    },
+    "analysis/backfill_cumulative_trial_count.py": {
+      "bucket": 3
+    },
+    "analysis/calibration_report.py": {
+      "bucket": 3
+    },
+    "analysis/contribution_lift/inputs.py": {
+      "bucket": 1
+    },
+    "analysis/cost_report.py": {
+      "bucket": 6
+    },
+    "analysis/decision_capture_coverage.py": {
+      "bucket": 1
+    },
+    "analysis/direction_calibration_study.py": {
+      "bucket": 1
+    },
+    "analysis/end_to_end.py": {
+      "bucket": 1
+    },
+    "analysis/executor_decision_capture_coverage.py": {
+      "bucket": 1
+    },
+    "analysis/exit_timing.py": {
+      "bucket": 1
+    },
+    "analysis/factor_blend_sensitivity.py": {
+      "bucket": 3
+    },
+    "analysis/measurement_coverage.py": {
+      "bucket": 1
+    },
+    "analysis/pit_parity.py": {
+      "bucket": 5
+    },
+    "analysis/pit_stats_artifact.py": {
+      "bucket": 2
+    },
+    "analysis/provenance_grounding.py": {
+      "bucket": 2
+    },
+    "analysis/regime_stratified_sortino_runner.py": {
+      "bucket": 1
+    },
+    "analysis/retired_table_guard.py": {
+      "bucket": 1
+    },
+    "analysis/scanner_predictor_research_free_backfill.py": {
+      "bucket": 2
+    },
+    "analysis/shadow_book.py": {
+      "bucket": 1
+    },
+    "analysis/stance_distribution.py": {
+      "bucket": 1
+    },
+    "analysis/wide_feed_counterfactual_review.py": {
+      "bucket": 2
+    },
+    "backtest.py": {
+      "bucket": 44
+    },
+    "bootstrap_champion_promotion.py": {
+      "bucket": 1
+    },
+    "config.yaml.example": {
+      "bucket": 3
+    },
+    "console.descriptor.yaml": {
+      "bucket": 6
+    },
+    "contracts/evaluator_attestation.schema.json": {
+      "bucket": 1
+    },
+    "evaluate.py": {
+      "bucket": 43
+    },
+    "infrastructure/_exec_code_pin_render.sh": {
+      "bucket": 1
+    },
+    "infrastructure/_spot_common.sh": {
+      "bucket": 3
+    },
+    "infrastructure/deploy_concordance.sh": {
+      "bucket": 1
+    },
+    "infrastructure/spot_backtest.sh": {
+      "bucket": 6
+    },
+    "infrastructure/spot_parity.sh": {
+      "bucket": 2
+    },
+    "infrastructure/spot_parity_replay.sh": {
+      "bucket": 2
+    },
+    "lambda_concordance/handler.py": {
+      "bucket": 2
+    },
+    "lambda_counterfactual/handler.py": {
+      "bucket": 1
+    },
+    "lambda_health/handler.py": {
+      "bucket": 3
+    },
+    "loaders/signal_loader.py": {
+      "bucket": 1
+    },
+    "optimizer/champion_digest.py": {
+      "bucket": 3
+    },
+    "optimizer/pillar_weight_optimizer.py": {
+      "bucket": 2
+    },
+    "optimizer/predictor_optimizer.py": {
+      "bucket": 3
+    },
+    "optimizer/tech_weight_ablation.py": {
+      "bucket": 1
+    },
+    "pipeline_common.py": {
+      "bucket": 2
+    },
+    "rehearsal_isolation.py": {
+      "bucket": 3
+    },
+    "replay/batch.py": {
+      "bucket": 1
+    },
+    "replay/cli.py": {
+      "bucket": 1
+    },
+    "replay/counterfactual.py": {
+      "bucket": 1
+    },
+    "replay/runner.py": {
+      "bucket": 2
+    },
+    "reporter.py": {
+      "bucket": 1
+    },
+    "scripts/backfill_producer_arena_register.py": {
+      "bucket": 1
+    },
+    "scripts/veto_era_lift.py": {
+      "bucket": 1
+    },
+    "store/arctic_reader.py": {
+      "bucket": 1
+    },
+    "synthetic/predictor_backtest.py": {
+      "bucket": 2
+    },
+    "synthetic/production_signal_backtest.py": {
+      "bucket": 1
+    },
+    "tests/fixtures/sf_substatus/weekly_2026-08-15_scheduled.json": {
+      "bucket": 2
+    },
+    "tests/test_arctic_reader_connect.py": {
+      "bucket": 5
+    },
+    "tests/test_assembler_arc_e2e.py": {
+      "bucket": 1
+    },
+    "tests/test_backfill_cumulative_trial_count.py": {
+      "bucket": 1
+    },
+    "tests/test_batch_exposure_caps.py": {
+      "bucket": 1
+    },
+    "tests/test_calibration_report.py": {
+      "bucket": 1
+    },
+    "tests/test_champion_digest.py": {
+      "bucket": 1
+    },
+    "tests/test_concordance_cost_sink_wiring.py": {
+      "bucket": 1
+    },
+    "tests/test_config_archive_pit.py": {
+      "bucket": 1
+    },
+    "tests/test_contribution_lift_predictor_ensemble.py": {
+      "bucket": 1
+    },
+    "tests/test_cost_report.py": {
+      "bucket": 4
+    },
+    "tests/test_cov_estimator_sweep_stage.py": {
+      "bucket": 3
+    },
+    "tests/test_digest_email.py": {
+      "bucket": 2
+    },
+    "tests/test_evaluate_handoff.py": {
+      "bucket": 1
+    },
+    "tests/test_evaluate_init_data_sources.py": {
+      "bucket": 9
+    },
+    "tests/test_evaluator_smoke.py": {
+      "bucket": 1
+    },
+    "tests/test_executor_optimizer_rejection_alert.py": {
+      "bucket": 1
+    },
+    "tests/test_failure_staging_is_retained.py": {
+      "bucket": 1
+    },
+    "tests/test_feature_drift.py": {
+      "bucket": 6
+    },
+    "tests/test_gamma_sweep_stage.py": {
+      "bucket": 1
+    },
+    "tests/test_heartbeat_wiring.py": {
+      "bucket": 7
+    },
+    "tests/test_init_pipeline_research_db.py": {
+      "bucket": 3
+    },
+    "tests/test_load_config_experiment_package.py": {
+      "bucket": 1
+    },
+    "tests/test_optimizer_param_sweep_stage.py": {
+      "bucket": 1
+    },
+    "tests/test_optimizer_run_manifest.py": {
+      "bucket": 4
+    },
+    "tests/test_parity_replay.py": {
+      "bucket": 4
+    },
+    "tests/test_parity_replay_atr_contract.py": {
+      "bucket": 2
+    },
+    "tests/test_pillar_weight_optimizer_retired.py": {
+      "bucket": 1
+    },
+    "tests/test_portfolio_optimizer_optimizer.py": {
+      "bucket": 2
+    },
+    "tests/test_portfolio_stats_json_no_series_repr.py": {
+      "bucket": 1
+    },
+    "tests/test_predictor_backtest_model_source.py": {
+      "bucket": 3
+    },
+    "tests/test_predictor_confusion.py": {
+      "bucket": 1
+    },
+    "tests/test_predictor_executor_apply_split.py": {
+      "bucket": 1
+    },
+    "tests/test_predictor_pipeline_skip_reload.py": {
+      "bucket": 4
+    },
+    "tests/test_preflight.py": {
+      "bucket": 15
+    },
+    "tests/test_producer_arena.py": {
+      "bucket": 1
+    },
+    "tests/test_regime_stratified_sortino_i7661.py": {
+      "bucket": 1
+    },
+    "tests/test_rehearsal_isolation.py": {
+      "bucket": 1
+    },
+    "tests/test_rehearsal_isolation_stubbed.py": {
+      "bucket": 1
+    },
+    "tests/test_replay_batch.py": {
+      "bucket": 1
+    },
+    "tests/test_replay_runner.py": {
+      "bucket": 2
+    },
+    "tests/test_reporter.py": {
+      "bucket": 15
+    },
+    "tests/test_retired_table_guard.py": {
+      "bucket": 1
+    },
+    "tests/test_retired_table_sweep.py": {
+      "bucket": 1
+    },
+    "tests/test_run_portfolio_optimizer_gate.py": {
+      "bucket": 1
+    },
+    "tests/test_shadow_book_return_units_i7936.py": {
+      "bucket": 1
+    },
+    "tests/test_simulate_autoskip_reload_by_name.py": {
+      "bucket": 1
+    },
+    "tests/test_simulate_via_deciders.py": {
+      "bucket": 1
+    },
+    "tests/test_stage_coverage_run_date.py": {
+      "bucket": 1
+    },
+    "tests/test_stance_distribution.py": {
+      "bucket": 1
+    },
+    "tests/test_team_skill_metrics.py": {
+      "bucket": 1
+    },
+    "tests/test_tech_weight_ablation.py": {
+      "bucket": 20
+    },
+    "tests/test_weight_optimizer_subscore_coverage.py": {
+      "bucket": 1
+    }
+  }
+}
