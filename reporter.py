@@ -1414,6 +1414,7 @@ def save(
     significance_observe: dict | None = None,
     all_orders: list[dict] | None = None,
     self_test: dict | None = None,
+    production_strategy: dict | None = None,
     *,
     upload_bucket: str | None = None,
     upload_prefix: str = "backtest",
@@ -1533,6 +1534,16 @@ def save(
             "Wrote %s (%d orders)", out_dir / "all_orders.csv", len(orders_df),
         )
         _persist(out_dir / "all_orders.csv")
+
+    # Deployed-strategy result (alpha-engine-config-I12658). Written whatever
+    # its status, so evaluate.py renders the real reason rather than "did not
+    # run". Only backtest.py passes it; evaluate.py reads it back.
+    if production_strategy is not None:
+        (out_dir / "production_strategy.json").write_text(
+            json.dumps(production_strategy, indent=2, default=str)
+        )
+        logger.info("Wrote %s", out_dir / "production_strategy.json")
+        _persist(out_dir / "production_strategy.json")
 
     # Attribution JSON
     if attribution and attribution.get("status") == "ok":

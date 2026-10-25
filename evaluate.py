@@ -340,6 +340,12 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
     # state here, never promoted to the evaluator's critical-artifact gate.
     config["_pit_parity_report"] = _load_pit_parity_report(s3, bucket, prefix)
 
+    # alpha-engine-config-I12658: the deployed-strategy headline backtest.py
+    # computed for this run_date. Best-effort, outside the critical-artifact
+    # accounting: a missing file renders as a banner naming the gap, never as
+    # an evaluator failure.
+    config["_production_stats"] = _load_production_strategy(s3, bucket, prefix)
+
     return {
         "research_db": has_research_db,
         "trades_db": has_trades_db,
@@ -350,6 +356,49 @@ def _init_data_sources(args: argparse.Namespace, config: dict) -> dict:
         "_skip_backtester": skip_bt,
         "_degraded": not skip_bt and len(unexpected_missing) > 0,
     }
+
+
+PRODUCTION_STRATEGY_ARTIFACT = "production_strategy.json"
+
+
+def _load_production_strategy(s3, bucket: str, prefix: str) -> dict:
+    """Read ``{prefix}/production_strategy.json``, written by backtest.py
+    (alpha-engine-config-I12658).
+
+    This is the deployed strategy's result: production signals through the
+    MVO optimizer. evaluate.py publishes ``report.md`` last, at the key
+    backtest.py also writes, so without this read the published report always
+    claimed the deployed-strategy backtest "did not run". Never raises: on any
+    failure it returns a non-``ok`` dict whose ``error`` names the gap, and the
+    reporter's banner prints that instead of "did not run".
+    """
+    key = f"{prefix}/{PRODUCTION_STRATEGY_ARTIFACT}"
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+        data = json.loads(resp["Body"].read())
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code == "NoSuchKey":
+            logger.warning(
+                "%s not found at s3://%s/%s — backtest.py did not persist the "
+                "deployed-strategy result for this run", PRODUCTION_STRATEGY_ARTIFACT, bucket, key,
+            )
+            return {
+                "status": "not_persisted",
+                "error": (
+                    f"backtest.py wrote no {PRODUCTION_STRATEGY_ARTIFACT} at "
+                    f"s3://{bucket}/{key}, so the deployed-strategy result for "
+                    "this run is unknown to the evaluator"
+                ),
+            }
+        logger.warning("S3 ClientError loading s3://%s/%s: %s", bucket, key, e)
+        return {"status": "unreadable", "error": f"s3://{bucket}/{key} unreadable: {code}"}
+    except Exception as e:  # noqa: BLE001 — banner, not a crash
+        logger.warning("Failed to parse s3://%s/%s: %s", bucket, key, e)
+        return {"status": "unreadable", "error": f"s3://{bucket}/{key} unparseable: {e}"}
+    if not isinstance(data, dict):
+        return {"status": "unreadable", "error": f"s3://{bucket}/{key} is not a JSON object"}
+    return data
 
 
 def _load_pit_parity_report(s3, bucket: str, prefix: str) -> dict | None:
@@ -2892,6 +2941,9 @@ def _main_impl() -> None:
             score_analysis=score_rows,
             attribution=attr_result,
             portfolio_stats=portfolio_stats,
+            # alpha-engine-config-I12658: without this the published report
+            # always rendered "the deployed-strategy backtest did not run".
+            production_stats=config.get("_production_stats"),
             sweep_df=config.get("_sweep_df"),
             weight_result=opt_results.get("weight_result"),
             config=config,
