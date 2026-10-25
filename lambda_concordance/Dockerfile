@@ -73,9 +73,28 @@ RUN microdnf install -y tar gzip && microdnf clean all && \
     chmod +x /tmp/gitleaks && \
     mv /tmp/gitleaks /usr/local/bin/gitleaks && \
     rm -f /tmp/gitleaks.tar.gz && \
-    gitleaks version && \
-    mkdir -p /opt/groom-llm-routing && \
-    printf '[extend]\nuseDefault = true\n' > /opt/groom-llm-routing/gitleaks-egress.toml
+    gitleaks version
+
+# The RULESET is not written here, deliberately (alpha-engine-config-I8058).
+# krepis.session_dlp resolves $KREPIS_GITLEAKS_DIR, then
+# /opt/{llm,groom,drain}-llm-routing, then the ruleset krepis ships as package
+# data (krepis/dlp_config/, since krepis-PR211; nousergon-lib's krepis floor
+# is above it). That packaged copy is the fleet's real egress config: stock
+# rules plus the nousergon-specific custom rules for our own credential shapes.
+# This image used to write a two-line `[extend] useDefault = true` stub to
+# /opt/groom-llm-routing. An operator directory outranks the packaged copy, so
+# the stub SHADOWED the real ruleset with gitleaks' stock rules alone, on a
+# path that calls OpenRouter live every weekly concordance run. Leaving the
+# directory absent is what lets the packaged ruleset win.
+#
+# The build then PROVES it: preflight exits 1 unless the binary is on PATH, the
+# ruleset resolves and scanning is enabled, and the grep fails the build unless
+# the resolved ruleset IS the packaged one. A narrower config scans and comes
+# back clean, so only this check can tell it apart. This must follow both the
+# pip install above and the gitleaks install. No scan, no network call.
+# tests/test_dockerfile_dlp_ruleset.py fails if either half comes back.
+RUN out="$(python -m krepis.session_dlp preflight)" && echo "${out}" && \
+    echo "${out}" | grep -qx 'ruleset_matches_packaged: True'
 
 # Application code — mirror lambda_health's per-file COPY pattern.
 # Lambda Lambda task layout flattens lambda_concordance/handler.py to
