@@ -700,11 +700,48 @@ def compute_weights(
     }
 
 
-def _check_stability(suggested: dict, bucket: str | None = None) -> dict:
+#: Where every weekly run's recommendation lands, whatever its promotion
+#: intent (``produce_artifact``). The prior weeks' series is read from here.
+_RECOMMENDATIONS_PREFIX = "config/scoring_weights/recommendations/"
+_STABILITY_WEEKS = 3
+
+
+def _prior_recommendation_dates(s3, bucket: str, before: str, n: int) -> list[str]:
+    """The ``n`` most recent recommendation partitions strictly before ``before``.
+
+    Listed, not computed from the calendar: runs land on trading days, ad-hoc
+    reruns add partitions, and a holiday shifts the weekly date.
     """
-    Load prior 3 weeks' weight recommendations from S3 history and check
+    dates: list[str] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=_RECOMMENDATIONS_PREFIX, Delimiter="/"):
+        for cp in page.get("CommonPrefixes") or []:
+            d = cp["Prefix"][len(_RECOMMENDATIONS_PREFIX):].strip("/")
+            if len(d) == 10 and d < before:
+                dates.append(d)
+    return sorted(dates)[-n:]
+
+
+def _check_stability(
+    suggested: dict,
+    bucket: str | None = None,
+    *,
+    s3=None,
+    run_date: str | None = None,
+) -> dict:
+    """
+    Load prior 3 weeks' weight recommendations from S3 and check
     for direction reversals (e.g., quant weight increased last week
     but decreased this week).
+
+    The series is read from ``config/scoring_weights/recommendations/{date}/
+    from_weight_optimizer.json`` (``recommended_params``), which every run
+    writes. alpha-engine-config-I12627: it used to read
+    ``config/scoring_weights_history/{calendar date}.json``, a key nothing
+    writes. ``apply_weights`` archives history only on an APPLIED change,
+    under a run-id layout, and the loop has been blocked by
+    ``min_meaningful_change`` for 20 straight weeks. So ``weeks_loaded`` was 0
+    on every run, and walk_forward_stability never measured anything.
 
     Returns:
         {"weeks_loaded": N, "reversals": [...], "stable": True/False}
@@ -713,27 +750,34 @@ def _check_stability(suggested: dict, bucket: str | None = None) -> dict:
         # Bucket not available at compute time — will be populated by caller
         return {"weeks_loaded": 0, "reversals": [], "stable": True, "note": "no bucket provided"}
 
-    from datetime import date as _date, timedelta
+    if run_date is None:
+        from optimizer.recommendation_artifact import today_iso
+        run_date = today_iso()
     history = []
-    s3 = boto3.client("s3")
+    s3 = s3 or boto3.client("s3")
 
-    # Load prior 3 weeks' history files
-    for weeks_ago in range(1, 4):
-        d = _date.today() - timedelta(weeks=weeks_ago)
-        key = f"config/scoring_weights_history/{d.isoformat()}.json"
+    try:
+        prior = _prior_recommendation_dates(s3, bucket, run_date, _STABILITY_WEEKS)
+    except Exception as e:  # noqa: BLE001 — a diagnostic read; recorded, never raised
+        logger.warning("walk-forward stability: could not list %s: %s", _RECOMMENDATIONS_PREFIX, e)
+        prior = []
+    for d in prior:
+        key = f"{_RECOMMENDATIONS_PREFIX}{d}/from_weight_optimizer.json"
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             data = json.loads(obj["Body"].read())
-            history.append({"date": d.isoformat(), "weights": {k: data.get(k) for k in SUB_SCORES}})
+            params = data.get("recommended_params") or {}
+            history.append({"date": d, "weights": {k: params.get(k) for k in SUB_SCORES}})
         except Exception:
             continue
+    history = history[::-1]  # newest first, as the window assembly below expects
 
     if not history:
         return {"weeks_loaded": 0, "reversals": [], "stable": True}
 
     # Add current suggestion to form the full window
     all_weeks = history[::-1]  # oldest first
-    all_weeks.append({"date": _date.today().isoformat(), "weights": suggested})
+    all_weeks.append({"date": run_date, "weights": suggested})
 
     reversals = []
     for k in SUB_SCORES:
