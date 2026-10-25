@@ -257,6 +257,28 @@ def _run(event: dict, context) -> dict:
     # identity now records UNMEASURED with a reason.
     from stage_coverage_run_date import resolve_stage_run_date
 
+    # alpha-engine-config-I12634: `deploy_counterfactual.sh`'s post-publish
+    # canary invokes `{"dry_run": true, "window_days": 14}` — no run_date,
+    # no end_time_iso, by design. It is not a stage execution (the weekly
+    # SF never sends `dry_run`; it sends `dry_run_llm`), yet it reached the
+    # two ERROR lines below on every deploy, which the cloudwatch mirror
+    # forwarded as incidents (2026-10-25 02:18Z and 03:10Z) with no issue
+    # behind them. Same reasoning as lambda_concordance's I8206 skip: a
+    # deploy canary records an explicit SKIPPED, at INFO. Narrow on
+    # purpose — a dry run that DOES carry an execution identity, and every
+    # non-dry-run event missing one, keep the existing path and its ERROR.
+    if dry_run and not str(event.get("run_date") or "").strip() and end_time is None:
+        logger.info(
+            "stage-coverage not asserted for Counterfactual: dry_run deploy "
+            "canary with no execution identity (alpha-engine-config-I12634)",
+        )
+        result["stage_coverage"] = {
+            "stage": "Counterfactual",
+            "status": "SKIPPED",
+            "reason": "dry_run=True with no run_date/end_time_iso (deploy canary) — not a stage execution, never asserted",
+        }
+        return result
+
     _coverage_run_date, _run_date_provenance = resolve_stage_run_date(
         event,
         stage="Counterfactual",
