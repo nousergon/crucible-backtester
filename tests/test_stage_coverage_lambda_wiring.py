@@ -332,7 +332,9 @@ class TestDryRunNeverAssertsCoverage:
     lambda_counterfactual is not exercised here: its canary shape and
     dry-run semantics are a separate contract (Counterfactual's own
     handler has no ``dry_run`` kwarg on ``compute_and_emit`` today) —
-    this issue and its evidence are ReplayConcordance-specific.
+    this issue and its evidence are ReplayConcordance-specific. Its
+    canary's no-identity ERROR path is covered by the three
+    ``test_counterfactual_*`` cases below (alpha-engine-config-I12634).
     """
 
     def test_dry_run_never_calls_assert_stage_coverage(self, fake_stage_coverage_module):
@@ -384,6 +386,78 @@ class TestDryRunNeverAssertsCoverage:
         # states plainly why no verdict was asserted.
         assert result["stage_coverage"]["stage"] == "ReplayConcordance"
         assert result["stage_coverage"]["status"] == "SKIPPED"
+
+    # alpha-engine-config-I12634: Counterfactual's deploy canary
+    # (`deploy_counterfactual.sh`: `{"dry_run": true, "window_days": 14}`)
+    # carries no execution identity and logged two ERROR lines per deploy,
+    # which the cloudwatch mirror delivered as incidents with no issue.
+    def _cf(self):
+        mod = _load_handler_module("lambda_counterfactual", _HANDLERS["lambda_counterfactual"]["path"])
+        mod._init_done = False
+        return mod
+
+    @staticmethod
+    def _records(mod):
+        """Capture on the handler's OWN logger, so the assertion does not
+        depend on propagation: a caplog version of the ERROR assertion
+        below missed ERROR records that were visibly emitted, and the
+        same blind spot would let the canary's no-ERROR check pass
+        vacuously."""
+        import logging
+
+        class _Keep(logging.Handler):
+            def __init__(self):
+                super().__init__(logging.DEBUG)
+                self.records = []
+
+            def emit(self, record):
+                self.records.append(record)
+
+        keep = _Keep()
+        mod.logger.addHandler(keep)
+        mod.logger.setLevel(logging.DEBUG)
+        return keep
+
+    def test_counterfactual_canary_skips_at_info_not_error(self, fake_stage_coverage_module):
+        import logging
+
+        mod = self._cf()
+        keep = self._records(mod)
+        with patch.object(mod, "_ensure_init"), \
+             patch(_HANDLERS["lambda_counterfactual"]["compute_target"],
+                   return_value=_ok_summary("lambda_counterfactual")):
+            result = mod.handler({"dry_run": True, "window_days": 14}, context=None)
+        assert result["stage_coverage"]["stage"] == "Counterfactual"
+        assert result["stage_coverage"]["status"] == "SKIPPED"
+        assert fake_stage_coverage_module == []
+        assert [r for r in keep.records if r.levelno == logging.INFO]
+        assert not [r for r in keep.records if r.levelno >= logging.ERROR], (
+            "the deploy canary must not log at ERROR — the cloudwatch mirror "
+            "pages on it (alpha-engine-config-I12634)"
+        )
+
+    def test_counterfactual_dry_run_with_identity_still_asserts(self, fake_stage_coverage_module):
+        mod = self._cf()
+        with patch.object(mod, "_ensure_init"), \
+             patch(_HANDLERS["lambda_counterfactual"]["compute_target"],
+                   return_value=_ok_summary("lambda_counterfactual")):
+            mod.handler({"dry_run": True, "run_date": "2026-09-04"}, context=None)
+        assert len(fake_stage_coverage_module) == 1
+        assert fake_stage_coverage_module[0]["run_date"] == "2026-09-04"
+
+    def test_counterfactual_non_dry_run_without_identity_still_errors(self, fake_stage_coverage_module):
+        """The skip is canary-only: a real invocation with no identity
+        keeps its UNMEASURED verdict AND its ERROR line."""
+        import logging
+
+        mod = self._cf()
+        keep = self._records(mod)
+        with patch.object(mod, "_ensure_init"), \
+             patch(_HANDLERS["lambda_counterfactual"]["compute_target"],
+                   return_value=_ok_summary("lambda_counterfactual")):
+            result = mod.handler({}, context=None)
+        assert result["stage_coverage"]["status"] == "UNMEASURED"
+        assert [r for r in keep.records if r.levelno >= logging.ERROR]
 
     def test_non_dry_run_still_asserts_coverage(self, handler_case, fake_stage_coverage_module):
         """Guards the fix from over-correcting into never asserting at all."""
