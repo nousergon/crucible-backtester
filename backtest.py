@@ -2773,6 +2773,64 @@ def _compute_risk_matched_headline(
         return {"status": "error", "note": str(e)}
 
 
+#: The S3/local artifact that carries ``run_production_strategy_backtest``'s
+#: result from backtest.py to evaluate.py (alpha-engine-config-I12658). Until it
+#: existed the result lived only inside backtest.py's ``report.md``, which
+#: evaluate.py then overwrote at the same key with a report built without it —
+#: so every published weekly report said the deployed-strategy backtest "did
+#: not run" when it had run and returned ``ok``.
+PRODUCTION_STRATEGY_ARTIFACT = "production_strategy.json"
+
+
+def _input_fingerprint(inputs: dict) -> dict:
+    """sha256 of each input the deployed-strategy backtest is computed from.
+
+    alpha-engine-config-I12658 defect 2: the Saturday SF runs backtest.py's
+    report path three times for one ``run_date``, and on 2026-10-24 the three
+    deployed-strategy headlines disagreed (IR -0.03 / +0.36 / +0.43) over an
+    identical window. Equal fingerprints across runs that disagree mean the
+    computation is nondeterministic; different fingerprints mean an input moved
+    between them. Never raises: a field it cannot hash reads ``unhashable``.
+    """
+    import hashlib
+
+    def _digest(value) -> str:
+        try:
+            if isinstance(value, (pd.DataFrame, pd.Series)):
+                hashed = pd.util.hash_pandas_object(value, index=True).values.tobytes()
+                cols = "|".join(map(str, getattr(value, "columns", [])))
+                return hashlib.sha256(hashed + cols.encode("utf-8")).hexdigest()
+            body = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+            return hashlib.sha256(body).hexdigest()
+        except Exception as e:  # noqa: BLE001 — diagnostic only
+            return f"unhashable: {type(e).__name__}"
+
+    keys = (
+        "predictions_by_date",
+        "alpha_uncertainty_by_date",
+        "price_matrix",
+        "spy_prices",
+        "sector_map",
+    )
+    return {k: _digest(inputs.get(k)) for k in keys}
+
+
+def _production_strategy_record(production_stats: dict | None, *, run_date: str, mode) -> dict:
+    """The ``production_strategy.json`` body: the result plus who wrote it.
+
+    ``mode`` and ``written_at`` say which of the cycle's backtest.py runs this
+    is; the S3 object's version history keeps the others.
+    """
+    from datetime import datetime, timezone
+
+    record = dict(production_stats or {"status": "error", "error": "production_stats was None"})
+    record["run_date"] = run_date
+    record["writer"] = "backtest.py"
+    record["mode"] = mode
+    record["written_at"] = datetime.now(timezone.utc).isoformat()
+    return record
+
+
 def run_production_strategy_backtest(config: dict, s3_client=None) -> dict:
     """Run the DEPLOYED strategy's backtest for the weekly report headline
     (config#1053): the production research cohort + α̂ → the production MVO solver
@@ -2846,6 +2904,7 @@ def run_production_strategy_backtest(config: dict, s3_client=None) -> dict:
             "status": "ok",
             "metrics": opt.metrics,
             "risk_matched": risk_matched,
+            "input_fingerprint": _input_fingerprint(inputs),
             "production_window": inputs.get("production_window"),
             "n_production_dates": inputs.get("n_production_dates"),
             "n_dates_with_alpha_std": inputs.get("n_dates_with_alpha_std"),
@@ -7589,6 +7648,12 @@ def _main_impl() -> None:
             score_analysis=[],
             sweep_df=save_sweep_df,
             all_orders=sim_all_orders,
+            # alpha-engine-config-I12658: the deployed-strategy result, persisted
+            # so evaluate.py's report (which is published last, at the same
+            # report.md key) renders it instead of a false "did not run".
+            production_strategy=_production_strategy_record(
+                production_stats, run_date=args.date, mode=_original_mode,
+            ),
             run_date=args.date,
             results_dir=config.get("results_dir", "results"),
             # Write-as-you-compute (config#1190): upload each artifact as it
