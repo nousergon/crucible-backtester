@@ -203,6 +203,31 @@ ACTIVE_HORIZON_DAYS = _load_active_horizon_days()
 # so any post-cutover resolved row always has a non-NULL value.
 CURRENT_HORIZON_FILTER_SQL = f"horizon_days = {ACTIVE_HORIZON_DAYS}"
 
+
+def effective_prediction_windows(prediction_dates, horizon_days) -> tuple[int, int]:
+    """Return ``(n_prediction_dates, n_effective)`` for a pool of outcome rows.
+
+    alpha-engine-config-I8701 — the ONE definition of effective N for metrics
+    graded on overlapping forward-return labels. Rows are (ticker, date) pairs
+    whose ``horizon_days``-trading-day label windows overlap across names on a
+    date and across consecutive dates, so the independent unit is the number of
+    NON-OVERLAPPING label windows the pool spans:
+
+        n_effective = max(1, n_prediction_dates // horizon_days)   (0 with no dates)
+
+    (Hansen & Hodrick 1980 non-overlapping-observations correction.)
+    crucible-evaluator ``grading/effective_n.py`` applies the same formula and
+    reads a declared ``n_effective`` as is; keep the two identical.
+
+    ``prediction_dates`` is any iterable/Series of date-like values (one per
+    row; duplicates and unparseable values are fine — distinct parsed calendar
+    dates are counted).
+    """
+    dates = pd.Series(list(prediction_dates) if not isinstance(prediction_dates, pd.Series) else prediction_dates)
+    n_dates = int(pd.to_datetime(dates, errors="coerce").dt.date.dropna().nunique()) if len(dates) else 0
+    n_effective = max(1, n_dates // max(1, int(horizon_days))) if n_dates else 0
+    return n_dates, n_effective
+
 # Canonical-alpha cutover date (2026-05-09; alpha-engine-predictor PRs A-E).
 # `horizon_days = 21` alone does NOT isolate the post-cutover model: the
 # grading job stamps `horizon_days` at GRADE time, so a PRE-cutover-model
@@ -1287,8 +1312,9 @@ def push_predictor_rolling_metrics(config: dict, db_path: str) -> None:
     # spans. Reported alongside, never instead of, `rolling_n` — a reader
     # comparing -0.0768 to its own standard error needs this and had no way to
     # derive it from the artifact.
-    n_dates = int(pd.to_datetime(valid["prediction_date"], errors="coerce").dt.date.nunique()) if len(valid) else 0
-    n_effective = max(1, n_dates // max(1, int(forward_days))) if n_dates else 0
+    n_dates, n_effective = effective_prediction_windows(
+        valid["prediction_date"] if len(valid) else [], forward_days
+    )
     ic_se_effective = (
         round(float(1.0 / (max(n_effective - 1, 1) ** 0.5)), 4) if n_effective else None
     )
