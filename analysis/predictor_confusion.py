@@ -24,10 +24,12 @@ import sqlite3
 import pandas as pd
 
 from pipeline_common import (
+    ACTIVE_HORIZON_DAYS,
     ALPHA_COALESCE_SQL,
     CURRENT_HORIZON_FILTER_SQL,
     HORIZON_COALESCE_SQL,
     OUTCOMES_RESOLVED_SQL,
+    effective_prediction_windows,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,11 +72,19 @@ def compute_confusion_matrix(
         per_class: {direction: {precision, recall, f1, n_predicted, n_actual}}
         up_threshold: the threshold used (echoed back for forensic trail)
         horizons_days: list of horizons present in the underlying rows
+        n_prediction_dates: distinct prediction dates behind `n`
+        n_effective: non-overlapping label windows those dates span —
+            `max(1, n_prediction_dates // horizon)` (alpha-engine-config-I8701
+            formula via `pipeline_common.effective_prediction_windows`). `n`
+            counts overlapping (ticker, date) rows; `n_effective` is the count a
+            significance or floor check may use (alpha-engine-config-I12695).
+            per_class[d] carries both fields too, over the dates on which `d`
+            was predicted.
     """
     try:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql_query(
-            "SELECT predicted_direction, "
+            "SELECT predicted_direction, prediction_date, "
             f"{ALPHA_COALESCE_SQL} AS canonical_actual, "
             f"{HORIZON_COALESCE_SQL} AS horizon_days "
             "FROM predictor_outcomes "
@@ -136,6 +146,26 @@ def compute_confusion_matrix(
 
     horizons_seen = sorted(df["horizon_days"].dropna().unique().tolist())
 
+    # alpha-engine-config-I12695 — declare EFFECTIVE N beside the row count.
+    # `n` / `n_predicted` count (ticker, date) rows whose forward-return labels
+    # overlap (~30 names per date; consecutive dates share horizon-1 of their
+    # horizon days), so they overstate the independent sample. The evaluator
+    # (crucible-evaluator grading/effective_n.py, I11094) grades the direction
+    # family on `n_effective` as declared and reads an undeclared one as
+    # insufficient-N. Additive only: no existing field changes. The query is
+    # filtered to the single active horizon; should more than one ever appear,
+    # the LONGEST is used, which yields the fewest (most conservative) windows.
+    eff_horizon = int(max(horizons_seen)) if horizons_seen else ACTIVE_HORIZON_DAYS
+    n_prediction_dates, n_effective = effective_prediction_windows(
+        df["prediction_date"], eff_horizon
+    )
+    for d in DIRECTIONS:
+        cls_dates, cls_eff = effective_prediction_windows(
+            df.loc[df["predicted_direction"] == d, "prediction_date"], eff_horizon
+        )
+        per_class[d]["n_prediction_dates"] = cls_dates
+        per_class[d]["n_effective"] = cls_eff
+
     return {
         "status": "ok",
         "n": n,
@@ -144,4 +174,6 @@ def compute_confusion_matrix(
         "per_class": per_class,
         "up_threshold": up_threshold,
         "horizons_days": [int(h) for h in horizons_seen],
+        "n_prediction_dates": n_prediction_dates,
+        "n_effective": n_effective,
     }
