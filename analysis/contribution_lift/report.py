@@ -145,8 +145,17 @@ def _n_arms(built: Sequence[tuple[ReplaySpec, object]]) -> int:
 def build_contribution_lift_report(
     inputs: ReplayInputs,
     specs: Sequence[ReplaySpec] | None = None,
+    *,
+    include_shadow: bool | None = None,
 ) -> dict:
-    """Run every spec and return the contract-shaped artifact body."""
+    """Run every spec and return the contract-shaped artifact body.
+
+    ``include_shadow`` (default: on for the registry run, off when a caller
+    passes its own ``specs``) adds the top-level ``shadow`` block — ungraded
+    diagnostics beside ``components``, see :func:`_shadow_block`.
+    """
+    if include_shadow is None:
+        include_shadow = specs is None
     if specs is None:
         from analysis.contribution_lift.registry import SPECS
 
@@ -186,11 +195,40 @@ def build_contribution_lift_report(
         inputs.dates[-1] if inputs.dates else "-",
         n_arms, n_trials,
     )
-    return base | {
+    body = base | {
         "status": "ok",
         "n_trials_cumulative": n_trials,
         "components": components,
     }
+    if include_shadow:
+        body["shadow"] = _shadow_block(inputs, n_trials)
+    return body
+
+
+def _shadow_block(inputs: ReplayInputs, n_trials: int) -> dict:
+    """Shadow diagnostics written beside ``components`` (alpha-engine-config-I12624).
+
+    The evaluator's tile reads ``components`` only, so nothing here is graded.
+    A failure here must never cost the live components their artifact: it is
+    recorded in-band as ``status: error`` and logged at WARNING.
+    """
+    from analysis.contribution_lift.groups import executor_rules
+
+    try:
+        decomposition = executor_rules.exit_family_decomposition(
+            inputs, n_trials=n_trials
+        )
+    except Exception as exc:  # noqa: BLE001 — shadow must not fail the live report
+        logger.warning(
+            "contribution_lift shadow exit_rules_decomposition failed: %s: %s",
+            type(exc).__name__, exc,
+        )
+        decomposition = {
+            "status": "error",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "issue": executor_rules.ISSUE_12624,
+        }
+    return {"exit_rules_decomposition": decomposition}
 
 
 def run_contribution_lift(config: dict, *, run_date: str | None = None) -> dict:

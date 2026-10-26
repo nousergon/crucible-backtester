@@ -72,13 +72,17 @@ from pathlib import Path
 
 import pandas as pd
 
+from analysis.contribution_lift import objective as _objective
 from analysis.contribution_lift.harness import (
-    ArmSet,
     HORIZON_DAYS,
+    MIN_SAMPLES,
+    UNIT,
+    ArmSet,
     NotAvailable,
     ReplayInputs,
     ReplaySpec,
     orders_arm,
+    run_spec,
 )
 
 ISSUE_7481 = "alpha-engine-config-I7481"
@@ -251,6 +255,311 @@ SPEC_EXIT_RULES = ReplaySpec(
     issue=ISSUE_7481,
     build_arms=_exit_rules_build_arms,
 )
+
+
+# --------------------------------------------------------------------------
+# exit_rules per-family decomposition (alpha-engine-config-I12624) — SHADOW
+# --------------------------------------------------------------------------
+#
+# ``exit_rules`` above ablates EVERY terminal exit at once, so its lift
+# cannot say which rule destroys the alpha. These arms ablate ONE family at a
+# time: only the roundtrips whose terminal ``EXIT`` row carries a reason in
+# family F are moved to a fixed hold; every other exit, every entry and every
+# share count stay as executed, so each cycle count-matches by construction.
+#
+# They are deliberately NOT in ``registry.SPECS``: the evaluator grades every
+# registered component, and these are a diagnostic of the existing
+# ``exit_rules`` row, not new graded components. ``exit_family_decomposition``
+# runs them and the report writes the result to its own shadow artifact,
+# beside ``contribution_lift.json``, without touching it. Nothing here reads
+# or writes executor config; no live exit, size or limit moves.
+#
+# Families come from the executed ``exit_reason`` taxonomy on terminal
+# ``EXIT`` rows (crucible-executor ``executor/trade_logger.py``). Partial
+# ``REDUCE`` legs (``optimizer_scale_down``, ``time_decay_reduce``,
+# ``intraday_profit_take``) are not modelled by ``_load_roundtrips`` in either
+# arm, so they are not ablatable here — the same simplification the
+# whole-group row already makes.
+
+ISSUE_12624 = "alpha-engine-config-I12624"
+
+#: Terminal ``EXIT`` ``exit_reason`` -> ablation family. A reason not listed
+#: falls into ``other`` rather than being dropped, so a new executor exit
+#: reason shows up as its own row instead of silently joining a family.
+EXIT_REASON_FAMILY: dict[str, str] = {
+    "optimizer_target_zero": "optimizer",
+    "time_decay_exit": "time",
+    "intraday_trailing_stop": "stop",
+    "atr_trailing_stop": "stop",
+    "position_loss_floor": "stop",
+    "intraday_collapse": "stop",
+    "research_signal": "signal",
+    "momentum_exit": "momentum",
+}
+
+#: Emission order of the family rows.
+EXIT_FAMILIES: tuple[str, ...] = (
+    "optimizer", "time", "stop", "signal", "momentum", "other",
+)
+
+#: Fixed holds each family is ablated at: 30 matches the whole-group
+#: ``exit_rules`` row (so the family rows decompose THAT number), and the
+#: 21-day primary horizon is the sensitivity row — a 30-day hold scored on a
+#: 21-day objective mixes two horizons.
+EXIT_FAMILY_HOLD_DAYS: tuple[int, ...] = (EXIT_RULES_FIXED_HOLD_DAYS, HORIZON_DAYS)
+
+
+def exit_family_of(reason: object) -> str:
+    """The ablation family of one terminal ``exit_reason`` (``other`` if unknown)."""
+    if not isinstance(reason, str) or not reason:
+        return "other"
+    return EXIT_REASON_FAMILY.get(reason, "other")
+
+
+def _load_terminal_exit_reasons(trades_db_path: str) -> dict[str, str]:
+    """``{entry_trade_id: exit_reason}`` of each roundtrip's terminal EXIT.
+
+    Same latest-row tie-break as :func:`_load_roundtrips`, so the reason is
+    the one on the exit that roundtrip actually closes at. A database without
+    an ``exit_reason`` column (an old schema, or a test fixture) returns
+    ``{}`` and every roundtrip lands in ``other``.
+    """
+    if not Path(trades_db_path).exists():
+        return {}
+    conn = sqlite3.connect(trades_db_path)
+    try:
+        rows = pd.read_sql_query(
+            "SELECT entry_trade_id, date AS exit_date, exit_reason FROM trades "
+            "WHERE action = 'EXIT' AND entry_trade_id IS NOT NULL",
+            conn,
+        )
+    except pd.errors.DatabaseError as exc:
+        if "no such column" in str(exc).lower():
+            return {}
+        raise
+    finally:
+        conn.close()
+    if rows.empty:
+        return {}
+    rows = rows.sort_values("exit_date").drop_duplicates(
+        "entry_trade_id", keep="last"
+    )
+    return {
+        str(r.entry_trade_id): (r.exit_reason if isinstance(r.exit_reason, str) else "")
+        for r in rows.itertuples(index=False)
+    }
+
+
+def build_exit_family_arms(
+    inputs: ReplayInputs,
+    family: str,
+    *,
+    hold_days: int = EXIT_RULES_FIXED_HOLD_DAYS,
+) -> ArmSet | NotAvailable:
+    """Baseline vs. "family ``family`` disabled": only its exits become a hold.
+
+    Same baseline and the same entry/share stream as ``exit_rules``; a
+    roundtrip whose terminal exit is NOT in ``family`` keeps its executed exit
+    date, one that is exits ``hold_days`` trading rows after entry.
+    """
+    if family not in EXIT_FAMILIES:
+        raise ValueError(f"unknown exit family {family!r}; one of {EXIT_FAMILIES}")
+    if not inputs.trades_db_path:
+        return _missing_db(f"exit_rules.{family}", ISSUE_12624)
+    roundtrips = _load_roundtrips(inputs.trades_db_path)
+    if roundtrips.empty:
+        return NotAvailable(
+            status="N/A-MISSING-INPUT",
+            reason=(
+                f"exit_rules.{family}: trades.db has no ENTER row with a "
+                f"matching terminal EXIT row ({ISSUE_12624})"
+            ),
+        )
+    reasons = _load_terminal_exit_reasons(inputs.trades_db_path)
+    in_family = [
+        exit_family_of(reasons.get(str(row.trade_id))) == family
+        for row in roundtrips.itertuples(index=False)
+    ]
+    if not any(in_family):
+        return NotAvailable(
+            status="N/A-MISSING-INPUT",
+            reason=(
+                f"exit_rules.{family}: no roundtrip in trades.db closes on a "
+                f"{family} exit, so there is nothing to ablate ({ISSUE_12624})"
+            ),
+        )
+    axis = pd.DatetimeIndex(inputs.price_matrix.index).sort_values()
+    baseline = orders_arm(
+        "as-executed order stream (trades.db)", _baseline_orders(roundtrips)
+    )
+
+    ablated_orders: list[dict] = []
+    for row, ablate in zip(roundtrips.itertuples(index=False), in_family):
+        entry = {
+            "date": str(row.date),
+            "ticker": str(row.ticker),
+            "action": "ENTER",
+            "shares": float(row.shares),
+            "price_at_order": float(row.fill_price) if pd.notna(row.fill_price) else None,
+        }
+        if not ablate:
+            ablated_orders.append(entry)
+            ablated_orders.append(
+                {"date": str(row.exit_date), "ticker": str(row.ticker), "action": "EXIT"}
+            )
+            continue
+        entry_snap = _snap_forward(axis, str(row.date))
+        if entry_snap is None or entry_snap not in axis:
+            continue
+        ablated_orders.append(entry)
+        fixed_exit = _hold_to_n_days_exit(axis, entry_snap, hold_days)
+        ablated_orders.append({
+            "date": fixed_exit.strftime("%Y-%m-%d"),
+            "ticker": str(row.ticker),
+            "action": "EXIT",
+        })
+    ablated = orders_arm(
+        f"{family} exits replaced by a hold-to-{hold_days}-trading-day exit "
+        "(that family disabled; every other exit as executed)",
+        ablated_orders,
+    )
+    return ArmSet(baseline=baseline, ablated=ablated)
+
+
+def exit_family_spec(family: str, hold_days: int) -> ReplaySpec:
+    """The shadow :class:`ReplaySpec` for one family at one fixed hold."""
+    return ReplaySpec(
+        name=f"exit_rules.{family}.hold{hold_days}",
+        module="executor",
+        criticality="supporting",
+        pattern="null_arm",
+        issue=ISSUE_12624,
+        build_arms=lambda inputs: build_exit_family_arms(
+            inputs, family, hold_days=hold_days
+        ),
+    )
+
+
+def exit_family_census(trades_db_path: str | None) -> dict[str, int]:
+    """``{family: n_roundtrips}`` closing on each family (terminal exits only)."""
+    if not trades_db_path:
+        return {}
+    roundtrips = _load_roundtrips(trades_db_path)
+    reasons = _load_terminal_exit_reasons(trades_db_path)
+    out = {f: 0 for f in EXIT_FAMILIES}
+    for row in roundtrips.itertuples(index=False):
+        out[exit_family_of(reasons.get(str(row.trade_id)))] += 1
+    return out
+
+
+#: The family pre-declared as the shadow arm for alpha-engine-config-I12624:
+#: the one the 2026-10-23 decomposition measured as the worst (MVO
+#: ``optimizer_target_zero``). Fixed here, not re-picked each run, so the
+#: shadow series is one pre-registered arm; ``worst_family`` is reported
+#: beside it so a change in which family is worst is visible, not silent.
+SHADOW_ARM_FAMILY = "optimizer"
+
+#: Window cuts reported per family. ``mvo_cutover``: the 2026-05-13 MVO
+#: cutover, before which no optimizer exit exists. ``destance_965``: the
+#: crucible-executor #965 de-stance-ification (closed 2026-10-24) — cycles on
+#: or after it measure the current rule set.
+EXIT_FAMILY_WINDOW_CUTS: dict[str, str] = {
+    "mvo_cutover": "2026-05-13",
+    "destance_965": "2026-10-24",
+}
+
+
+#: The per-cycle series key ``run_spec`` writes on each arm payload.
+_PER_CYCLE_KEY = f"per_cycle_{UNIT}"
+
+
+def _window_summary(diffs_by_date: dict[str, float], lo: str | None, hi: str | None) -> dict:
+    sel = [
+        v for d, v in sorted(diffs_by_date.items())
+        if (lo is None or d >= lo) and (hi is None or d < hi)
+    ]
+    out: dict = {"n_samples": len(sel), "from": lo, "before": hi}
+    if len(sel) < MIN_SAMPLES:
+        out.update(status="N/A-LOW-N", value=None, ci_low=None, ci_high=None)
+        return out
+    ci = _objective.paired_bootstrap_ci(sel)
+    out.update(status="ok", value=ci["estimate"], ci_low=ci["ci_low"], ci_high=ci["ci_high"])
+    return out
+
+
+def exit_family_decomposition(inputs: ReplayInputs, *, n_trials: int) -> dict:
+    """SHADOW: per-family ``exit_rules`` ablation, never a graded component.
+
+    Returns the ``exit_rules_decomposition`` block the report writes under its
+    top-level ``shadow`` key. Each row is ``run_spec`` on one
+    :func:`exit_family_spec`; only its summary is kept (no arm series, no DSR —
+    these arms are not candidates for promotion and are not added to the
+    fleet trial accumulator).
+    """
+    rows: list[dict] = []
+    for hold in EXIT_FAMILY_HOLD_DAYS:
+        for family in EXIT_FAMILIES:
+            spec = exit_family_spec(family, hold)
+            comp = run_spec(spec, inputs, n_trials=n_trials)
+            row = {
+                "name": spec.name,
+                "family": family,
+                "hold_days": hold,
+                "status": comp.get("status"),
+                "status_reason": comp.get("status_reason"),
+                "value": comp.get("value"),
+                "ci_low": comp.get("ci_low"),
+                "ci_high": comp.get("ci_high"),
+                "n_samples": comp.get("n_samples"),
+                "count_matched": comp.get("count_matched"),
+            }
+            arms = comp.get("arms") or {}
+            if comp.get("status") == "ok" and arms:
+                base = arms["baseline"][_PER_CYCLE_KEY]
+                abl = arms["ablated"][_PER_CYCLE_KEY]
+                diffs = {d: float(base[d] - abl[d]) for d in sorted(set(base) & set(abl))}
+                cut_mvo = EXIT_FAMILY_WINDOW_CUTS["mvo_cutover"]
+                cut_965 = EXIT_FAMILY_WINDOW_CUTS["destance_965"]
+                row["windows"] = {
+                    "pre_mvo_cutover": _window_summary(diffs, None, cut_mvo),
+                    "post_mvo_pre_965": _window_summary(diffs, cut_mvo, cut_965),
+                    "post_965": _window_summary(diffs, cut_965, None),
+                }
+                row["ablated_total_alpha"] = arms["ablated"].get("total_alpha")
+                row["baseline_total_alpha"] = arms["baseline"].get("total_alpha")
+            rows.append(row)
+
+    primary = [
+        r for r in rows
+        if r["hold_days"] == EXIT_RULES_FIXED_HOLD_DAYS and r["status"] == "ok"
+        and r["ci_high"] is not None and r["ci_high"] < 0.0
+    ]
+    worst = min(primary, key=lambda r: r["value"]) if primary else None
+    shadow_name = f"exit_rules.{SHADOW_ARM_FAMILY}.hold{EXIT_RULES_FIXED_HOLD_DAYS}"
+    return {
+        "schema_version": 1,
+        "issue": ISSUE_12624,
+        "mode": "shadow",
+        "graded": False,
+        "note": (
+            "Diagnostic of the exit_rules component: one family of terminal "
+            "exits replaced by a fixed hold at a time, every other order as "
+            "executed. Not a graded component, not in registry.SPECS, not "
+            "counted in n_trials_cumulative; moves no live exit, size or limit."
+        ),
+        "family_of_exit_reason": dict(EXIT_REASON_FAMILY),
+        "census_roundtrips": exit_family_census(inputs.trades_db_path),
+        "shadow_arm": {
+            "family": SHADOW_ARM_FAMILY,
+            "name": shadow_name,
+            "row": next((r for r in rows if r["name"] == shadow_name), None),
+        },
+        "worst_family": None if worst is None else {
+            "family": worst["family"], "name": worst["name"], "value": worst["value"],
+        },
+        "families": rows,
+    }
+
 
 
 # --------------------------------------------------------------------------
