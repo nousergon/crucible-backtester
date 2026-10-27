@@ -225,8 +225,10 @@ def test_report_writes_decomposition_under_shadow_not_components(tmp_path, monke
     assert block["shadow_arm"]["name"] == "exit_rules.optimizer.hold30"
     names = {r["name"] for r in block["families"]}
     assert names == {
-        f"exit_rules.{f}.hold{h}" for f in er.EXIT_FAMILIES for h in er.EXIT_FAMILY_HOLD_DAYS
+        f"exit_rules.{f}.hold{h}" for f in er.ALL_EXIT_FAMILIES for h in er.EXIT_FAMILY_HOLD_DAYS
     }
+    assert block["schema_version"] == 2
+    assert {r["leg_kind"] for r in block["families"] if r["family"].startswith("reduce_")} == {"reduce"}
     opt = block["shadow_arm"]["row"]
     assert opt["status"] in {"ok", "N/A-LOW-N"} and opt["count_matched"] is True
     json.dumps(body, allow_nan=False)

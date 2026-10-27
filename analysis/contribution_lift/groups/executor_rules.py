@@ -13,9 +13,11 @@ through vectorbt_bridge.orders_to_portfolio + portfolio_stats").
 
     - ``exit_rules``: same ENTER (date, ticker, shares) as baseline; EXIT
       replaced with a fixed hold-to-30-trading-day close instead of the
-      trade's actual exit date/reason.
+      trade's actual exit date/reason, and no partial REDUCE leg (every
+      exit rule is off, the reduce rules included).
     - ``position_sizing``: same ENTER/EXIT dates and tickers as baseline;
-      shares replaced with equal-weight ``init_cash / picks_that_day``.
+      shares replaced with equal-weight ``init_cash / picks_that_day``;
+      each REDUCE leg sells the same fraction of the resized entry.
     - ``entry_triggers``: same ticker, shares and EXIT date as baseline;
       ENTER date replaced with ``signal_date`` (the pre-trigger date the
       order was sourced from, ``trade_logger.py``'s
@@ -63,6 +65,13 @@ never injects it — ``inputs.load_replay_inputs`` reads
 ``config.get("_trades_db")``/``config.get("trades_db")``, both unset by
 default) is the expected steady state today; every spec below emits
 ``N/A-MISSING-INPUT`` naming that in that case.
+
+Every baseline is the as-executed book INCLUDING the executor's partial
+``REDUCE`` legs (alpha-engine-config-I12683): each REDUCE sells its own
+``shares`` on its own date and the terminal EXIT sells the rest, simulated
+with ``vectorbt_bridge.orders_to_portfolio(partial_exits=True)``. Before
+I12683 a REDUCE row was not read at all, so every baseline held the full
+entry until the terminal exit — a book the executor never ran.
 """
 
 from __future__ import annotations
@@ -116,25 +125,33 @@ def _missing_db(component: str, issue: str) -> NotAvailable:
     )
 
 
+_ROUNDTRIP_COLS = [
+    "trade_id", "date", "ticker", "shares", "fill_price", "signal_date",
+    "exit_date", "days_held", "reduce_legs",
+]
+
+
 def _load_roundtrips(trades_db_path: str) -> pd.DataFrame:
     """One row per completed roundtrip: ``trade_id, date, ticker, shares,
-    fill_price, signal_date, exit_date``.
+    fill_price, signal_date, exit_date, days_held, reduce_legs``.
 
     Reads ``trades`` exactly as ``analysis/post_trade.py`` and
     ``analysis/shadow_book.py`` already do (same table, same connection
     pattern). An ENTER row without a matching terminal ``action='EXIT'`` row
     (still open, or only ever partially ``REDUCE``d) has no defined exit and
-    is dropped — a documented simplification: partial ``REDUCE`` legs are
-    not modeled as separate sub-positions, the roundtrip closes at the
-    terminal ``EXIT`` row. A ``trade_id`` closed more than once (not
-    expected under the schema) keeps its LATEST exit row, a deterministic
-    tie-break.
+    is dropped. A ``trade_id`` closed more than once (not expected under the
+    schema) keeps its LATEST exit row, a deterministic tie-break.
+
+    ``reduce_legs`` is the roundtrip's partial ``REDUCE`` legs, as a tuple of
+    ``(date, shares, exit_reason)`` sorted by date (alpha-engine-config-I12683):
+    the executor logs each REDUCE as its own row carrying the entry's
+    ``trade_id`` in ``entry_trade_id`` and the shares it sold
+    (crucible-executor ``executor/trade_logger.py::get_unmatched_entry``), and
+    the terminal EXIT sells what is left. See :func:`_load_reduce_legs` for
+    which legs are kept.
     """
     if not Path(trades_db_path).exists():
-        return pd.DataFrame(
-            columns=["trade_id", "date", "ticker", "shares", "fill_price",
-                     "signal_date", "exit_date"]
-        )
+        return pd.DataFrame(columns=_ROUNDTRIP_COLS)
     conn = sqlite3.connect(trades_db_path)
     try:
         entries = pd.read_sql_query(
@@ -148,17 +165,63 @@ def _load_roundtrips(trades_db_path: str) -> pd.DataFrame:
     finally:
         conn.close()
     if entries.empty or exits.empty:
-        return pd.DataFrame(
-            columns=["trade_id", "date", "ticker", "shares", "fill_price",
-                     "signal_date", "exit_date", "days_held"]
-        )
+        return pd.DataFrame(columns=_ROUNDTRIP_COLS)
     exits = exits.sort_values("exit_date").drop_duplicates(
         "entry_trade_id", keep="last"
     )
     merged = entries.merge(
         exits, left_on="trade_id", right_on="entry_trade_id", how="inner"
     )
+    legs = _load_reduce_legs(trades_db_path)
+    merged["reduce_legs"] = [
+        tuple(
+            leg for leg in legs.get(str(row.trade_id), ())
+            if leg[0] <= str(row.exit_date)
+        )
+        for row in merged.itertuples(index=False)
+    ]
     return merged
+
+
+def _load_reduce_legs(trades_db_path: str) -> dict[str, list[tuple[str, float, str]]]:
+    """``{entry_trade_id: [(date, shares, exit_reason), ...]}`` of REDUCE rows.
+
+    Sorted by date. A row with no ``entry_trade_id`` or non-positive
+    ``shares`` sells nothing attributable and is skipped. A database without
+    an ``exit_reason`` column (an old schema, or a test fixture) reads every
+    reason as ``""``. :func:`_load_roundtrips` additionally drops a leg dated
+    after its roundtrip's terminal exit; :func:`reduce_leg_census` counts the
+    legs that end up outside the replay.
+    """
+    if not Path(trades_db_path).exists():
+        return {}
+    conn = sqlite3.connect(trades_db_path)
+    try:
+        try:
+            rows = pd.read_sql_query(
+                "SELECT entry_trade_id, date, shares, exit_reason FROM trades "
+                "WHERE action = 'REDUCE' AND entry_trade_id IS NOT NULL",
+                conn,
+            )
+        except pd.errors.DatabaseError as exc:
+            if "no such column" not in str(exc).lower():
+                raise
+            rows = pd.read_sql_query(
+                "SELECT entry_trade_id, date, shares, '' AS exit_reason FROM trades "
+                "WHERE action = 'REDUCE' AND entry_trade_id IS NOT NULL",
+                conn,
+            )
+    finally:
+        conn.close()
+    out: dict[str, list[tuple[str, float, str]]] = {}
+    for r in rows.sort_values("date", kind="stable").itertuples(index=False):
+        if r.shares is None or pd.isna(r.shares) or float(r.shares) <= 0.0:
+            continue
+        reason = r.exit_reason if isinstance(r.exit_reason, str) else ""
+        out.setdefault(str(r.entry_trade_id), []).append(
+            (str(r.date), float(r.shares), reason)
+        )
+    return out
 
 
 def _snap_forward(axis: pd.DatetimeIndex, raw_date: str) -> pd.Timestamp | None:
@@ -176,7 +239,52 @@ def _hold_to_n_days_exit(
     return axis[exit_pos]
 
 
+def _exit_leg_orders(
+    ticker: str,
+    entry_shares: float,
+    reduce_legs: list[tuple[str, float]],
+    terminal_date: str,
+) -> list[dict]:
+    """Sell orders for one roundtrip: its REDUCE legs, then the terminal exit.
+
+    ``reduce_legs`` is ``[(date, shares), ...]`` already placed on the dates
+    the arm wants them (as executed, or moved to a fixed hold). The terminal
+    exit sells the remainder, ``entry_shares`` minus every reduce. Whatever
+    leg(s) fall on the LATEST date close the position outright (an order with
+    no ``shares``), so a moved reduce that lands after the terminal exit holds
+    exactly its own shares until then, and the book ends flat either way.
+
+    With no reduce legs this is one ``EXIT`` on ``terminal_date`` with no
+    ``shares`` — the exact order every arm emitted before I12683.
+    """
+    legs = [(d, float(sh), "REDUCE") for d, sh in reduce_legs]
+    remainder = max(0.0, float(entry_shares) - sum(sh for _, sh, _ in legs))
+    legs.append((terminal_date, remainder, "EXIT"))
+    last = max(d for d, _, _ in legs)
+    orders: list[dict] = []
+    if any(d < last for d, _, _ in legs):
+        for d, sh, action in sorted(legs, key=lambda leg: leg[0]):
+            if d == last or sh <= 0.0:
+                continue
+            orders.append({"date": d, "ticker": ticker, "action": action, "shares": sh})
+    orders.append({"date": last, "ticker": ticker, "action": "EXIT"})
+    return orders
+
+
+def _executed_reduce_legs(row, scale: float = 1.0) -> list[tuple[str, float]]:
+    """``row.reduce_legs`` as ``[(date, shares)]`` on their executed dates.
+
+    ``scale`` resizes each leg to the same FRACTION of a differently sized
+    entry (``position_sizing``'s equal-weight arm), floored to whole shares.
+    """
+    legs = getattr(row, "reduce_legs", ()) or ()
+    if scale == 1.0:
+        return [(d, sh) for d, sh, _ in legs]
+    return [(d, float(int(sh * scale))) for d, sh, _ in legs]
+
+
 def _baseline_orders(roundtrips: pd.DataFrame) -> list[dict]:
+    """The as-executed book: each ENTER, its partial REDUCE legs, its EXIT."""
     orders: list[dict] = []
     for row in roundtrips.itertuples(index=False):
         orders.append({
@@ -186,11 +294,10 @@ def _baseline_orders(roundtrips: pd.DataFrame) -> list[dict]:
             "shares": float(row.shares),
             "price_at_order": float(row.fill_price) if pd.notna(row.fill_price) else None,
         })
-        orders.append({
-            "date": str(row.exit_date),
-            "ticker": str(row.ticker),
-            "action": "EXIT",
-        })
+        orders.extend(_exit_leg_orders(
+            str(row.ticker), float(row.shares),
+            _executed_reduce_legs(row), str(row.exit_date),
+        ))
     return orders
 
 
@@ -277,9 +384,10 @@ SPEC_EXIT_RULES = ReplaySpec(
 # Families come from the executed ``exit_reason`` taxonomy on terminal
 # ``EXIT`` rows (crucible-executor ``executor/trade_logger.py``). Partial
 # ``REDUCE`` legs (``optimizer_scale_down``, ``time_decay_reduce``,
-# ``intraday_profit_take``) are not modelled by ``_load_roundtrips`` in either
-# arm, so they are not ablatable here — the same simplification the
-# whole-group row already makes.
+# ``intraday_profit_take``) are modelled in every arm since
+# alpha-engine-config-I12683 and are their own ``reduce_*`` families: ablating
+# one holds the shares that leg sold to the family's fixed hold instead, and
+# the terminal exit still sells the rest on its executed date.
 
 ISSUE_12624 = "alpha-engine-config-I12624"
 
@@ -297,10 +405,31 @@ EXIT_REASON_FAMILY: dict[str, str] = {
     "momentum_exit": "momentum",
 }
 
-#: Emission order of the family rows.
+#: Emission order of the terminal-exit family rows.
 EXIT_FAMILIES: tuple[str, ...] = (
     "optimizer", "time", "stop", "signal", "momentum", "other",
 )
+
+ISSUE_12683 = "alpha-engine-config-I12683"
+
+#: Partial ``REDUCE`` ``exit_reason`` -> ablation family
+#: (alpha-engine-config-I12683). ``optimizer_scale_down`` is the MVO turnover
+#: leg beside ``optimizer_target_zero``; ``time_decay_reduce`` is the reduce
+#: leg of the time-decay rule. An unlisted reduce reason falls into
+#: ``reduce_other``, as an unlisted terminal reason falls into ``other``.
+REDUCE_REASON_FAMILY: dict[str, str] = {
+    "optimizer_scale_down": "reduce_optimizer",
+    "time_decay_reduce": "reduce_time",
+    "intraday_profit_take": "reduce_profit_take",
+}
+
+#: Emission order of the reduce-leg family rows (after the terminal ones).
+REDUCE_FAMILIES: tuple[str, ...] = (
+    "reduce_optimizer", "reduce_time", "reduce_profit_take", "reduce_other",
+)
+
+#: Every ablatable family, terminal first.
+ALL_EXIT_FAMILIES: tuple[str, ...] = EXIT_FAMILIES + REDUCE_FAMILIES
 
 #: Fixed holds each family is ablated at: 30 matches the whole-group
 #: ``exit_rules`` row (so the family rows decompose THAT number), and the
@@ -314,6 +443,13 @@ def exit_family_of(reason: object) -> str:
     if not isinstance(reason, str) or not reason:
         return "other"
     return EXIT_REASON_FAMILY.get(reason, "other")
+
+
+def reduce_family_of(reason: object) -> str:
+    """The ablation family of one ``REDUCE`` ``exit_reason`` (``reduce_other`` if unknown)."""
+    if not isinstance(reason, str) or not reason:
+        return "reduce_other"
+    return REDUCE_REASON_FAMILY.get(reason, "reduce_other")
 
 
 def _load_terminal_exit_reasons(trades_db_path: str) -> dict[str, str]:
@@ -356,36 +492,51 @@ def build_exit_family_arms(
     *,
     hold_days: int = EXIT_RULES_FIXED_HOLD_DAYS,
 ) -> ArmSet | NotAvailable:
-    """Baseline vs. "family ``family`` disabled": only its exits become a hold.
+    """Baseline vs. "family ``family`` disabled": only its legs become a hold.
 
-    Same baseline and the same entry/share stream as ``exit_rules``; a
-    roundtrip whose terminal exit is NOT in ``family`` keeps its executed exit
-    date, one that is exits ``hold_days`` trading rows after entry.
+    Same baseline and the same entry/share stream as ``exit_rules``. For a
+    terminal family, a roundtrip whose terminal exit is in ``family`` sells
+    its remainder ``hold_days`` trading rows after entry instead; its REDUCE
+    legs stay as executed. For a ``reduce_*`` family, each REDUCE leg in it
+    sells its shares at that hold instead, and the terminal exit still sells
+    the rest on its executed date (alpha-engine-config-I12683). Every other
+    leg is as executed.
     """
-    if family not in EXIT_FAMILIES:
-        raise ValueError(f"unknown exit family {family!r}; one of {EXIT_FAMILIES}")
+    if family not in ALL_EXIT_FAMILIES:
+        raise ValueError(f"unknown exit family {family!r}; one of {ALL_EXIT_FAMILIES}")
+    issue = ISSUE_12683 if family in REDUCE_FAMILIES else ISSUE_12624
     if not inputs.trades_db_path:
-        return _missing_db(f"exit_rules.{family}", ISSUE_12624)
+        return _missing_db(f"exit_rules.{family}", issue)
     roundtrips = _load_roundtrips(inputs.trades_db_path)
     if roundtrips.empty:
         return NotAvailable(
             status="N/A-MISSING-INPUT",
             reason=(
                 f"exit_rules.{family}: trades.db has no ENTER row with a "
-                f"matching terminal EXIT row ({ISSUE_12624})"
+                f"matching terminal EXIT row ({issue})"
             ),
         )
-    reasons = _load_terminal_exit_reasons(inputs.trades_db_path)
-    in_family = [
-        exit_family_of(reasons.get(str(row.trade_id))) == family
-        for row in roundtrips.itertuples(index=False)
-    ]
-    if not any(in_family):
+    is_reduce_family = family in REDUCE_FAMILIES
+    reasons = (
+        {} if is_reduce_family else _load_terminal_exit_reasons(inputs.trades_db_path)
+    )
+
+    def ablated_legs(row) -> tuple[bool, list[bool]]:
+        """(terminal ablated?, per-REDUCE-leg ablated?) for one roundtrip."""
+        legs = row.reduce_legs or ()
+        if is_reduce_family:
+            return False, [reduce_family_of(why) == family for _, _, why in legs]
+        terminal = exit_family_of(reasons.get(str(row.trade_id))) == family
+        return terminal, [False] * len(legs)
+
+    plan = [ablated_legs(row) for row in roundtrips.itertuples(index=False)]
+    if not any(term or any(legs) for term, legs in plan):
+        what = "has a REDUCE leg in" if is_reduce_family else "closes on a"
         return NotAvailable(
             status="N/A-MISSING-INPUT",
             reason=(
-                f"exit_rules.{family}: no roundtrip in trades.db closes on a "
-                f"{family} exit, so there is nothing to ablate ({ISSUE_12624})"
+                f"exit_rules.{family}: no roundtrip in trades.db {what} "
+                f"{family} exit, so there is nothing to ablate ({issue})"
             ),
         )
     axis = pd.DatetimeIndex(inputs.price_matrix.index).sort_values()
@@ -394,7 +545,7 @@ def build_exit_family_arms(
     )
 
     ablated_orders: list[dict] = []
-    for row, ablate in zip(roundtrips.itertuples(index=False), in_family):
+    for row, (terminal_off, legs_off) in zip(roundtrips.itertuples(index=False), plan):
         entry = {
             "date": str(row.date),
             "ticker": str(row.ticker),
@@ -402,25 +553,26 @@ def build_exit_family_arms(
             "shares": float(row.shares),
             "price_at_order": float(row.fill_price) if pd.notna(row.fill_price) else None,
         }
-        if not ablate:
-            ablated_orders.append(entry)
-            ablated_orders.append(
-                {"date": str(row.exit_date), "ticker": str(row.ticker), "action": "EXIT"}
-            )
-            continue
-        entry_snap = _snap_forward(axis, str(row.date))
-        if entry_snap is None or entry_snap not in axis:
-            continue
+        reduce_legs = _executed_reduce_legs(row)
+        terminal_date = str(row.exit_date)
+        if terminal_off or any(legs_off):
+            entry_snap = _snap_forward(axis, str(row.date))
+            if entry_snap is None or entry_snap not in axis:
+                continue
+            held = _hold_to_n_days_exit(axis, entry_snap, hold_days).strftime("%Y-%m-%d")
+            reduce_legs = [
+                (held if off else d, sh) for (d, sh), off in zip(reduce_legs, legs_off)
+            ]
+            if terminal_off:
+                terminal_date = held
         ablated_orders.append(entry)
-        fixed_exit = _hold_to_n_days_exit(axis, entry_snap, hold_days)
-        ablated_orders.append({
-            "date": fixed_exit.strftime("%Y-%m-%d"),
-            "ticker": str(row.ticker),
-            "action": "EXIT",
-        })
+        ablated_orders.extend(_exit_leg_orders(
+            str(row.ticker), float(row.shares), reduce_legs, terminal_date,
+        ))
+    leg_kind = "REDUCE legs" if is_reduce_family else "exits"
     ablated = orders_arm(
-        f"{family} exits replaced by a hold-to-{hold_days}-trading-day exit "
-        "(that family disabled; every other exit as executed)",
+        f"{family} {leg_kind} replaced by a hold-to-{hold_days}-trading-day exit "
+        "(that family disabled; every other leg as executed)",
         ablated_orders,
     )
     return ArmSet(baseline=baseline, ablated=ablated)
@@ -433,7 +585,7 @@ def exit_family_spec(family: str, hold_days: int) -> ReplaySpec:
         module="executor",
         criticality="supporting",
         pattern="null_arm",
-        issue=ISSUE_12624,
+        issue=ISSUE_12683 if family in REDUCE_FAMILIES else ISSUE_12624,
         build_arms=lambda inputs: build_exit_family_arms(
             inputs, family, hold_days=hold_days
         ),
@@ -450,6 +602,30 @@ def exit_family_census(trades_db_path: str | None) -> dict[str, int]:
     for row in roundtrips.itertuples(index=False):
         out[exit_family_of(reasons.get(str(row.trade_id)))] += 1
     return out
+
+
+def reduce_leg_census(trades_db_path: str | None) -> dict:
+    """REDUCE legs per ``reduce_*`` family, modelled vs. outside the replay.
+
+    ``modelled`` counts the legs that ride a completed roundtrip in every arm
+    (alpha-engine-config-I12683). ``unmodelled`` counts the rest, by family: a
+    leg of a position with no terminal EXIT yet (still open), or one dated
+    after its roundtrip's terminal exit. Both are reported so the share of the
+    executed REDUCE book the replay sees is a number, not an assumption.
+    """
+    if not trades_db_path:
+        return {}
+    modelled = {f: 0 for f in REDUCE_FAMILIES}
+    unmodelled = {f: 0 for f in REDUCE_FAMILIES}
+    for row in _load_roundtrips(trades_db_path).itertuples(index=False):
+        for _, _, why in row.reduce_legs or ():
+            modelled[reduce_family_of(why)] += 1
+    for legs in _load_reduce_legs(trades_db_path).values():
+        for _, _, why in legs:
+            unmodelled[reduce_family_of(why)] += 1
+    for f in REDUCE_FAMILIES:
+        unmodelled[f] -= modelled[f]
+    return {"modelled": modelled, "unmodelled": unmodelled}
 
 
 #: The family pre-declared as the shadow arm for alpha-engine-config-I12624:
@@ -495,15 +671,20 @@ def exit_family_decomposition(inputs: ReplayInputs, *, n_trials: int) -> dict:
     :func:`exit_family_spec`; only its summary is kept (no arm series, no DSR —
     these arms are not candidates for promotion and are not added to the
     fleet trial accumulator).
+
+    Schema 2 (alpha-engine-config-I12683) adds the ``reduce_*`` rows (one per
+    partial-REDUCE family, ``leg_kind: "reduce"``), the reduce-leg census, and
+    models every REDUCE leg in both arms of every row.
     """
     rows: list[dict] = []
     for hold in EXIT_FAMILY_HOLD_DAYS:
-        for family in EXIT_FAMILIES:
+        for family in ALL_EXIT_FAMILIES:
             spec = exit_family_spec(family, hold)
             comp = run_spec(spec, inputs, n_trials=n_trials)
             row = {
                 "name": spec.name,
                 "family": family,
+                "leg_kind": "reduce" if family in REDUCE_FAMILIES else "terminal",
                 "hold_days": hold,
                 "status": comp.get("status"),
                 "status_reason": comp.get("status_reason"),
@@ -537,18 +718,22 @@ def exit_family_decomposition(inputs: ReplayInputs, *, n_trials: int) -> dict:
     worst = min(primary, key=lambda r: r["value"]) if primary else None
     shadow_name = f"exit_rules.{SHADOW_ARM_FAMILY}.hold{EXIT_RULES_FIXED_HOLD_DAYS}"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "issue": ISSUE_12624,
+        "issues": [ISSUE_12624, ISSUE_12683],
         "mode": "shadow",
         "graded": False,
         "note": (
             "Diagnostic of the exit_rules component: one family of terminal "
-            "exits replaced by a fixed hold at a time, every other order as "
-            "executed. Not a graded component, not in registry.SPECS, not "
-            "counted in n_trials_cumulative; moves no live exit, size or limit."
+            "exits, or of partial REDUCE legs, replaced by a fixed hold at a "
+            "time, every other order (REDUCE legs included) as executed. Not a "
+            "graded component, not in registry.SPECS, not counted in "
+            "n_trials_cumulative; moves no live exit, size or limit."
         ),
         "family_of_exit_reason": dict(EXIT_REASON_FAMILY),
+        "family_of_reduce_reason": dict(REDUCE_REASON_FAMILY),
         "census_roundtrips": exit_family_census(inputs.trades_db_path),
+        "census_reduce_legs": reduce_leg_census(inputs.trades_db_path),
         "shadow_arm": {
             "family": SHADOW_ARM_FAMILY,
             "name": shadow_name,
@@ -601,9 +786,13 @@ def _position_sizing_build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
             "date": str(row.date), "ticker": str(row.ticker), "action": "ENTER",
             "shares": shares, "price_at_order": float(entry_price),
         })
-        ablated_orders.append({
-            "date": str(row.exit_date), "ticker": str(row.ticker), "action": "EXIT",
-        })
+        # Each REDUCE keeps its executed date and sells the same FRACTION of
+        # the resized entry, so only the sizing rule varies (I12683).
+        scale = shares / float(row.shares) if float(row.shares) > 0.0 else 0.0
+        ablated_orders.extend(_exit_leg_orders(
+            str(row.ticker), shares,
+            _executed_reduce_legs(row, scale), str(row.exit_date),
+        ))
     ablated = orders_arm(
         "equal-weight sizing (init_cash / picks_that_day), same entries/exits "
         "(sizing rule disabled)",
@@ -658,9 +847,10 @@ def _entry_triggers_build_arms(inputs: ReplayInputs) -> ArmSet | NotAvailable:
             "shares": float(row.shares),
             "price_at_order": float(row.fill_price) if pd.notna(row.fill_price) else None,
         })
-        ablated_orders.append({
-            "date": str(row.exit_date), "ticker": str(row.ticker), "action": "EXIT",
-        })
+        ablated_orders.extend(_exit_leg_orders(
+            str(row.ticker), float(row.shares),
+            _executed_reduce_legs(row), str(row.exit_date),
+        ))
     ablated = orders_arm(
         "entry at signal_date (pre-trigger source date), no trigger delay; "
         "same shares and exit date as baseline",
