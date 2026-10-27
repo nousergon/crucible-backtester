@@ -748,6 +748,19 @@ def _buy_fills_by_date(pf: Any, index: pd.Index) -> dict[str, int]:
     return dict(sorted(out.items()))
 
 
+def has_partial_exits(orders: Sequence[Mapping[str, Any]]) -> bool:
+    """True when any EXIT/REDUCE carries ``shares`` — a partial sell leg.
+
+    Only then does the simulator run with ``partial_exits=True``; every other
+    arm (picks arms, terminal-exit-only order arms) takes the default path
+    unchanged (alpha-engine-config-I12683).
+    """
+    return any(
+        str(o.get("action")) in ("EXIT", "REDUCE") and o.get("shares") is not None
+        for o in orders
+    )
+
+
 def simulate_arm(arm: Arm, arm_set: ArmSet, inputs: ReplayInputs) -> dict:
     """Run one arm through the production simulator and return its stats.
 
@@ -772,6 +785,7 @@ def simulate_arm(arm: Arm, arm_set: ArmSet, inputs: ReplayInputs) -> dict:
         init_cash=inputs.init_cash,
         fees=fees,
         slippage_bps=slippage_bps,
+        partial_exits=has_partial_exits(orders),
     )
     stats = portfolio_stats(pf, spy_prices=inputs.spy_prices)
     stats["n_orders"] = len(orders)

@@ -221,6 +221,7 @@ def orders_to_portfolio(
     fees: float = 0.001,
     slippage_bps: float = 0.0,
     assume_next_day_fill: bool = False,
+    partial_exits: bool = False,
 ) -> vbt.Portfolio:
     """
     Convert executor order list to a vectorbt Portfolio.
@@ -236,6 +237,16 @@ def orders_to_portfolio(
         slippage_bps: Additional slippage per side in basis points (e.g. 10 = 10bps).
         assume_next_day_fill: If True, shift ENTER orders forward by 1 trading day
             to simulate next-day-close fills. EXIT/REDUCE stay same-day (conservative).
+        partial_exits: If False (the default, and every production caller), any
+            EXIT/REDUCE closes the whole position, whatever ``shares`` it
+            carries. If True, an EXIT/REDUCE that carries ``shares`` sells only
+            that many shares (a partial leg), and one without ``shares`` closes
+            the position; legs on the same date and ticker add up, and a
+            close-all leg wins. Entries are unchanged: an ENTER while already
+            holding is still ignored (vectorbt ``accumulate="removeonly"``). An
+            order stream with no ``shares`` on any exit simulates identically
+            either way. Opt-in for the contribution-lift replay, which models
+            the executor's partial REDUCE legs (alpha-engine-config-I12683).
 
     Returns:
         vbt.Portfolio with full analytics available via .sharpe_ratio(),
@@ -247,6 +258,9 @@ def orders_to_portfolio(
     entries = pd.DataFrame(False, index=dates, columns=tickers)
     exits   = pd.DataFrame(False, index=dates, columns=tickers)
     sizes   = pd.DataFrame(0.0,   index=dates, columns=tickers)
+    # partial_exits only: {(date, ticker): shares to sell}; inf = close all.
+    sell_legs: dict[tuple[pd.Timestamp, str], float] = {}
+    entered: set[tuple[pd.Timestamp, str]] = set()
 
     for order in orders:
         d = pd.Timestamp(order["date"])
@@ -264,8 +278,23 @@ def orders_to_portfolio(
                     continue  # no next trading day available — skip order
             entries.loc[fill_date, t] = True
             sizes.loc[fill_date, t]   = float(order.get("shares", 0))
+            entered.add((fill_date, t))
         elif order["action"] in ("EXIT", "REDUCE"):
             exits.loc[d, t] = True
+            if partial_exits:
+                leg = order.get("shares")
+                leg_shares = np.inf if leg is None else float(leg)
+                sell_legs[(d, t)] = sell_legs.get((d, t), 0.0) + leg_shares
+
+    accumulate = False
+    if partial_exits:
+        # One size array serves both signal kinds. A bar carrying both an ENTER
+        # and an exit for one ticker is a signal conflict vectorbt ignores on
+        # either path, so the ENTER's size is simply kept there.
+        for (d, t), leg_shares in sell_legs.items():
+            if (d, t) not in entered:
+                sizes.loc[d, t] = leg_shares
+        accumulate = "removeonly"
 
     # Combine base fees with slippage: total_fees = base_fees + slippage_bps/10000
     total_fees = fees + slippage_bps / 10_000
@@ -280,6 +309,7 @@ def orders_to_portfolio(
         cash_sharing=True,
         group_by=True,
         fees=total_fees,
+        accumulate=accumulate,
         # freq="D" tells vectorbt the index is calendar-daily, which is only
         # needed for its own internal (365-day) annualization of drawdown/
         # calmar timing math. It is NOT the annualization convention for
