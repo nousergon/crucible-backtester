@@ -189,3 +189,27 @@ def test_krepis_floor_does_not_need_the_deploy_role_to_list_aliases() -> None:
         f"lambda:ListAliases and leaves a PARTIAL deploy "
         f"(alpha-engine-config-I8030)"
     )
+
+
+def test_concordance_denies_the_retired_provider_key() -> None:
+    """alpha-engine-config-I6789: `alpha-engine-replay-concordance` still held
+    ANTHROPIC_API_KEY on 2026-10-31 although nothing it runs reads it — the
+    router-env merge above carries every live variable forward. A provider
+    credential on a router-addressed function is a bypass
+    (llm-egress-proxy-policy §2a), so the deploy removes it."""
+    code = _SCRIPTS["concordance"].read_text(encoding="utf-8")
+    declaration = code.split("LAMBDA_ENV_DENIED_KEYS=(", 1)[1].split(")", 1)[0]
+    assert "ANTHROPIC_API_KEY" in declaration.split()
+
+
+def test_no_concordance_code_reads_the_denied_provider_key() -> None:
+    """Denying a key the code still needs breaks the function at runtime;
+    pin that the shipped concordance path never reads it."""
+    root = Path(__file__).resolve().parents[1]
+    readers = [
+        str(path.relative_to(root))
+        for folder in ("lambda_concordance", "replay")
+        for path in (root / folder).rglob("*.py")
+        if "ANTHROPIC_API_KEY" in path.read_text(encoding="utf-8")
+    ]
+    assert readers == [], f"code still references ANTHROPIC_API_KEY: {readers}"

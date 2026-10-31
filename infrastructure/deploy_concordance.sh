@@ -110,7 +110,7 @@ fi
 # Mirrors crucible-research/infrastructure/deploy.sh::_apply_router_env
 # (alpha-engine-config-I6373). Read-modify-write because
 # update-function-configuration --environment REPLACES the whole map, and
-# this Lambda's other env vars (ANTHROPIC_API_KEY, FMP_API_KEY, etc. — see
+# this Lambda's other env vars (FMP_API_KEY, RAG_DATABASE_URL, etc. — see
 # alpha-engine-config-I6377, the same uncodified-env gap on the sibling
 # research Lambda) are not owned by this script.
 _apply_router_env() {
@@ -227,7 +227,14 @@ python3 -m krepis.aws merge-lambda-env --function-name alpha-engine-replay-conco
 # Placed after publish-version it would mutate $LATEST only and be a
 # silent no-op on the alias (L4497). --missing-ok: every deploy after the
 # first finds the key already gone.
-LAMBDA_ENV_DENIED_KEYS=(GITHUB_TOKEN)
+#
+# ANTHROPIC_API_KEY (alpha-engine-config-I6789): a provider credential is a
+# router bypass (llm-egress-proxy-policy §2a). Nothing this function runs
+# reads it: lambda_concordance/handler.py lists no provider key, and the
+# target-model call authenticates to the router edge with this function's
+# own KREPIS_ROUTER_CREDENTIAL_SECRET (I2997, I7878). The key survived only
+# because _apply_router_env above carries every live variable forward.
+LAMBDA_ENV_DENIED_KEYS=(GITHUB_TOKEN ANTHROPIC_API_KEY)
 
 echo ""
 echo "==> Converging Lambda environment on ${LAMBDA_FUNCTION} (removing denied keys)..."
