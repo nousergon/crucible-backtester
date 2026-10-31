@@ -158,8 +158,13 @@ def analyze(research_db_path: str) -> dict:
     rejected = merged[merged["quant_filter_pass"] == 0]
 
     if rejected.empty:
-        return {"status": "ok", "leakage_rate": 0.0, "note": "No rejected stocks",
-                "recommendations": [], "n_weeks": n_weeks}
+        # alpha-engine-config-I9708: leakage is "% of REJECTED stocks that beat
+        # SPY", which is undefined over zero rejections. This used to return
+        # `ok` with a fabricated leakage_rate of 0.0, and the completeness
+        # tracker graded the module ok on a measurement that never happened.
+        return {"status": "insufficient_data",
+                "note": "No rejected stocks: leakage is undefined over zero rejections",
+                "n_weeks": n_weeks}
 
     # Overall leakage: % of rejected stocks that beat SPY
     rejected_with_returns = rejected[rejected["beat_spy_5d"].notna()]
