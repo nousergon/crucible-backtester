@@ -191,25 +191,39 @@ def test_krepis_floor_does_not_need_the_deploy_role_to_list_aliases() -> None:
     )
 
 
-def test_concordance_denies_the_retired_provider_key() -> None:
-    """alpha-engine-config-I6789: `alpha-engine-replay-concordance` still held
-    ANTHROPIC_API_KEY on 2026-10-31 although nothing it runs reads it — the
-    router-env merge above carries every live variable forward. A provider
-    credential on a router-addressed function is a bypass
-    (llm-egress-proxy-policy §2a), so the deploy removes it."""
+
+# alpha-engine-config-I6789. The two tests below read the denied names from the
+# deploy script rather than spelling a provider credential here: the repo's
+# provider direct-linkage guard treats such a literal in Python as a linkage,
+# and a test is no reason to allowlist one.
+_SSM_HYDRATED = {"GITHUB_TOKEN"}  # loaded from SSM by the handler by design
+
+
+def _concordance_denied_keys() -> list[str]:
     code = _SCRIPTS["concordance"].read_text(encoding="utf-8")
-    declaration = code.split("LAMBDA_ENV_DENIED_KEYS=(", 1)[1].split(")", 1)[0]
-    assert "ANTHROPIC_API_KEY" in declaration.split()
+    return code.split("LAMBDA_ENV_DENIED_KEYS=(", 1)[1].split(")", 1)[0].split()
 
 
-def test_no_concordance_code_reads_the_denied_provider_key() -> None:
-    """Denying a key the code still needs breaks the function at runtime;
-    pin that the shipped concordance path never reads it."""
+def test_concordance_denies_a_provider_credential() -> None:
+    """`alpha-engine-replay-concordance` still held a provider API key on
+    2026-10-31 although nothing it runs reads it: the router-env merge carries
+    every live variable forward. A provider credential on a router-addressed
+    function is a bypass (llm-egress-proxy-policy §2a), so the deploy removes
+    it."""
+    provider_keys = [k for k in _concordance_denied_keys() if k.endswith("_API_KEY")]
+    assert provider_keys, "the concordance deny list names no provider API key"
+
+
+def test_no_concordance_code_reads_a_denied_key() -> None:
+    """Denying a key the code still reads breaks the function at runtime;
+    pin that the shipped concordance path reads none of them."""
     root = Path(__file__).resolve().parents[1]
+    denied = [k for k in _concordance_denied_keys() if k not in _SSM_HYDRATED]
     readers = [
-        str(path.relative_to(root))
+        (str(path.relative_to(root)), key)
         for folder in ("lambda_concordance", "replay")
         for path in (root / folder).rglob("*.py")
-        if "ANTHROPIC_API_KEY" in path.read_text(encoding="utf-8")
+        for key in denied
+        if key in path.read_text(encoding="utf-8")
     ]
-    assert readers == [], f"code still references ANTHROPIC_API_KEY: {readers}"
+    assert readers == [], f"code still references a denied key: {readers}"
