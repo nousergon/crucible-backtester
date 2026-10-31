@@ -42,7 +42,9 @@ echo "Working directory: $REPO_ROOT"
 
 echo ""
 echo "==> Building Docker image..."
-docker build --platform linux/amd64 --provenance=false --tag "${ECR_REPO}:${IMAGE_TAG}" --file lambda_counterfactual/Dockerfile .
+# alpha-engine-config-I12122: CI exports GITHUB_SHA; a local run stamps HEAD.
+GIT_SHA="${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+docker build --platform linux/amd64 --provenance=false --build-arg GIT_SHA="${GIT_SHA}" --tag "${ECR_REPO}:${IMAGE_TAG}" --file lambda_counterfactual/Dockerfile .
 echo "  Image built: ${ECR_REPO}:${IMAGE_TAG}"
 
 if [ "$DRY_RUN" = true ]; then

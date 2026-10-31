@@ -50,7 +50,9 @@ echo "Working directory: $REPO_ROOT"
 # ── Step 1: Build Docker image ───────────────────────────────────────────────
 echo ""
 echo "==> Building Docker image..."
-docker build --platform linux/amd64 --provenance=false --tag "${ECR_REPO}:${IMAGE_TAG}" --file lambda_concordance/Dockerfile .
+# alpha-engine-config-I12122: CI exports GITHUB_SHA; a local run stamps HEAD.
+GIT_SHA="${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+docker build --platform linux/amd64 --provenance=false --build-arg GIT_SHA="${GIT_SHA}" --tag "${ECR_REPO}:${IMAGE_TAG}" --file lambda_concordance/Dockerfile .
 
 echo "  Image built: ${ECR_REPO}:${IMAGE_TAG}"
 

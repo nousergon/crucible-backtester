@@ -67,4 +67,10 @@ COPY flow-doctor.yaml .
 COPY lambda_counterfactual/handler.py handler.py
 
 # Lambda handler entry point
+# alpha-engine-config-I12122: stamp the commit this image was built from, as
+# crucible-evaluator and crucible-predictor do, so a deploy-drift check can
+# read which commit is live instead of inferring it. Last, so the stamp never
+# invalidates the cached dependency layers above.
+ARG GIT_SHA=unknown
+RUN echo "${GIT_SHA}" > /var/task/GIT_SHA.txt
 CMD ["handler.handler"]
