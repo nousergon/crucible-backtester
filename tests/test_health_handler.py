@@ -178,3 +178,57 @@ def test_handler_full_run(mock_db, mock_drift, mock_health, mock_cal, mock_trigg
     assert result["statusCode"] == 200
     body = json.loads(result["body"])
     assert body["status"] == "ok"
+
+
+@patch("lambda_health.handler.write_health", create=True)
+@patch("lambda_health.handler.evaluate_retrain_triggers", create=True)
+@patch("lambda_health.handler.compute_calibration_validation", create=True)
+@patch("lambda_health.handler.compute_production_health", create=True)
+@patch("lambda_health.handler._load_last_feature_drift", return_value=None)
+@patch("lambda_health.handler._download_research_db", return_value="/tmp/test.db")
+def test_handler_real_run_that_graded_nothing_is_not_ok(
+    mock_db, mock_drift, mock_health, mock_cal, mock_triggers, mock_write,
+):
+    """alpha-engine-config-I9708: both compute phases skipped (no metric
+    evaluated) used to fall through to status "ok" and an ok health stamp."""
+    mock_health.return_value = {"status": "skipped", "reason": "insufficient_samples"}
+    mock_cal.return_value = {"status": "skipped", "reason": "no_db"}
+    mock_triggers.return_value = {"triggered": False, "n_triggers": 0, "summary": ""}
+
+    with patch("analysis.production_health.compute_production_health", mock_health), \
+         patch("analysis.production_health.compute_calibration_validation", mock_cal), \
+         patch("analysis.retrain_alert.evaluate_retrain_triggers", mock_triggers), \
+         patch("nousergon_lib.health.write_health", mock_write):
+        result = handler({}, None)
+
+    assert result["statusCode"] == 200  # nothing failed
+    body = json.loads(result["body"])
+    assert body["status"] == "insufficient_data"
+    # The stamp carries a warning, so write_health derives `degraded`, not ok.
+    warnings = mock_write.call_args.kwargs["warnings"]
+    assert warnings and "NO metric was evaluated" in warnings[0]
+
+
+@patch("lambda_health.handler.write_health", create=True)
+@patch("lambda_health.handler.evaluate_retrain_triggers", create=True)
+@patch("lambda_health.handler.compute_calibration_validation", create=True)
+@patch("lambda_health.handler.compute_production_health", create=True)
+@patch("lambda_health.handler._load_last_feature_drift", return_value=None)
+@patch("lambda_health.handler._download_research_db", return_value="/tmp/test.db")
+def test_handler_one_graded_phase_is_still_a_verdict(
+    mock_db, mock_drift, mock_health, mock_cal, mock_triggers, mock_write,
+):
+    """Production health measured, calibration skipped: a real verdict."""
+    mock_health.return_value = {
+        "rolling_30d_ic": 0.04, "degradation_flag": False, "mode_collapse_flag": False,
+    }
+    mock_cal.return_value = {"status": "skipped", "reason": "no_db"}
+    mock_triggers.return_value = {"triggered": False, "n_triggers": 0, "summary": ""}
+
+    with patch("analysis.production_health.compute_production_health", mock_health), \
+         patch("analysis.production_health.compute_calibration_validation", mock_cal), \
+         patch("analysis.retrain_alert.evaluate_retrain_triggers", mock_triggers), \
+         patch("nousergon_lib.health.write_health", mock_write):
+        result = handler({}, None)
+
+    assert json.loads(result["body"])["status"] == "ok"
