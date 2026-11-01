@@ -259,6 +259,26 @@ def _run(event: dict, context) -> dict:
     if results.get("retrain_alert", {}).get("triggered"):
         status = "degraded"
 
+    # alpha-engine-config-I9708 — a REAL run can grade nothing too. When both
+    # compute phases return `skipped` (too few post-cutover outcomes, or the
+    # post-cutover IC blackout, or no calibration window yet), no metric was
+    # evaluated, `degradation_flag` is absent, and every check above fell
+    # through to the initial "ok". That is the dry-run defect below on the
+    # live path: a health check that measured nothing reporting healthy. The
+    # warning makes the health stamp derive `degraded`; the HTTP status stays
+    # 200 because nothing failed.
+    def _skipped(phase_result) -> bool:
+        return isinstance(phase_result, dict) and phase_result.get("status") == "skipped"
+
+    if status == "ok" and _skipped(production_health) and _skipped(calibration):
+        status = "insufficient_data"
+        warnings.append(
+            "insufficient_data: NO metric was evaluated — production health "
+            f"({production_health.get('reason')}) and calibration "
+            f"({calibration.get('reason')}) were both skipped, so this run is "
+            "not a health verdict."
+        )
+
     # alpha-engine-config-I8704 — a dry run GRADED NOTHING, and must never say
     # `ok`. Under dry_run both compute phases short-circuit to
     # {"status": "dry_run"}, so `degradation_flag` is absent from
