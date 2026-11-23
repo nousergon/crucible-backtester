@@ -147,6 +147,10 @@ cvxpy>=1.9.2,<1.10
 # trailing window) is a correctness fix this slot consumes unchanged.
 # LOCKSTEP with crucible-predictor (lib-pin-cross-repo-guard.yml).
 nousergon-lib[arcticdb,flow-doctor,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.165
+# alpha-engine-config-I14262: nousergon-lib's [arcticdb] extra is floor-only (>=6.11), and
+# arcticdb 7.0.0 (2026-11-23) changed the static-schema mismatch error the data
+# layer keys on. Cap it here until the lib extra carries the ceiling.
+arcticdb<7
 # ── Predictor-replay runtime deps (config#3031) ──────────────────────────────
 # synthetic/predictor_backtest.py and analysis/scanner_predictor_research_free_
 # backfill.py import crucible-predictor CODE in-process (sys.path), so THIS
